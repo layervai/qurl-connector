@@ -1,0 +1,4 @@
+* text=auto
+*.go linguist-language=Go
+*.md linguist-documentation
+*.sh eol=lf

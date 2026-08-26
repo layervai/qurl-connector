@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "new_proxy_rejects": [
+    {
+      "tag": "owner_missing",
+      "wire_text": "owner_missing: connector identity missing"
+    },
+    {
+      "tag": "knock_invalid",
+      "wire_text": "knock_invalid: knock token expired"
+    },
+    {
+      "tag": "session_stale",
+      "wire_text": "session_stale: serving session is stale"
+    }
+  ]
+}

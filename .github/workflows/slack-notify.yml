@@ -1,0 +1,174 @@
+name: Slack Notify
+
+# Reusable workflow: posts a build/deploy status card to the Slack channel
+# bound to the org SLACK_WEBHOOK_URL secret (#build-notifications). Called by
+# ci.yml through a trailing notification job that passes a title and its
+# `needs` results. This workflow aggregates those results into the card status.
+#
+# The card format (attachments -> color + blocks: header with status emoji,
+# ref/trigger fields, commit subject, footer with commit + workflow links)
+# uses the shared build-notification format.
+#
+# The incoming webhook posts to exactly one channel. If the secret is unset
+# (forks or secretless runs), the step no-ops instead of erroring.
+
+on:
+  workflow_call:
+    inputs:
+      title:
+        description: "Card header label, e.g. 'qurl-connector CI'."
+        required: true
+        type: string
+      results:
+        description: >-
+          The caller's `needs` context as JSON — pass the toJSON(needs)
+          expression from the caller's `with:`. The card status is aggregated
+          from the per-job `.result` values here (failure > cancelled >
+          success) so each caller doesn't re-implement the precedence; a caller
+          only has to list the jobs in its `needs:`.
+        required: true
+        type: string
+    secrets:
+      SLACK_WEBHOOK_URL:
+        description: "Slack incoming-webhook URL bound to #build-notifications."
+        required: false
+
+# Talks only to a Slack webhook; touches no repo state, needs no token. The
+# single job inherits this empty default, so no job-level override is needed.
+permissions: {}
+
+jobs:
+  notify:
+    name: Post to Slack
+    runs-on: ubuntu-latest
+    # Cap so a hung Slack endpoint can't sit on the default 360m timeout.
+    timeout-minutes: 5
+    steps:
+      - name: Post status card
+        env:
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK_URL }}
+          TITLE: ${{ inputs.title }}
+          RESULTS: ${{ inputs.results }}
+          # Passed via env (never inline ${{ }}) so a crafted commit message,
+          # branch, or actor name can't break out of the script — the standard
+          # GitHub Actions script-injection guard.
+          COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
+          ACTOR: ${{ github.actor }}
+          REF_NAME: ${{ github.ref_name }}
+          REF_TYPE: ${{ github.ref_type }}
+          EVENT_NAME: ${{ github.event_name }}
+          SHA: ${{ github.sha }}
+          SERVER_URL: ${{ github.server_url }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          if [[ -z "$SLACK_WEBHOOK" ]]; then
+            echo "SLACK_WEBHOOK_URL not configured, skipping notification"
+            exit 0
+          fi
+
+          # Aggregate the caller's job results into one status. Precedence:
+          # any failure -> failure; else any cancelled -> cancelled; else
+          # success. The caller gates on `!cancelled()`, so a whole-run
+          # cancellation skips this job entirely; the cancelled arm is a cheap
+          # defensive default for the rarer case of an individual need reporting
+          # `cancelled` while the run continues — a yellow card beats a
+          # misleading green one. A `skipped` need counts as success; callers
+          # whose needed jobs can be skipped gate their notify so a skipped need
+          # never reaches here (verify-release skips notify when verify is
+          # skipped), so that can't mislabel a card.
+          STATUS=$(printf '%s' "$RESULTS" | jq -r '
+            [.[].result] as $r
+            | if   ($r | any(. == "failure"))   then "failure"
+              elif ($r | any(. == "cancelled")) then "cancelled"
+              else "success" end')
+
+          SHORT_SHA="${SHA:0:7}"
+          WORKFLOW_URL="$SERVER_URL/$REPO/actions/runs/$RUN_ID"
+          COMMIT_URL="$SERVER_URL/$REPO/commit/$SHA"
+
+          # First line of the push's head commit (empty on release /
+          # workflow_dispatch, where head_commit is absent). Bash builtin — no
+          # subprocess, and no echo (which would mangle a subject starting with
+          # -n/-e). Reused for both the trigger label and the Commit block.
+          FIRST_LINE="${COMMIT_MESSAGE%%$'\n'*}"
+
+          # Human-readable trigger source. For a branch push, distinguish a
+          # merged PR — a merge-commit subject, or a squash-merge subject ending
+          # "(#N)" (this repo squash-merges) — from a direct push.
+          PR_SUBJECT_RE='\(#[0-9]+\)$'
+          case "$EVENT_NAME" in
+            push)
+              if [[ "$REF_TYPE" == "tag" ]]; then
+                TRIGGER_TEXT="Tag push"
+              elif [[ "$FIRST_LINE" == *"Merge pull request"* || "$FIRST_LINE" =~ $PR_SUBJECT_RE ]]; then
+                TRIGGER_TEXT="PR merge"
+              else
+                TRIGGER_TEXT="Push"
+              fi
+              ;;
+            workflow_dispatch) TRIGGER_TEXT="Manual" ;;
+            release) TRIGGER_TEXT="Release" ;;
+            *) TRIGGER_TEXT="$EVENT_NAME" ;;
+          esac
+
+          # Tags (and releases, which are tag-based) label the ref field "Tag".
+          if [[ "$REF_TYPE" == "tag" ]]; then REF_LABEL="Tag"; else REF_LABEL="Branch"; fi
+
+          case "$STATUS" in
+            success)   COLOR="#36a64f"; EMOJI="white_check_mark"; STATUS_TEXT="successful" ;;
+            failure)   COLOR="#dc3545"; EMOJI="x";                STATUS_TEXT="failed" ;;
+            cancelled) COLOR="#ffc107"; EMOJI="warning";          STATUS_TEXT="cancelled" ;;
+            *)         COLOR="#ffc107"; EMOJI="grey_question";    STATUS_TEXT="${STATUS:-unknown}" ;;
+          esac
+
+          # Commit subject for the card: backticks -> single quotes so they
+          # can't break the mrkdwn code span. Empty FIRST_LINE yields an empty
+          # subject and the jq below omits the Commit block. Length capping +
+          # JSON/UTF-8 escaping happen in jq (codepoint-aware, no mid-byte cut).
+          COMMIT_SUBJECT=$(printf '%s' "$FIRST_LINE" | tr '`' "'")
+
+          # Build the payload with jq so every interpolated value — title, ref
+          # name, actor, commit subject — is correctly JSON-escaped regardless of
+          # content (a tag like v1"x, or an emoji straddling the length cap,
+          # can't break the payload). Optional commit + failure-nudge blocks are
+          # concatenated conditionally.
+          PAYLOAD=$(jq -cn \
+            --arg emoji "$EMOJI" \
+            --arg title "$TITLE" \
+            --arg status_text "$STATUS_TEXT" \
+            --arg ref_label "$REF_LABEL" \
+            --arg ref_name "$REF_NAME" \
+            --arg short_sha "$SHORT_SHA" \
+            --arg trigger "$TRIGGER_TEXT" \
+            --arg actor "$ACTOR" \
+            --arg commit "$COMMIT_SUBJECT" \
+            --arg status "$STATUS" \
+            --arg color "$COLOR" \
+            --arg commit_url "$COMMIT_URL" \
+            --arg workflow_url "$WORKFLOW_URL" \
+            '
+            [
+              { type: "section", text: { type: "mrkdwn", text: ":\($emoji): *\($title)* \($status_text)" } },
+              { type: "section", fields: [
+                  { type: "mrkdwn", text: "*\($ref_label):*\n`\($ref_name)` (\($short_sha))" },
+                  { type: "mrkdwn", text: "*Trigger:*\n\($trigger) by \($actor)" }
+              ] }
+            ]
+            + (if $commit != "" then
+                 [ { type: "section", text: { type: "mrkdwn", text: "*Commit:* `\($commit | .[0:100])`" } } ]
+               else [] end)
+            + (if $status == "failure" then
+                 [ { type: "context", elements: [ { type: "mrkdwn", text: ":rotating_light: A job failed — open the run for the failing step." } ] } ]
+               else [] end)
+            + [ { type: "context", elements: [ { type: "mrkdwn", text: "<\($commit_url)|\($short_sha)>  |  <\($workflow_url)|View workflow>" } ] } ]
+            | { attachments: [ { color: $color, blocks: . } ] }
+            ')
+
+          # Non-critical: a webhook/Slack outage must not fail the build. Emit a
+          # ::warning:: (not a bare echo) so a broken webhook surfaces as a
+          # visible run annotation instead of hiding behind a green job.
+          curl -sfS -X POST "$SLACK_WEBHOOK" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD" \
+            || echo "::warning::Slack notification failed (webhook error) — card not delivered"

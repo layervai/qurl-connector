@@ -1,0 +1,128 @@
+name: Bug Report
+description: Report a bug to help us improve. Do NOT use this for security vulnerabilities — see SECURITY.md.
+title: "[BUG] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        > **Security vulnerabilities: stop.** Report privately via [GitHub Security Advisory](https://github.com/layervai/qurl-connector/security/advisories/new). Do NOT open a public issue. See `SECURITY.md`.
+  - type: dropdown
+    id: priority
+    attributes:
+      label: Priority
+      description: |
+        - **critical** — production outage potential, data loss risk, live-customer breakage
+        - **high** — significant user impact, blocker for other work, correctness bug in shipped feature
+        - **medium** — standard bug, non-urgent
+        - **low** — polish, minor fix, tech debt
+      options:
+        - critical
+        - high
+        - medium
+        - low
+    validations:
+      required: true
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: A clear description of the bug.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to Reproduce
+      placeholder: |
+        1.
+        2.
+        3.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected Behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual Behavior
+    validations:
+      required: true
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      # Keep this list aligned with the Scopes list in CLAUDE.md's
+      # Commit Convention section, EXCEPT for `other` — that's a
+      # reporter-UX escape hatch, not a valid commit scope. Adding a
+      # new scope? Update both places in the same PR.
+      # Not enforced at CI here; convention only.
+      description: Match one of the commit scopes in CLAUDE.md (or pick `other` for cross-cutting).
+      options:
+        - share
+        - agent
+        - config
+        - service
+        - frpc
+        - audit
+        - release
+        - ci
+        - docs
+        - deps
+        - other
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Release tag or commit SHA
+      description: Use the qurl version and, for source builds, the connector module tag or commit.
+      placeholder: e.g. v0.8.x or commit abcd1234
+    # Optional: reporters often lack deploy access to discover a SHA; triage fills it in.
+  - type: dropdown
+    id: distribution
+    attributes:
+      label: Distribution
+      description: Where did you observe the connector behavior?
+      options:
+        - qurl CLI
+        - Developer source build
+        - Embedded module
+        - other
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: OS
+      description: Relevant for qurl daemon and developer-command paths.
+      placeholder: e.g. macOS 15 (arm64), Ubuntu 24.04, Windows 11
+    validations:
+      required: true
+  - type: input
+    id: go_version
+    attributes:
+      label: Go version
+      description: Only needed for build-from-source bugs.
+      placeholder: e.g. 1.26.x (paste from `go version`)
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: |
+        - **qurl:** include foreground command output and per-user daemon logs.
+        - **Developer command:** stderr; set verbosity with `--log-level` on `run`.
+        - **Audit trail:** JSONL file from the `audit` subsystem.
+        Include correlation IDs and timestamps if available.
+        **Redact before pasting:** API keys (`lv_live_…` / `lv_test_…`), OAuth access tokens, any `QURL_API_KEY` value, and customer identifiers.
+      # No `render:` — `render: shell` shell-highlights content, which
+      # miscolors Go stack traces and JSON-structured log lines.
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional Context
+      description: Screenshots, related issues, prior discussion, anything else worth knowing.

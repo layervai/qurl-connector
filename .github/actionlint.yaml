@@ -1,0 +1,6 @@
+# Configuration for actionlint (run by validate-workflows.yml via
+# reviewdog/action-actionlint on every workflow change).
+self-hosted-runner:
+  # Public workflows use GitHub-hosted runners only. Add a label here only
+  # after a workflow and its runner are both deliberately provisioned.
+  labels: []

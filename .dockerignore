@@ -1,0 +1,43 @@
+# Patterns excluded from the Docker build context for docker/Dockerfile.
+# Goals: (1) keep `COPY . .` from invalidating on noise like editor cruft,
+# (2) trim the context transferred to buildx (cost is amplified under
+# QEMU emulation), (3) avoid copying directories that are pure waste in
+# a Go-build context (prior build artifacts and coverage).
+#
+# Notes:
+# - The top-level `.git/` is not needed inside the builder. VERSION/
+#   GIT_COMMIT/BUILD_DATE are injected via Docker build-args from the
+#   docker-publish.yml workflow (which runs `git describe` on the host),
+#   not from `git describe` inside the builder.
+# Top-level VCS state.
+/.git
+/.gitattributes
+/.gitignore
+/.gitmodules
+
+# Build artifacts.
+/bin/
+/coverage.out
+/coverage.html
+
+# Test fixtures and developer docs — not consumed by the Dockerfile.
+# (NOTE: do NOT exclude `/web/` — `cmd/frpc/main.go` blank-imports
+# `web/frpc`, which `go:embed`s `web/frpc/dist` into the binary.)
+/tests/
+/docs/
+
+# Docs / repo metadata not consumed by the Dockerfile.
+/README.md
+/CHANGELOG.md
+/CONTRIBUTING.md
+/LICENSE
+/SECURITY.md
+/CODE_OF_CONDUCT.md
+/.github/
+
+# Editor / OS / agent cruft.
+.DS_Store
+.idea/
+.vscode/
+*.swp
+.claude/

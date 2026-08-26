@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "login_metas_key": "qurl_knock_token",
+  "reject_tag": "knock_invalid",
+  "client_needles": [
+    "knock_invalid"
+  ],
+  "login_reject_wire_texts": [
+    "knock_invalid: knock token rejected",
+    "knock_invalid: knock-token validation unavailable",
+    "knock_invalid: knock token expired"
+  ]
+}

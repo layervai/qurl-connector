@@ -1,0 +1,53 @@
+# Dependency Age Check (GitHub Actions pins)
+# Thin shim calling shared reusable workflow.
+# Source: https://github.com/layervai/ops-routines-workflows/blob/main/.github/workflows/age-check-actions.yml
+name: Dependency Age Check (Actions)
+
+# Fires on every PR (no path filter) so the status check always reports.
+# This lets branch protection require it without the path-filtered-
+# required-check footgun. The reusable's script exits 0 quickly when
+# no workflow/composite-action changes are in the diff.
+on:
+  pull_request:
+  workflow_dispatch:
+
+# Cancel superseded runs on the same PR branch — the reusable workflow
+# makes sequential registry calls; no reason to let two race for an
+# outdated diff.
+concurrency:
+  group: dep-age-actions-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  age-check:
+    # No outer `if:` for `age-check-bypass`. The required status check
+    # is `age-check / Check GitHub Actions pin ages` (caller-job / reusable-inner-job).
+    # Skipping here means the reusable never runs and the inner job
+    # never reports → required check stuck at "Expected — Waiting"
+    # forever. The reusable's inner `if:` handles bypass and reports
+    # SKIPPED, which satisfies the required check.
+    # Note: `timeout-minutes` is intentionally NOT set here. Per GH
+    # docs (https://docs.github.com/en/actions/using-workflows/reusing-workflows#supported-keywords-for-jobs-that-call-a-reusable-workflow)
+    # only if/name/needs/permissions/secrets/strategy/uses/with/concurrency
+    # are valid on a job that calls a reusable workflow. The reusable
+    # workflow itself sets `timeout-minutes: 5` internally.
+    uses: layervai/ops-routines-workflows/.github/workflows/age-check-actions.yml@e8c55b3945b963d0b6a87095214693731c024560 # v0.11.0
+    with:
+      min_age_days: 7
+      # Post a sticky PR comment when an age-check fails, listing each
+      # pin with its eligible-after date and days remaining. The PR
+      # author / reviewer sees the retry-after date inline on the PR
+      # instead of having to click into the run log to find it. Sticky
+      # comment is updated in place on re-runs and deleted on a clean
+      # pass; soft-fails to a `::notice` if the token can't write.
+      comment_on_failure: true
+    permissions:
+      contents: read
+      # Required for `comment_on_failure: true` to actually post.
+      # Dependabot PRs default to read-only and need this grant
+      # explicitly. Without it, the workflow still fails the age check
+      # correctly — only the inline comment is suppressed.
+      pull-requests: write

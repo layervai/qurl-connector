@@ -1,0 +1,182 @@
+//go:build darwin
+
+package service
+
+import (
+	"bytes"
+	"errors"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strconv"
+	"strings"
+
+	"github.com/layervai/qurl-connector/pkg/internal/atomicfile"
+)
+
+type launchdUserJobManager struct {
+	plistPath      func(string) (string, error)
+	launchctlQuery func(...string) (string, error)
+}
+
+// NewUserJobManager returns a per-user launchd manager.
+func NewUserJobManager() UserJobManager {
+	return &launchdUserJobManager{plistPath: currentUserJobPlistPath, launchctlQuery: launchctlOutput}
+}
+
+func (m *launchdUserJobManager) Ensure(job UserJob) error {
+	return m.ensure(job, false)
+}
+
+func (m *launchdUserJobManager) Replace(job UserJob) error {
+	return m.ensure(job, true)
+}
+
+func (m *launchdUserJobManager) ensure(job UserJob, forceReplace bool) error {
+	content, err := RenderLaunchdUserJob(job)
+	if err != nil {
+		return err
+	}
+	plistPath, err := m.plistPath(job.Label)
+	if err != nil {
+		return err
+	}
+	for _, dir := range []string{filepath.Dir(plistPath), filepath.Dir(job.StandardOut), filepath.Dir(job.StandardErr)} {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			return fmt.Errorf("create launchd job directory %s: %w", dir, err)
+		}
+	}
+	domain := "gui/" + strconv.Itoa(os.Getuid())
+	service := domain + "/" + job.Label
+	existing, readErr := os.ReadFile(plistPath)
+	definitionChanged := readErr != nil || !bytes.Equal(existing, []byte(content))
+	if readErr != nil && !errors.Is(readErr, os.ErrNotExist) {
+		return fmt.Errorf("read launchd job %s: %w", job.Label, readErr)
+	}
+	printOutput, printErr := m.launchctlQuery("print", service)
+	loaded := printErr == nil
+	if printErr != nil && !isLaunchdNotFound(printErr) {
+		return fmt.Errorf("inspect launchd job %s: %w", job.Label, printErr)
+	}
+	if !forceReplace && !definitionChanged && loaded {
+		if launchdOutputRunning(printOutput) {
+			return nil
+		}
+		if _, err := m.launchctlQuery("kickstart", "-k", service); err != nil {
+			return fmt.Errorf("start launchd job %s: %w", job.Label, err)
+		}
+		return nil
+	}
+	// launchd retains a loaded job's ProgramArguments when its plist changes,
+	// so a changed definition must be booted out before the replacement plist
+	// is written. Keeping the old plist intact when bootout fails ensures the
+	// next Ensure cannot mistake an incompatible loaded process for a matching
+	// definition.
+	if loaded {
+		if _, err := m.launchctlQuery("bootout", service); err != nil && !isLaunchdNotFound(err) {
+			return fmt.Errorf("reload launchd job %s: %w", job.Label, err)
+		}
+	}
+	if definitionChanged {
+		if err := atomicfile.Write(plistPath, []byte(content), 0o600); err != nil {
+			return fmt.Errorf("write launchd job %s: %w", job.Label, err)
+		}
+	}
+	if _, err := m.launchctlQuery("bootstrap", domain, plistPath); err != nil {
+		return fmt.Errorf("bootstrap launchd job %s: %w", job.Label, err)
+	}
+	if _, err := m.launchctlQuery("kickstart", "-k", service); err != nil {
+		return fmt.Errorf("start launchd job %s: %w", job.Label, err)
+	}
+	return nil
+}
+
+func (m *launchdUserJobManager) Remove(label string) error {
+	plistPath, err := m.plistPath(label)
+	if err != nil {
+		return err
+	}
+	domain := "gui/" + strconv.Itoa(os.Getuid())
+	service := domain + "/" + label
+	if _, err := m.launchctlQuery("bootout", service); err != nil && !isLaunchdNotFound(err) {
+		return fmt.Errorf("stop launchd job %s: %w", label, err)
+	}
+	if err := os.Remove(plistPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("remove launchd job %s: %w", label, err)
+	}
+	return nil
+}
+
+func (m *launchdUserJobManager) Status(label string) (ServiceStatus, error) {
+	plistPath, err := m.plistPath(label)
+	if err != nil {
+		return ServiceStatus{}, err
+	}
+	status := ServiceStatus{}
+	if _, err := os.Stat(plistPath); err == nil {
+		status.Installed = true
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return status, fmt.Errorf("inspect launchd job %s: %w", label, err)
+	}
+	service := "gui/" + strconv.Itoa(os.Getuid()) + "/" + label
+	if output, err := m.launchctlQuery("print", service); err == nil {
+		status.Running = launchdOutputRunning(output)
+	} else if !isLaunchdNotFound(err) {
+		return status, fmt.Errorf("inspect launchd job %s: %w", label, err)
+	}
+	return status, nil
+}
+
+type launchctlError struct {
+	args   []string
+	output string
+	err    error
+}
+
+func (e *launchctlError) Error() string {
+	return fmt.Sprintf("launchctl %s: %v: %s", strings.Join(e.args, " "), e.err, e.output)
+}
+
+func (e *launchctlError) Unwrap() error { return e.err }
+
+func runLaunchctl(args ...string) error {
+	_, err := launchctlOutput(args...)
+	return err
+}
+
+func launchctlOutput(args ...string) (string, error) {
+	cmd := exec.Command("launchctl", args...)
+	output, err := cmd.CombinedOutput()
+	if err == nil {
+		return string(output), nil
+	}
+	return "", &launchctlError{args: append([]string(nil), args...), output: strings.TrimSpace(string(output)), err: err}
+}
+
+func launchdOutputRunning(output string) bool {
+	stateRunning := false
+	pidPresent := false
+	for _, line := range strings.Split(output, "\n") {
+		line = strings.TrimSpace(line)
+		switch {
+		case line == "state = running":
+			stateRunning = true
+		case strings.HasPrefix(line, "pid = "):
+			pid, err := strconv.Atoi(strings.TrimSpace(strings.TrimPrefix(line, "pid = ")))
+			pidPresent = err == nil && pid > 0
+		}
+	}
+	return stateRunning && pidPresent
+}
+
+func isLaunchdNotFound(err error) bool {
+	var launchErr *launchctlError
+	if !errors.As(err, &launchErr) {
+		return false
+	}
+	output := bytes.ToLower([]byte(launchErr.output))
+	return bytes.Contains(output, []byte("could not find service")) ||
+		bytes.Contains(output, []byte("no such process")) ||
+		bytes.Contains(output, []byte("service not found"))
+}

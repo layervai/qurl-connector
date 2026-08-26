@@ -1,0 +1,119 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    paths-ignore:
+      - "**.md"
+      - ".gitignore"
+      - "LICENSE"
+      - "docs/**"
+
+concurrency:
+  group: "ci-${{ github.ref }}"
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
+        with:
+          version: v2.12.2
+          args: ./pkg/... ./cmd/... ./internal/...
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - name: Run tests
+        run: make test
+      # cmd/frpc is a developer command, not a released customer artifact. It
+      # must stay fail-closed unless the operator supplies an explicit custom
+      # Hub trust configuration.
+      - name: Assert developer command stays dark by default
+        run: |
+          make frpc
+          ./bin/qurl-connector version
+          ./bin/qurl-connector version | grep -qF 'hub trust pin: none (dark build'
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: coverage
+          path: coverage.out
+
+  # qURL Desktop ships on Darwin and depends on the local-key descriptor
+  # transport added for its OS-keystore bridge. Keep the Darwin-only anonymous
+  # pipe and socketpair checks executable in CI rather than relying on local
+  # developer runs.
+  darwin-test:
+    name: Test (macOS)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - name: Run Darwin bridge tests
+        run: CGO_ENABLED=0 go test -count=1 ./pkg/agentstate ./pkg/config ./cmd/frpc ./internal/pinnedfs
+
+  # The race detector requires cgo, so this lane builds with CGO_ENABLED=1 —
+  # the only place in CI that does. `make test` keeps proving the CGO_ENABLED=0
+  # build; this lane exists because a suite that is never run under -race
+  # cannot catch the data races its concurrency tests claim to cover.
+  race:
+    name: Race
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - name: Run tests under the race detector
+        run: make test-race
+
+  security:
+    name: Security
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - name: Install govulncheck
+        run: go install golang.org/x/vuln/cmd/govulncheck@latest
+      - name: Verify FRP provenance
+        run: ./scripts/verify-frp-provenance.sh
+      - name: Run govulncheck
+        run: govulncheck ./...
+
+  shellcheck:
+    name: Shellcheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Run shellcheck
+        run: shellcheck scripts/verify-frp-provenance.sh
+
+  notify-main-failure:
+    name: Notify Slack of main CI failure
+    needs: [lint, test, darwin-test, race, security, shellcheck]
+    if: ${{ always() && !cancelled() && github.event_name == 'push' && contains(needs.*.result, 'failure') }}
+    uses: ./.github/workflows/slack-notify.yml
+    with:
+      title: qurl-connector CI
+      results: ${{ toJSON(needs) }}
+    secrets:
+      SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}

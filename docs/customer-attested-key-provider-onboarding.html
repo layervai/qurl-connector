@@ -1,0 +1,1003 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>qURL Connector Attested State Provider Onboarding</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --ink: #17202a;
+      --muted: #5d6976;
+      --line: #d7dee6;
+      --panel: #f7f9fb;
+      --panel-strong: #eef3f7;
+      --accent: #176b87;
+      --accent-dark: #0f4d61;
+      --ok: #146c43;
+      --warn: #9a5b00;
+      --risk: #9f1239;
+      --code: #10212f;
+      --code-bg: #edf2f7;
+      --white: #ffffff;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      color: var(--ink);
+      background: var(--white);
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      line-height: 1.55;
+    }
+
+    a {
+      color: var(--accent-dark);
+      text-decoration-thickness: 0.08em;
+      text-underline-offset: 0.16em;
+    }
+
+    code,
+    pre,
+    kbd {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+    }
+
+    header {
+      border-bottom: 1px solid var(--line);
+      background: linear-gradient(180deg, #f9fbfc 0%, #ffffff 100%);
+    }
+
+    .wrap {
+      width: min(1180px, calc(100% - 40px));
+      margin: 0 auto;
+    }
+
+    .hero {
+      padding: 48px 0 34px;
+    }
+
+    .eyebrow {
+      margin: 0 0 10px;
+      color: var(--accent-dark);
+      font-size: 0.78rem;
+      font-weight: 700;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+
+    h1,
+    h2,
+    h3,
+    h4 {
+      margin: 0;
+      line-height: 1.2;
+    }
+
+    h1 {
+      max-width: 900px;
+      font-size: clamp(2rem, 4vw, 3.4rem);
+      font-weight: 780;
+    }
+
+    .subtitle {
+      max-width: 850px;
+      margin: 18px 0 0;
+      color: var(--muted);
+      font-size: 1.08rem;
+    }
+
+    .doc-meta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin-top: 24px;
+    }
+
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      min-height: 32px;
+      padding: 5px 10px;
+      border: 1px solid var(--line);
+      border-radius: 4px;
+      background: var(--white);
+      color: var(--muted);
+      font-size: 0.88rem;
+    }
+
+    .layout {
+      display: grid;
+      grid-template-columns: 260px minmax(0, 1fr);
+      gap: 36px;
+      padding: 30px 0 60px;
+    }
+
+    nav {
+      position: sticky;
+      top: 20px;
+      align-self: start;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel);
+      padding: 18px;
+    }
+
+    nav h2 {
+      margin-bottom: 12px;
+      font-size: 0.88rem;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+    }
+
+    nav ol {
+      margin: 0;
+      padding-left: 20px;
+    }
+
+    nav li {
+      margin: 8px 0;
+      color: var(--muted);
+      font-size: 0.94rem;
+    }
+
+    main {
+      min-width: 0;
+    }
+
+    section {
+      padding: 30px 0;
+      border-bottom: 1px solid var(--line);
+    }
+
+    section:first-child {
+      padding-top: 0;
+    }
+
+    section:last-child {
+      border-bottom: 0;
+    }
+
+    h2 {
+      margin-bottom: 14px;
+      font-size: 1.65rem;
+    }
+
+    h3 {
+      margin: 28px 0 10px;
+      font-size: 1.16rem;
+    }
+
+    h4 {
+      margin: 20px 0 8px;
+      color: var(--accent-dark);
+      font-size: 1rem;
+    }
+
+    p {
+      margin: 0 0 14px;
+    }
+
+    .lead {
+      color: var(--muted);
+      font-size: 1.02rem;
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 16px;
+      margin: 18px 0;
+    }
+
+    .card {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--white);
+      padding: 18px;
+    }
+
+    .card h3 {
+      margin-top: 0;
+    }
+
+    .callout {
+      margin: 18px 0;
+      padding: 16px 18px;
+      border-left: 4px solid var(--accent);
+      border-radius: 6px;
+      background: var(--panel);
+    }
+
+    .callout.warning {
+      border-left-color: var(--warn);
+      background: #fff7e8;
+    }
+
+    .callout.risk {
+      border-left-color: var(--risk);
+      background: #fff1f3;
+    }
+
+    .callout.ok {
+      border-left-color: var(--ok);
+      background: #edf8f2;
+    }
+
+    .callout strong {
+      display: block;
+      margin-bottom: 4px;
+    }
+
+    table {
+      width: 100%;
+      margin: 18px 0 22px;
+      border-collapse: collapse;
+      border: 1px solid var(--line);
+      font-size: 0.95rem;
+    }
+
+    caption {
+      padding: 10px 12px;
+      border: 1px solid var(--line);
+      border-bottom: 0;
+      background: var(--panel);
+      font-weight: 700;
+      text-align: left;
+    }
+
+    th,
+    td {
+      padding: 12px;
+      border-bottom: 1px solid var(--line);
+      vertical-align: top;
+      text-align: left;
+    }
+
+    th {
+      background: var(--panel-strong);
+      font-weight: 700;
+    }
+
+    tr:last-child td {
+      border-bottom: 0;
+    }
+
+    ul,
+    ol {
+      margin-top: 8px;
+      margin-bottom: 18px;
+      padding-left: 24px;
+    }
+
+    li {
+      margin: 7px 0;
+    }
+
+    pre {
+      overflow-x: auto;
+      margin: 16px 0 22px;
+      padding: 16px;
+      border: 1px solid #c5d0dc;
+      border-radius: 8px;
+      background: var(--code-bg);
+      color: var(--code);
+      font-size: 0.9rem;
+      line-height: 1.5;
+    }
+
+    code {
+      padding: 0.1em 0.28em;
+      border-radius: 4px;
+      background: var(--code-bg);
+      color: var(--code);
+    }
+
+    pre code {
+      padding: 0;
+      background: transparent;
+    }
+
+    .checklist {
+      padding-left: 0;
+      list-style: none;
+    }
+
+    .checklist li {
+      position: relative;
+      padding-left: 30px;
+    }
+
+    .checklist li::before {
+      content: "";
+      position: absolute;
+      top: 0.35em;
+      left: 0;
+      width: 16px;
+      height: 16px;
+      border: 1px solid var(--accent);
+      border-radius: 3px;
+      background: var(--white);
+    }
+
+    .phase {
+      margin: 20px 0;
+      padding: 18px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel);
+    }
+
+    .phase h3 {
+      margin-top: 0;
+    }
+
+    .footer {
+      padding: 24px 0 48px;
+      color: var(--muted);
+      font-size: 0.92rem;
+    }
+
+    @media (max-width: 900px) {
+      .layout {
+        grid-template-columns: 1fr;
+      }
+
+      nav {
+        position: static;
+      }
+
+      .grid {
+        grid-template-columns: 1fr;
+      }
+    }
+
+    @media print {
+      header {
+        background: #ffffff;
+      }
+
+      nav {
+        display: none;
+      }
+
+      .wrap {
+        width: 100%;
+      }
+
+      .layout {
+        display: block;
+      }
+
+      a {
+        color: var(--ink);
+      }
+
+      pre {
+        white-space: pre-wrap;
+      }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="wrap hero">
+      <p class="eyebrow">Customer enablement</p>
+      <h1>Onboarding qURL Connector with attested state providers</h1>
+      <p class="subtitle">
+        A field-ready onboarding guide for customers deploying qURL Connector with
+        AWS Nitro or Google Cloud Confidential Space key custody. Use this to plan the rollout,
+        configure cloud policy, complete first native registration, and hand the deployment to operations.
+      </p>
+      <div class="doc-meta">
+        <span class="pill">Audience: customer platform, security, and operations teams</span>
+        <span class="pill">Scope: qURL Connector</span>
+        <span class="pill">Providers: aws-nitro, gcp-confidential-space</span>
+        <span class="pill">Format: onboarding runbook</span>
+      </div>
+    </div>
+  </header>
+
+  <div class="wrap layout">
+    <nav aria-label="Table of contents">
+      <h2>Contents</h2>
+      <ol>
+        <li><a href="#outcomes">Outcomes</a></li>
+        <li><a href="#model">Architecture model</a></li>
+        <li><a href="#inputs">Inputs to collect</a></li>
+        <li><a href="#provider-choice">Provider choice</a></li>
+        <li><a href="#aws">AWS Nitro onboarding</a></li>
+        <li><a href="#gcp">GCP Confidential Space onboarding</a></li>
+        <li><a href="#native-registration">Native registration</a></li>
+        <li><a href="#validation">Validation plan</a></li>
+        <li><a href="#operations">Operations handoff</a></li>
+        <li><a href="#troubleshooting">Troubleshooting</a></li>
+      </ol>
+    </nav>
+
+    <main>
+      <section id="outcomes">
+        <h2>1. Outcomes</h2>
+        <p class="lead">
+          The goal is a qURL Connector deployment where its complete native identity, assigned-cell
+          endpoint, and device credential are never stored as durable plaintext. The Connector stores
+          one qurl-go state envelope whose random data-encryption key is wrapped by the attested provider.
+        </p>
+
+        <div class="callout">
+          <strong>Maintainer note</strong>
+          This guide is intentionally standalone HTML so it can be handed to customers as a single
+          print-friendly artifact. When updating it, re-check the source-of-truth env-var contract in
+          <code>docs/install-docker.md</code> and the provider gates in <code>pkg/agentstate</code>.
+          For customer distribution, send a rendered or downloaded HTML artifact, not the GitHub source view.
+        </div>
+
+        <div class="grid">
+          <div class="card">
+            <h3>What success looks like</h3>
+            <ul class="checklist">
+              <li>The customer can start the qURL agent without keeping <code>QURL_API_KEY</code> in steady state.</li>
+              <li>The persistent state directory contains <code>agent_state.sealed.json</code>, not split identity or TOML files.</li>
+              <li>Replacement instances can unseal only when cloud attestation policy matches the approved workload.</li>
+              <li>Cloud audit logs show the expected KMS encrypt/decrypt calls and no unexpected principal can decrypt.</li>
+            </ul>
+          </div>
+          <div class="card">
+            <h3>What this does not do</h3>
+            <ul>
+              <li>It does not remove the need for cloud IAM or KMS policy review.</li>
+              <li>It does not make the local GCP token parse a cryptographic verifier.</li>
+              <li>It does not make AWS first seal host-compromise-resistant if first seal runs in the parent host process.</li>
+              <li>It does not treat the NHP public key as secret; this guide protects private-key custody and durable private-key state.</li>
+              <li>It does not replace first native UDP registration through the pinned LayerV Hub.</li>
+            </ul>
+          </div>
+        </div>
+
+        <div class="callout ok">
+          <strong>Definition of done</strong>
+          The customer has completed the provider-specific policy gate, performed a greenfield native UDP registration,
+          restarted without the enrollment credential, verified Connector connectivity, and documented rollback ownership.
+        </div>
+      </section>
+
+      <section id="model">
+        <h2>2. Architecture model</h2>
+        <p>
+          qurl-go owns the stable X25519 identity, Hub-provided cell assignment, and device credential.
+          With a sealed provider, the persistent volume stores one encrypted complete-state envelope.
+          The provider unwraps only the envelope DEK; no rendered runtime TOML or split key file exists.
+        </p>
+
+        <h3>Provider tiers</h3>
+        <table>
+          <caption>Provider tiers and customer security posture</caption>
+          <thead>
+            <tr>
+              <th>Tier</th>
+              <th>Provider</th>
+              <th>Customer posture</th>
+              <th>Typical use</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Baseline</td>
+              <td><code>file</code></td>
+              <td>Complete plaintext <code>agent_state.json</code> in the state directory.</td>
+              <td>Development or low-sensitivity local deployments.</td>
+            </tr>
+            <tr>
+              <td>Tier 1</td>
+              <td><code>aws-kms</code>, <code>gcp-kms</code></td>
+              <td>KMS envelope encryption, but no attested release condition.</td>
+              <td>Customers who need sealed state but do not run in attested compute.</td>
+            </tr>
+            <tr>
+              <td>Tier 2</td>
+              <td><code>aws-nitro</code>, <code>gcp-confidential-space</code></td>
+              <td>Key release is tied to cloud attestation policy and matching workload identity.</td>
+              <td>Production workloads with stronger key-custody requirements.</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <div class="callout risk">
+          <strong>The security boundary is cloud policy.</strong>
+          The qURL client fails closed and checks local configuration, but the actual confidentiality boundary is
+          the AWS KMS key policy for Nitro or the GCP Workload Identity Federation/IAM binding for Confidential Space.
+          A misconfigured cloud binding can silently downgrade the deployment.
+        </div>
+      </section>
+
+      <section id="inputs">
+        <h2>3. Inputs to collect before the first working session</h2>
+        <p>
+          Ask the customer to complete this worksheet before implementation. Do not start the deployment until the
+          security owner and platform owner agree on the provider and validation gates.
+        </p>
+
+        <table>
+          <caption>Inputs worksheet for the first customer working session</caption>
+          <thead>
+            <tr>
+              <th>Input</th>
+              <th>Owner</th>
+              <th>Required for</th>
+              <th>Notes</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>qURL API key and stable agent ID</td>
+              <td>LayerV plus customer platform team</td>
+              <td>All onboarding</td>
+              <td>The enrollment credential is needed for first native registration only. Agent ID must be stable for the deployment.</td>
+            </tr>
+            <tr>
+              <td>Persistent state path or volume</td>
+              <td>Customer platform team</td>
+              <td>All onboarding</td>
+              <td>Default is <code>/var/lib/layerv/agent</code>. Do not share one state volume across competing agents.</td>
+            </tr>
+            <tr>
+              <td>Runtime directory decision</td>
+              <td>Customer platform team</td>
+              <td>Sealed providers</td>
+              <td>No rendered runtime configuration exists. Protect the mode-0700 state directory and provider-specific attestation inputs.</td>
+            </tr>
+            <tr>
+              <td>AWS KMS key ARN and region</td>
+              <td>Customer AWS owner</td>
+              <td><code>aws-nitro</code></td>
+              <td>Prefer a full key ARN. Region must resolve through environment or the AWS SDK default chain.</td>
+            </tr>
+            <tr>
+              <td>AWS attestation document path and unwrap command</td>
+              <td>Customer AWS enclave owner</td>
+              <td><code>aws-nitro</code></td>
+              <td>The unwrap command must run in the attested runtime and output exactly the 32 raw state-envelope DEK bytes.</td>
+            </tr>
+            <tr>
+              <td>GCP Cloud KMS key name</td>
+              <td>Customer GCP owner</td>
+              <td><code>gcp-confidential-space</code></td>
+              <td>Full resource path: <code>projects/.../locations/.../keyRings/.../cryptoKeys/...</code>.</td>
+            </tr>
+            <tr>
+              <td>GCP image digest and service account</td>
+              <td>Customer GCP owner</td>
+              <td><code>gcp-confidential-space</code></td>
+              <td>Must be mirrored in local qURL config and WIF/IAM conditions.</td>
+            </tr>
+            <tr>
+              <td>Negative-policy test plan</td>
+              <td>Customer security owner</td>
+              <td>Tier 2 providers</td>
+              <td>Prove that an unapproved principal, image, PCR, or service account cannot decrypt.</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section id="provider-choice">
+        <h2>4. Choose the provider</h2>
+        <p>
+          Pick exactly one key provider per state volume. Provider selection is bound to the envelope already on
+          disk: <code>file</code> may open only <code>agent_state.json</code>, while KMS and attested providers may
+          open only <code>agent_state.sealed.json</code>. Switching a non-empty volume fails closed. Use an empty
+          mode-0700 state directory and a new enrollment when changing providers.
+        </p>
+
+        <div class="grid">
+          <div class="card">
+            <h3>Choose AWS Nitro when</h3>
+            <ul>
+              <li>The workload runs in AWS Nitro Enclaves or NitroTPM-backed attested runtime.</li>
+              <li>The customer can enforce <code>kms:RecipientAttestation:*</code> conditions on the KMS key.</li>
+              <li>The customer has an attested unwrap helper inside the runtime.</li>
+              <li>The first seal can happen in the attested runtime or a tightly controlled provisioning window.</li>
+            </ul>
+          </div>
+          <div class="card">
+            <h3>Choose GCP Confidential Space when</h3>
+            <ul>
+              <li>The workload runs in Google Cloud Confidential Space.</li>
+              <li>The customer can bind Workload Identity Federation and Cloud KMS IAM to the same image and service-account claims.</li>
+              <li>The container has access to the Confidential Space attestation token file.</li>
+              <li>The customer is prepared to validate IAM with a negative test before production enablement.</li>
+            </ul>
+          </div>
+        </div>
+
+        <div class="callout warning">
+          <strong>Do not mix install paths.</strong>
+          Use either the container path or binary/service path for one host and one state volume. Running two agents
+          against the same state directory creates competing Connector registrations for the same agent identity.
+        </div>
+      </section>
+
+      <section id="aws">
+        <h2>5. AWS Nitro onboarding</h2>
+        <p class="lead">
+          <code>aws-nitro</code> uses normal KMS encrypt for first seal, then requires KMS Recipient decrypt on
+          unseal. AWS KMS returns <code>CiphertextForRecipient</code> instead of host plaintext when the decrypt
+          request includes a signed attestation document. The qURL client fails closed if AWS returns host plaintext.
+        </p>
+
+        <h3>AWS prerequisites</h3>
+        <ul class="checklist">
+          <li>A customer-managed AWS KMS key in the target region.</li>
+          <li>An IAM principal for first native registration with <code>kms:Encrypt</code>.</li>
+          <li>A steady-state decrypt principal constrained by KMS Recipient Attestation conditions.</li>
+          <li>An attestation document generated for the current process start.</li>
+          <li>An unwrap helper that runs inside the attested runtime, reads <code>CiphertextForRecipient</code> from stdin, and writes exactly the 32 raw state-envelope DEK bytes to stdout with no trailing newline.</li>
+        </ul>
+
+        <h3>Recommended AWS key-policy shape</h3>
+        <pre><code>{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "AllowQurlAgentFirstSeal",
+      "Effect": "Allow",
+      "Principal": {
+        "AWS": "arn:aws:iam::111122223333:role/qurl-agent-provisioner"
+      },
+      "Action": "kms:Encrypt",
+      "Resource": "*"
+    },
+    {
+      "Sid": "AllowQurlAgentNitroDecrypt",
+      "Effect": "Allow",
+      "Principal": {
+        "AWS": "arn:aws:iam::111122223333:role/qurl-agent-parent"
+      },
+      "Action": "kms:Decrypt",
+      "Resource": "*",
+      "Condition": {
+        "StringEqualsIgnoreCase": {
+          "kms:RecipientAttestation:ImageSha384": "PCR0_OR_IMAGE_SHA384_HEX"
+        }
+      }
+    }
+  ]
+}</code></pre>
+
+        <div class="callout warning">
+          Treat this as a KMS key policy, not an IAM identity policy. In a key policy, <code>"Resource": "*"</code>
+          refers to the current KMS key; do not copy these statements into a broad identity policy without replacing
+          the resource with the exact key ARN.
+        </div>
+
+        <p>
+          Use additional <code>kms:RecipientAttestation:PCR&lt;PCR_ID&gt;</code> conditions when the customer wants
+          PCR1, PCR2, or custom PCR binding. AWS documents Nitro Enclaves KMS attestation condition keys in
+          <a href="https://docs.aws.amazon.com/kms/latest/developerguide/conditions-nitro-enclave.html">Condition keys for Nitro Enclaves</a>.
+          AWS KMS <code>Decrypt</code> with <code>Recipient</code> returns the encrypted result in
+          <code>CiphertextForRecipient</code>; see the AWS KMS
+          <a href="https://docs.aws.amazon.com/kms/latest/APIReference/API_Decrypt.html">Decrypt API reference</a>.
+        </p>
+
+        <h3>AWS environment contract</h3>
+        <pre><code>LAYERV_KEY_PROVIDER=aws-nitro
+LAYERV_AWS_KMS_KEY_ID=arn:aws:kms:us-east-1:111122223333:key/...
+LAYERV_AWS_KMS_REGION=us-east-1
+LAYERV_AWS_NITRO_ATTESTATION_DOCUMENT_FILE=/run/qurl/attestation.cose
+LAYERV_AWS_NITRO_ATTESTATION_DOCUMENT_ENCODING=raw
+LAYERV_AWS_NITRO_RECIPIENT_UNWRAP_COMMAND=/opt/qurl/bin/unwrap-recipient
+QURL_API_KEY_FILE=/run/secrets/qurl-api-key
+LAYERV_AGENT_ID=customer-prod-agent-01</code></pre>
+        <p class="callout">
+          The unwrap command is split on whitespace without shell or quote parsing. Use an executable path and
+          arguments that do not contain spaces.
+        </p>
+
+        <h3>AWS implementation steps</h3>
+        <ol>
+          <li>Create or select the KMS key and apply the first-seal and recipient-decrypt policy.</li>
+          <li>Build the attested runtime image with the qURL client and unwrap helper.</li>
+          <li>Generate the Nitro attestation document for the current process start and mount it at the configured path.</li>
+          <li>Start qURL Connector with <code>LAYERV_KEY_PROVIDER=aws-nitro</code> and the enrollment credential mounted.</li>
+          <li>Confirm <code>agent_state.sealed.json</code> exists and no legacy split state remains.</li>
+          <li>Restart without the enrollment credential and confirm the Connector reconnects through attested unseal.</li>
+          <li>Remove or narrow <code>kms:Encrypt</code> if first seal happened in a separate provisioning role.</li>
+        </ol>
+
+        <div class="callout risk">
+          <strong>First-seal caveat</strong>
+          AWS KMS Encrypt has no Recipient mode. First seal generates the complete native state in the qURL agent
+          process before KMS encrypts its envelope key. Run first seal inside the attested runtime whenever
+          possible. If a separate provisioning window is required, keep it tightly controlled and remove encrypt
+          permission from steady-state roles afterward.
+        </div>
+      </section>
+
+      <section id="gcp">
+        <h2>6. GCP Confidential Space onboarding</h2>
+        <p class="lead">
+          <code>gcp-confidential-space</code> validates local Confidential Space token claims before Cloud KMS calls,
+          but the local parse is not a JWT verifier. The real key-release gate is Workload Identity Federation,
+          IAM policy, and Cloud KMS.
+        </p>
+
+        <h3>GCP prerequisites</h3>
+        <ul class="checklist">
+          <li>A Cloud KMS key that the federated Confidential Space workload can use.</li>
+          <li>A Workload Identity Pool and OIDC provider for the Confidential Space attestation token.</li>
+          <li>An attribute mapping that exposes the approved image digest and other required claims.</li>
+          <li>An attribute condition that requires <code>swname == 'CONFIDENTIAL_SPACE'</code>, stable support attributes, and the approved image or service-account claims.</li>
+          <li>The qURL container must be able to read the Confidential Space token file, defaulting to <code>/run/container_launcher/attestation_verifier_claims_token</code>.</li>
+        </ul>
+
+        <div class="callout risk">
+          <strong>Mandatory GCP warning</strong>
+          The qURL local checks are advisory. If the customer does not enforce the same image digest and service-account
+          claims in WIF/IAM, forged local token-file claims can pass startup while Cloud KMS still releases the key.
+          Treat the negative IAM test as a production gate.
+        </div>
+
+        <h3>Recommended GCP WIF and KMS shape</h3>
+        <pre><code>gcloud iam workload-identity-pools providers create-oidc attestation-verifier \
+  --location=global \
+  --workload-identity-pool=QURL_AGENT_POOL \
+  --issuer-uri="https://confidentialcomputing.googleapis.com" \
+  --allowed-audiences="https://sts.googleapis.com" \
+  --attribute-mapping="google.subject=\"gcpcs::\"+assertion.submods.container.image_digest+\"::\"+assertion.submods.gce.project_number+\"::\"+assertion.submods.gce.instance_id,attribute.image_digest=assertion.submods.container.image_digest" \
+  --attribute-condition="assertion.swname == 'CONFIDENTIAL_SPACE' &amp;&amp; 'STABLE' in assertion.submods.confidential_space.support_attributes &amp;&amp; assertion.submods.container.image_digest == 'sha256:...'"
+
+gcloud kms keys add-iam-policy-binding \
+  projects/example-project/locations/us/keyRings/qurl/cryptoKeys/agent-identity \
+  --member="principalSet://iam.googleapis.com/projects/123456789/locations/global/workloadIdentityPools/QURL_AGENT_POOL/attribute.image_digest/sha256:..." \
+  --role=roles/cloudkms.cryptoKeyEncrypterDecrypter</code></pre>
+
+        <p>
+          Google documents Confidential Space attestation assertions, including <code>swname</code>,
+          <code>dbgstat</code>, container image attributes, and support attributes, in the
+          <a href="https://cloud.google.com/confidential-computing/confidential-space/docs/reference/attestation-assertions">Confidential Space attestation assertions reference</a>.
+          The token claim payload includes <code>google_service_accounts</code> and default audience guidance in the
+          <a href="https://cloud.google.com/confidential-computing/confidential-space/docs/reference/token-claims">Confidential Space token claims reference</a>.
+          Google also documents WIF attribute conditions in the
+          <a href="https://cloud.google.com/iam/docs/workload-identity-federation">Workload Identity Federation documentation</a>.
+        </p>
+
+        <h3>GCP environment contract</h3>
+        <pre><code>LAYERV_KEY_PROVIDER=gcp-confidential-space
+LAYERV_GCP_KMS_KEY_NAME=projects/example-project/locations/us/keyRings/qurl/cryptoKeys/agent-identity
+LAYERV_GCP_CONFIDENTIAL_SPACE_TOKEN_FILE=/run/container_launcher/attestation_verifier_claims_token
+LAYERV_GCP_CONFIDENTIAL_SPACE_IMAGE_DIGEST=sha256:...
+LAYERV_GCP_CONFIDENTIAL_SPACE_SERVICE_ACCOUNT=qurl-agent@example-project.iam.gserviceaccount.com
+QURL_API_KEY_FILE=/run/secrets/qurl-api-key
+LAYERV_AGENT_ID=customer-agent-01</code></pre>
+
+        <h3>GCP implementation steps</h3>
+        <ol>
+          <li>Create or select the Cloud KMS key.</li>
+          <li>Create the Workload Identity Pool provider with attribute mapping and a restrictive attribute condition.</li>
+          <li>Grant Cloud KMS access only to the federated principal that matches the approved image digest and service account.</li>
+          <li>Start the qURL client in Confidential Space with <code>LAYERV_KEY_PROVIDER=gcp-confidential-space</code>.</li>
+          <li>Confirm startup logs show the local attestation check passed and that key release is enforced by WIF/IAM.</li>
+          <li>Confirm <code>agent_state.sealed.json</code> exists and the Connector connects.</li>
+          <li>Run a negative policy test using a mismatched image digest or service account before production enablement.</li>
+        </ol>
+      </section>
+
+      <section id="native-registration">
+        <h2>7. Native registration</h2>
+        <p>
+          qurl-go persists the complete sealed state only after the configured provider wraps its random DEK.
+          Registration and assignment occur directly over UDP through the pinned LayerV Hub; there is no HTTP
+          registration or assignment call.
+        </p>
+
+        <h3>New deployment</h3>
+        <ol>
+          <li>Mount the LayerV enrollment credential as a file and set <code>QURL_API_KEY_FILE</code>.</li>
+          <li>Set a stable <code>LAYERV_AGENT_ID</code> for the deployment.</li>
+          <li>Set the provider-specific environment variables.</li>
+          <li>Start the Connector and wait for Hub registration, cell assignment, assigned-cell completion, and Connector connection.</li>
+          <li>Restart without <code>QURL_API_KEY_FILE</code> and confirm the agent reconnects from persisted state.</li>
+        </ol>
+
+        <h3>Greenfield state requirement</h3>
+        <div class="callout warning">
+          <strong>No in-place migration or provider switch</strong>
+          Native UDP builds reject legacy split state, both native envelopes together, and an envelope that does not
+          match <code>LAYERV_KEY_PROVIDER</code> before writing anything. Archive the old volume when required,
+          provision an empty mode-0700 state directory, and perform an explicit new enrollment.
+        </div>
+
+        <ol>
+          <li>Back up the state volume according to the customer's policy.</li>
+          <li>Provision an empty state directory owned by the Connector runtime UID with mode <code>0700</code>.</li>
+          <li>Set <code>LAYERV_KEY_PROVIDER</code> and its provider-specific inputs.</li>
+          <li>Start with the enrollment credential and confirm native UDP registration succeeds.</li>
+          <li>Confirm <code>agent_state.sealed.json</code> exists, then restart without the enrollment credential.</li>
+        </ol>
+      </section>
+
+      <section id="validation">
+        <h2>8. Validation plan</h2>
+        <p>
+          The customer should complete all validation before the rollout is considered production-ready.
+          Capture evidence in the customer's change ticket.
+        </p>
+
+        <div class="phase">
+          <h3>Phase A: startup and state</h3>
+          <ul class="checklist">
+            <li>Agent starts with the selected provider and exits non-zero if required provider env is missing.</li>
+            <li>State directory contains exactly one <code>agent_state.sealed.json</code> complete-state envelope.</li>
+            <li>State directory contains no legacy split key, identity-cache, or rendered TOML artifacts.</li>
+          </ul>
+        </div>
+
+        <div class="phase">
+          <h3>Phase B: Connector behavior</h3>
+          <ul class="checklist">
+            <li>Agent registers or loads the expected <code>LAYERV_AGENT_ID</code>.</li>
+            <li>Routes connect through qURL Connector and survive an agent restart.</li>
+            <li>Restart without the enrollment credential succeeds from sealed persisted state.</li>
+            <li>Removing or corrupting required attestation inputs causes startup failure before the Connector establishes a connection.</li>
+          </ul>
+        </div>
+
+        <div class="phase">
+          <h3>Phase C: cloud policy gates</h3>
+          <ul class="checklist">
+            <li>AWS: approved attestation decrypt succeeds and returns <code>CiphertextForRecipient</code>, not host plaintext.</li>
+            <li>AWS: an unapproved image digest or PCR cannot decrypt.</li>
+            <li>GCP: approved Confidential Space workload obtains KMS access.</li>
+            <li>GCP: a non-attested principal, wrong image digest, or wrong service account cannot decrypt.</li>
+            <li>CloudTrail or Cloud Audit Logs show only expected KMS operations during rollout.</li>
+          </ul>
+        </div>
+
+        <h3>Useful local checks</h3>
+        <p>
+          These examples use the default state dir. If the deployment sets <code>LAYERV_AGENT_STATE_DIR</code>,
+          replace <code>/var/lib/layerv/agent</code> with that path.
+        </p>
+        <pre><code># Confirm sealed state
+ls -la /var/lib/layerv/agent
+test -f /var/lib/layerv/agent/agent_state.sealed.json
+test ! -e /var/lib/layerv/agent/private_key
+test ! -e /var/lib/layerv/agent/etc/config.toml
+
+# Confirm the provider recorded in the sealed blob
+grep -m1 -E '"provider"[[:space:]]*:[[:space:]]*"(aws-nitro|gcp-confidential-space)"' \
+  /var/lib/layerv/agent/agent_state.sealed.json
+
+# Confirm steady-state restart does not need the enrollment credential
+# Remove QURL_API_KEY / QURL_API_KEY_FILE from compose or service env first.
+docker compose up -d --force-recreate qurl-agent</code></pre>
+      </section>
+
+      <section id="operations">
+        <h2>9. Operations handoff</h2>
+        <p>
+          After onboarding, transfer these operating notes to the customer's runbook owner.
+        </p>
+
+        <table>
+          <caption>Operations handoff topics</caption>
+          <thead>
+            <tr>
+              <th>Topic</th>
+              <th>Operational guidance</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>API key handling</td>
+              <td>Keep the enrollment credential available only for first native registration or deliberate reprovisioning. Remove it from steady-state runtime when sealed state is confirmed.</td>
+            </tr>
+            <tr>
+              <td>State volume</td>
+              <td>Do not delete or share the state volume. It contains the stable identity, device credential, assignment, and sealed complete-state envelope.</td>
+            </tr>
+            <tr>
+              <td>Key rotation</td>
+              <td>Coordinate KMS key policy changes with qURL restarts. Replacement instances need the same attestation policy and access to the sealed blob.</td>
+            </tr>
+            <tr>
+              <td>AWS attestation document</td>
+              <td>Regenerate for each process start. Keep it paired with the recipient key held by the attested unwrap runtime.</td>
+            </tr>
+            <tr>
+              <td>GCP token file</td>
+              <td>The client revalidates the token before KMS calls. Expired, debug, non-stable, wrong-image, or wrong-service-account tokens fail startup or unseal.</td>
+            </tr>
+            <tr>
+              <td>Audit</td>
+              <td>Review AWS CloudTrail or GCP Cloud Audit Logs for unexpected decrypt attempts, principals, image digests, or policy condition failures.</td>
+            </tr>
+            <tr>
+              <td>Rollback</td>
+              <td>Rollback only to a native-envelope-compatible workload using the unchanged matching-provider state. A pre-native build requires a separate empty volume and new enrollment.</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <h3>Customer acceptance checklist</h3>
+        <ul class="checklist">
+          <li>Customer security owner approved the cloud KMS policy and negative tests.</li>
+          <li>Customer platform owner confirmed restart behavior without the API key.</li>
+          <li>Customer operations owner accepted the troubleshooting and rollback notes.</li>
+          <li>LayerV owner confirmed qURL Connector connectivity and expected agent ID.</li>
+          <li>Evidence links are attached to the customer change ticket.</li>
+        </ul>
+      </section>
+
+      <section id="troubleshooting">
+        <h2>10. Troubleshooting</h2>
+        <table>
+          <caption>Troubleshooting symptoms and actions</caption>
+          <thead>
+            <tr>
+              <th>Symptom</th>
+              <th>Likely cause</th>
+              <th>Action</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Startup says provider requires an env var.</td>
+              <td>Required provider configuration is missing.</td>
+              <td>Set the provider-specific env vars listed in this guide. For GCP, image digest and service account are required before the token file is read.</td>
+            </tr>
+            <tr>
+              <td>AWS unwrap helper fails or returns wrong-size plaintext.</td>
+              <td>Helper is not running in the attested runtime, writes text/newline, or emits too much stdout.</td>
+              <td>Verify the command path, stdin/stdout contract, and that stdout is exactly 32 raw bytes.</td>
+            </tr>
+            <tr>
+              <td>AWS KMS returns host plaintext.</td>
+              <td>Recipient decrypt is not being enforced or the request did not include valid attestation.</td>
+              <td>Fix the key policy and attestation document. The client intentionally rejects host plaintext for <code>aws-nitro</code>.</td>
+            </tr>
+            <tr>
+              <td>GCP startup says token is expired.</td>
+              <td>The Confidential Space token is stale beyond the 30-second leeway.</td>
+              <td>Refresh the workload/token source and restart. Validate system clock behavior if it repeats.</td>
+            </tr>
+            <tr>
+              <td>GCP startup says <code>dbgstat</code> is not disabled.</td>
+              <td>The workload is running in a debug configuration.</td>
+              <td>Use production Confidential Space settings with debug disabled since boot.</td>
+            </tr>
+            <tr>
+              <td>GCP local checks pass, but KMS decrypt fails.</td>
+              <td>WIF/IAM binding, principalSet, service account, or Cloud KMS permission does not match.</td>
+              <td>Compare local pins to the WIF attribute mapping and Cloud KMS IAM binding. Confirm the federated principal matches the approved workload.</td>
+            </tr>
+            <tr>
+              <td>Agent asks for API key after restart.</td>
+              <td>State volume is missing, not mounted, or belongs to a different agent.</td>
+              <td>Restore the correct persistent state directory or intentionally perform a new native enrollment.</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <div class="callout">
+          <strong>Escalation packet</strong>
+          When escalating to LayerV, include the selected provider, redacted environment contract, agent ID,
+          state directory listing, relevant startup logs, KMS key policy or IAM binding summary, and cloud audit
+          event IDs. Do not send raw API keys, private keys, attestation private keys, or full unredacted customer
+          IAM credentials.
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <footer class="wrap footer">
+    <p>
+      This document is a customer onboarding aid for qURL Connector. Keep the provider-specific
+      cloud policy examples aligned with the current customer environment and the production change ticket.
+    </p>
+  </footer>
+</body>
+</html>

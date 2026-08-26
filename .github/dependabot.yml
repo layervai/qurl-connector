@@ -1,0 +1,51 @@
+version: 2
+updates:
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    labels: [dependencies, go]
+    commit-message:
+      prefix: "chore(deps)"
+    groups:
+      minor-and-patch:
+        update-types: [minor, patch]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    labels: [dependencies, ci]
+    commit-message:
+      prefix: "chore(ci)"
+    # Grouped by SOURCE REPO, not by update-type. Dependabot resolves each
+    # sub-path of a multi-action repo as its own dependency, so it bumps one
+    # and leaves its siblings behind on the old SHA.
+    #
+    # Deliberately NOT a broad `minor-and-patch` group like the gomod
+    # ecosystem above: dependency-age-check-actions.yml fails a PR when ANY
+    # pin in the diff is younger than 7 days, and Dependabot won't split a
+    # blocked member out of a group — one fresh release would hold every
+    # other eligible bump red. Same-repo groups have no straggler: every
+    # member shares one release and one SHA, so the group ages in as a unit.
+    groups:
+      # init and analyze must run the same version or analyze hard-fails with
+      # "Loaded a configuration file for version 'X', but running version 'Y'"
+      # (PR #476 bumped analyze to 4.37.3 and left init at 4.36.2).
+      codeql-action:
+        patterns:
+          - "github/codeql-action*"
+      # Same shape: four reusable workflows, one source repo, one version tag.
+      layerv-ops-routines:
+        patterns:
+          - "layervai/ops-routines-workflows*"
+      # `groups` covers version updates only; an advisory on codeql-action
+      # would otherwise reopen the split above via an ungrouped security PR.
+      codeql-action-security:
+        applies-to: security-updates
+        patterns:
+          - "github/codeql-action*"

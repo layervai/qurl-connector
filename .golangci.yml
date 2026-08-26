@@ -1,0 +1,54 @@
+version: "2"
+run:
+  modules-download-mode: readonly
+linters:
+  default: none
+  enable:
+    - govet
+    - misspell
+    - unconvert
+    - gosec
+    - errorlint
+    - errcheck
+  settings:
+    govet:
+      disable:
+        - fieldalignment
+        - shadow
+    misspell:
+      locale: US
+    gosec:
+      excludes:
+        - G110  # Decompression bomb - already size-limited by maxDownloadSize
+        - G115  # Integer overflow - safe bounded conversions
+        - G204  # Subprocess with variable - systemctl calls with controlled args
+        - G306  # WriteFile permissions > 0600 - config files need 0644
+        - G404  # math/rand for jitter timing - not security-sensitive
+    errcheck:
+      exclude-functions:
+        - (io.Closer).Close
+        - (net.Conn).Close
+  exclusions:
+    generated: lax
+    presets:
+      - comments
+      - common-false-positives
+      - legacy
+      - std-error-handling
+    rules:
+      - linters:
+          - gosec
+        path: _test\.go
+issues:
+  max-issues-per-linter: 50
+  max-same-issues: 10
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  settings:
+    goimports:
+      local-prefixes:
+        - github.com/layervai/qurl-connector
+  exclusions:
+    generated: lax

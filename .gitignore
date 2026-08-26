@@ -1,0 +1,38 @@
+# Build output
+bin/
+!bin/etc/
+release/
+# A bare `go build ./cmd/frpc` drops a `frpc` binary at the repo root;
+# canonical builds go to bin/ (make frpc).
+/frpc
+
+# Test artifacts
+coverage.out
+*.test
+
+# Go
+vendor/
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# IDE
+.idea/
+.vscode/
+*.sublime-*
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Docker
+docker/logs/
+
+# Secrets / credentials
+.env
+.env.*
+*.pem
+*.key
+credentials.json

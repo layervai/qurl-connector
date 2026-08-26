@@ -1,0 +1,38 @@
+name: Dependency Review
+
+# Fails any PR that introduces a HIGH or CRITICAL CVE via dependency bump.
+# Structural prevention for dependency drift across the connector,
+# container, and workflow surfaces.
+
+on:
+  # No branches filter — future release branches should gate too.
+  pull_request:
+
+permissions:
+  contents: read
+  # Needed for `comment-summary-in-pr: on-failure` below. Note: GitHub grants
+  # only a read-only GITHUB_TOKEN on fork PRs, so the summary comment silently
+  # no-ops there — the merge-blocking exit code still fires, which is what
+  # matters.
+  pull-requests: write
+
+concurrency:
+  group: dependency-review-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    name: Dependency Review
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Dependency Review
+        uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
+        with:
+          # Gates BOTH runtime and development scopes by default.
+          fail-on-severity: high
+          # Block non-permissive copyleft licenses in redistributed
+          # connector artifacts.
+          deny-licenses: AGPL-1.0-only, AGPL-1.0-or-later, AGPL-3.0-only, AGPL-3.0-or-later, GPL-2.0-only, GPL-2.0-or-later, GPL-3.0-only, GPL-3.0-or-later
+          comment-summary-in-pr: on-failure
