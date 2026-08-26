@@ -1,0 +1,18 @@
+# CODEOWNERS — automatic review requests + branch-protection
+# code-owner gating.
+# https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
+
+# Default owners for everything
+* @justin-layerv
+
+# Config files and issue forms
+/.github/ @justin-layerv
+/.github/workflows/ @justin-layerv
+/go.mod @justin-layerv
+/go.sum @justin-layerv
+
+# Runtime packages
+/cmd/ @justin-layerv
+/internal/ @justin-layerv
+/pkg/ @justin-layerv
+/contracts/ @justin-layerv
