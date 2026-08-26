@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.8.1](https://github.com/layervai/qurl-connector/compare/v0.8.0...v0.8.1) (2026-08-26)
+
+
+### Bug Fixes
+
+* **share:** bind CRID resource into native knock ([#7](https://github.com/layervai/qurl-connector/issues/7)) ([2ad86da](https://github.com/layervai/qurl-connector/commit/2ad86dafb95a7c3c7f50753b1b79eb5896a1f3c5))
+
 ## [0.8.0](https://github.com/layervai/qurl-connector/compare/v0.7.1...v0.8.0) (2026-08-26)
 
 
@@ -10,11 +17,6 @@
 ### Features
 
 * publish CRID lifecycle runtime module ([7cd7455](https://github.com/layervai/qurl-connector/commit/7cd7455763b7b6e4d4ed1098d17cd803b192b98a))
-
-
-### Bug Fixes
-
-* **share:** bind CRID resource into native knock ([#7](https://github.com/layervai/qurl-connector/issues/7)) ([2ad86da](https://github.com/layervai/qurl-connector/commit/2ad86dafb95a7c3c7f50753b1b79eb5896a1f3c5))
 
 
 ### Build System
