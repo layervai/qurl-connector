@@ -191,6 +191,148 @@ func TestOpenNativeRuntimeStopsAutomaticRefreshOnCorruptCompletedState(t *testin
 	}
 }
 
+func TestOpenNativeRuntimeRecoversAuthenticatedRejectedIdentity(t *testing.T) {
+	oldStore := newNativeStateStore
+	oldRefresh := refreshNativeRuntime
+	oldRecover := recoverNativeRuntime
+	oldWait := waitNativeRefresh
+	t.Cleanup(func() {
+		newNativeStateStore = oldStore
+		refreshNativeRuntime = oldRefresh
+		recoverNativeRuntime = oldRecover
+		waitNativeRefresh = oldWait
+	})
+	store := &memoryNativeStore{
+		present: true,
+		marker:  agentstate.RefreshMarker{Version: 2, Reason: "assigned NHP cell lease expired"},
+	}
+	newNativeStateStore = func(string, string) (nativeStateStore, error) { return store, nil }
+	waitNativeRefresh = func(context.Context, time.Duration) error { return nil }
+	refreshNativeRuntime = func(context.Context, qurl.HubBootstrap, qurl.AgentStateStore, ...qurl.AgentRuntimeRefreshOption) (*qurl.Client, *qurl.AgentRuntimeBinding, error) {
+		return nil, nil, errors.Join(errors.New("Hub rejected persisted key"), qurl.ErrAssignmentIdentityRejected)
+	}
+	providerCalls := 0
+	recoveryCalls := 0
+	recoverNativeRuntime = func(_ context.Context, credential string, _ qurl.AgentStateStore, options ...qurl.AgentRuntimeRecoveryOption) (*qurl.Client, *qurl.AgentRuntimeBinding, error) {
+		recoveryCalls++
+		if credential != "lv_test_recoverycredentialabcdefghijklmnopqrstuvwxyz0123456789" {
+			t.Fatalf("recovery credential = %q", credential)
+		}
+		if len(options) != 3 {
+			t.Fatalf("recovery options = %d, want Hub, expected agent, and base URL", len(options))
+		}
+		return &qurl.Client{}, &qurl.AgentRuntimeBinding{AgentID: "agent-one"}, nil
+	}
+	runtime, err := OpenNativeRuntime(context.Background(), NativeRuntimeConfig{
+		StateDir: "/private/state", AgentID: "agent-one", ClientBaseURL: "https://api.example.test",
+		RecoveryCredentialProvider: func(context.Context) (string, error) {
+			providerCalls++
+			return "lv_test_recoverycredentialabcdefghijklmnopqrstuvwxyz0123456789", nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if runtime.OpenKind != NativeOpenRecovery || runtime.AgentID != "agent-one" {
+		t.Fatalf("recovered runtime = kind %q agent %q", runtime.OpenKind, runtime.AgentID)
+	}
+	if providerCalls != 1 || recoveryCalls != 1 || store.marks != 1 {
+		t.Fatalf("provider=%d recovery=%d refresh marks=%d, want 1/1/1", providerCalls, recoveryCalls, store.marks)
+	}
+	if store.cleared != 0 {
+		t.Fatal("credential recovery cleared assignment marker before serving health")
+	}
+	if err := runtime.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestOpenNativeRuntimeDoesNotRecoverWithoutExplicitAuthority(t *testing.T) {
+	oldStore := newNativeStateStore
+	oldRefresh := refreshNativeRuntime
+	oldRecover := recoverNativeRuntime
+	oldWait := waitNativeRefresh
+	t.Cleanup(func() {
+		newNativeStateStore = oldStore
+		refreshNativeRuntime = oldRefresh
+		recoverNativeRuntime = oldRecover
+		waitNativeRefresh = oldWait
+	})
+	store := &memoryNativeStore{present: true, marker: agentstate.RefreshMarker{Version: 2, Reason: "placement recovery"}}
+	newNativeStateStore = func(string, string) (nativeStateStore, error) { return store, nil }
+	waitNativeRefresh = func(context.Context, time.Duration) error { return nil }
+	refreshNativeRuntime = func(context.Context, qurl.HubBootstrap, qurl.AgentStateStore, ...qurl.AgentRuntimeRefreshOption) (*qurl.Client, *qurl.AgentRuntimeBinding, error) {
+		return nil, nil, qurl.ErrAssignmentIdentityRejected
+	}
+	recoverNativeRuntime = func(context.Context, string, qurl.AgentStateStore, ...qurl.AgentRuntimeRecoveryOption) (*qurl.Client, *qurl.AgentRuntimeBinding, error) {
+		t.Fatal("recovery ran without an explicit credential provider")
+		return nil, nil, nil
+	}
+	_, err := OpenNativeRuntime(context.Background(), NativeRuntimeConfig{StateDir: "/private/state"})
+	if !errors.Is(err, qurl.ErrAssignmentIdentityRejected) {
+		t.Fatalf("OpenNativeRuntime() = %v, want identity rejection", err)
+	}
+}
+
+func TestOpenNativeRuntimeDoesNotSpendRecoveryAuthorityOnOtherFailures(t *testing.T) {
+	oldStore := newNativeStateStore
+	oldRefresh := refreshNativeRuntime
+	oldRecover := recoverNativeRuntime
+	oldWait := waitNativeRefresh
+	t.Cleanup(func() {
+		newNativeStateStore = oldStore
+		refreshNativeRuntime = oldRefresh
+		recoverNativeRuntime = oldRecover
+		waitNativeRefresh = oldWait
+	})
+	store := &memoryNativeStore{present: true, marker: agentstate.RefreshMarker{Version: 2, Reason: "placement recovery"}}
+	newNativeStateStore = func(string, string) (nativeStateStore, error) { return store, nil }
+	waitNativeRefresh = func(context.Context, time.Duration) error { return nil }
+	refreshNativeRuntime = func(context.Context, qurl.HubBootstrap, qurl.AgentStateStore, ...qurl.AgentRuntimeRefreshOption) (*qurl.Client, *qurl.AgentRuntimeBinding, error) {
+		return nil, nil, qurl.ErrInvalidAssignmentConfig
+	}
+	providerCalls := 0
+	recoverNativeRuntime = func(context.Context, string, qurl.AgentStateStore, ...qurl.AgentRuntimeRecoveryOption) (*qurl.Client, *qurl.AgentRuntimeBinding, error) {
+		t.Fatal("recovery ran for a non-identity failure")
+		return nil, nil, nil
+	}
+	_, err := OpenNativeRuntime(context.Background(), NativeRuntimeConfig{
+		StateDir: "/private/state",
+		RecoveryCredentialProvider: func(context.Context) (string, error) {
+			providerCalls++
+			return "must-not-be-read", nil
+		},
+	})
+	if !errors.Is(err, qurl.ErrInvalidAssignmentConfig) || providerCalls != 0 {
+		t.Fatalf("OpenNativeRuntime() = %v, provider calls=%d, want original error and no recovery authority read", err, providerCalls)
+	}
+}
+
+func TestOpenNativeRuntimeRecoveryProviderFailurePreservesIdentityRejection(t *testing.T) {
+	oldStore := newNativeStateStore
+	oldRefresh := refreshNativeRuntime
+	oldWait := waitNativeRefresh
+	t.Cleanup(func() {
+		newNativeStateStore = oldStore
+		refreshNativeRuntime = oldRefresh
+		waitNativeRefresh = oldWait
+	})
+	store := &memoryNativeStore{present: true, marker: agentstate.RefreshMarker{Version: 2, Reason: "placement recovery"}}
+	newNativeStateStore = func(string, string) (nativeStateStore, error) { return store, nil }
+	waitNativeRefresh = func(context.Context, time.Duration) error { return nil }
+	refreshNativeRuntime = func(context.Context, qurl.HubBootstrap, qurl.AgentStateStore, ...qurl.AgentRuntimeRefreshOption) (*qurl.Client, *qurl.AgentRuntimeBinding, error) {
+		return nil, nil, qurl.ErrAssignmentIdentityRejected
+	}
+	want := errors.New("account credential unavailable")
+	_, err := OpenNativeRuntime(context.Background(), NativeRuntimeConfig{
+		StateDir:                   "/private/state",
+		RecoveryCredentialProvider: func(context.Context) (string, error) { return "", want },
+	})
+	if !errors.Is(err, qurl.ErrAssignmentIdentityRejected) || !errors.Is(err, want) {
+		t.Fatalf("OpenNativeRuntime() = %v, want identity rejection joined with provider failure", err)
+	}
+}
+
 func TestNativeOpenPermanentClassification(t *testing.T) {
 	for name, err := range map[string]error{
 		"bad enrollment token": qurl.ErrAssignmentKeyRejected,

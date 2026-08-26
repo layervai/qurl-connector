@@ -25,8 +25,13 @@ type NativeRuntimeConfig struct {
 	ClientBaseURL                string
 	EnrollmentCredential         string
 	EnrollmentCredentialProvider qurl.AgentEnrollmentCredentialProvider
-	RefreshMode                  string
-	UDPOptions                   []qurl.AgentRuntimeUDPOption
+	// RecoveryCredentialProvider is invoked only after the pinned Hub
+	// authenticates the persisted agent and rejects its device credential.
+	// It must return a live qurl:agent account credential. The provider and its
+	// result are never retained after OpenNativeRuntime returns.
+	RecoveryCredentialProvider func(context.Context) (string, error)
+	RefreshMode                string
+	UDPOptions                 []qurl.AgentRuntimeUDPOption
 }
 
 // nativeRefreshConfig is the credential-free subset retained after opening
@@ -62,6 +67,7 @@ const (
 	NativeOpenWarm         NativeOpenKind = "warm"
 	NativeOpenRegistration NativeOpenKind = "registration"
 	NativeOpenRefresh      NativeOpenKind = "refresh"
+	NativeOpenRecovery     NativeOpenKind = "recovery"
 )
 
 type nativeStateStore interface {
@@ -80,6 +86,7 @@ var (
 	}
 	connectNativeRuntime = qurl.ConnectAgentRuntime
 	refreshNativeRuntime = qurl.RefreshAgentRuntime
+	recoverNativeRuntime = qurl.RecoverAgentRuntime
 	waitNativeRefresh    = sleepWithContext
 	knockNativeRuntime   = qurl.KnockRegisteredAgent
 	retireNativeSession  = qurl.RetireRegisteredAgentSession
@@ -126,7 +133,11 @@ func OpenNativeRuntime(ctx context.Context, cfg NativeRuntimeConfig) (_ *NativeR
 		present = false
 	}
 	if present {
-		return refreshUntilOpen(ctx, refreshConfig(cfg, mode), store, marker, mode)
+		runtime, refreshErr := refreshUntilOpen(ctx, refreshConfig(cfg, mode), store, marker, mode)
+		if refreshErr == nil {
+			return runtime, nil
+		}
+		return recoverRejectedNativeIdentity(ctx, cfg, store, refreshErr, mode)
 	}
 
 	state, err := store.Handoff()
@@ -149,7 +160,11 @@ func OpenNativeRuntime(ctx context.Context, cfg NativeRuntimeConfig) (_ *NativeR
 		if err != nil || !present {
 			return nil, errors.Join(errors.New("assignment refresh state missing after lease expiry"), err)
 		}
-		return refreshUntilOpen(ctx, refreshConfig(cfg, mode), store, marker, mode)
+		runtime, refreshErr := refreshUntilOpen(ctx, refreshConfig(cfg, mode), store, marker, mode)
+		if refreshErr == nil {
+			return runtime, nil
+		}
+		return recoverRejectedNativeIdentity(ctx, cfg, store, refreshErr, mode)
 	}
 	if !errors.Is(openErr, qurl.ErrAgentStateNotFound) {
 		return nil, openErr
@@ -186,6 +201,41 @@ func OpenNativeRuntime(ctx context.Context, cfg NativeRuntimeConfig) (_ *NativeR
 		return nil, err
 	}
 	return assembleNativeRuntime(client, binding, store, refreshConfig(cfg, mode), NativeOpenRegistration)
+}
+
+func recoverRejectedNativeIdentity(ctx context.Context, cfg NativeRuntimeConfig, store nativeStateStore, refreshErr error, mode string) (*NativeRuntime, error) {
+	if !errors.Is(refreshErr, qurl.ErrAssignmentIdentityRejected) || cfg.RecoveryCredentialProvider == nil {
+		return nil, refreshErr
+	}
+	credential, err := cfg.RecoveryCredentialProvider(ctx)
+	if err != nil {
+		return nil, errors.Join(refreshErr, fmt.Errorf("resolve native credential recovery authority: %w", err))
+	}
+	credential = strings.TrimSpace(credential)
+	if credential == "" {
+		return nil, errors.Join(refreshErr, errors.New("native credential recovery authority is empty"))
+	}
+	state, err := store.Handoff()
+	if err != nil {
+		return nil, errors.Join(refreshErr, err)
+	}
+	options := make([]qurl.AgentRuntimeRecoveryOption, 0, len(cfg.UDPOptions)+3)
+	options = append(options, qurl.WithAgentRuntimeRecoveryHub(cfg.Hub))
+	if expected := strings.TrimSpace(cfg.AgentID); expected != "" {
+		options = append(options, qurl.WithExpectedAgentRuntimeRecoveryAgentID(expected))
+	}
+	if cfg.ClientBaseURL != "" {
+		options = append(options, qurl.WithAgentClientBaseURL(cfg.ClientBaseURL))
+	}
+	for _, option := range cfg.UDPOptions {
+		options = append(options, option)
+	}
+	client, binding, err := recoverNativeRuntime(ctx, credential, state, options...)
+	credential = ""
+	if err != nil {
+		return nil, fmt.Errorf("recover rejected native identity: %w", err)
+	}
+	return assembleNativeRuntime(client, binding, store, refreshConfig(cfg, mode), NativeOpenRecovery)
 }
 
 func refreshConfig(cfg NativeRuntimeConfig, mode string) nativeRefreshConfig {
