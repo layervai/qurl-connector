@@ -39,6 +39,22 @@ jobs:
     uses: layervai/ops-routines-workflows/.github/workflows/age-check-go.yml@e8c55b3945b963d0b6a87095214693731c024560 # v0.11.0
     with:
       min_age_days: 7
+      # First-party modules cut from this org's own protected default
+      # branches. The reusable skips ONLY these modules' age delay, and only
+      # after the Go proxy origin, exact GitHub tag, verified target commit
+      # and default-branch ancestry all agree; anything unverifiable fails
+      # closed. This is far narrower than `age-check-bypass`, which skips the
+      # entire check for every dependency in the PR.
+      # Matching rule (`module_is_exempt` in the reusable's age-check-go.sh): an
+      # entry WITHOUT a trailing slash matches ONE module path exactly. So the
+      # entries below do not cover `qurl-go-extra`, `qurl-golang`, or a future
+      # `qurl-go/v2` major path — a v2 bump falls back to the cooldown until
+      # its own line is added. Only an entry ending in `/` prefix-matches, and
+      # then only at a path-segment boundary. Keep these exact; never shorten
+      # one to a bare `github.com/layervai/`.
+      exempt_module_prefixes: |
+        github.com/layervai/qurl-go
+        github.com/layervai/qurl-conformance
       # Post a sticky PR comment when an age-check fails, listing each
       # pin with its eligible-after date and days remaining. The PR
       # author / reviewer sees the retry-after date inline on the PR
