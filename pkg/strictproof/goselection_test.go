@@ -6,7 +6,7 @@ import (
 	"time"
 )
 
-// TestSelectedQurlGoIsTheReviewedRelease is the toolchain half of the
+// TestSelectedQurlGoIsTheReviewedArtifact is the toolchain half of the
 // exact-signed-qurl-go-selection row. Unlike the go.mod/go.sum text
 // assertions it does not trust the files: it asks the Go toolchain what this
 // module graph actually resolves, then binds the resolved zip back to a VCS
