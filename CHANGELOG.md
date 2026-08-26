@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.8.2](https://github.com/layervai/qurl-connector/compare/v0.8.1...v0.8.2) (2026-08-26)
+
+
+### Bug Fixes
+
+* **share:** recover rejected agent credentials ([#9](https://github.com/layervai/qurl-connector/issues/9)) ([490a717](https://github.com/layervai/qurl-connector/commit/490a7175e045ab15a30fdd7b65c5f3be0c76ac12))
+
 ## [0.8.1](https://github.com/layervai/qurl-connector/compare/v0.8.0...v0.8.1) (2026-08-26)
 
 
