@@ -1,5 +1,31 @@
 # Changelog
 
+## [0.9.0](https://github.com/layervai/qurl-connector/compare/v0.8.1...v0.9.0) (2026-08-26)
+
+
+### ⚠ BREAKING CHANGES
+
+* publish CRID lifecycle runtime module
+
+### Features
+
+* publish CRID lifecycle runtime module ([7cd7455](https://github.com/layervai/qurl-connector/commit/7cd7455763b7b6e4d4ed1098d17cd803b192b98a))
+
+
+### Bug Fixes
+
+* **share:** bind CRID resource into native knock ([#7](https://github.com/layervai/qurl-connector/issues/7)) ([2ad86da](https://github.com/layervai/qurl-connector/commit/2ad86dafb95a7c3c7f50753b1b79eb5896a1f3c5))
+
+
+### Build System
+
+* **deps:** repin the FRP fork to v1.0.0 ([#5](https://github.com/layervai/qurl-connector/issues/5)) ([e3ba0c0](https://github.com/layervai/qurl-connector/commit/e3ba0c07e3a8c07c8d31c087619197699744cc02))
+
+
+### Continuous Integration
+
+* align public repository controls ([#6](https://github.com/layervai/qurl-connector/issues/6)) ([df6cbd3](https://github.com/layervai/qurl-connector/commit/df6cbd3ab87af40391d1b7ad83aed61fdce15f50))
+
 ## [0.8.1](https://github.com/layervai/qurl-connector/compare/v0.8.0...v0.8.1) (2026-08-26)
 
 
