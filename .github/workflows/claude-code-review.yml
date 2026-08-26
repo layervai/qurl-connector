@@ -187,7 +187,7 @@ jobs:
             actionable line-specific findings, with commit_id=HEAD SHA and
             confirmed=true.
           claude_args: >-
-            --model claude-opus-4-8
+            --model claude-opus-5
             --allowed-tools
             "mcp__github__get_pull_request,mcp__github__get_pull_request_diff,mcp__github__get_pull_request_files,mcp__github__get_pull_request_review_comments,mcp__github__get_pull_request_reviews,mcp__github__get_pull_request_status,mcp__github__get_issue_comments,mcp__github__get_file_contents,mcp__github__get_commit,mcp__github__add_issue_comment,mcp__github_inline_comment__create_inline_comment"
             --disallowed-tools
