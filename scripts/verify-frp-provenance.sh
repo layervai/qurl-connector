@@ -16,21 +16,27 @@ readonly repository='https://github.com/layervai/frp.git'
 # Reviewed release commit on layerv/main. See FORK.md in the fork repository.
 readonly commit='ecb28a1dece90985dfc20f829f75ccbc7406adba'
 
-replace_line="$(grep -E "^replace github\.com/fatedier/frp => ${module} v" go.mod || true)"
+module_re="${module//./\\.}"
+replace_line="$(grep -E "^replace github\\.com/fatedier/frp => ${module_re} v" go.mod || true)"
 if [ -z "${replace_line}" ]; then
   echo "FRP replace directive for ${module} not found in go.mod" >&2
   exit 1
 fi
-version="${replace_line##* }"
+# Field 5, not the last token: a trailing comment on the replace directive would
+# make ${replace_line##* } grab the comment and surface later as a confusing
+# "checksum pin missing" instead of a parse failure here.
+version="$(awk '{print $5}' <<<"${replace_line}")"
 readonly version
-if [ -z "${version}" ]; then
-  echo "could not read pinned FRP version from go.mod" >&2
+if [[ ! "${version}" =~ ^v[0-9] ]]; then
+  printf 'could not read a pinned FRP version from go.mod; got %s\n' "${version}" >&2
   exit 1
 fi
+version_re="${version//./\\.}"
+readonly version_re
 
 read_sum() { # <go.sum key suffix>
   local key="$1" line
-  line="$(grep -E "^${module} ${version}${key} h1:" go.sum || true)"
+  line="$(grep -E "^${module_re} ${version_re}${key} h1:" go.sum || true)"
   if [ -z "${line}" ]; then
     echo "FRP checksum pin missing from go.sum: ${module} ${version}${key}" >&2
     exit 1
