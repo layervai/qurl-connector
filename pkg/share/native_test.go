@@ -322,6 +322,30 @@ func TestNativeAdmitterRecoversSustainedStaleAssignmentWithoutOperatorInput(t *t
 	}
 }
 
+func TestNativeAdmitterBindsProtectedResourceIntoKnock(t *testing.T) {
+	oldKnock := knockNativeRuntime
+	t.Cleanup(func() { knockNativeRuntime = oldKnock })
+	want := "protected-resource"
+	knockNativeRuntime = func(_ context.Context, _ *qurl.AgentRuntimeBinding, _ []byte, knockResourceID string,
+		opts qurl.NativeKnockOptions, _ ...qurl.AgentRuntimeUDPOption,
+	) (*qurl.NativeKnockResult, error) {
+		if knockResourceID != "q_catalog_key" || opts.ProtectedResourceID != want {
+			t.Fatalf("knock binding = catalog %q protected %q", knockResourceID, opts.ProtectedResourceID)
+		}
+		return &qurl.NativeKnockResult{
+			ACToken: "token", ResourceHost: "127.0.0.1:7000", SessionID: 77, OpenTime: 60,
+			SessionReceipt: testSessionReceipt(77, opts.RunID, opts.RunAttempt),
+		}, nil
+	}
+	admitter := &NativeAdmitter{
+		binding: &qurl.AgentRuntimeBinding{AgentID: "agent-one"}, privateKey: make([]byte, 32),
+		store: &memoryNativeStore{},
+	}
+	if _, err := admitter.Admit(context.Background(), "q_catalog_key", want); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestRefreshableKnockErrorClassification(t *testing.T) {
 	tests := []struct {
 		name string

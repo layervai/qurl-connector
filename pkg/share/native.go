@@ -515,7 +515,7 @@ func (a *NativeAdmitter) knockLocked(ctx context.Context, knockResourceID, resou
 	}
 	result, err := knockNativeRuntime(
 		ctx, a.binding, a.privateKey, knockResourceID,
-		qurl.NativeKnockOptions{RunID: runID, RunAttempt: 1}, a.udpOpts...,
+		qurl.NativeKnockOptions{RunID: runID, RunAttempt: 1, ProtectedResourceID: resourceID}, a.udpOpts...,
 	)
 	if err != nil {
 		var deny *qurl.ServerDenyError
