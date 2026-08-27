@@ -525,6 +525,16 @@ func TestSDKStoreRefreshMarkerRoundTripsThroughRetainedStateDir(t *testing.T) {
 	if marker.AttemptCount != 0 || marker.Reason != reason || marker.StartedAtUnix <= 0 {
 		t.Fatalf("armed marker = %#v, want fresh recovery episode with reason %q", marker, reason)
 	}
+	if err := owner.MarkRegistrationRefreshAttempted(); err != nil {
+		t.Fatal(err)
+	}
+	if err := owner.MarkRegistrationRefreshSucceeded(); err != nil {
+		t.Fatal(err)
+	}
+	marker, present, err = owner.LoadRegistrationRefreshMarker()
+	if err != nil || !present || marker.RefreshSucceededUnixMilli == 0 || marker.NextAttemptUnixMilli <= marker.LastAttemptUnixMilli {
+		t.Fatalf("successful marker handoff = (%#v, %v, %v)", marker, present, err)
+	}
 
 	if err := owner.ClearRegistrationRefreshMarker(); err != nil {
 		t.Fatal(err)

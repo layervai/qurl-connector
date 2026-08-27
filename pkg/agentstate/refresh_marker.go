@@ -47,7 +47,8 @@ var ErrInvalidRefreshMarker = errors.New("invalid assignment refresh marker")
 // A stale over-cap file fails closed as corrupt and the warm-open side logs and
 // clears it through the same retained namespace.
 const refreshMarkerFileMaxBytes = 4 << 10 // 4 KiB
-const refreshMarkerVersion = 2
+const refreshMarkerVersion = 3
+const legacyRefreshMarkerVersion = 2
 const refreshMarkerReasonMaxBytes = 256
 const refreshRetryInitial = 5 * time.Second
 const refreshRetryMaximum = 5 * time.Minute
@@ -57,6 +58,10 @@ const refreshRetryMaximum = 5 * time.Minute
 // persisted exponential backoff with jitter before network I/O starts, so a
 // crash cannot reset the retry cadence. A confirmed healthy NHP/FRP cycle
 // clears the marker; ordinary refresh failures never require operator action.
+// RefreshSucceededUnixMilli separates a completed, authenticated assignment
+// refresh from the later serving confirmation. That durable handoff lets a
+// different process warm-open the refreshed assignment without repeating the
+// Hub request, while the marker still survives until the route really serves.
 type RefreshMarker struct {
 	// Version selects the closed marker schema.
 	Version int `json:"version"`
@@ -66,10 +71,11 @@ type RefreshMarker struct {
 	// only; the self-heal logic does not key off Reason.
 	Reason string `json:"reason,omitempty"`
 
-	AttemptCount         uint32 `json:"attempt_count"`
-	StartedAtUnix        int64  `json:"started_at_unix"`
-	LastAttemptUnixMilli int64  `json:"last_attempt_unix_milli"`
-	NextAttemptUnixMilli int64  `json:"next_attempt_unix_milli"`
+	AttemptCount              uint32 `json:"attempt_count"`
+	StartedAtUnix             int64  `json:"started_at_unix"`
+	LastAttemptUnixMilli      int64  `json:"last_attempt_unix_milli"`
+	NextAttemptUnixMilli      int64  `json:"next_attempt_unix_milli"`
+	RefreshSucceededUnixMilli int64  `json:"refresh_succeeded_unix_milli"`
 }
 
 func withRefreshMarkerNamespace(dir string, fn func(*pinnedfs.Directory) error) (retErr error) {
@@ -177,7 +183,7 @@ func decodeRefreshMarker(raw []byte) (RefreshMarker, error) {
 		return RefreshMarker{}, errors.New("registration refresh marker must be a JSON object")
 	}
 	var marker RefreshMarker
-	seen := make(map[string]struct{}, 7)
+	seen := make(map[string]struct{}, 8)
 	for decoder.More() {
 		keyToken, err := decoder.Token()
 		if err != nil {
@@ -204,6 +210,8 @@ func decodeRefreshMarker(raw []byte) (RefreshMarker, error) {
 			err = decoder.Decode(&marker.LastAttemptUnixMilli)
 		case "next_attempt_unix_milli":
 			err = decoder.Decode(&marker.NextAttemptUnixMilli)
+		case "refresh_succeeded_unix_milli":
+			err = decoder.Decode(&marker.RefreshSucceededUnixMilli)
 		default:
 			return RefreshMarker{}, fmt.Errorf("unknown registration refresh marker field %q", key)
 		}
@@ -226,18 +234,42 @@ func decodeRefreshMarker(raw []byte) (RefreshMarker, error) {
 			return RefreshMarker{}, fmt.Errorf("registration refresh marker is missing required field %q", required)
 		}
 	}
-	if marker.Version != refreshMarkerVersion {
+	if marker.Version != legacyRefreshMarkerVersion && marker.Version != refreshMarkerVersion {
 		return RefreshMarker{}, fmt.Errorf("unsupported registration refresh marker version %d", marker.Version)
+	}
+	_, successFieldPresent := seen["refresh_succeeded_unix_milli"]
+	if marker.Version == refreshMarkerVersion && !successFieldPresent {
+		return RefreshMarker{}, errors.New("registration refresh marker is missing required field \"refresh_succeeded_unix_milli\"")
+	}
+	if marker.Version == legacyRefreshMarkerVersion && successFieldPresent {
+		return RefreshMarker{}, errors.New("legacy registration refresh marker contains refresh_succeeded_unix_milli")
 	}
 	if marker.StartedAtUnix <= 0 {
 		return RefreshMarker{}, errors.New("registration refresh marker started_at_unix must be positive")
 	}
+	// An early v3 writer recorded successful handoff with a zero retry deadline.
+	// Normalize that closed legacy shape to one deterministic backoff from the
+	// recorded success. Current writers preserve their persisted jittered value.
+	if marker.AttemptCount > 0 && marker.RefreshSucceededUnixMilli > 0 && marker.NextAttemptUnixMilli == 0 {
+		marker.NextAttemptUnixMilli = marker.RefreshSucceededUnixMilli +
+			refreshRetryBase(marker.AttemptCount).Milliseconds()
+	}
 	if marker.AttemptCount == 0 {
-		if marker.LastAttemptUnixMilli != 0 || marker.NextAttemptUnixMilli != 0 {
-			return RefreshMarker{}, errors.New("unattempted registration refresh marker must have zero last/next attempt")
+		if marker.LastAttemptUnixMilli != 0 || marker.NextAttemptUnixMilli != 0 || marker.RefreshSucceededUnixMilli != 0 {
+			return RefreshMarker{}, errors.New("unattempted registration refresh marker must have zero attempt and success timestamps")
 		}
-	} else if marker.LastAttemptUnixMilli <= 0 || marker.NextAttemptUnixMilli < marker.LastAttemptUnixMilli || marker.LastAttemptUnixMilli < marker.StartedAtUnix*1000 {
-		return RefreshMarker{}, errors.New("attempted registration refresh marker has an invalid retry schedule")
+	} else {
+		if marker.LastAttemptUnixMilli <= 0 || marker.LastAttemptUnixMilli < marker.StartedAtUnix*1000 {
+			return RefreshMarker{}, errors.New("attempted registration refresh marker has an invalid retry schedule")
+		}
+		if marker.RefreshSucceededUnixMilli == 0 {
+			if marker.NextAttemptUnixMilli < marker.LastAttemptUnixMilli {
+				return RefreshMarker{}, errors.New("attempted registration refresh marker has an invalid retry schedule")
+			}
+		} else if marker.RefreshSucceededUnixMilli < marker.LastAttemptUnixMilli ||
+			marker.NextAttemptUnixMilli < marker.LastAttemptUnixMilli {
+			return RefreshMarker{}, errors.New("successful registration refresh marker has an invalid handoff schedule")
+		}
 	}
 	if invalidRefreshMarkerReason(marker.Reason) ||
 		strings.TrimSpace(marker.Reason) != marker.Reason {
@@ -326,13 +358,50 @@ func markRegistrationRefreshAttempted(namespace *pinnedfs.Directory) error {
 		return errors.New("registration refresh attempt count exhausted")
 	}
 	m.AttemptCount++
+	m.Version = refreshMarkerVersion
 	now := time.Now()
 	m.LastAttemptUnixMilli = now.UnixMilli()
 	m.NextAttemptUnixMilli = now.Add(refreshRetryBackoff(m.AttemptCount)).UnixMilli()
+	m.RefreshSucceededUnixMilli = 0
+	return writeRefreshMarker(namespace, m)
+}
+
+// MarkRegistrationRefreshSucceeded records that the Hub authenticated and
+// persisted a fresh assignment. It keeps the episode open until serving is
+// confirmed and preserves the crash-safe retry deadline. Another process tries
+// the fresh assignment offline first and honors that deadline only if warm open
+// fails and another Hub refresh is required.
+func MarkRegistrationRefreshSucceeded(dir string) error {
+	return withRefreshMarkerNamespace(dir, markRegistrationRefreshSucceeded)
+}
+
+func markRegistrationRefreshSucceeded(namespace *pinnedfs.Directory) error {
+	m, present, err := loadRegistrationRefreshMarker(namespace)
+	if err != nil {
+		return err
+	}
+	if !present {
+		return nil
+	}
+	if m.AttemptCount == 0 || m.LastAttemptUnixMilli <= 0 {
+		return errors.New("registration refresh cannot succeed before an attempt")
+	}
+	m.Version = refreshMarkerVersion
+	m.RefreshSucceededUnixMilli = max(time.Now().UnixMilli(), m.LastAttemptUnixMilli)
 	return writeRefreshMarker(namespace, m)
 }
 
 func refreshRetryBackoff(attempt uint32) time.Duration {
+	base := refreshRetryBase(attempt)
+	half := base / 2
+	var raw [8]byte
+	if _, err := rand.Read(raw[:]); err != nil {
+		return base
+	}
+	return half + time.Duration(binary.BigEndian.Uint64(raw[:])%uint64(base-half+1))
+}
+
+func refreshRetryBase(attempt uint32) time.Duration {
 	base := refreshRetryInitial
 	for i := uint32(1); i < attempt && base < refreshRetryMaximum; i++ {
 		base *= 2
@@ -340,12 +409,7 @@ func refreshRetryBackoff(attempt uint32) time.Duration {
 			base = refreshRetryMaximum
 		}
 	}
-	half := base / 2
-	var raw [8]byte
-	if _, err := rand.Read(raw[:]); err != nil {
-		return base
-	}
-	return half + time.Duration(binary.BigEndian.Uint64(raw[:])%uint64(base-half+1))
+	return base
 }
 
 // ClearRegistrationRefreshMarker removes the registration-refresh marker,

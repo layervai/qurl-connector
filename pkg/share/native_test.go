@@ -17,13 +17,15 @@ import (
 )
 
 type memoryNativeStore struct {
-	mu      sync.Mutex
-	marker  agentstate.RefreshMarker
-	present bool
-	loadErr error
-	marks   int
-	cleared int
-	closed  int
+	mu         sync.Mutex
+	marker     agentstate.RefreshMarker
+	present    bool
+	loadErr    error
+	successErr error
+	marks      int
+	succeeded  int
+	cleared    int
+	closed     int
 }
 
 func (*memoryNativeStore) Handoff() (qurl.AgentStateStore, error) { return nil, nil }
@@ -47,6 +49,17 @@ func (s *memoryNativeStore) MarkRegistrationRefreshAttempted() error {
 	s.marker.AttemptCount++
 	s.marker.LastAttemptUnixMilli = time.Now().UnixMilli()
 	s.marker.NextAttemptUnixMilli = s.marker.LastAttemptUnixMilli + 1
+	s.marker.RefreshSucceededUnixMilli = 0
+	return nil
+}
+func (s *memoryNativeStore) MarkRegistrationRefreshSucceeded() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.succeeded++
+	if s.successErr != nil {
+		return s.successErr
+	}
+	s.marker.RefreshSucceededUnixMilli = max(time.Now().UnixMilli(), s.marker.LastAttemptUnixMilli)
 	return nil
 }
 func (s *memoryNativeStore) ClearRegistrationRefreshMarker() error {
@@ -103,14 +116,160 @@ func TestOpenNativeRuntimeAutomaticallyRetriesAssignmentRefresh(t *testing.T) {
 	if waits == 0 {
 		t.Fatal("persisted assignment refresh backoff was ignored")
 	}
-	if store.cleared != 0 {
-		t.Fatal("refresh marker cleared before FRP reported serving")
+	if store.succeeded != 1 || store.cleared != 0 || !store.present || store.marker.RefreshSucceededUnixMilli == 0 {
+		t.Fatalf("successful assignment handoff = succeeded=%d cleared=%d present=%t marker=%#v", store.succeeded, store.cleared, store.present, store.marker)
 	}
 	if err := runtime.MarkServingHealthy(); err != nil {
 		t.Fatal(err)
 	}
 	if store.cleared != 1 {
 		t.Fatalf("healthy serving clears = %d, want 1", store.cleared)
+	}
+	if err := runtime.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestOpenNativeRuntimeWarmOpensSuccessfulRefreshHandoffWithoutRepeatingHub(t *testing.T) {
+	oldStore := newNativeStateStore
+	oldConnect := connectNativeRuntime
+	oldRefresh := refreshNativeRuntime
+	t.Cleanup(func() {
+		newNativeStateStore = oldStore
+		connectNativeRuntime = oldConnect
+		refreshNativeRuntime = oldRefresh
+	})
+	now := time.Now().UnixMilli()
+	store := &memoryNativeStore{present: true, marker: agentstate.RefreshMarker{
+		Version: 3, Reason: "assigned NHP cell lease expired", AttemptCount: 1,
+		StartedAtUnix: now/1000 - 1, LastAttemptUnixMilli: now - 1,
+		RefreshSucceededUnixMilli: now,
+	}}
+	newNativeStateStore = func(string, string) (nativeStateStore, error) { return store, nil }
+	connects := 0
+	connectNativeRuntime = func(context.Context, qurl.AgentStateStore, ...qurl.AgentRuntimeRegistrationOption) (*qurl.Client, *qurl.AgentRuntimeBinding, error) {
+		connects++
+		return &qurl.Client{}, &qurl.AgentRuntimeBinding{AgentID: "agent-one"}, nil
+	}
+	refreshNativeRuntime = func(context.Context, qurl.HubBootstrap, qurl.AgentStateStore, ...qurl.AgentRuntimeRefreshOption) (*qurl.Client, *qurl.AgentRuntimeBinding, error) {
+		t.Fatal("successful cross-process handoff repeated the Hub refresh")
+		return nil, nil, nil
+	}
+
+	runtime, err := OpenNativeRuntime(context.Background(), NativeRuntimeConfig{StateDir: "/private/state", RefreshMode: "auto"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if connects != 1 || runtime.OpenKind != NativeOpenWarm || store.marks != 0 || store.cleared != 0 || !store.present {
+		t.Fatalf("handoff open = connects=%d kind=%q marks=%d clears=%d present=%t", connects, runtime.OpenKind, store.marks, store.cleared, store.present)
+	}
+	if err := runtime.MarkServingHealthy(); err != nil {
+		t.Fatal(err)
+	}
+	if store.cleared != 1 || store.present {
+		t.Fatalf("serving confirmation clears=%d present=%t, want 1/false", store.cleared, store.present)
+	}
+	if err := runtime.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestOpenNativeRuntimeRefreshesRetryableSuccessfulHandoffWarmOpenFailures(t *testing.T) {
+	oldStore := newNativeStateStore
+	oldConnect := connectNativeRuntime
+	oldRefresh := refreshNativeRuntime
+	oldWait := waitNativeRefresh
+	t.Cleanup(func() {
+		newNativeStateStore = oldStore
+		connectNativeRuntime = oldConnect
+		refreshNativeRuntime = oldRefresh
+		waitNativeRefresh = oldWait
+	})
+	for name, warmErr := range map[string]error{
+		"expired assignment lease": qurl.ErrAssignmentLeaseExpired,
+		"transient key wrapper":    qurl.ErrAgentStateKeyWrapper,
+	} {
+		t.Run(name, func(t *testing.T) {
+			now := time.Now().UnixMilli()
+			waits := 0
+			waitNativeRefresh = func(context.Context, time.Duration) error {
+				waits++
+				return nil
+			}
+			store := &memoryNativeStore{present: true, marker: agentstate.RefreshMarker{
+				Version: 3, Reason: "assigned NHP cell lease expired", AttemptCount: 1,
+				StartedAtUnix: now/1000 - 1, LastAttemptUnixMilli: now - 1,
+				NextAttemptUnixMilli: now + int64(time.Minute/time.Millisecond), RefreshSucceededUnixMilli: now,
+			}}
+			newNativeStateStore = func(string, string) (nativeStateStore, error) { return store, nil }
+			connectNativeRuntime = func(context.Context, qurl.AgentStateStore, ...qurl.AgentRuntimeRegistrationOption) (*qurl.Client, *qurl.AgentRuntimeBinding, error) {
+				return nil, nil, warmErr
+			}
+			refreshCalls := 0
+			refreshNativeRuntime = func(context.Context, qurl.HubBootstrap, qurl.AgentStateStore, ...qurl.AgentRuntimeRefreshOption) (*qurl.Client, *qurl.AgentRuntimeBinding, error) {
+				refreshCalls++
+				return &qurl.Client{}, &qurl.AgentRuntimeBinding{AgentID: "agent-one"}, nil
+			}
+
+			runtime, err := OpenNativeRuntime(context.Background(), NativeRuntimeConfig{StateDir: "/private/state", RefreshMode: "auto"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if runtime.OpenKind != NativeOpenRefresh || refreshCalls != 1 || waits != 1 || store.marks != 1 ||
+				store.succeeded != 1 || store.marker.RefreshSucceededUnixMilli == 0 {
+				t.Fatalf("handoff recovery = kind=%q refresh=%d waits=%d marks=%d success=%d marker=%#v",
+					runtime.OpenKind, refreshCalls, waits, store.marks, store.succeeded, store.marker)
+			}
+			if err := runtime.Close(); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestOpenNativeRuntimeSuccessfulHandoffPermanentWarmOpenFailureDoesNotContactHub(t *testing.T) {
+	oldStore := newNativeStateStore
+	oldConnect := connectNativeRuntime
+	oldRefresh := refreshNativeRuntime
+	t.Cleanup(func() {
+		newNativeStateStore = oldStore
+		connectNativeRuntime = oldConnect
+		refreshNativeRuntime = oldRefresh
+	})
+	now := time.Now().UnixMilli()
+	store := &memoryNativeStore{present: true, marker: agentstate.RefreshMarker{
+		Version: 3, AttemptCount: 1, StartedAtUnix: now/1000 - 1,
+		LastAttemptUnixMilli: now - 1, NextAttemptUnixMilli: now + 1, RefreshSucceededUnixMilli: now,
+	}}
+	newNativeStateStore = func(string, string) (nativeStateStore, error) { return store, nil }
+	connectNativeRuntime = func(context.Context, qurl.AgentStateStore, ...qurl.AgentRuntimeRegistrationOption) (*qurl.Client, *qurl.AgentRuntimeBinding, error) {
+		return nil, nil, qurl.ErrInvalidAgentState
+	}
+	refreshCalls := 0
+	refreshNativeRuntime = func(context.Context, qurl.HubBootstrap, qurl.AgentStateStore, ...qurl.AgentRuntimeRefreshOption) (*qurl.Client, *qurl.AgentRuntimeBinding, error) {
+		refreshCalls++
+		return nil, nil, errors.New("unexpected Hub refresh")
+	}
+	if _, err := OpenNativeRuntime(context.Background(), NativeRuntimeConfig{StateDir: "/private/state", RefreshMode: "auto"}); !errors.Is(err, qurl.ErrInvalidAgentState) {
+		t.Fatalf("permanent handoff warm-open failure = %v, want invalid agent state", err)
+	}
+	if refreshCalls != 0 || store.closed != 1 {
+		t.Fatalf("permanent handoff failure = refresh calls %d store closes %d, want 0/1", refreshCalls, store.closed)
+	}
+}
+
+func TestAssembleRefreshedNativeRuntimeMarkerFailureKeepsRuntimeAndCallerStore(t *testing.T) {
+	want := errors.New("marker write failed")
+	store := &memoryNativeStore{successErr: want}
+	runtime, err := assembleRefreshedNativeRuntime(
+		context.Background(), &qurl.Client{}, &qurl.AgentRuntimeBinding{AgentID: "agent-one"}, store,
+		nativeRefreshConfig{}, NativeOpenRefresh,
+	)
+	if err != nil || runtime == nil || runtime.Binding == nil {
+		t.Fatalf("assemble marker failure = (%#v, %v), want usable runtime", runtime, err)
+	}
+	if store.closed != 0 || store.succeeded != 1 {
+		t.Fatalf("caller store after marker failure = closes=%d success calls=%d, want 0/1", store.closed, store.succeeded)
 	}
 	if err := runtime.Close(); err != nil {
 		t.Fatal(err)
@@ -239,8 +398,8 @@ func TestOpenNativeRuntimeRecoversAuthenticatedRejectedIdentity(t *testing.T) {
 	if providerCalls != 1 || recoveryCalls != 1 || store.marks != 1 {
 		t.Fatalf("provider=%d recovery=%d refresh marks=%d, want 1/1/1", providerCalls, recoveryCalls, store.marks)
 	}
-	if store.cleared != 0 {
-		t.Fatal("credential recovery cleared assignment marker before serving health")
+	if store.succeeded != 1 || store.cleared != 0 || !store.present {
+		t.Fatalf("credential recovery handoff = succeeded=%d cleared=%d present=%t", store.succeeded, store.cleared, store.present)
 	}
 	if err := runtime.Close(); err != nil {
 		t.Fatal(err)
