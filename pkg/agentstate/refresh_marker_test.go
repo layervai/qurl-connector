@@ -115,6 +115,52 @@ func TestRegistrationRefreshMarker_MarkAttemptAdvancesAndPersistsFields(t *testi
 	}
 }
 
+func TestRegistrationRefreshMarker_SuccessHandsOffWithoutClearingEpisode(t *testing.T) {
+	dir := refreshMarkerTestDir(t)
+	if err := RequestRegistrationRefresh(dir, "lease recovery"); err != nil {
+		t.Fatal(err)
+	}
+	if err := MarkRegistrationRefreshAttempted(dir); err != nil {
+		t.Fatal(err)
+	}
+	attempted, _, err := LoadRegistrationRefreshMarker(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := MarkRegistrationRefreshSucceeded(dir); err != nil {
+		t.Fatal(err)
+	}
+	handoff, present, err := LoadRegistrationRefreshMarker(dir)
+	if err != nil || !present {
+		t.Fatalf("successful handoff present=%t err=%v", present, err)
+	}
+	if handoff.Version != refreshMarkerVersion || handoff.AttemptCount != attempted.AttemptCount ||
+		handoff.LastAttemptUnixMilli != attempted.LastAttemptUnixMilli || handoff.NextAttemptUnixMilli != attempted.NextAttemptUnixMilli ||
+		handoff.RefreshSucceededUnixMilli < handoff.LastAttemptUnixMilli {
+		t.Fatalf("successful handoff marker = %#v, attempted = %#v", handoff, attempted)
+	}
+	if err := MarkRegistrationRefreshAttempted(dir); err != nil {
+		t.Fatal(err)
+	}
+	retry, _, err := LoadRegistrationRefreshMarker(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if retry.RefreshSucceededUnixMilli != 0 || retry.NextAttemptUnixMilli <= retry.LastAttemptUnixMilli || retry.AttemptCount != attempted.AttemptCount+1 {
+		t.Fatalf("new attempt did not restore retry state: %#v", retry)
+	}
+}
+
+func TestRegistrationRefreshMarker_SuccessAbsentIsNoop(t *testing.T) {
+	dir := refreshMarkerTestDir(t)
+	if err := MarkRegistrationRefreshSucceeded(dir); err != nil {
+		t.Fatalf("MarkRegistrationRefreshSucceeded on absent marker: %v", err)
+	}
+	if _, present, err := LoadRegistrationRefreshMarker(dir); err != nil || present {
+		t.Fatalf("success on absent marker = present=%t err=%v", present, err)
+	}
+}
+
 func TestRegistrationRefreshMarker_AttemptsBackOffAndCap(t *testing.T) {
 	dir := refreshMarkerTestDir(t)
 	if err := RequestRegistrationRefresh(dir, "outage"); err != nil {
@@ -213,17 +259,22 @@ func TestRegistrationRefreshMarker_CorruptJSONIsError(t *testing.T) {
 func TestRegistrationRefreshMarker_StrictSchemaRejectsAmbiguity(t *testing.T) {
 	valid := `"attempt_count":0,"started_at_unix":1,"last_attempt_unix_milli":0,"next_attempt_unix_milli":0`
 	tests := map[string]string{
-		"missing version":       `{` + valid + `}`,
-		"wrong version":         `{"version":1,` + valid + `}`,
-		"missing attempt count": `{"version":2,"started_at_unix":1,"last_attempt_unix_milli":0,"next_attempt_unix_milli":0}`,
-		"zero timestamp":        `{"version":2,"attempt_count":0,"started_at_unix":0,"last_attempt_unix_milli":0,"next_attempt_unix_milli":0}`,
-		"invalid attempted":     `{"version":2,"attempt_count":1,"started_at_unix":1,"last_attempt_unix_milli":0,"next_attempt_unix_milli":0}`,
-		"unknown field":         `{"version":2,` + valid + `,"extra":true}`,
-		"duplicate field":       `{"version":2,` + valid + `,"attempt_count":1}`,
-		"trailing value":        `{"version":2,` + valid + `}{}`,
-		"unclean reason":        `{"version":2,"reason":" spaced ",` + valid + `}`,
-		"control reason":        "{\"version\":2,\"reason\":\"line\\nfeed\"," + valid + "}",
-		"oversize reason":       `{"version":2,"reason":"` + strings.Repeat("a", refreshMarkerReasonMaxBytes+1) + `",` + valid + `}`,
+		"missing version":        `{` + valid + `}`,
+		"wrong version":          `{"version":1,` + valid + `}`,
+		"missing attempt count":  `{"version":2,"started_at_unix":1,"last_attempt_unix_milli":0,"next_attempt_unix_milli":0}`,
+		"zero timestamp":         `{"version":2,"attempt_count":0,"started_at_unix":0,"last_attempt_unix_milli":0,"next_attempt_unix_milli":0}`,
+		"invalid attempted":      `{"version":2,"attempt_count":1,"started_at_unix":1,"last_attempt_unix_milli":0,"next_attempt_unix_milli":0}`,
+		"unknown field":          `{"version":2,` + valid + `,"extra":true}`,
+		"duplicate field":        `{"version":2,` + valid + `,"attempt_count":1}`,
+		"trailing value":         `{"version":2,` + valid + `}{}`,
+		"unclean reason":         `{"version":2,"reason":" spaced ",` + valid + `}`,
+		"control reason":         "{\"version\":2,\"reason\":\"line\\nfeed\"," + valid + "}",
+		"oversize reason":        `{"version":2,"reason":"` + strings.Repeat("a", refreshMarkerReasonMaxBytes+1) + `",` + valid + `}`,
+		"v3 missing success":     `{"version":3,` + valid + `}`,
+		"v2 carries v3 field":    `{"version":2,` + valid + `,"refresh_succeeded_unix_milli":0}`,
+		"bad success handoff":    `{"version":3,"attempt_count":1,"started_at_unix":1,"last_attempt_unix_milli":1000,"next_attempt_unix_milli":999,"refresh_succeeded_unix_milli":1001}`,
+		"success before attempt": `{"version":3,"attempt_count":0,"started_at_unix":1,"last_attempt_unix_milli":0,"next_attempt_unix_milli":0,"refresh_succeeded_unix_milli":1000}`,
+		"success before last":    `{"version":3,"attempt_count":1,"started_at_unix":1,"last_attempt_unix_milli":1000,"next_attempt_unix_milli":0,"refresh_succeeded_unix_milli":999}`,
 	}
 	for name, raw := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -235,6 +286,71 @@ func TestRegistrationRefreshMarker_StrictSchemaRejectsAmbiguity(t *testing.T) {
 				t.Fatalf("LoadRegistrationRefreshMarker = (%#v, %v, %v), want zero, absent, invalid", marker, present, err)
 			}
 		})
+	}
+}
+
+func TestRegistrationRefreshMarker_LoadsLegacyV2ForInPlaceRecovery(t *testing.T) {
+	dir := refreshMarkerTestDir(t)
+	raw := `{"version":2,"reason":"existing episode","attempt_count":1,"started_at_unix":1,"last_attempt_unix_milli":1000,"next_attempt_unix_milli":2000}`
+	if err := os.WriteFile(markerPathFor(dir), []byte(raw), pubMode); err != nil {
+		t.Fatal(err)
+	}
+	marker, present, err := LoadRegistrationRefreshMarker(dir)
+	if err != nil || !present {
+		t.Fatalf("legacy marker = (%#v, %t, %v)", marker, present, err)
+	}
+	if marker.Version != legacyRefreshMarkerVersion || marker.RefreshSucceededUnixMilli != 0 {
+		t.Fatalf("legacy marker normalized unexpectedly: %#v", marker)
+	}
+	if err := MarkRegistrationRefreshAttempted(dir); err != nil {
+		t.Fatal(err)
+	}
+	upgraded, present, err := LoadRegistrationRefreshMarker(dir)
+	if err != nil || !present || upgraded.Version != refreshMarkerVersion || upgraded.AttemptCount != 2 {
+		t.Fatalf("upgraded marker = (%#v, %t, %v)", upgraded, present, err)
+	}
+}
+
+func TestRegistrationRefreshMarker_SuccessUpgradesLegacyV2InPlace(t *testing.T) {
+	dir := refreshMarkerTestDir(t)
+	raw := `{"version":2,"reason":"existing episode","attempt_count":1,"started_at_unix":1,"last_attempt_unix_milli":1000,"next_attempt_unix_milli":2000}`
+	if err := os.WriteFile(markerPathFor(dir), []byte(raw), pubMode); err != nil {
+		t.Fatal(err)
+	}
+	if err := MarkRegistrationRefreshSucceeded(dir); err != nil {
+		t.Fatal(err)
+	}
+	upgraded, present, err := LoadRegistrationRefreshMarker(dir)
+	if err != nil || !present || upgraded.Version != refreshMarkerVersion ||
+		upgraded.NextAttemptUnixMilli != 2000 || upgraded.RefreshSucceededUnixMilli < upgraded.LastAttemptUnixMilli {
+		t.Fatalf("successful legacy handoff = (%#v, %t, %v)", upgraded, present, err)
+	}
+}
+
+func TestRegistrationRefreshMarker_NormalizesLegacyV3ZeroRetryDeadline(t *testing.T) {
+	dir := refreshMarkerTestDir(t)
+	raw := `{"version":3,"reason":"existing handoff","attempt_count":2,"started_at_unix":1,"last_attempt_unix_milli":1000,"next_attempt_unix_milli":0,"refresh_succeeded_unix_milli":1001}`
+	if err := os.WriteFile(markerPathFor(dir), []byte(raw), pubMode); err != nil {
+		t.Fatal(err)
+	}
+	marker, present, err := LoadRegistrationRefreshMarker(dir)
+	want := 1001 + refreshRetryBase(2).Milliseconds()
+	if err != nil || !present || marker.NextAttemptUnixMilli != want {
+		t.Fatalf("legacy zero-deadline handoff = (%#v, %t, %v), want next %d", marker, present, err, want)
+	}
+}
+
+func TestRegistrationRefreshMarker_SuccessBeforeAttemptFailsClosed(t *testing.T) {
+	dir := refreshMarkerTestDir(t)
+	if err := RequestRegistrationRefresh(dir, "not attempted"); err != nil {
+		t.Fatal(err)
+	}
+	if err := MarkRegistrationRefreshSucceeded(dir); err == nil {
+		t.Fatal("MarkRegistrationRefreshSucceeded accepted an unattempted episode")
+	}
+	marker, present, err := LoadRegistrationRefreshMarker(dir)
+	if err != nil || !present || marker.AttemptCount != 0 || marker.RefreshSucceededUnixMilli != 0 {
+		t.Fatalf("failed success mutation changed marker = (%#v, %t, %v)", marker, present, err)
 	}
 }
 
@@ -511,7 +627,7 @@ func TestRegistrationRefreshMarker_OnDiskShape(t *testing.T) {
 	if err := json.Unmarshal(raw, &generic); err != nil {
 		t.Fatalf("marker is not valid JSON: %v", err)
 	}
-	for _, field := range []string{"attempt_count", "started_at_unix", "last_attempt_unix_milli", "next_attempt_unix_milli"} {
+	for _, field := range []string{"attempt_count", "started_at_unix", "last_attempt_unix_milli", "next_attempt_unix_milli", "refresh_succeeded_unix_milli"} {
 		if _, ok := generic[field]; !ok {
 			t.Fatalf("marker JSON missing %q key: %s", field, raw)
 		}

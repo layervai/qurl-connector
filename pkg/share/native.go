@@ -76,6 +76,7 @@ type nativeStateStore interface {
 	LoadRegistrationRefreshMarker() (agentstate.RefreshMarker, bool, error)
 	RequestRegistrationRefresh(string) error
 	MarkRegistrationRefreshAttempted() error
+	MarkRegistrationRefreshSucceeded() error
 	ClearRegistrationRefreshMarker() error
 	Close() error
 }
@@ -132,6 +133,21 @@ func OpenNativeRuntime(ctx context.Context, cfg NativeRuntimeConfig) (_ *NativeR
 		marker = agentstate.RefreshMarker{}
 		present = false
 	}
+	if present && marker.RefreshSucceededUnixMilli > 0 {
+		runtime, openErr := warmOpenNativeRuntime(ctx, cfg, store, mode)
+		if openErr == nil {
+			return runtime, nil
+		}
+		// Offline open and Hub refresh share the same local transient-error
+		// sentinels. Reuse the closed refresh classifier so new or corrupt local
+		// state still fails closed instead of widening unattended retries. Offline
+		// open is network-free and cannot return an authenticated identity reject;
+		// missing state stays permanent so a surviving marker cannot mint a new
+		// immutable identity.
+		if !errors.Is(openErr, qurl.ErrAssignmentLeaseExpired) && permanentRefreshError(openErr) {
+			return nil, openErr
+		}
+	}
 	if present {
 		runtime, refreshErr := refreshUntilOpen(ctx, refreshConfig(cfg, mode), store, marker, mode)
 		if refreshErr == nil {
@@ -140,17 +156,9 @@ func OpenNativeRuntime(ctx context.Context, cfg NativeRuntimeConfig) (_ *NativeR
 		return recoverRejectedNativeIdentity(ctx, cfg, store, refreshErr, mode)
 	}
 
-	state, err := store.Handoff()
-	if err != nil {
-		return nil, err
-	}
-	openOptions := []qurl.AgentRuntimeRegistrationOption{qurl.WithAgentRuntimeOfflineOpen()}
-	if cfg.ClientBaseURL != "" {
-		openOptions = append(openOptions, qurl.WithAgentClientBaseURL(cfg.ClientBaseURL))
-	}
-	client, binding, openErr := connectNativeRuntime(ctx, state, openOptions...)
+	runtime, openErr := warmOpenNativeRuntime(ctx, cfg, store, mode)
 	if openErr == nil {
-		return assembleNativeRuntime(client, binding, store, refreshConfig(cfg, mode), NativeOpenWarm)
+		return runtime, nil
 	}
 	if errors.Is(openErr, qurl.ErrAssignmentLeaseExpired) {
 		if err := store.RequestRegistrationRefresh("assigned NHP cell lease expired"); err != nil {
@@ -192,15 +200,31 @@ func OpenNativeRuntime(ctx context.Context, cfg NativeRuntimeConfig) (_ *NativeR
 	for _, option := range cfg.UDPOptions {
 		registerOptions = append(registerOptions, option)
 	}
-	state, err = store.Handoff()
+	state, err := store.Handoff()
 	if err != nil {
 		return nil, err
 	}
-	client, binding, err = connectNativeRuntime(ctx, state, registerOptions...)
+	client, binding, err := connectNativeRuntime(ctx, state, registerOptions...)
 	if err != nil {
 		return nil, err
 	}
 	return assembleNativeRuntime(client, binding, store, refreshConfig(cfg, mode), NativeOpenRegistration)
+}
+
+func warmOpenNativeRuntime(ctx context.Context, cfg NativeRuntimeConfig, store nativeStateStore, mode string) (*NativeRuntime, error) {
+	state, err := store.Handoff()
+	if err != nil {
+		return nil, err
+	}
+	options := []qurl.AgentRuntimeRegistrationOption{qurl.WithAgentRuntimeOfflineOpen()}
+	if cfg.ClientBaseURL != "" {
+		options = append(options, qurl.WithAgentClientBaseURL(cfg.ClientBaseURL))
+	}
+	client, binding, err := connectNativeRuntime(ctx, state, options...)
+	if err != nil {
+		return nil, err
+	}
+	return assembleNativeRuntime(client, binding, store, refreshConfig(cfg, mode), NativeOpenWarm)
 }
 
 func recoverRejectedNativeIdentity(ctx context.Context, cfg NativeRuntimeConfig, store nativeStateStore, refreshErr error, mode string) (*NativeRuntime, error) {
@@ -235,7 +259,7 @@ func recoverRejectedNativeIdentity(ctx context.Context, cfg NativeRuntimeConfig,
 	if err != nil {
 		return nil, fmt.Errorf("recover rejected native identity: %w", err)
 	}
-	return assembleNativeRuntime(client, binding, store, refreshConfig(cfg, mode), NativeOpenRecovery)
+	return assembleRefreshedNativeRuntime(ctx, client, binding, store, refreshConfig(cfg, mode), NativeOpenRecovery)
 }
 
 func refreshConfig(cfg NativeRuntimeConfig, mode string) nativeRefreshConfig {
@@ -274,7 +298,7 @@ func refreshUntilOpen(ctx context.Context, cfg nativeRefreshConfig, store native
 		}
 		client, binding, refreshErr := refreshNativeRuntime(ctx, cfg.Hub, state, options...)
 		if refreshErr == nil {
-			return assembleNativeRuntime(client, binding, store, cfg, NativeOpenRefresh)
+			return assembleRefreshedNativeRuntime(ctx, client, binding, store, cfg, NativeOpenRefresh)
 		}
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
@@ -287,6 +311,21 @@ func refreshUntilOpen(ctx context.Context, cfg nativeRefreshConfig, store native
 			return nil, fmt.Errorf("reload assignment refresh retry state: %w", err)
 		}
 	}
+}
+
+func assembleRefreshedNativeRuntime(ctx context.Context, client *qurl.Client, binding *qurl.AgentRuntimeBinding, store nativeStateStore, cfg nativeRefreshConfig, kind NativeOpenKind) (*NativeRuntime, error) {
+	runtime, err := assembleNativeRuntime(client, binding, store, cfg, kind)
+	if err != nil {
+		return nil, err
+	}
+	if err := store.MarkRegistrationRefreshSucceeded(); err != nil {
+		// The authenticated assignment and binding are already persisted and
+		// usable. This marker is a non-secret retry breadcrumb, so its write is
+		// non-fatal just like RequestRegistrationRefresh. Keeping the runtime
+		// avoids discarding a valid binding or closing an admitter-owned store.
+		slog.WarnContext(ctx, "could not record successful assignment refresh handoff; continuing with persisted assignment", "err", err)
+	}
+	return runtime, nil
 }
 
 func permanentRefreshError(err error) bool {

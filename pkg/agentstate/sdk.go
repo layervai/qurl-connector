@@ -130,6 +130,12 @@ func (s *SDKStore) MarkRegistrationRefreshAttempted() error {
 	return s.withRefreshMarkerMutation(markRegistrationRefreshAttempted)
 }
 
+// MarkRegistrationRefreshSucceeded records the authenticated assignment
+// handoff while retaining the marker until the route serves.
+func (s *SDKStore) MarkRegistrationRefreshSucceeded() error {
+	return s.withRefreshMarkerMutation(markRegistrationRefreshSucceeded)
+}
+
 // ClearRegistrationRefreshMarker closes the episode only after a confirmed
 // healthy Connector-server login.
 func (s *SDKStore) ClearRegistrationRefreshMarker() error {
