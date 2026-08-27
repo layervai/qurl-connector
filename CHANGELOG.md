@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.8.3](https://github.com/layervai/qurl-connector/compare/v0.8.2...v0.8.3) (2026-08-27)
+
+
+### Bug Fixes
+
+* **share:** preserve successful refresh handoff ([#14](https://github.com/layervai/qurl-connector/issues/14)) ([74bebfc](https://github.com/layervai/qurl-connector/commit/74bebfcd0816b70627fff359d41e9e1734c256e8))
+
+
+### Continuous Integration
+
+* **deps:** exempt provenance-verified first-party modules from age check ([b7e78ae](https://github.com/layervai/qurl-connector/commit/b7e78ae730cb2fcb996c936f1687a99cd2ed2544))
+* move Claude PR review to Opus 5 ([#12](https://github.com/layervai/qurl-connector/issues/12)) ([05b9f86](https://github.com/layervai/qurl-connector/commit/05b9f8651836ad7fa5e4e800e5c7723f81567ff4))
+
 ## [0.8.2](https://github.com/layervai/qurl-connector/compare/v0.8.1...v0.8.2) (2026-08-26)
 
 
