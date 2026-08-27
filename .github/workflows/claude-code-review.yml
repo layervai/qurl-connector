@@ -149,6 +149,11 @@ jobs:
         if: steps.pin_review_snapshots.outcome == 'success'
         # v1.0.183 and later include upstream #1496's fail-closed SDK result
         # handling, so `subtype: success` plus `is_error: true` fails this check.
+        # Under the job cap on purpose: an overrun fails this step and leaves
+        # the job alive to report it. A kill at the JOB cap cancels every later
+        # step, so the verify step never runs and the PR gets a bare
+        # `cancelled` check with no comment and nothing saying why.
+        timeout-minutes: 16
         uses: anthropics/claude-code-action@9d7150bc8a3dae8149739a88019d192b579ad90c # v1.0.193
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
