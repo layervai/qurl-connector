@@ -51,8 +51,8 @@ func TestWindowsUserJobRenderIsCredentialFreeAndEscaped(t *testing.T) {
 		}
 	}
 	for _, forbidden := range []string{"QURL_API_KEY", "bearer", "credential"} {
-		if strings.Contains(strings.ToLower(content), strings.ToLower(forbidden)) {
-			t.Fatalf("Windows task XML contains forbidden %q", forbidden)
+		if strings.Contains(strings.ToLower(launcher), strings.ToLower(forbidden)) {
+			t.Fatalf("Windows task launcher contains forbidden %q", forbidden)
 		}
 	}
 }
@@ -89,7 +89,7 @@ func TestWindowsUserJobEnsureCreateReuseReplaceAndRemove(t *testing.T) {
 					if err != nil {
 						return "", err
 					}
-					existing = string(raw)
+					existing = decodeWindowsTaskXML(t, raw)
 				}
 			}
 			return "", nil
@@ -228,6 +228,18 @@ func decodeWindowsPowerShellCommand(t *testing.T, encoded string) string {
 	units := make([]uint16, len(raw)/2)
 	for index := range units {
 		units[index] = binary.LittleEndian.Uint16(raw[index*2:])
+	}
+	return string(utf16.Decode(units))
+}
+
+func decodeWindowsTaskXML(t *testing.T, raw []byte) string {
+	t.Helper()
+	if len(raw) < 2 || raw[0] != 0xff || raw[1] != 0xfe || len(raw)%2 != 0 {
+		t.Fatalf("Windows task XML is not UTF-16LE with a BOM")
+	}
+	units := make([]uint16, (len(raw)-2)/2)
+	for index := range units {
+		units[index] = binary.LittleEndian.Uint16(raw[2+index*2:])
 	}
 	return string(utf16.Decode(units))
 }

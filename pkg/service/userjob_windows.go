@@ -24,7 +24,7 @@ import (
 
 const windowsTaskDefinitionPrefix = "layerv-qurl-user-job-sha256:"
 
-const windowsUserJobTemplate = `<?xml version="1.0" encoding="UTF-8"?>
+const windowsUserJobTemplate = `<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <RegistrationInfo>
     <Description>{{xml .DefinitionMarker}}</Description>
@@ -149,7 +149,7 @@ func (m *windowsUserJobManager) ensure(job UserJob, forceReplace bool) error {
 	}
 	definitionPath := definition.Name()
 	defer func() { _ = os.Remove(definitionPath) }()
-	if _, err := definition.WriteString(content); err != nil {
+	if _, err := definition.Write(windowsTaskXMLBytes(content)); err != nil {
 		_ = definition.Close()
 		return fmt.Errorf("write temporary Windows user job definition: %w", err)
 	}
@@ -299,6 +299,16 @@ func windowsPowerShellLauncher(job UserJob) string {
 		binary.LittleEndian.PutUint16(raw[index*2:], unit)
 	}
 	return base64.StdEncoding.EncodeToString(raw)
+}
+
+func windowsTaskXMLBytes(content string) []byte {
+	units := utf16.Encode([]rune(content))
+	raw := make([]byte, 2+len(units)*2)
+	raw[0], raw[1] = 0xff, 0xfe
+	for index, unit := range units {
+		binary.LittleEndian.PutUint16(raw[2+index*2:], unit)
+	}
+	return raw
 }
 
 func windowsPowerShellLiteral(value string) string {
