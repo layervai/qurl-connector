@@ -553,7 +553,7 @@ func connectorNativeSessionAuthority() (share.NativeSessionOperationAuthority, e
 	ownerID := strings.TrimSpace(os.Getenv(envNativeOwnerID))
 	authority := share.NativeSessionOperationAuthority{OwnerID: ownerID}
 	if err := share.ValidateNativeSessionOperationAuthority(authority); err != nil {
-		return share.NativeSessionOperationAuthority{}, fmt.Errorf("native session authority: %w", err)
+		return share.NativeSessionOperationAuthority{}, fmt.Errorf("native session authority from %s: %w", envNativeOwnerID, err)
 	}
 	return authority, nil
 }

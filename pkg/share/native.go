@@ -664,7 +664,11 @@ func (a *NativeAdmitter) admitOnce(ctx context.Context, knockResourceID,
 	}
 	generation := a.generation
 	if err := a.operations.RecoverPending(ctx, a.binding, a.privateKey, resourceID, a.liveOperationIDs(resourceID), a.udpOpts); err != nil {
-		return Admission{}, fmt.Errorf("recover prior native session operation before replacement: %w", err), generation, false
+		// Recovery is source-fenced to the operation's persisted cell. A cell move
+		// can therefore fail here before the new assignment is tried. Let the same
+		// closed error classifier decide whether one assignment refresh can repair
+		// it; authenticated policy and malformed-reply failures remain ineligible.
+		return Admission{}, fmt.Errorf("recover prior native session operation before replacement: %w", err), generation, true
 	}
 	if err := a.retirePendingForResource(ctx, resourceID); err != nil {
 		return Admission{}, fmt.Errorf("retire prior native NHP session before replacement: %w", err), generation, false

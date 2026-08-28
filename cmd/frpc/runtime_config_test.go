@@ -96,7 +96,8 @@ func TestConnectorNativeRuntimeConfigWiresSessionAuthority(t *testing.T) {
 }
 
 func TestConnectorNativeSessionAuthorityRejectsMissingOwner(t *testing.T) {
-	if _, err := connectorNativeSessionAuthority(); err == nil || !strings.Contains(err.Error(), "owner ID") {
+	if _, err := connectorNativeSessionAuthority(); err == nil || !strings.Contains(err.Error(), "owner ID") ||
+		!strings.Contains(err.Error(), envNativeOwnerID) {
 		t.Fatalf("ownerless native session authority = %v", err)
 	}
 }

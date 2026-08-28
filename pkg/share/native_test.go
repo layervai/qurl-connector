@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -105,7 +106,7 @@ func (s *memoryNativeStore) TransitionSessionOperation(_ context.Context, previo
 	defer s.mu.Unlock()
 	resourceID := previous.Operation.ProtectedResourceID
 	for index, current := range s.operations[resourceID] {
-		if current == previous {
+		if reflect.DeepEqual(current, previous) {
 			s.operations[resourceID][index] = next
 			return nil
 		}
@@ -118,7 +119,7 @@ func (s *memoryNativeStore) DeleteSessionOperation(_ context.Context, terminal a
 	defer s.mu.Unlock()
 	resourceID := terminal.Operation.ProtectedResourceID
 	for index, current := range s.operations[resourceID] {
-		if current == terminal {
+		if reflect.DeepEqual(current, terminal) {
 			s.operations[resourceID] = append(s.operations[resourceID][:index], s.operations[resourceID][index+1:]...)
 			return nil
 		}
@@ -130,6 +131,15 @@ type testNativeSessionOperations struct{}
 
 func (testNativeSessionOperations) RecoverPending(context.Context, *qurl.AgentRuntimeBinding, []byte, string, map[string]struct{}, []qurl.AgentRuntimeUDPOption) error {
 	return nil
+}
+
+type recoveryFailureOperations struct {
+	testNativeSessionOperations
+	err error
+}
+
+func (o recoveryFailureOperations) RecoverPending(context.Context, *qurl.AgentRuntimeBinding, []byte, string, map[string]struct{}, []qurl.AgentRuntimeUDPOption) error {
+	return o.err
 }
 
 func (testNativeSessionOperations) RecoverOperation(context.Context, *qurl.AgentRuntimeBinding, []byte, string, string, []qurl.AgentRuntimeUDPOption) error {
@@ -309,6 +319,17 @@ func TestOpenNativeRuntimeAutomaticallyRetriesAssignmentRefresh(t *testing.T) {
 	}
 	if err := runtime.Close(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestNativeAdmitterLetsRecoveryTransportFailureReachRefreshClassifier(t *testing.T) {
+	admitter := &NativeAdmitter{
+		binding: &qurl.AgentRuntimeBinding{AgentID: "agent-one"}, privateKey: make([]byte, 32),
+		operations: recoveryFailureOperations{err: nativeudp.ErrNoReply}, generation: 7,
+	}
+	admission, err, generation, refreshEligible := admitter.admitOnce(context.Background(), "q_catalog", "resource-one")
+	if !reflect.DeepEqual(admission, Admission{}) || err == nil || generation != 7 || !refreshEligible || !refreshableKnockError(err) {
+		t.Fatalf("recovery refresh classification = %#v, %v, generation=%d, eligible=%t", admission, err, generation, refreshEligible)
 	}
 }
 

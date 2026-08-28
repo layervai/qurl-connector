@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"strings"
 	"time"
 
@@ -176,24 +177,56 @@ func (d *durableNativeSessionOperations) RecoverOperation(ctx context.Context, b
 		}
 		now := d.clock().UTC()
 		if record.RecoveryNotBeforeMilli > now.UnixMilli() {
-			if err := waitNativeSessionRecovery(ctx, time.Duration(record.RecoveryNotBeforeMilli-now.UnixMilli())*time.Millisecond); err != nil {
+			waitMillis := record.RecoveryNotBeforeMilli - now.UnixMilli()
+			if waitMillis > nativeSessionRecoveryMaxDelay.Milliseconds() {
+				waitMillis = nativeSessionRecoveryMaxDelay.Milliseconds()
+			}
+			wait := time.Duration(waitMillis) * time.Millisecond
+			// Persisted wall time can appear far in the future after a clock
+			// correction. Enforce one bounded delay, then let the server remain the
+			// recovery authority instead of waiting on the local clock indefinitely.
+			if err := waitNativeSessionRecovery(ctx, wait); err != nil {
 				return err
 			}
-			continue
+			now = d.clock().UTC()
 		}
 		if record.RecoveryAttempt == ^uint32(0) {
 			return errors.New("recover native session operation: recovery attempt counter is exhausted")
 		}
 		attempt := record
 		attempt.RecoveryAttempt++
-		attempt.RecoveryNotBeforeMilli = now.Add(nativeSessionRecoveryBackoff(attempt.RecoveryAttempt)).UnixMilli()
+		nextAttemptMilli := now.Add(nativeSessionRecoveryBackoff(attempt.RecoveryAttempt)).UnixMilli()
+		if nextAttemptMilli <= record.RecoveryNotBeforeMilli {
+			if record.RecoveryNotBeforeMilli == math.MaxInt64 {
+				return errors.New("recover native session operation: recovery deadline is exhausted")
+			}
+			nextAttemptMilli = record.RecoveryNotBeforeMilli + 1
+		}
+		attempt.RecoveryNotBeforeMilli = nextAttemptMilli
 		if err := d.store.TransitionSessionOperation(ctx, record, attempt); err != nil {
 			return fmt.Errorf("persist native session recovery backoff: %w", err)
 		}
 		record = attempt
 		result, err := recoverNativeSessionOperation(ctx, binding, privateKey, record.Operation, record.RecoveryEndpoint, udpOptions...)
 		if err != nil {
-			return fmt.Errorf("recover native session operation: %w", err)
+			var unexpected *qurl.NativeSessionOperationUnexpectedAdmissionError
+			if !errors.As(err, &unexpected) {
+				return fmt.Errorf("recover native session operation: %w", err)
+			}
+			// A recovery KNK must not admit. If a compatible authority regresses,
+			// preserve the authenticated receipt as MAPPED before any retry. The
+			// next loop moves it to CLOSING and asks the same durable server
+			// operation to retire it; no EXT fallback or replacement is created.
+			if record.Status != agentstate.SessionOperationDispatching || record.Admission != nil {
+				return fmt.Errorf("%w: recovery admitted over a non-dispatching operation", agentstate.ErrSessionOperationConflict)
+			}
+			mapped := record
+			mapped.Status = agentstate.SessionOperationMapped
+			mapped.Admission = admissionFromReceipt(unexpected.SessionReceipt)
+			if transitionErr := d.store.TransitionSessionOperation(ctx, record, mapped); transitionErr != nil {
+				return fmt.Errorf("persist unexpected recovery admission: %w", transitionErr)
+			}
+			continue
 		}
 		if result == nil {
 			return errors.New("recover native session operation: server returned no result")
