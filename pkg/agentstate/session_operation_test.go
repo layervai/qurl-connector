@@ -171,9 +171,10 @@ func TestSDKStoreEnumeratesJournalsAndRemovesCrashTemporaries(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, temporaryName), []byte("partial"), sessionOperationFileMode); err != nil {
 		t.Fatal(err)
 	}
-	resources, err := store.ListSessionOperationResources(context.Background())
-	if err != nil || len(resources) != 1 || resources[0] != record.Operation.ProtectedResourceID {
-		t.Fatalf("enumerated resources = %v, %v", resources, err)
+	scan := store.ScanSessionOperationResources(context.Background())
+	if scan.PermanentError != nil || scan.RetryableError != nil || len(scan.ResourceIDs) != 1 ||
+		scan.ResourceIDs[0] != record.Operation.ProtectedResourceID {
+		t.Fatalf("enumerated resources = %+v", scan)
 	}
 	if _, err := os.Lstat(filepath.Join(dir, temporaryName)); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("orphaned temporary file remains: %v", err)
@@ -207,12 +208,20 @@ func TestSDKStoreRejectsJournalWhoseHashedFilenameDoesNotMatchResource(t *testin
 	if err := os.WriteFile(spoofedPath, raw, sessionOperationFileMode); err != nil {
 		t.Fatal(err)
 	}
-	if resources, err := store.ListSessionOperationResources(context.Background()); resources != nil ||
-		!errors.Is(err, ErrSessionOperationJournalCorrupt) {
-		t.Fatalf("spoofed journal enumeration = (%v, %v)", resources, err)
+	temporaryName := "." + name + ".tmp-" + strings.Repeat("b", 16)
+	if err := os.WriteFile(filepath.Join(dir, temporaryName), []byte("partial"), sessionOperationFileMode); err != nil {
+		t.Fatal(err)
+	}
+	scan := store.ScanSessionOperationResources(context.Background())
+	if len(scan.ResourceIDs) != 1 || scan.ResourceIDs[0] != record.Operation.ProtectedResourceID ||
+		!errors.Is(scan.PermanentError, ErrSessionOperationJournalCorrupt) || scan.RetryableError != nil {
+		t.Fatalf("spoofed journal enumeration = %+v", scan)
 	}
 	if _, err := os.Stat(spoofedPath); err != nil {
 		t.Fatalf("unsafe journal was not retained for diagnosis: %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(dir, temporaryName)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("orphaned temporary file after corrupt sibling remains: %v", err)
 	}
 }
 

@@ -338,6 +338,44 @@ func TestNativeAdmitterOrphanRecoveryIsolatesSiblingResources(t *testing.T) {
 	}
 }
 
+func TestNativeAdmitterOrphanRecoveryContinuesPastCorruptSiblingJournal(t *testing.T) {
+	store := &memoryNativeStore{scanPermanentErr: agentstate.ErrSessionOperationJournalCorrupt}
+	operation := testPreparedDurableRecord(t)
+	if err := store.CreateSessionOperation(context.Background(), operation); err != nil {
+		t.Fatal(err)
+	}
+	controller, err := newDurableNativeSessionOperations(store, testNativeSessionAuthority())
+	if err != nil {
+		t.Fatal(err)
+	}
+	admitter := &NativeAdmitter{
+		binding: &qurl.AgentRuntimeBinding{AgentID: "agent-one"}, privateKey: make([]byte, 32),
+		store: store, operations: controller,
+	}
+	if err := admitter.recoverAllPending(context.Background()); err != nil {
+		t.Fatalf("terminal sibling journal error stopped valid recovery: %v", err)
+	}
+	if len(store.operations[operation.Operation.ProtectedResourceID]) != 0 {
+		t.Fatalf("valid sibling operation was not recovered: %+v", store.operations)
+	}
+}
+
+func TestNativeAdmitterOrphanRecoveryRetriesNamespaceFailure(t *testing.T) {
+	want := errors.New("temporary namespace read failure")
+	store := &memoryNativeStore{scanRetryableErr: want}
+	controller, err := newDurableNativeSessionOperations(store, testNativeSessionAuthority())
+	if err != nil {
+		t.Fatal(err)
+	}
+	admitter := &NativeAdmitter{
+		binding: &qurl.AgentRuntimeBinding{AgentID: "agent-one"}, privateKey: make([]byte, 32),
+		store: store, operations: controller,
+	}
+	if err := admitter.recoverAllPending(context.Background()); !errors.Is(err, want) {
+		t.Fatalf("recoverAllPending() = %v, want retryable namespace error", err)
+	}
+}
+
 func TestDurableNativeSessionRecoverySharesOneResourceDeadline(t *testing.T) {
 	oldRecover := recoverNativeSessionOperation
 	t.Cleanup(func() { recoverNativeSessionOperation = oldRecover })

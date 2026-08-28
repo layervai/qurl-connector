@@ -81,7 +81,7 @@ type nativeStateStore interface {
 	MarkRegistrationRefreshAttempted() error
 	MarkRegistrationRefreshSucceeded() error
 	ClearRegistrationRefreshMarker() error
-	ListSessionOperationResources(context.Context) ([]string, error)
+	ScanSessionOperationResources(context.Context) agentstate.SessionOperationResourceScan
 	LoadSessionOperations(context.Context, string) ([]agentstate.SessionOperationRecord, error)
 	CreateSessionOperation(context.Context, agentstate.SessionOperationRecord) error
 	TransitionSessionOperation(context.Context, agentstate.SessionOperationRecord, agentstate.SessionOperationRecord) error
@@ -523,12 +523,13 @@ type NativeAdmitter struct {
 	// runtimeMu prevents refresh or close from replacing the binding and key
 	// while a native exchange uses them. Ordinary operations take a read lock,
 	// so unrelated resources can recover and retire concurrently.
-	runtimeMu  sync.RWMutex
-	refreshMu  sync.Mutex
-	knockMu    sync.Mutex
-	stateMu    sync.Mutex
-	resources  keyedResourceLocks
-	recoveryWG sync.WaitGroup
+	runtimeMu             sync.RWMutex
+	refreshMu             sync.Mutex
+	knockMu               sync.Mutex
+	stateMu               sync.Mutex
+	resources             keyedResourceLocks
+	recoveryWG            sync.WaitGroup
+	recoveryPermanentOnce sync.Once
 
 	binding    *qurl.AgentRuntimeBinding
 	privateKey []byte
@@ -619,7 +620,7 @@ func NewNativeAdmitter(ctx context.Context, runtime *NativeRuntime) (*NativeAdmi
 		clear(key)
 		return nil, fmt.Errorf("build native admitter: device key is %d bytes, want 32", len(key))
 	}
-	lifecycle, cancel := context.WithCancel(context.Background())
+	lifecycle, cancel := context.WithCancel(ctx)
 	admitter := &NativeAdmitter{
 		binding: runtime.Binding, privateKey: key, store: runtime.store,
 		udpOpts:    append([]qurl.AgentRuntimeUDPOption(nil), runtime.UDPOptions...),
@@ -676,12 +677,20 @@ func (a *NativeAdmitter) recoverAllPending(ctx context.Context) error {
 	if closed || store == nil {
 		return errors.New("recover native session operations: native admitter is closed")
 	}
-	resources, err := store.ListSessionOperationResources(ctx)
-	if err != nil {
-		return fmt.Errorf("enumerate native session operations: %w", err)
+	scan := store.ScanSessionOperationResources(ctx)
+	if scan.PermanentError != nil {
+		// A corrupt journal remains fail-closed when its own resource next
+		// admits. Report it once without suppressing valid sibling cleanup or
+		// spinning the retry loop on state that cannot heal by itself.
+		a.recoveryPermanentOnce.Do(func() {
+			slog.ErrorContext(ctx, "durable native session journal requires operator attention", "err", scan.PermanentError)
+		})
 	}
 	var recoveryErr error
-	for _, resourceID := range resources {
+	if scan.RetryableError != nil {
+		recoveryErr = fmt.Errorf("enumerate native session operations: %w", scan.RetryableError)
+	}
+	for _, resourceID := range scan.ResourceIDs {
 		if err := ctx.Err(); err != nil {
 			return errors.Join(recoveryErr, err)
 		}
@@ -1283,8 +1292,6 @@ func (a *NativeAdmitter) Close() error {
 	a.udpOpts = nil
 	a.store = nil
 	a.operations = nil
-	a.lifecycle = nil
-	a.cancel = nil
 	a.stateMu.Lock()
 	a.live = nil
 	a.pending = nil

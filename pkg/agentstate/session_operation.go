@@ -118,12 +118,21 @@ func (s *SDKStore) LoadSessionOperations(ctx context.Context, resourceID string)
 	return records, err
 }
 
-// ListSessionOperationResources returns every self-describing durable
+// SessionOperationResourceScan separates permanent, fail-closed journal
+// diagnostics from retryable namespace failures. Valid resources remain
+// available even when a sibling journal needs operator attention.
+type SessionOperationResourceScan struct {
+	ResourceIDs    []string
+	PermanentError error
+	RetryableError error
+}
+
+// ScanSessionOperationResources returns every self-describing durable
 // operation journal in the private SDK namespace. It also removes temporary
 // journal files left by a process crash. The stable cross-process lock proves
 // that a matching temporary file has no live writer.
-func (s *SDKStore) ListSessionOperationResources(ctx context.Context) (resources []string, retErr error) {
-	err := s.withSessionOperationNamespaceLock(ctx, func(namespace *pinnedfs.Directory) error {
+func (s *SDKStore) ScanSessionOperationResources(ctx context.Context) (scan SessionOperationResourceScan) {
+	lockErr := s.withSessionOperationNamespaceLock(ctx, func(namespace *pinnedfs.Directory) error {
 		names, err := namespace.ReadDirNames(sessionOperationMaxStateFiles)
 		if err != nil {
 			return err
@@ -134,41 +143,61 @@ func (s *SDKStore) ListSessionOperationResources(ctx context.Context) (resources
 			case validSessionOperationFileName(name):
 				journal, present, err := loadSessionOperationJournal(namespace, name)
 				if err != nil {
-					return err
+					if errors.Is(err, ErrSessionOperationJournalCorrupt) {
+						scan.PermanentError = errors.Join(scan.PermanentError, err)
+					} else {
+						scan.RetryableError = errors.Join(scan.RetryableError, err)
+					}
+					continue
 				}
 				if !present {
-					return fmt.Errorf("%w: enumerated journal disappeared", ErrSessionOperationConflict)
+					scan.RetryableError = errors.Join(scan.RetryableError,
+						fmt.Errorf("%w: enumerated journal disappeared", ErrSessionOperationConflict))
+					continue
 				}
 				expected, err := sessionOperationFileName(journal.ProtectedResourceID)
 				if err != nil || expected != name {
-					return errors.Join(fmt.Errorf("%w: resource journal filename mismatch", ErrSessionOperationJournalCorrupt), err)
+					scan.PermanentError = errors.Join(scan.PermanentError,
+						fmt.Errorf("%w: resource journal filename mismatch", ErrSessionOperationJournalCorrupt), err)
+					continue
 				}
-				resources = append(resources, journal.ProtectedResourceID)
+				scan.ResourceIDs = append(scan.ResourceIDs, journal.ProtectedResourceID)
 			case validSessionOperationTemporaryFileName(name):
 				entry, err := namespace.Lstat(name)
 				if err != nil {
-					return fmt.Errorf("stat orphaned native session operation temporary file: %w", err)
+					scan.RetryableError = errors.Join(scan.RetryableError,
+						fmt.Errorf("stat orphaned native session operation temporary file: %w", err))
+					continue
 				}
 				if entry.Mode()&os.ModeSymlink != 0 || !entry.Mode().IsRegular() {
-					return fmt.Errorf("orphaned native session operation temporary file %s has an unsafe shape", filepath.Join(namespace.Path(), name))
+					scan.PermanentError = errors.Join(scan.PermanentError,
+						fmt.Errorf("%w: orphaned native session operation temporary file %s has an unsafe shape",
+							ErrSessionOperationJournalCorrupt, filepath.Join(namespace.Path(), name)))
+					continue
 				}
 				if err := namespace.Remove(name); err != nil {
-					return fmt.Errorf("remove orphaned native session operation temporary file: %w", err)
+					scan.RetryableError = errors.Join(scan.RetryableError,
+						fmt.Errorf("remove orphaned native session operation temporary file: %w", err))
+					continue
 				}
 				removedTemporary = true
 			}
 		}
 		if removedTemporary {
 			if err := namespace.Sync(); err != nil {
-				return fmt.Errorf("sync orphaned native session operation cleanup: %w", err)
+				scan.RetryableError = errors.Join(scan.RetryableError,
+					fmt.Errorf("sync orphaned native session operation cleanup: %w", err))
 			}
 		}
-		return namespace.ValidateCurrent()
+		if err := namespace.ValidateCurrent(); err != nil {
+			scan.RetryableError = errors.Join(scan.RetryableError, err)
+		}
+		return nil
 	})
-	if err != nil {
-		return nil, err
+	if lockErr != nil {
+		scan.RetryableError = errors.Join(scan.RetryableError, lockErr)
 	}
-	return resources, nil
+	return scan
 }
 
 // CreateSessionOperation appends a distinct PREPARED operation. A resource may
@@ -330,7 +359,8 @@ func loadSessionOperationJournal(namespace *pinnedfs.Directory, name string) (jo
 		return sessionOperationJournal{}, false, fmt.Errorf("stat native session operation %s: %w", path, err)
 	}
 	if entry.Mode()&os.ModeSymlink != 0 || !entry.Mode().IsRegular() {
-		return sessionOperationJournal{}, false, fmt.Errorf("native session operation %s must be a non-symlink regular file", path)
+		return sessionOperationJournal{}, false, fmt.Errorf("%w: native session operation %s must be a non-symlink regular file",
+			ErrSessionOperationJournalCorrupt, path)
 	}
 	file, err := namespace.OpenFile(name, os.O_RDONLY|pinnedfs.SafeOpenFlags(), 0)
 	if err != nil {
@@ -345,20 +375,22 @@ func loadSessionOperationJournal(namespace *pinnedfs.Directory, name string) (jo
 	}()
 	info, err := pinnedfs.ValidateRegularFile(namespace, name, file, "native session operation", sessionOperationFileMode)
 	if err != nil {
-		return sessionOperationJournal{}, false, err
+		return sessionOperationJournal{}, false, fmt.Errorf("%w: %w", ErrSessionOperationJournalCorrupt, err)
 	}
 	if info.Size() <= 0 || info.Size() > sessionOperationFileMaxBytes {
-		return sessionOperationJournal{}, false, fmt.Errorf("native session operation %s has invalid size %d", path, info.Size())
+		return sessionOperationJournal{}, false, fmt.Errorf("%w: native session operation %s has invalid size %d",
+			ErrSessionOperationJournalCorrupt, path, info.Size())
 	}
 	raw, err := io.ReadAll(io.LimitReader(file, sessionOperationFileMaxBytes+1))
 	if err != nil {
 		return sessionOperationJournal{}, false, fmt.Errorf("read native session operation %s: %w", path, err)
 	}
 	if len(raw) > sessionOperationFileMaxBytes {
-		return sessionOperationJournal{}, false, fmt.Errorf("native session operation %s exceeds %d bytes", path, sessionOperationFileMaxBytes)
+		return sessionOperationJournal{}, false, fmt.Errorf("%w: native session operation %s exceeds %d bytes",
+			ErrSessionOperationJournalCorrupt, path, sessionOperationFileMaxBytes)
 	}
 	if _, err := pinnedfs.ValidateRegularFile(namespace, name, file, "native session operation after read", sessionOperationFileMode); err != nil {
-		return sessionOperationJournal{}, false, err
+		return sessionOperationJournal{}, false, fmt.Errorf("%w: %w", ErrSessionOperationJournalCorrupt, err)
 	}
 	journal, err = decodeSessionOperationJournal(raw)
 	if err != nil {

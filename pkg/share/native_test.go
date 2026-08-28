@@ -19,16 +19,18 @@ import (
 )
 
 type memoryNativeStore struct {
-	mu         sync.Mutex
-	marker     agentstate.RefreshMarker
-	present    bool
-	loadErr    error
-	successErr error
-	marks      int
-	succeeded  int
-	cleared    int
-	closed     int
-	operations map[string][]agentstate.SessionOperationRecord
+	mu               sync.Mutex
+	marker           agentstate.RefreshMarker
+	present          bool
+	loadErr          error
+	successErr       error
+	marks            int
+	succeeded        int
+	cleared          int
+	closed           int
+	operations       map[string][]agentstate.SessionOperationRecord
+	scanPermanentErr error
+	scanRetryableErr error
 }
 
 func (*memoryNativeStore) Handoff() (qurl.AgentStateStore, error) { return nil, nil }
@@ -86,7 +88,7 @@ func (s *memoryNativeStore) LoadSessionOperations(_ context.Context, resourceID 
 	return append([]agentstate.SessionOperationRecord(nil), s.operations[resourceID]...), nil
 }
 
-func (s *memoryNativeStore) ListSessionOperationResources(context.Context) ([]string, error) {
+func (s *memoryNativeStore) ScanSessionOperationResources(context.Context) agentstate.SessionOperationResourceScan {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	resources := make([]string, 0, len(s.operations))
@@ -96,7 +98,9 @@ func (s *memoryNativeStore) ListSessionOperationResources(context.Context) ([]st
 		}
 	}
 	sort.Strings(resources)
-	return resources, nil
+	return agentstate.SessionOperationResourceScan{
+		ResourceIDs: resources, PermanentError: s.scanPermanentErr, RetryableError: s.scanRetryableErr,
+	}
 }
 
 func (s *memoryNativeStore) CreateSessionOperation(_ context.Context, record agentstate.SessionOperationRecord) error {
@@ -1518,6 +1522,88 @@ func TestNewNativeAdmitterStartsWhileOrphanRecoveryRetriesAndCloseCancels(t *tes
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("Close did not cancel background orphan recovery")
+	}
+}
+
+func TestNewNativeAdmitterCallerCancellationStopsOrphanRecovery(t *testing.T) {
+	oldTakeKey := takeNativeKey
+	oldRecover := recoverNativeSessionOperation
+	t.Cleanup(func() {
+		takeNativeKey = oldTakeKey
+		recoverNativeSessionOperation = oldRecover
+	})
+	takeNativeKey = func(*qurl.AgentRuntimeBinding) []byte { return make([]byte, 32) }
+	store := &memoryNativeStore{}
+	prepared := testPreparedDurableRecord(t)
+	prepared.Status = agentstate.SessionOperationDispatching
+	if err := store.CreateSessionOperation(context.Background(), prepared); err != nil {
+		t.Fatal(err)
+	}
+	started := make(chan struct{})
+	stopped := make(chan struct{})
+	var once sync.Once
+	recoverNativeSessionOperation = func(ctx context.Context, _ *qurl.AgentRuntimeBinding, _ []byte,
+		_ qurl.NativeSessionOperation, _ qurl.NHPUDPEndpoint, _ ...qurl.AgentRuntimeUDPOption,
+	) (*qurl.NativeSessionOperationRecovery, error) {
+		once.Do(func() { close(started) })
+		<-ctx.Done()
+		close(stopped)
+		return nil, ctx.Err()
+	}
+	runtime := &NativeRuntime{
+		Binding: &qurl.AgentRuntimeBinding{AgentID: "agent-one"}, store: store,
+		SessionOperations: testNativeSessionAuthority(),
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	admitter, err := NewNativeAdmitter(ctx, runtime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("background orphan recovery did not start")
+	}
+	cancel()
+	select {
+	case <-stopped:
+	case <-time.After(2 * time.Second):
+		t.Fatal("caller cancellation did not stop background orphan recovery")
+	}
+	if err := admitter.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestNativeAdmitterCloseDoesNotRaceLifecycleBinding(t *testing.T) {
+	lifecycle, cancelLifecycle := context.WithCancel(context.Background())
+	admitter := &NativeAdmitter{
+		lifecycle: lifecycle,
+		cancel:    cancelLifecycle,
+		live:      make(map[nativeAdmissionKey]nativeLiveAdmission),
+		pending:   make(map[nativeAdmissionKey]bool),
+	}
+	started := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		close(started)
+		for {
+			ctx, cancel := admitter.withLifecycle(context.Background())
+			cancel()
+			if ctx.Err() != nil {
+				close(done)
+				return
+			}
+		}
+	}()
+	<-started
+	if err := admitter.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("lifecycle binding did not observe close cancellation")
 	}
 }
 
