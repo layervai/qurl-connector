@@ -92,6 +92,9 @@ func (d *durableNativeSessionOperations) PrepareDispatch(ctx context.Context, bi
 	if err := d.store.CreateSessionOperation(ctx, record); err != nil {
 		return nil, fmt.Errorf("persist prepared native session operation: %w", err)
 	}
+	// PREPARED makes local cancellation safe before any packet can leave.
+	// DISPATCHING then records the ambiguity boundary before the caller sends
+	// the knock. These are separate durable transitions by design.
 	dispatching := record
 	dispatching.Status = agentstate.SessionOperationDispatching
 	if err := d.store.TransitionSessionOperation(ctx, record, dispatching); err != nil {
@@ -129,15 +132,16 @@ func (d *durableNativeSessionOperations) RecoverPending(ctx context.Context, bin
 	if err != nil {
 		return err
 	}
+	var recoveryErr error
 	for _, record := range records {
 		if _, keep := preserve[record.Operation.OperationID]; keep {
 			continue
 		}
 		if err := d.RecoverOperation(ctx, binding, privateKey, protectedResourceID, record.Operation.OperationID, udpOptions); err != nil {
-			return err
+			recoveryErr = errors.Join(recoveryErr, err)
 		}
 	}
-	return nil
+	return recoveryErr
 }
 
 func (d *durableNativeSessionOperations) RecoverOperation(ctx context.Context, binding *qurl.AgentRuntimeBinding,

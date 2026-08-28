@@ -71,7 +71,9 @@ type SessionOperationRecord struct {
 
 // NewSessionOperationRecord builds the only valid initial durable record. The
 // schema stays owned by this package so callers cannot accidentally pin a
-// retired journal format.
+// retired journal format. This feature is unreleased: a future qurl-go
+// operation-schema change must add an explicit journal migration before this
+// repository moves its exact qurl-go pin.
 func NewSessionOperationRecord(operation qurl.NativeSessionOperation,
 	recoveryEndpoint qurl.NHPUDPEndpoint,
 ) (SessionOperationRecord, error) {

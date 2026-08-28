@@ -908,6 +908,92 @@ func TestNativeAdmitterSlowRecoveryDoesNotBlockSiblingResource(t *testing.T) {
 	}
 }
 
+func TestNativeAdmitterPreparedRefreshDoesNotBlockSiblingResource(t *testing.T) {
+	oldKnock := knockNativeRuntime
+	oldRefresh := refreshNativeRuntime
+	oldWait := waitNativeRefresh
+	oldTakeKey := takeNativeKey
+	t.Cleanup(func() {
+		knockNativeRuntime = oldKnock
+		refreshNativeRuntime = oldRefresh
+		waitNativeRefresh = oldWait
+		takeNativeKey = oldTakeKey
+	})
+
+	var knockMu sync.Mutex
+	nextSession := uint64(120)
+	knockNativeRuntime = func(_ context.Context, _ *qurl.AgentRuntimeBinding, _ []byte, _ string,
+		opts qurl.NativeKnockOptions, _ ...qurl.AgentRuntimeUDPOption,
+	) (*qurl.NativeKnockResult, error) {
+		knockMu.Lock()
+		nextSession++
+		sessionID := nextSession
+		knockMu.Unlock()
+		return &qurl.NativeKnockResult{
+			ACToken: "token", ResourceHost: "127.0.0.1:7000", SessionID: sessionID, OpenTime: 60,
+			SessionReceipt: testSessionReceipt(sessionID, opts.RunID, opts.RunAttempt),
+		}, nil
+	}
+	waitNativeRefresh = func(context.Context, time.Duration) error { return nil }
+	takeNativeKey = func(*qurl.AgentRuntimeBinding) []byte { return make([]byte, 32) }
+	refreshPrepared := make(chan struct{})
+	refreshNativeRuntime = func(context.Context, qurl.HubBootstrap, qurl.AgentStateStore,
+		...qurl.AgentRuntimeRefreshOption,
+	) (*qurl.Client, *qurl.AgentRuntimeBinding, error) {
+		close(refreshPrepared)
+		return &qurl.Client{}, &qurl.AgentRuntimeBinding{AgentID: "agent-one"}, nil
+	}
+
+	operations := &blockingRecoveryOperations{
+		resource: "resource-one", started: make(chan struct{}), release: make(chan struct{}),
+	}
+	admitter := &NativeAdmitter{
+		binding: &qurl.AgentRuntimeBinding{AgentID: "agent-one"}, privateKey: make([]byte, 32),
+		operations: operations, store: &memoryNativeStore{},
+		refreshCfg: nativeRefreshConfig{AgentID: "agent-one", RefreshMode: "auto"},
+	}
+	defer admitter.Close()
+
+	firstDone := make(chan error, 1)
+	go func() {
+		_, err := admitter.Admit(context.Background(), "q_one", "resource-one")
+		firstDone <- err
+	}()
+	select {
+	case <-operations.started:
+	case <-time.After(time.Second):
+		t.Fatal("slow recovery did not start")
+	}
+	refreshDone := make(chan error, 1)
+	go func() { refreshDone <- admitter.refresh(context.Background(), 0) }()
+	select {
+	case <-refreshPrepared:
+	case <-time.After(time.Second):
+		t.Fatal("replacement runtime was not prepared")
+	}
+
+	secondDone := make(chan error, 1)
+	go func() {
+		_, err := admitter.Admit(context.Background(), "q_two", "resource-two")
+		secondDone <- err
+	}()
+	select {
+	case err := <-secondDone:
+		if err != nil {
+			t.Fatalf("sibling admission = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("prepared refresh blocked an unrelated resource")
+	}
+	close(operations.release)
+	if err := <-firstDone; err != nil {
+		t.Fatalf("released admission = %v", err)
+	}
+	if err := <-refreshDone; err != nil {
+		t.Fatalf("refresh = %v", err)
+	}
+}
+
 func TestNativeAdmitterSerializesOnlyPrepareCommitAndKnockAcrossResources(t *testing.T) {
 	oldKnock := knockNativeRuntime
 	t.Cleanup(func() { knockNativeRuntime = oldKnock })

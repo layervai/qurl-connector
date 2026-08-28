@@ -218,6 +218,7 @@ func TestDurableNativeSessionRecoveryClampsClockRegressionAndDefersToServer(t *t
 	store := &memoryNativeStore{}
 	record := testPreparedDurableRecord(t)
 	record.Status = agentstate.SessionOperationDispatching
+	record.RecoveryAttempt = 1
 	now := time.UnixMilli(1_900_000_000_000).UTC()
 	record.RecoveryNotBeforeMilli = now.Add(time.Hour).UnixMilli()
 	if err := store.CreateSessionOperation(context.Background(), record); err != nil {
@@ -253,6 +254,50 @@ func TestDurableNativeSessionRecoveryClampsClockRegressionAndDefersToServer(t *t
 	}
 	if records, err := store.LoadSessionOperations(context.Background(), testProtectedResourceID); err != nil || len(records) != 0 {
 		t.Fatalf("server-complete records=%+v err=%v", records, err)
+	}
+}
+
+func TestDurableNativeSessionRecoveryContinuesAfterSiblingFailure(t *testing.T) {
+	oldRecover := recoverNativeSessionOperation
+	t.Cleanup(func() { recoverNativeSessionOperation = oldRecover })
+
+	store := &memoryNativeStore{}
+	first := testPreparedDurableRecord(t)
+	if err := store.CreateSessionOperation(context.Background(), first); err != nil {
+		t.Fatal(err)
+	}
+	firstDispatching := first
+	firstDispatching.Status = agentstate.SessionOperationDispatching
+	if err := store.TransitionSessionOperation(context.Background(), first, firstDispatching); err != nil {
+		t.Fatal(err)
+	}
+	secondOperation := testDurableOperation()
+	secondOperation.OperationID = strings.Repeat("4", 64)
+	second := first
+	second.Operation = secondOperation
+	// The in-memory test store deliberately bypasses journal validation here.
+	// The test exercises sibling iteration, not operation construction; the
+	// prepared sibling takes the local cancel path and never reaches the wire.
+	store.operations[testProtectedResourceID] = append(store.operations[testProtectedResourceID], second)
+
+	want := errors.New("first recovery failed")
+	recoverNativeSessionOperation = func(context.Context, *qurl.AgentRuntimeBinding, []byte,
+		qurl.NativeSessionOperation, qurl.NHPUDPEndpoint, ...qurl.AgentRuntimeUDPOption,
+	) (*qurl.NativeSessionOperationRecovery, error) {
+		return nil, want
+	}
+	controller, err := newDurableNativeSessionOperations(store, testNativeSessionAuthority())
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = controller.RecoverPending(context.Background(), &qurl.AgentRuntimeBinding{AgentID: "agent-one"},
+		make([]byte, 32), testProtectedResourceID, nil, nil)
+	if !errors.Is(err, want) {
+		t.Fatalf("RecoverPending() = %v, want first recovery error", err)
+	}
+	records, loadErr := store.LoadSessionOperations(context.Background(), testProtectedResourceID)
+	if loadErr != nil || len(records) != 1 || records[0].Operation.OperationID != first.Operation.OperationID {
+		t.Fatalf("sibling recovery did not continue: records=%+v err=%v", records, loadErr)
 	}
 }
 

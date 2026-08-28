@@ -727,7 +727,8 @@ func (a *NativeAdmitter) knock(ctx context.Context, knockResourceID, resourceID 
 		// invariant (for example canonical host:port) rejects the result.
 		key, trackErr := a.trackAdmission(admission, operation.OperationID)
 		if trackErr != nil {
-			return Admission{}, errors.Join(err, trackErr)
+			cleanupErr := a.recoverOperationCleanup(resourceID, operation.OperationID)
+			return Admission{}, errors.Join(err, trackErr, cleanupErr)
 		}
 		a.stateMu.Lock()
 		a.pending[key] = true
@@ -785,56 +786,103 @@ func refreshableKnockError(err error) bool {
 func (a *NativeAdmitter) refresh(ctx context.Context, failedGeneration uint64) error {
 	a.refreshMu.Lock()
 	defer a.refreshMu.Unlock()
-	a.runtimeMu.Lock()
-	defer a.runtimeMu.Unlock()
+	a.runtimeMu.RLock()
 	if a.closed || a.binding == nil || len(a.privateKey) != 32 {
+		a.runtimeMu.RUnlock()
 		return errors.New("refresh native admission runtime: native admitter is closed")
 	}
 	if a.generation != failedGeneration {
+		a.runtimeMu.RUnlock()
 		return nil
 	}
-	if err := a.refreshRuntimeLocked(ctx); err != nil {
-		return err
-	}
-	a.generation++
-	a.resetPlacementFailures(a.generation)
-	return nil
-}
+	store := a.store
+	refreshCfg := a.refreshCfg
+	a.runtimeMu.RUnlock()
 
-func (a *NativeAdmitter) refreshRuntimeLocked(ctx context.Context) error {
-	if a.store == nil {
-		return errors.New("refresh native admission runtime: state store is closed")
-	}
-	if err := a.store.RequestRegistrationRefresh("sustained native NHP knock failures"); err != nil {
-		return fmt.Errorf("request assignment refresh: %w", err)
-	}
-	marker, present, err := a.store.LoadRegistrationRefreshMarker()
-	if err != nil || !present {
-		return errors.Join(errors.New("assignment refresh state missing after sustained knock failures"), err)
-	}
-	runtime, err := refreshUntilOpen(ctx, a.refreshCfg, a.store, marker, a.refreshCfg.RefreshMode)
+	runtime, key, err := prepareRefreshedRuntime(ctx, store, refreshCfg)
 	if err != nil {
 		return err
 	}
-	key := takeNativeKey(runtime.Binding)
-	if len(key) != 32 {
-		clear(key)
-		runtime.Binding.Destroy()
-		runtime.Binding = nil
-		runtime.store = nil
-		return fmt.Errorf("refreshed native runtime key is %d bytes, want 32", len(key))
+	if err := a.lockRuntimeForRefresh(ctx); err != nil {
+		discardRefreshedRuntime(runtime, key)
+		return err
+	}
+	defer a.runtimeMu.Unlock()
+	if a.closed || a.store != store || a.binding == nil || len(a.privateKey) != 32 {
+		discardRefreshedRuntime(runtime, key)
+		return errors.New("refresh native admission runtime: native admitter is closed")
+	}
+	if a.generation != failedGeneration {
+		discardRefreshedRuntime(runtime, key)
+		return nil
 	}
 	oldBinding := a.binding
-	clear(a.privateKey)
+	oldKey := a.privateKey
 	a.binding = runtime.Binding
 	a.privateKey = key
 	a.udpOpts = append(a.udpOpts[:0], runtime.UDPOptions...)
 	runtime.Binding = nil
 	runtime.store = nil
-	if oldBinding != nil {
-		oldBinding.Destroy()
-	}
+	a.generation++
+	a.resetPlacementFailures(a.generation)
+	clear(oldKey)
+	oldBinding.Destroy()
 	return nil
+}
+
+func prepareRefreshedRuntime(ctx context.Context, store nativeStateStore, cfg nativeRefreshConfig) (*NativeRuntime, []byte, error) {
+	if store == nil {
+		return nil, nil, errors.New("refresh native admission runtime: state store is closed")
+	}
+	if err := store.RequestRegistrationRefresh("sustained native NHP knock failures"); err != nil {
+		return nil, nil, fmt.Errorf("request assignment refresh: %w", err)
+	}
+	marker, present, err := store.LoadRegistrationRefreshMarker()
+	if err != nil || !present {
+		return nil, nil, errors.Join(errors.New("assignment refresh state missing after sustained knock failures"), err)
+	}
+	runtime, err := refreshUntilOpen(ctx, cfg, store, marker, cfg.RefreshMode)
+	if err != nil {
+		return nil, nil, err
+	}
+	key := takeNativeKey(runtime.Binding)
+	if len(key) != 32 {
+		got := len(key)
+		discardRefreshedRuntime(runtime, key)
+		return nil, nil, fmt.Errorf("refreshed native runtime key is %d bytes, want 32", got)
+	}
+	return runtime, key, nil
+}
+
+func (a *NativeAdmitter) lockRuntimeForRefresh(ctx context.Context) error {
+	if ctx == nil {
+		return errors.New("refresh native admission runtime: context is nil")
+	}
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if a.runtimeMu.TryLock() {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+		}
+	}
+}
+
+func discardRefreshedRuntime(runtime *NativeRuntime, key []byte) {
+	clear(key)
+	if runtime == nil {
+		return
+	}
+	if runtime.Binding != nil {
+		runtime.Binding.Destroy()
+	}
+	runtime.Binding = nil
+	runtime.store = nil
+	runtime.Client = nil
 }
 
 func (a *NativeAdmitter) recordPlacementFailure(generation uint64) bool {
@@ -997,6 +1045,8 @@ func sameSessionReceipt(a, b qurl.NativeSessionReceipt) bool {
 }
 
 func (a *NativeAdmitter) MarkServingHealthy() error {
+	a.refreshMu.Lock()
+	defer a.refreshMu.Unlock()
 	a.runtimeMu.RLock()
 	defer a.runtimeMu.RUnlock()
 	if a.closed || a.store == nil {
@@ -1009,6 +1059,8 @@ func (a *NativeAdmitter) Close() error {
 	if a == nil {
 		return nil
 	}
+	a.refreshMu.Lock()
+	defer a.refreshMu.Unlock()
 	a.runtimeMu.Lock()
 	if a.closed {
 		a.runtimeMu.Unlock()
