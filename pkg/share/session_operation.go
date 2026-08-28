@@ -13,21 +13,18 @@ import (
 )
 
 const (
-	nativeSessionOperationLifetime = 20 * time.Minute
-	nativeSessionRecoveryDelay     = 100 * time.Millisecond
-	nativeSessionCleanupBudget     = 30 * time.Second
+	nativeSessionOperationLifetime    = 20 * time.Minute
+	nativeSessionRecoveryInitialDelay = 100 * time.Millisecond
+	nativeSessionRecoveryMaxDelay     = 2 * time.Second
+	nativeSessionCleanupBudget        = 30 * time.Second
 )
 
-// NativeSessionOperationAuthority is the non-secret deployment authority that
-// binds native session operations to their durable control-plane tables and
-// owner. It must come from trusted deployment configuration, not from a CRID,
-// an API response controlled by the target, or an NHP packet.
+// NativeSessionOperationAuthority is authenticated account context used by
+// durable session operations. It must come from the signed-in account, not
+// from a CRID, a target-controlled API response, or an NHP packet. Deployment
+// coordinates remain private to the NHP server.
 type NativeSessionOperationAuthority struct {
-	AWSAccountID        string
-	AWSRegion           string
-	OwnerID             string
-	QURLAgentKeysTable  string
-	SessionControlTable string
+	OwnerID string
 }
 
 type nativeSessionOperationController interface {
@@ -47,6 +44,7 @@ type durableNativeSessionOperations struct {
 var (
 	prepareLiveNativeSessionOperation = qurl.PrepareLiveNativeSessionOperation
 	recoverNativeSessionOperation     = qurl.RecoverNativeSessionOperation
+	waitNativeSessionRecovery         = sleepWithContext
 )
 
 func newDurableNativeSessionOperations(store nativeStateStore, authority NativeSessionOperationAuthority) (*durableNativeSessionOperations, error) {
@@ -59,64 +57,15 @@ func newDurableNativeSessionOperations(store nativeStateStore, authority NativeS
 	return &durableNativeSessionOperations{store: store, authority: authority, clock: time.Now}, nil
 }
 
-// ValidateNativeSessionOperationAuthority validates the complete non-secret
-// deployment authority before a caller opens or hands off a native runtime.
-// It is the shared contract for release-time configuration and admission.
+// ValidateNativeSessionOperationAuthority validates authenticated account
+// context before a caller opens or hands off a native runtime.
 func ValidateNativeSessionOperationAuthority(authority NativeSessionOperationAuthority) error {
-	for name, value := range map[string]string{
-		"AWS account ID": authority.AWSAccountID, "AWS region": authority.AWSRegion,
-		"owner ID": authority.OwnerID, "qURL AgentKeys table": authority.QURLAgentKeysTable,
-		"SessionControl table": authority.SessionControlTable,
-	} {
-		if value == "" || strings.TrimSpace(value) != value || strings.ContainsAny(value, "\r\n\x00") {
-			return fmt.Errorf("build native session operations: %s is invalid", name)
-		}
-	}
-	if len(authority.AWSAccountID) != 12 {
-		return errors.New("build native session operations: AWS account ID is invalid")
-	}
-	for _, digit := range authority.AWSAccountID {
-		if digit < '0' || digit > '9' {
-			return errors.New("build native session operations: AWS account ID is invalid")
-		}
-	}
-	if !validNativeSessionRegion(authority.AWSRegion) || !validNativeSessionTable(authority.QURLAgentKeysTable) ||
-		!validNativeSessionTable(authority.SessionControlTable) || len(authority.OwnerID) > 256 {
-		return errors.New("build native session operations: deployment authority is invalid")
+	if authority.OwnerID == "" || len(authority.OwnerID) > 256 ||
+		strings.TrimSpace(authority.OwnerID) != authority.OwnerID ||
+		strings.ContainsAny(authority.OwnerID, "\r\n\x00") {
+		return errors.New("build native session operations: owner ID is invalid")
 	}
 	return nil
-}
-
-func validNativeSessionRegion(region string) bool {
-	parts := strings.Split(region, "-")
-	if len(parts) != 3 || len(parts[0]) != 2 || parts[1] == "" || parts[2] == "" || parts[2][0] == '0' {
-		return false
-	}
-	for _, part := range parts[:2] {
-		for _, char := range part {
-			if char < 'a' || char > 'z' {
-				return false
-			}
-		}
-	}
-	for _, char := range parts[2] {
-		if char < '0' || char > '9' {
-			return false
-		}
-	}
-	return true
-}
-
-func validNativeSessionTable(table string) bool {
-	if len(table) < 3 || len(table) > 255 {
-		return false
-	}
-	for _, char := range table {
-		if !strings.ContainsRune("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-.", char) {
-			return false
-		}
-	}
-	return true
 }
 
 func (d *durableNativeSessionOperations) PrepareDispatch(ctx context.Context, binding *qurl.AgentRuntimeBinding,
@@ -126,20 +75,18 @@ func (d *durableNativeSessionOperations) PrepareDispatch(ctx context.Context, bi
 		return nil, errors.New("prepare native session operation: runtime is incomplete")
 	}
 	now := d.clock().UTC()
-	operation, assignment, err := prepareLiveNativeSessionOperation(ctx, binding, privateKey, qurl.NativeSessionOperationInput{
-		AWSAccountID: d.authority.AWSAccountID, AWSRegion: d.authority.AWSRegion,
+	operation, recoveryEndpoint, err := prepareLiveNativeSessionOperation(ctx, binding, privateKey, qurl.NativeSessionOperationInput{
 		ExpiresAtMillis: now.Add(nativeSessionOperationLifetime).UnixMilli(),
 		OwnerID:         d.authority.OwnerID, PreparedAtMillis: now.UnixMilli(),
-		ProtectedResourceID: protectedResourceID, QURLAgentKeysTable: d.authority.QURLAgentKeysTable,
-		ResourceID: knockResourceID, RunAttempt: runAttempt, RunID: runID,
-		SessionControlTable: d.authority.SessionControlTable,
+		ProtectedResourceID: protectedResourceID,
+		ResourceID:          knockResourceID, RunAttempt: runAttempt, RunID: runID,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("prepare native session operation: %w", err)
 	}
-	record := agentstate.SessionOperationRecord{
-		Schema: 1, Operation: *operation, RecoveryEndpoint: assignment.Endpoint,
-		Status: agentstate.SessionOperationPrepared,
+	record, err := agentstate.NewSessionOperationRecord(*operation, recoveryEndpoint)
+	if err != nil {
+		return nil, fmt.Errorf("build prepared native session operation: %w", err)
 	}
 	if err := d.store.CreateSessionOperation(ctx, record); err != nil {
 		return nil, fmt.Errorf("persist prepared native session operation: %w", err)
@@ -211,11 +158,11 @@ func (d *durableNativeSessionOperations) RecoverOperation(ctx context.Context, b
 			return d.store.DeleteSessionOperation(ctx, record)
 		case agentstate.SessionOperationPrepared:
 			next := record
-			next.Status = agentstate.SessionOperationDispatching
+			next.Status = agentstate.SessionOperationCanceled
 			if err := d.store.TransitionSessionOperation(ctx, record, next); err != nil {
 				return err
 			}
-			record = next
+			return d.store.DeleteSessionOperation(ctx, next)
 		case agentstate.SessionOperationMapped:
 			next := record
 			next.Status = agentstate.SessionOperationClosing
@@ -227,34 +174,43 @@ func (d *durableNativeSessionOperations) RecoverOperation(ctx context.Context, b
 		default:
 			return fmt.Errorf("%w: unsupported recovery state", agentstate.ErrSessionOperationConflict)
 		}
+		now := d.clock().UTC()
+		if record.RecoveryNotBeforeMilli > now.UnixMilli() {
+			if err := waitNativeSessionRecovery(ctx, time.Duration(record.RecoveryNotBeforeMilli-now.UnixMilli())*time.Millisecond); err != nil {
+				return err
+			}
+			continue
+		}
+		if record.RecoveryAttempt == ^uint32(0) {
+			return errors.New("recover native session operation: recovery attempt counter is exhausted")
+		}
+		attempt := record
+		attempt.RecoveryAttempt++
+		attempt.RecoveryNotBeforeMilli = now.Add(nativeSessionRecoveryBackoff(attempt.RecoveryAttempt)).UnixMilli()
+		if err := d.store.TransitionSessionOperation(ctx, record, attempt); err != nil {
+			return fmt.Errorf("persist native session recovery backoff: %w", err)
+		}
+		record = attempt
 		result, err := recoverNativeSessionOperation(ctx, binding, privateKey, record.Operation, record.RecoveryEndpoint, udpOptions...)
 		if err != nil {
 			return fmt.Errorf("recover native session operation: %w", err)
 		}
+		if result == nil {
+			return errors.New("recover native session operation: server returned no result")
+		}
+		if !result.Complete {
+			continue
+		}
 		next := record
-		switch result.State {
-		case agentstate.SessionOperationCanceled:
+		if record.Admission == nil {
 			next.Status = agentstate.SessionOperationCanceled
-			next.Admission = nil
-		case agentstate.SessionOperationClosing, agentstate.SessionOperationClosed:
-			next.Status = result.State
-			next.Admission = &agentstate.SessionOperationAdmission{
-				CellID: result.CellID, SessionID: result.SessionID,
-				SessionIssuedAtMillis: result.SessionIssuedAtMillis,
-				RunID:                 result.RunID, RunAttempt: result.RunAttempt,
-			}
-		default:
-			return errors.New("recover native session operation: server returned an invalid state")
+		} else {
+			next.Status = agentstate.SessionOperationClosed
 		}
 		if err := d.store.TransitionSessionOperation(ctx, record, next); err != nil {
 			return fmt.Errorf("persist recovered native session operation: %w", err)
 		}
-		if next.Status == agentstate.SessionOperationCanceled || next.Status == agentstate.SessionOperationClosed {
-			return d.store.DeleteSessionOperation(ctx, next)
-		}
-		if err := sleepWithContext(ctx, nativeSessionRecoveryDelay); err != nil {
-			return err
-		}
+		return d.store.DeleteSessionOperation(ctx, next)
 	}
 }
 
@@ -266,21 +222,36 @@ func (d *durableNativeSessionOperations) Retire(ctx context.Context, binding *qu
 	if err != nil {
 		return err
 	}
-	if !present || record.Status != agentstate.SessionOperationMapped ||
+	if !present {
+		// A prior call can complete the durable terminal deletion while its
+		// caller loses the result. Retirement is therefore idempotent when the
+		// exact operation is already absent.
+		return nil
+	}
+	if (record.Status != agentstate.SessionOperationMapped && record.Status != agentstate.SessionOperationClosing) ||
 		record.Admission == nil || *record.Admission != *admissionFromReceipt(receipt) {
 		return fmt.Errorf("%w: live receipt does not match durable operation", agentstate.ErrSessionOperationConflict)
 	}
-	closing := record
-	closing.Status = agentstate.SessionOperationClosing
-	if err := d.store.TransitionSessionOperation(ctx, record, closing); err != nil {
-		return err
+	if record.Status == agentstate.SessionOperationMapped {
+		closing := record
+		closing.Status = agentstate.SessionOperationClosing
+		if err := d.store.TransitionSessionOperation(ctx, record, closing); err != nil {
+			return err
+		}
+		record = closing
 	}
-	_, retireErr := retireNativeSession(ctx, binding, privateKey, receipt, udpOptions...)
-	recoverErr := d.RecoverOperation(ctx, binding, privateKey, protectedResourceID, operationID, udpOptions)
-	if recoverErr == nil {
-		return nil
+	return d.RecoverOperation(ctx, binding, privateKey, protectedResourceID, operationID, udpOptions)
+}
+
+func nativeSessionRecoveryBackoff(attempt uint32) time.Duration {
+	delay := nativeSessionRecoveryInitialDelay
+	for step := uint32(1); step < attempt && delay < nativeSessionRecoveryMaxDelay; step++ {
+		delay *= 2
+		if delay > nativeSessionRecoveryMaxDelay {
+			return nativeSessionRecoveryMaxDelay
+		}
 	}
-	return errors.Join(retireErr, recoverErr)
+	return delay
 }
 
 func (d *durableNativeSessionOperations) loadOperation(ctx context.Context, protectedResourceID,

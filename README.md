@@ -101,6 +101,11 @@ not derive or substitute one identity for another. Standard placement comes
 from the authenticated NHP response; custom Hub and endpoint overrides are
 intended only for deployments that own the corresponding trust configuration.
 
+Native session operations require `QURL_CONNECTOR_NATIVE_OWNER_ID` from the
+authenticated account context. The command never derives the owner from a CRID,
+route, API resource, or NHP packet. AWS accounts, regions, and storage names are
+private NHP server configuration and are not Connector settings or build data.
+
 The developer command stays in the foreground:
 
 ```bash

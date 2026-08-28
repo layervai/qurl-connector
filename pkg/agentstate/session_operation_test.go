@@ -25,19 +25,18 @@ func testSessionOperationRecord(status string) SessionOperationRecord {
 		Schema: sessionOperationRecordSchema,
 		Operation: qurl.NativeSessionOperation{
 			AgentID: "agent-a", AgentKeySchema: 2, AgentPublicKeyB64: publicKey, AuthServiceID: "agent",
-			AWSAccountID: "111122223333", AWSRegion: "us-east-2", BindingSchema: 2,
-			BindingSHA256: "8cde8a58630c4e6739b4f0663da3069fccedf5a2d90e3d4d65d802044fc2c551",
+			BindingSchema: 2,
+			BindingSHA256: "c5cc2a2b0273d2bca546d484411d917cf6cf5d46a46137a2e5460a0db66d428f",
 			CellID:        "cell-01", ConnectorIDClaim: "", CredentialKind: "account",
 			ExpiresAtMillis: 1_800_001_210_000,
 			OperationID:     "3b2a3a9eabea3af78d8c317ea710e7f0601580163e25c98d50d5e2e17b68f3cc",
 			OwnerID:         "auth0|canary-owner", PreparedAtMillis: 1_800_000_009_000,
 			ProtectedResourceID: testOperationProtectedResourceID,
-			QURLAgentKeysTable:  "control-agent-keys", ResourceID: "resource-a",
-			RunAttempt: 7, RunID: "0123456789abcdef", Schema: 2,
-			SessionControlTable: "sandbox-session-control",
+			ResourceID:          "resource-a",
+			RunAttempt:          7, RunID: "0123456789abcdef", Schema: 2,
 		},
 		RecoveryEndpoint: qurl.NHPUDPEndpoint{
-			Host: "cell0.nhp.layerv.ai", Port: 443, ServerPublicKeyB64: endpointKey,
+			Host: "cell0.example.test", Port: 443, ServerPublicKeyB64: endpointKey,
 		},
 		Status: status,
 	}
@@ -60,8 +59,6 @@ func testSessionOperationWithRun(record SessionOperationRecord, runID string, ru
 		AgentKeySchema      int    `json:"agent_key_schema_version"`
 		AgentPublicKeyB64   string `json:"agent_public_key_b64"`
 		AuthServiceID       string `json:"auth_service_id"`
-		AWSAccountID        string `json:"aws_account_id"`
-		AWSRegion           string `json:"aws_region"`
 		BindingSchema       int    `json:"binding_schema"`
 		CellID              string `json:"cell_id"`
 		ConnectorIDClaim    string `json:"connector_id_claim"`
@@ -71,23 +68,19 @@ func testSessionOperationWithRun(record SessionOperationRecord, runID string, ru
 		OwnerID             string `json:"owner_id"`
 		PreparedAtMillis    int64  `json:"prepared_at_ms"`
 		ProtectedResourceID string `json:"protected_resource_id"`
-		QURLAgentKeysTable  string `json:"qurl_agent_keys_table"`
 		ResourceID          string `json:"resource_id"`
 		RunAttempt          uint64 `json:"run_attempt"`
 		RunID               string `json:"run_id"`
-		SessionControlTable string `json:"session_control_table"`
 	}{
 		AgentID: record.Operation.AgentID, AgentKeySchema: record.Operation.AgentKeySchema,
 		AgentPublicKeyB64: record.Operation.AgentPublicKeyB64, AuthServiceID: record.Operation.AuthServiceID,
-		AWSAccountID: record.Operation.AWSAccountID, AWSRegion: record.Operation.AWSRegion,
 		BindingSchema: record.Operation.BindingSchema, CellID: record.Operation.CellID,
 		ConnectorIDClaim: record.Operation.ConnectorIDClaim, CredentialKind: record.Operation.CredentialKind,
 		ExpiresAtMillis: record.Operation.ExpiresAtMillis, OperationID: record.Operation.OperationID,
 		OwnerID: record.Operation.OwnerID, PreparedAtMillis: record.Operation.PreparedAtMillis,
 		ProtectedResourceID: record.Operation.ProtectedResourceID,
-		QURLAgentKeysTable:  record.Operation.QURLAgentKeysTable, ResourceID: record.Operation.ResourceID,
-		RunAttempt: record.Operation.RunAttempt, RunID: record.Operation.RunID,
-		SessionControlTable: record.Operation.SessionControlTable,
+		ResourceID:          record.Operation.ResourceID,
+		RunAttempt:          record.Operation.RunAttempt, RunID: record.Operation.RunID,
 	}
 	raw, _ := json.Marshal(binding)
 	digest := sha256.Sum256(raw)
@@ -183,6 +176,58 @@ func TestSDKStoreSessionOperationRejectsStaleCASAndReplacementDelete(t *testing.
 	}
 }
 
+func TestSDKStoreSessionOperationPersistsCancellationAndRecoveryBackoff(t *testing.T) {
+	store, err := NewSDKStore(filepath.Join(realSDKTempDir(t), "state"), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	prepared := testSessionOperationRecord(SessionOperationPrepared)
+	if err := store.CreateSessionOperation(context.Background(), prepared); err != nil {
+		t.Fatal(err)
+	}
+	canceled := prepared
+	canceled.Status = SessionOperationCanceled
+	if err := store.TransitionSessionOperation(context.Background(), prepared, canceled); err != nil {
+		t.Fatalf("PREPARED -> CANCELED: %v", err)
+	}
+	if err := store.DeleteSessionOperation(context.Background(), canceled); err != nil {
+		t.Fatal(err)
+	}
+
+	prepared = testSessionOperationWithRun(prepared, "fedcba9876543210", 8)
+	if err := store.CreateSessionOperation(context.Background(), prepared); err != nil {
+		t.Fatal(err)
+	}
+	dispatching := prepared
+	dispatching.Status = SessionOperationDispatching
+	if err := store.TransitionSessionOperation(context.Background(), prepared, dispatching); err != nil {
+		t.Fatal(err)
+	}
+	attempt := dispatching
+	attempt.RecoveryAttempt = 1
+	attempt.RecoveryNotBeforeMilli = 1_800_000_010_100
+	if err := store.TransitionSessionOperation(context.Background(), dispatching, attempt); err != nil {
+		t.Fatalf("persist first recovery attempt: %v", err)
+	}
+	skipped := attempt
+	skipped.RecoveryAttempt = 3
+	skipped.RecoveryNotBeforeMilli++
+	if err := store.TransitionSessionOperation(context.Background(), attempt, skipped); !errors.Is(err, ErrSessionOperationConflict) {
+		t.Fatalf("skipped recovery attempt = %v", err)
+	}
+	regressed := attempt
+	regressed.RecoveryNotBeforeMilli--
+	if err := store.TransitionSessionOperation(context.Background(), attempt, regressed); !errors.Is(err, ErrSessionOperationConflict) {
+		t.Fatalf("regressed recovery deadline = %v", err)
+	}
+	loaded, err := store.LoadSessionOperations(context.Background(), attempt.Operation.ProtectedResourceID)
+	if err != nil || len(loaded) != 1 || !sameSessionOperationRecord(loaded[0], attempt) {
+		t.Fatalf("persisted recovery backoff=%+v err=%v", loaded, err)
+	}
+}
+
 func TestSDKStoreSessionOperationAllowsMakeBeforeBreak(t *testing.T) {
 	store, err := NewSDKStore(filepath.Join(realSDKTempDir(t), "state"), "")
 	if err != nil {
@@ -241,6 +286,26 @@ func TestSessionOperationRecordRejectsNoncanonicalOrTamperedState(t *testing.T) 
 		t.Run(name, func(t *testing.T) {
 			if _, err := decodeSessionOperationJournal(mutation); err == nil {
 				t.Fatal("mutated operation record decoded")
+			}
+		})
+	}
+}
+
+func TestNewSessionOperationRecordRejectsGenericTrustBoundaryDrift(t *testing.T) {
+	valid := testSessionOperationRecord(SessionOperationPrepared)
+	for name, mutate := range map[string]func(*SessionOperationRecord){
+		"empty operation": func(record *SessionOperationRecord) { record.Operation.OperationID = "" },
+		"raw IP":          func(record *SessionOperationRecord) { record.RecoveryEndpoint.Host = "192.0.2.1" },
+		"uppercase DNS":   func(record *SessionOperationRecord) { record.RecoveryEndpoint.Host = "Cell.example.test" },
+		"nonstandard port": func(record *SessionOperationRecord) {
+			record.RecoveryEndpoint.Port = 8443
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			record := valid
+			mutate(&record)
+			if _, err := NewSessionOperationRecord(record.Operation, record.RecoveryEndpoint); !errors.Is(err, ErrSessionOperationConflict) {
+				t.Fatalf("drifted initial record = %v", err)
 			}
 		})
 	}

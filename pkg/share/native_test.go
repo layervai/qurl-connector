@@ -157,15 +157,69 @@ func (testNativeSessionOperations) Retire(ctx context.Context, binding *qurl.Age
 }
 
 func testNativeSessionAuthority() NativeSessionOperationAuthority {
-	return NativeSessionOperationAuthority{
-		AWSAccountID: "111122223333", AWSRegion: "us-east-2", OwnerID: "owner-one",
-		QURLAgentKeysTable: "agent-keys", SessionControlTable: "session-control",
-	}
+	return NativeSessionOperationAuthority{OwnerID: "owner-one"}
 }
 
 type makeBeforeBreakTestOperations struct {
 	next      int
 	preserves []map[string]struct{}
+}
+
+type blockingRecoveryOperations struct {
+	testNativeSessionOperations
+	resource string
+	started  chan struct{}
+	release  chan struct{}
+	once     sync.Once
+}
+
+func (o *blockingRecoveryOperations) RecoverPending(ctx context.Context, _ *qurl.AgentRuntimeBinding, _ []byte,
+	resourceID string, _ map[string]struct{}, _ []qurl.AgentRuntimeUDPOption,
+) error {
+	if resourceID != o.resource {
+		return nil
+	}
+	o.once.Do(func() { close(o.started) })
+	select {
+	case <-o.release:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+type prepareFenceOperations struct {
+	testNativeSessionOperations
+	mu             sync.Mutex
+	prepares       int
+	secondPrepared chan struct{}
+	secondReady    chan struct{}
+	readyOnce      sync.Once
+	prepareOnce    sync.Once
+}
+
+func (o *prepareFenceOperations) RecoverPending(_ context.Context, _ *qurl.AgentRuntimeBinding, _ []byte,
+	resourceID string, _ map[string]struct{}, _ []qurl.AgentRuntimeUDPOption,
+) error {
+	if resourceID == "resource-two" {
+		o.readyOnce.Do(func() { close(o.secondReady) })
+	}
+	return nil
+}
+
+func (o *prepareFenceOperations) PrepareDispatch(_ context.Context, _ *qurl.AgentRuntimeBinding, _ []byte,
+	knockResourceID, protectedResourceID, runID string, runAttempt uint64,
+) (*qurl.NativeSessionOperation, error) {
+	o.mu.Lock()
+	o.prepares++
+	if o.prepares == 2 {
+		o.prepareOnce.Do(func() { close(o.secondPrepared) })
+	}
+	o.mu.Unlock()
+	return &qurl.NativeSessionOperation{
+		ResourceID: knockResourceID, ProtectedResourceID: protectedResourceID,
+		OperationID: runID, RunID: runID, RunAttempt: runAttempt,
+	}, nil
 }
 
 func (o *makeBeforeBreakTestOperations) RecoverPending(_ context.Context, _ *qurl.AgentRuntimeBinding, _ []byte,
@@ -775,6 +829,140 @@ func TestNativeAdmitterBindsProtectedResourceIntoKnock(t *testing.T) {
 	}
 	if _, err := admitter.Admit(context.Background(), "q_catalog_key", want); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestNativeAdmitterSlowRecoveryDoesNotBlockSiblingResource(t *testing.T) {
+	oldKnock := knockNativeRuntime
+	t.Cleanup(func() { knockNativeRuntime = oldKnock })
+	var knockMu sync.Mutex
+	nextSession := uint64(90)
+	knockNativeRuntime = func(_ context.Context, _ *qurl.AgentRuntimeBinding, _ []byte, _ string,
+		opts qurl.NativeKnockOptions, _ ...qurl.AgentRuntimeUDPOption,
+	) (*qurl.NativeKnockResult, error) {
+		knockMu.Lock()
+		nextSession++
+		sessionID := nextSession
+		knockMu.Unlock()
+		return &qurl.NativeKnockResult{
+			ACToken: "token", ResourceHost: "127.0.0.1:7000", SessionID: sessionID, OpenTime: 60,
+			SessionReceipt: testSessionReceipt(sessionID, opts.RunID, opts.RunAttempt),
+		}, nil
+	}
+	operations := &blockingRecoveryOperations{
+		resource: "resource-one", started: make(chan struct{}), release: make(chan struct{}),
+	}
+	admitter := &NativeAdmitter{
+		binding: &qurl.AgentRuntimeBinding{AgentID: "agent-one"}, privateKey: make([]byte, 32),
+		operations: operations, store: &memoryNativeStore{},
+	}
+	defer admitter.Close()
+
+	firstDone := make(chan error, 1)
+	go func() {
+		_, err := admitter.Admit(context.Background(), "q_one", "resource-one")
+		firstDone <- err
+	}()
+	select {
+	case <-operations.started:
+	case <-time.After(time.Second):
+		t.Fatal("slow recovery did not start")
+	}
+	secondDone := make(chan error, 1)
+	go func() {
+		_, err := admitter.Admit(context.Background(), "q_two", "resource-two")
+		secondDone <- err
+	}()
+	select {
+	case err := <-secondDone:
+		if err != nil {
+			t.Fatalf("sibling admission = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("slow recovery blocked an unrelated resource")
+	}
+	close(operations.release)
+	if err := <-firstDone; err != nil {
+		t.Fatalf("released admission = %v", err)
+	}
+}
+
+func TestNativeAdmitterSerializesOnlyPrepareCommitAndKnockAcrossResources(t *testing.T) {
+	oldKnock := knockNativeRuntime
+	t.Cleanup(func() { knockNativeRuntime = oldKnock })
+	firstKnock := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	var once sync.Once
+	var resultMu sync.Mutex
+	nextSession := uint64(100)
+	knockNativeRuntime = func(ctx context.Context, _ *qurl.AgentRuntimeBinding, _ []byte, _ string,
+		opts qurl.NativeKnockOptions, _ ...qurl.AgentRuntimeUDPOption,
+	) (*qurl.NativeKnockResult, error) {
+		blocked := false
+		once.Do(func() {
+			blocked = true
+			close(firstKnock)
+		})
+		if blocked {
+			select {
+			case <-releaseFirst:
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		}
+		resultMu.Lock()
+		nextSession++
+		sessionID := nextSession
+		resultMu.Unlock()
+		return &qurl.NativeKnockResult{
+			ACToken: "token", ResourceHost: "127.0.0.1:7000", SessionID: sessionID, OpenTime: 60,
+			SessionReceipt: testSessionReceipt(sessionID, opts.RunID, opts.RunAttempt),
+		}, nil
+	}
+	operations := &prepareFenceOperations{
+		secondPrepared: make(chan struct{}), secondReady: make(chan struct{}),
+	}
+	admitter := &NativeAdmitter{
+		binding: &qurl.AgentRuntimeBinding{AgentID: "agent-one"}, privateKey: make([]byte, 32),
+		operations: operations, store: &memoryNativeStore{},
+	}
+	defer admitter.Close()
+	firstDone := make(chan error, 1)
+	go func() {
+		_, err := admitter.Admit(context.Background(), "q_one", "resource-one")
+		firstDone <- err
+	}()
+	select {
+	case <-firstKnock:
+	case <-time.After(time.Second):
+		t.Fatal("first knock did not start")
+	}
+	secondDone := make(chan error, 1)
+	go func() {
+		_, err := admitter.Admit(context.Background(), "q_two", "resource-two")
+		secondDone <- err
+	}()
+	select {
+	case <-operations.secondReady:
+	case <-time.After(time.Second):
+		t.Fatal("sibling did not finish independent recovery")
+	}
+	select {
+	case <-operations.secondPrepared:
+		t.Fatal("sibling prepared while the first operation had not finished its knock")
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(releaseFirst)
+	if err := <-firstDone; err != nil {
+		t.Fatalf("first admission = %v", err)
+	}
+	if err := <-secondDone; err != nil {
+		t.Fatalf("second admission = %v", err)
+	}
+	select {
+	case <-operations.secondPrepared:
+	default:
+		t.Fatal("sibling did not prepare after the first knock completed")
 	}
 }
 

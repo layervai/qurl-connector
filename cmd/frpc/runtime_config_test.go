@@ -9,6 +9,8 @@ import (
 	"strings"
 	"testing"
 	"unicode/utf8"
+
+	nhpconfig "github.com/layervai/qurl-connector/pkg/config"
 )
 
 const validTestHubPublicKeyB64 = "CQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
@@ -65,6 +67,37 @@ func TestConnectorHubBootstrapRejectsPartialOrMalformedOverride(t *testing.T) {
 func TestDefaultHubPinRemainsUnprovisionedInSource(t *testing.T) {
 	if defaultHubServerPublicKeyB64 != "" {
 		t.Fatal("source embeds a production Hub key instead of release-time injection")
+	}
+}
+
+func TestConnectorNativeSessionAuthorityUsesAuthenticatedOwner(t *testing.T) {
+	t.Setenv(envNativeOwnerID, "owner-one")
+	authority, err := connectorNativeSessionAuthority()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if authority.OwnerID != "owner-one" {
+		t.Fatalf("native session authority = %#v", authority)
+	}
+}
+
+func TestConnectorNativeRuntimeConfigWiresSessionAuthority(t *testing.T) {
+	t.Setenv(envHubHost, "hub.example.test")
+	t.Setenv(envHubPort, "443")
+	t.Setenv(envHubServerPublicKey, validTestHubPublicKeyB64)
+	t.Setenv(envNativeOwnerID, "owner-one")
+	config, err := connectorNativeRuntimeConfig(&nhpconfig.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if config.SessionOperations.OwnerID != "owner-one" {
+		t.Fatalf("native runtime session authority = %#v", config.SessionOperations)
+	}
+}
+
+func TestConnectorNativeSessionAuthorityRejectsMissingOwner(t *testing.T) {
+	if _, err := connectorNativeSessionAuthority(); err == nil || !strings.Contains(err.Error(), "owner ID") {
+		t.Fatalf("ownerless native session authority = %v", err)
 	}
 }
 

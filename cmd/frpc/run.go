@@ -44,6 +44,7 @@ const (
 	envHubPort            = "QURL_CONNECTOR_HUB_PORT"
 	envHubServerPublicKey = "QURL_CONNECTOR_HUB_SERVER_PUBLIC_KEY_B64"
 	envRefreshMode        = "LAYERV_AGENT_REGISTRATION_REFRESH_MODE"
+	envNativeOwnerID      = "QURL_CONNECTOR_NATIVE_OWNER_ID"
 
 	defaultHubHost = "hub.nhp.layerv.ai"
 	defaultHubPort = 443
@@ -492,26 +493,11 @@ func validateConnectorRunRoutes(cfg *nhpconfig.Config) error {
 }
 
 func openConnectorRuntime(ctx context.Context, cfg *nhpconfig.Config) (_ connectorRuntime, retErr error) {
-	stateDir := agentstate.ResolveDir("")
-	agentID := agentstate.ConfiguredAgentID()
-	hub, err := connectorHubBootstrap()
+	nativeConfig, err := connectorNativeRuntimeConfig(cfg)
 	if err != nil {
 		return connectorRuntime{}, err
 	}
-	udpOpts, err := connectorUDPOptions(cfg)
-	if err != nil {
-		return connectorRuntime{}, err
-	}
-	mode, err := registrationRefreshMode()
-	if err != nil {
-		return connectorRuntime{}, err
-	}
-	sharedRuntime, err := share.OpenNativeRuntime(ctx, share.NativeRuntimeConfig{
-		StateDir: stateDir, AgentID: agentID, Hub: hub,
-		Hostname: runtimeHostname(), Version: clientVersionMeta(version.Version),
-		EnrollmentCredential: enrollmentCredential(), RefreshMode: mode,
-		UDPOptions: udpOpts,
-	})
+	sharedRuntime, err := share.OpenNativeRuntime(ctx, nativeConfig)
 	if err != nil {
 		return connectorRuntime{}, err
 	}
@@ -532,6 +518,44 @@ func openConnectorRuntime(ctx context.Context, cfg *nhpconfig.Config) (_ connect
 		return connectorRuntime{}, errors.Join(err, runtime.Close())
 	}
 	return runtime, nil
+}
+
+func connectorNativeRuntimeConfig(cfg *nhpconfig.Config) (share.NativeRuntimeConfig, error) {
+	sessionOperations, err := connectorNativeSessionAuthority()
+	if err != nil {
+		return share.NativeRuntimeConfig{}, err
+	}
+	hub, err := connectorHubBootstrap()
+	if err != nil {
+		return share.NativeRuntimeConfig{}, err
+	}
+	udpOpts, err := connectorUDPOptions(cfg)
+	if err != nil {
+		return share.NativeRuntimeConfig{}, err
+	}
+	mode, err := registrationRefreshMode()
+	if err != nil {
+		return share.NativeRuntimeConfig{}, err
+	}
+	return share.NativeRuntimeConfig{
+		StateDir: agentstate.ResolveDir(""), AgentID: agentstate.ConfiguredAgentID(), Hub: hub,
+		Hostname: runtimeHostname(), Version: clientVersionMeta(version.Version),
+		EnrollmentCredential: enrollmentCredential(), RefreshMode: mode,
+		UDPOptions: udpOpts, SessionOperations: sessionOperations,
+	}, nil
+}
+
+// connectorNativeSessionAuthority resolves authenticated account context before
+// registration can consume a credential or send a packet. The owner is never
+// inferred from a CRID, route, or NHP response. NHP deployment coordinates are
+// private server configuration and are not present in this binary.
+func connectorNativeSessionAuthority() (share.NativeSessionOperationAuthority, error) {
+	ownerID := strings.TrimSpace(os.Getenv(envNativeOwnerID))
+	authority := share.NativeSessionOperationAuthority{OwnerID: ownerID}
+	if err := share.ValidateNativeSessionOperationAuthority(authority); err != nil {
+		return share.NativeSessionOperationAuthority{}, fmt.Errorf("native session authority: %w", err)
+	}
+	return authority, nil
 }
 
 func finalizeStrictOperationalBoundary(runtime connectorRuntime, boundary proofprovenance.Boundary) (connectorRuntime, error) {

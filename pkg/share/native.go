@@ -519,7 +519,14 @@ func (r *NativeRuntime) Close() error {
 }
 
 type NativeAdmitter struct {
-	mu sync.Mutex
+	// runtimeMu prevents refresh or close from replacing the binding and key
+	// while a native exchange uses them. Ordinary operations take a read lock,
+	// so unrelated resources can recover and retire concurrently.
+	runtimeMu sync.RWMutex
+	refreshMu sync.Mutex
+	knockMu   sync.Mutex
+	stateMu   sync.Mutex
+	resources keyedResourceLocks
 
 	binding    *qurl.AgentRuntimeBinding
 	privateKey []byte
@@ -528,9 +535,45 @@ type NativeAdmitter struct {
 	refreshCfg nativeRefreshConfig
 	operations nativeSessionOperationController
 	failures   int
+	failureGen uint64
+	generation uint64
 	closed     bool
 	live       map[nativeAdmissionKey]nativeLiveAdmission
 	pending    map[nativeAdmissionKey]bool
+}
+
+type keyedResourceLocks struct {
+	mu    sync.Mutex
+	locks map[string]*keyedResourceLock
+}
+
+type keyedResourceLock struct {
+	mu   sync.Mutex
+	refs int
+}
+
+func (l *keyedResourceLocks) lock(resourceID string) func() {
+	l.mu.Lock()
+	if l.locks == nil {
+		l.locks = make(map[string]*keyedResourceLock)
+	}
+	entry := l.locks[resourceID]
+	if entry == nil {
+		entry = &keyedResourceLock{}
+		l.locks[resourceID] = entry
+	}
+	entry.refs++
+	l.mu.Unlock()
+	entry.mu.Lock()
+	return func() {
+		entry.mu.Unlock()
+		l.mu.Lock()
+		entry.refs--
+		if entry.refs == 0 {
+			delete(l.locks, resourceID)
+		}
+		l.mu.Unlock()
+	}
 }
 
 // nativeAdmissionKey is the complete exported exact-session identity. Session
@@ -580,63 +623,80 @@ func NewNativeAdmitter(runtime *NativeRuntime) (*NativeAdmitter, error) {
 }
 
 func (a *NativeAdmitter) Admit(ctx context.Context, knockResourceID, resourceID string) (Admission, error) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if a.closed || a.binding == nil || len(a.privateKey) != 32 {
-		return Admission{}, errors.New("native admitter is closed")
+	if ctx == nil {
+		return Admission{}, errors.New("admit native resource: context is nil")
 	}
-	if a.operations == nil {
-		return Admission{}, errors.New("native admitter has no durable session-operation authority")
-	}
-	a.ensureAdmissionMapsLocked()
-	if err := a.operations.RecoverPending(ctx, a.binding, a.privateKey, resourceID, a.liveOperationIDsLocked(resourceID), a.udpOpts); err != nil {
-		return Admission{}, fmt.Errorf("recover prior native session operation before replacement: %w", err)
-	}
-	if err := a.retirePendingForResourceLocked(ctx, resourceID); err != nil {
-		return Admission{}, fmt.Errorf("retire prior native NHP session before replacement: %w", err)
-	}
-	admission, err := a.knockLocked(ctx, knockResourceID, resourceID)
+	unlockResource := a.resources.lock(resourceID)
+	defer unlockResource()
+
+	admission, err, generation, refreshEligible := a.admitOnce(ctx, knockResourceID, resourceID)
 	if err == nil {
-		a.failures = 0
+		a.resetPlacementFailures(generation)
 		return admission, nil
 	}
-	if !refreshableKnockError(err) {
-		// A non-placement result breaks the consecutive placement-failure
-		// streak. In particular, an authenticated deny proves that the current
-		// cell and key path are live, so a later transport failure starts a new
-		// recovery budget.
-		a.failures = 0
+	if !refreshEligible || !refreshableKnockError(err) {
+		a.resetPlacementFailures(generation)
 		return Admission{}, err
 	}
-	a.failures++
-	if a.failures < 5 {
+	if !a.recordPlacementFailure(generation) {
 		return Admission{}, err
 	}
-	if refreshErr := a.refreshLocked(ctx); refreshErr != nil {
+	if refreshErr := a.refresh(ctx, generation); refreshErr != nil {
 		return Admission{}, errors.Join(err, refreshErr)
 	}
-	a.failures = 0
-	return a.knockLocked(ctx, knockResourceID, resourceID)
+	admission, retryErr, retryGeneration, _ := a.admitOnce(ctx, knockResourceID, resourceID)
+	if retryErr == nil {
+		a.resetPlacementFailures(retryGeneration)
+	}
+	return admission, retryErr
 }
 
-func (a *NativeAdmitter) knockLocked(ctx context.Context, knockResourceID, resourceID string) (Admission, error) {
+func (a *NativeAdmitter) admitOnce(ctx context.Context, knockResourceID,
+	resourceID string,
+) (Admission, error, uint64, bool) {
+	a.runtimeMu.RLock()
+	defer a.runtimeMu.RUnlock()
+	if a.closed || a.binding == nil || len(a.privateKey) != 32 {
+		return Admission{}, errors.New("native admitter is closed"), a.generation, false
+	}
+	if a.operations == nil {
+		return Admission{}, errors.New("native admitter has no durable session-operation authority"), a.generation, false
+	}
+	generation := a.generation
+	if err := a.operations.RecoverPending(ctx, a.binding, a.privateKey, resourceID, a.liveOperationIDs(resourceID), a.udpOpts); err != nil {
+		return Admission{}, fmt.Errorf("recover prior native session operation before replacement: %w", err), generation, false
+	}
+	if err := a.retirePendingForResource(ctx, resourceID); err != nil {
+		return Admission{}, fmt.Errorf("retire prior native NHP session before replacement: %w", err), generation, false
+	}
+	admission, err := a.knock(ctx, knockResourceID, resourceID)
+	return admission, err, generation, true
+}
+
+func (a *NativeAdmitter) knock(ctx context.Context, knockResourceID, resourceID string) (Admission, error) {
 	runID, err := qurl.NewCycleRunID()
 	if err != nil {
 		return Admission{}, err
 	}
+	// Each admission cycle owns a fresh RunID. Ambiguous results recover that
+	// same durable operation, so a new local retry attempt is never invented.
 	const runAttempt = uint64(1)
+	// qurl-go requires preparation, the durable dispatch commit, and the knock
+	// to be one critical section on a shared binding. Recovery and retirement
+	// use their own source-fenced endpoint and do not take this lock.
+	a.knockMu.Lock()
 	operation, err := a.operations.PrepareDispatch(ctx, a.binding, a.privateKey, knockResourceID, resourceID, runID, runAttempt)
 	if err != nil {
+		a.knockMu.Unlock()
 		return Admission{}, err
 	}
 	result, err := knockNativeRuntime(
 		ctx, a.binding, a.privateKey, knockResourceID,
 		qurl.NativeKnockOptions{RunID: runID, RunAttempt: runAttempt, ProtectedResourceID: resourceID, Operation: operation}, a.udpOpts...,
 	)
+	a.knockMu.Unlock()
 	if err != nil {
-		cleanupCtx, cancelCleanup := nativeSessionCleanupContext()
-		cleanupErr := a.operations.RecoverOperation(cleanupCtx, a.binding, a.privateKey, resourceID, operation.OperationID, a.udpOpts)
-		cancelCleanup()
+		cleanupErr := a.recoverOperationCleanup(resourceID, operation.OperationID)
 		var deny *qurl.ServerDenyError
 		if errors.As(err, &deny) && deny.ErrCode == "52004" {
 			return Admission{}, errors.Join(fmt.Errorf("%w: %w", ErrResourceGone, err), cleanupErr)
@@ -644,15 +704,11 @@ func (a *NativeAdmitter) knockLocked(ctx context.Context, knockResourceID, resou
 		return Admission{}, errors.Join(err, cleanupErr)
 	}
 	if result == nil {
-		cleanupCtx, cancelCleanup := nativeSessionCleanupContext()
-		cleanupErr := a.operations.RecoverOperation(cleanupCtx, a.binding, a.privateKey, resourceID, operation.OperationID, a.udpOpts)
-		cancelCleanup()
+		cleanupErr := a.recoverOperationCleanup(resourceID, operation.OperationID)
 		return Admission{}, errors.Join(errors.New("native knock returned no admission"), cleanupErr)
 	}
 	if err := a.operations.RecordMapped(ctx, resourceID, *operation, result.SessionReceipt); err != nil {
-		cleanupCtx, cancelCleanup := nativeSessionCleanupContext()
-		cleanupErr := a.operations.RecoverOperation(cleanupCtx, a.binding, a.privateKey, resourceID, operation.OperationID, a.udpOpts)
-		cancelCleanup()
+		cleanupErr := a.recoverOperationCleanup(resourceID, operation.OperationID)
 		return Admission{}, errors.Join(err, cleanupErr)
 	}
 	admission := Admission{
@@ -665,20 +721,29 @@ func (a *NativeAdmitter) knockLocked(ctx context.Context, knockResourceID, resou
 		// The authenticated ACK may already have opened server-side authority.
 		// Track and retire that exact receipt even when a stricter local
 		// invariant (for example canonical host:port) rejects the result.
-		key, trackErr := a.trackAdmissionLocked(admission, operation.OperationID)
+		key, trackErr := a.trackAdmission(admission, operation.OperationID)
 		if trackErr != nil {
 			return Admission{}, errors.Join(err, trackErr)
 		}
+		a.stateMu.Lock()
 		a.pending[key] = true
-		return Admission{}, errors.Join(err, a.retireOneLocked(ctx, key, a.live[key]))
+		live := a.live[key]
+		a.stateMu.Unlock()
+		return Admission{}, errors.Join(err, a.retireOne(ctx, key, live))
 	}
-	if _, err := a.trackAdmissionLocked(admission, operation.OperationID); err != nil {
-		cleanupCtx, cancelCleanup := nativeSessionCleanupContext()
-		cleanupErr := a.operations.RecoverOperation(cleanupCtx, a.binding, a.privateKey, resourceID, operation.OperationID, a.udpOpts)
-		cancelCleanup()
+	if _, err := a.trackAdmission(admission, operation.OperationID); err != nil {
+		cleanupErr := a.recoverOperationCleanup(resourceID, operation.OperationID)
 		return Admission{}, errors.Join(err, cleanupErr)
 	}
 	return admission, nil
+}
+
+func (a *NativeAdmitter) recoverOperationCleanup(resourceID, operationID string) error {
+	cleanupCtx, cancelCleanup := nativeSessionCleanupContext()
+	defer cancelCleanup()
+	return a.operations.RecoverOperation(
+		cleanupCtx, a.binding, a.privateKey, resourceID, operationID, a.udpOpts,
+	)
 }
 
 func refreshableKnockError(err error) bool {
@@ -695,6 +760,7 @@ func refreshableKnockError(err error) bool {
 	// longer admit a session. They deliberately take precedence over the
 	// invalid-input/deadline errors a bounded renewal may also wrap.
 	if errors.Is(err, qurl.ErrAssignmentLeaseExpired) ||
+		errors.Is(err, qurl.ErrNativeSessionOperationLeaseMargin) ||
 		errors.Is(err, qurl.ErrAssignmentRecoveryRequired) ||
 		errors.Is(err, qurl.ErrAssignmentReassignmentRequired) {
 		return true
@@ -712,7 +778,26 @@ func refreshableKnockError(err error) bool {
 		errors.Is(err, nativeudp.ErrServerUnauthenticated)
 }
 
-func (a *NativeAdmitter) refreshLocked(ctx context.Context) error {
+func (a *NativeAdmitter) refresh(ctx context.Context, failedGeneration uint64) error {
+	a.refreshMu.Lock()
+	defer a.refreshMu.Unlock()
+	a.runtimeMu.Lock()
+	defer a.runtimeMu.Unlock()
+	if a.closed || a.binding == nil || len(a.privateKey) != 32 {
+		return errors.New("refresh native admission runtime: native admitter is closed")
+	}
+	if a.generation != failedGeneration {
+		return nil
+	}
+	if err := a.refreshRuntimeLocked(ctx); err != nil {
+		return err
+	}
+	a.generation++
+	a.resetPlacementFailures(a.generation)
+	return nil
+}
+
+func (a *NativeAdmitter) refreshRuntimeLocked(ctx context.Context) error {
 	if a.store == nil {
 		return errors.New("refresh native admission runtime: state store is closed")
 	}
@@ -748,6 +833,24 @@ func (a *NativeAdmitter) refreshLocked(ctx context.Context) error {
 	return nil
 }
 
+func (a *NativeAdmitter) recordPlacementFailure(generation uint64) bool {
+	a.stateMu.Lock()
+	defer a.stateMu.Unlock()
+	if a.failureGen != generation {
+		a.failureGen = generation
+		a.failures = 0
+	}
+	a.failures++
+	return a.failures >= 5
+}
+
+func (a *NativeAdmitter) resetPlacementFailures(generation uint64) {
+	a.stateMu.Lock()
+	a.failureGen = generation
+	a.failures = 0
+	a.stateMu.Unlock()
+}
+
 // Retire durably closes only the exact NHP session represented by admission.
 // A failed retirement remains pending and must succeed before the same
 // resource can obtain another admission.
@@ -755,25 +858,31 @@ func (a *NativeAdmitter) Retire(ctx context.Context, admission Admission) error 
 	if ctx == nil {
 		return errors.New("retire native admission: context is nil")
 	}
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if a.closed || a.binding == nil || len(a.privateKey) != 32 {
-		return errors.New("native admitter is closed")
-	}
-	a.ensureAdmissionMapsLocked()
 	if err := validateAdmissionReceipt(admission); err != nil {
 		return err
 	}
+	unlockResource := a.resources.lock(admission.ResourceID)
+	defer unlockResource()
+	a.runtimeMu.RLock()
+	defer a.runtimeMu.RUnlock()
+	if a.closed || a.binding == nil || len(a.privateKey) != 32 {
+		return errors.New("native admitter is closed")
+	}
 	key := admissionKey(admission.SessionReceipt)
+	a.stateMu.Lock()
+	a.ensureAdmissionMapsLocked()
 	live, ok := a.live[key]
 	if !ok {
+		a.stateMu.Unlock()
 		return nil
 	}
 	if live.resourceID != admission.ResourceID || !sameSessionReceipt(live.receipt, admission.SessionReceipt) {
+		a.stateMu.Unlock()
 		return errors.New("retire native admission: exact-session receipt does not match the live admission")
 	}
 	a.pending[key] = true
-	return a.retireOneLocked(ctx, key, live)
+	a.stateMu.Unlock()
+	return a.retireOne(ctx, key, live)
 }
 
 func (a *NativeAdmitter) ensureAdmissionMapsLocked() {
@@ -785,7 +894,7 @@ func (a *NativeAdmitter) ensureAdmissionMapsLocked() {
 	}
 }
 
-func (a *NativeAdmitter) trackAdmissionLocked(admission Admission, operationID string) (nativeAdmissionKey, error) {
+func (a *NativeAdmitter) trackAdmission(admission Admission, operationID string) (nativeAdmissionKey, error) {
 	if err := validateAdmissionReceipt(admission); err != nil {
 		return nativeAdmissionKey{}, err
 	}
@@ -793,6 +902,9 @@ func (a *NativeAdmitter) trackAdmissionLocked(admission Admission, operationID s
 		return nativeAdmissionKey{}, errors.New("track native admission: operation ID is empty")
 	}
 	key := admissionKey(admission.SessionReceipt)
+	a.stateMu.Lock()
+	defer a.stateMu.Unlock()
+	a.ensureAdmissionMapsLocked()
 	if existing, ok := a.live[key]; ok &&
 		(existing.resourceID != admission.ResourceID || existing.operationID != operationID ||
 			!sameSessionReceipt(existing.receipt, admission.SessionReceipt)) {
@@ -810,29 +922,51 @@ func admissionKey(receipt qurl.NativeSessionReceipt) nativeAdmissionKey {
 	}
 }
 
-func (a *NativeAdmitter) retirePendingForResourceLocked(ctx context.Context, resourceID string) error {
-	for key := range a.pending {
-		live, ok := a.live[key]
-		if !ok {
-			delete(a.pending, key)
-			continue
+func (a *NativeAdmitter) retirePendingForResource(ctx context.Context, resourceID string) error {
+	for {
+		a.stateMu.Lock()
+		a.ensureAdmissionMapsLocked()
+		var key nativeAdmissionKey
+		var live nativeLiveAdmission
+		found := false
+		for candidate := range a.pending {
+			candidateLive, ok := a.live[candidate]
+			if !ok {
+				delete(a.pending, candidate)
+				continue
+			}
+			if candidateLive.resourceID == resourceID {
+				key, live, found = candidate, candidateLive, true
+				break
+			}
 		}
-		if live.resourceID != resourceID {
-			continue
+		a.stateMu.Unlock()
+		if !found {
+			return nil
 		}
-		if err := a.retireOneLocked(ctx, key, live); err != nil {
+		if err := a.retireOne(ctx, key, live); err != nil {
 			return err
 		}
 	}
-	return nil
 }
 
-func (a *NativeAdmitter) retireOneLocked(ctx context.Context, key nativeAdmissionKey, live nativeLiveAdmission) error {
+func (a *NativeAdmitter) retireOne(ctx context.Context, key nativeAdmissionKey, live nativeLiveAdmission) error {
 	if a.operations == nil {
 		return errors.New("native admitter has no durable session-operation authority")
 	}
 	if err := a.operations.Retire(ctx, a.binding, a.privateKey, live.resourceID, live.operationID, live.receipt, a.udpOpts); err != nil {
 		return err
+	}
+	a.stateMu.Lock()
+	defer a.stateMu.Unlock()
+	current, present := a.live[key]
+	if !present {
+		delete(a.pending, key)
+		return nil
+	}
+	if current.resourceID != live.resourceID || current.operationID != live.operationID ||
+		!sameSessionReceipt(current.receipt, live.receipt) {
+		return errors.New("retire native admission: live session changed during exact retirement")
 	}
 	delete(a.pending, key)
 	delete(a.live, key)
@@ -840,7 +974,10 @@ func (a *NativeAdmitter) retireOneLocked(ctx context.Context, key nativeAdmissio
 	return nil
 }
 
-func (a *NativeAdmitter) liveOperationIDsLocked(resourceID string) map[string]struct{} {
+func (a *NativeAdmitter) liveOperationIDs(resourceID string) map[string]struct{} {
+	a.stateMu.Lock()
+	defer a.stateMu.Unlock()
+	a.ensureAdmissionMapsLocked()
 	operations := make(map[string]struct{})
 	for _, live := range a.live {
 		if live.resourceID == resourceID && live.operationID != "" {
@@ -856,8 +993,8 @@ func sameSessionReceipt(a, b qurl.NativeSessionReceipt) bool {
 }
 
 func (a *NativeAdmitter) MarkServingHealthy() error {
-	a.mu.Lock()
-	defer a.mu.Unlock()
+	a.runtimeMu.RLock()
+	defer a.runtimeMu.RUnlock()
 	if a.closed || a.store == nil {
 		return errors.New("native admitter is closed")
 	}
@@ -868,9 +1005,9 @@ func (a *NativeAdmitter) Close() error {
 	if a == nil {
 		return nil
 	}
-	a.mu.Lock()
+	a.runtimeMu.Lock()
 	if a.closed {
-		a.mu.Unlock()
+		a.runtimeMu.Unlock()
 		return nil
 	}
 	a.closed = true
@@ -880,20 +1017,26 @@ func (a *NativeAdmitter) Close() error {
 	store := a.store
 	operations := a.operations
 	var closeErr error
+	a.stateMu.Lock()
+	liveAdmissions := make(map[nativeAdmissionKey]nativeLiveAdmission, len(a.live))
+	for key, live := range a.live {
+		liveAdmissions[key] = live
+	}
+	a.stateMu.Unlock()
 	if binding != nil && len(privateKey) == 32 {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		type closeResult struct {
 			key nativeAdmissionKey
 			err error
 		}
-		results := make(chan closeResult, len(a.live))
+		results := make(chan closeResult, len(liveAdmissions))
 		var retireWG sync.WaitGroup
 		// Durable exact retirement is safe to fan out through one binding. Each
 		// operation owns its source-fenced endpoint and its own file transition,
 		// packet, socket, and reply. The private key stays read-only until this
 		// wait completes. Parallel calls prevent one silent issuing cell from
 		// consuming the whole shutdown budget before sibling closes start.
-		for key, live := range a.live {
+		for key, live := range liveAdmissions {
 			retireWG.Add(1)
 			go func(key nativeAdmissionKey, live nativeLiveAdmission) {
 				defer retireWG.Done()
@@ -913,8 +1056,10 @@ func (a *NativeAdmitter) Close() error {
 				closeErr = errors.Join(closeErr, result.err)
 				continue
 			}
+			a.stateMu.Lock()
 			delete(a.pending, result.key)
 			delete(a.live, result.key)
+			a.stateMu.Unlock()
 		}
 		cancel()
 	}
@@ -923,9 +1068,11 @@ func (a *NativeAdmitter) Close() error {
 	a.udpOpts = nil
 	a.store = nil
 	a.operations = nil
+	a.stateMu.Lock()
 	a.live = nil
 	a.pending = nil
-	a.mu.Unlock()
+	a.stateMu.Unlock()
+	a.runtimeMu.Unlock()
 	clear(privateKey)
 	if binding != nil {
 		binding.Destroy()

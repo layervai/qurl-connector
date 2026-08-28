@@ -22,8 +22,8 @@ import (
 )
 
 const (
-	sessionOperationRecordSchema  = 1
-	sessionOperationJournalSchema = 1
+	sessionOperationRecordSchema  = 2
+	sessionOperationJournalSchema = 2
 	sessionOperationFileMaxBytes  = 64 << 10
 	sessionOperationFileMode      = 0o600
 	sessionOperationLockFile      = ".native_session_operations.lock"
@@ -54,11 +54,32 @@ type SessionOperationAdmission struct {
 // A restarted process therefore recovers this operation instead of guessing
 // whether the prior UDP exchange crossed the server boundary.
 type SessionOperationRecord struct {
-	Schema           int                         `json:"schema"`
-	Operation        qurl.NativeSessionOperation `json:"operation"`
-	RecoveryEndpoint qurl.NHPUDPEndpoint         `json:"recovery_endpoint"`
-	Status           string                      `json:"status"`
-	Admission        *SessionOperationAdmission  `json:"admission,omitempty"`
+	Schema                 int                         `json:"schema"`
+	Operation              qurl.NativeSessionOperation `json:"operation"`
+	RecoveryEndpoint       qurl.NHPUDPEndpoint         `json:"recovery_endpoint"`
+	Status                 string                      `json:"status"`
+	Admission              *SessionOperationAdmission  `json:"admission,omitempty"`
+	RecoveryAttempt        uint32                      `json:"recovery_attempt,omitempty"`
+	RecoveryNotBeforeMilli int64                       `json:"recovery_not_before_ms,omitempty"`
+}
+
+// NewSessionOperationRecord builds the only valid initial durable record. The
+// schema stays owned by this package so callers cannot accidentally pin a
+// retired journal format.
+func NewSessionOperationRecord(operation qurl.NativeSessionOperation,
+	recoveryEndpoint qurl.NHPUDPEndpoint,
+) (SessionOperationRecord, error) {
+	record := SessionOperationRecord{
+		Schema: sessionOperationRecordSchema, Operation: operation,
+		RecoveryEndpoint: recoveryEndpoint, Status: SessionOperationPrepared,
+	}
+	if !validOperation(operation) {
+		return SessionOperationRecord{}, fmt.Errorf("%w: invalid initial operation", ErrSessionOperationConflict)
+	}
+	if !validRecoveryEndpoint(recoveryEndpoint) {
+		return SessionOperationRecord{}, fmt.Errorf("%w: invalid initial recovery endpoint", ErrSessionOperationConflict)
+	}
+	return record, nil
 }
 
 type sessionOperationJournal struct {
@@ -287,7 +308,9 @@ func validSessionOperationJournal(journal sessionOperationJournal) bool {
 
 func validSessionOperationRecord(record SessionOperationRecord) bool {
 	if record.Schema != sessionOperationRecordSchema || !validOperation(record.Operation) ||
-		!validRecoveryEndpoint(record.RecoveryEndpoint) {
+		!validRecoveryEndpoint(record.RecoveryEndpoint) ||
+		(record.RecoveryAttempt == 0) != (record.RecoveryNotBeforeMilli == 0) ||
+		record.RecoveryNotBeforeMilli < 0 {
 		return false
 	}
 	switch record.Status {
@@ -303,6 +326,9 @@ func validSessionOperationRecord(record SessionOperationRecord) bool {
 }
 
 func validOperation(operation qurl.NativeSessionOperation) bool {
+	if operation.OperationID == "" {
+		return false
+	}
 	raw, err := json.Marshal(operation)
 	if err != nil {
 		return false
@@ -312,6 +338,8 @@ func validOperation(operation qurl.NativeSessionOperation) bool {
 }
 
 func validRecoveryEndpoint(endpoint qurl.NHPUDPEndpoint) bool {
+	// Recovery is a native NHP protocol exchange. qurl-go deliberately fixes
+	// that protocol to UDP/443; the deployment chooses the canonical DNS name.
 	if !validRecoveryEndpointHost(endpoint.Host) || endpoint.Port != 443 {
 		return false
 	}
@@ -320,8 +348,7 @@ func validRecoveryEndpoint(endpoint qurl.NHPUDPEndpoint) bool {
 }
 
 func validRecoveryEndpointHost(host string) bool {
-	if host == "" || len(host) > 253 || strings.HasSuffix(host, ".") || net.ParseIP(host) != nil ||
-		(!strings.HasSuffix(host, ".layerv.ai") && !strings.HasSuffix(host, ".layerv.xyz")) {
+	if host == "" || len(host) > 253 || strings.HasSuffix(host, ".") || net.ParseIP(host) != nil {
 		return false
 	}
 	for _, label := range strings.Split(host, ".") {
@@ -351,11 +378,15 @@ func validSessionOperationTransition(previous, next SessionOperationRecord) bool
 	if previous.Admission != nil && (next.Admission == nil || *previous.Admission != *next.Admission) {
 		return false
 	}
+	if !validSessionOperationRecoveryProgress(previous, next) {
+		return false
+	}
 	switch previous.Status {
 	case SessionOperationPrepared:
-		return next.Status == SessionOperationDispatching
+		return next.Status == SessionOperationDispatching || next.Status == SessionOperationCanceled
 	case SessionOperationDispatching:
-		return next.Status == SessionOperationMapped || next.Status == SessionOperationCanceled || next.Status == SessionOperationClosing || next.Status == SessionOperationClosed
+		return next.Status == SessionOperationDispatching || next.Status == SessionOperationMapped ||
+			next.Status == SessionOperationCanceled || next.Status == SessionOperationClosing || next.Status == SessionOperationClosed
 	case SessionOperationMapped:
 		return next.Status == SessionOperationClosing || next.Status == SessionOperationClosed
 	case SessionOperationClosing:
@@ -363,6 +394,18 @@ func validSessionOperationTransition(previous, next SessionOperationRecord) bool
 	default:
 		return false
 	}
+}
+
+func validSessionOperationRecoveryProgress(previous, next SessionOperationRecord) bool {
+	if next.RecoveryAttempt < previous.RecoveryAttempt ||
+		next.RecoveryNotBeforeMilli < previous.RecoveryNotBeforeMilli {
+		return false
+	}
+	if next.RecoveryAttempt == previous.RecoveryAttempt {
+		return next.RecoveryNotBeforeMilli == previous.RecoveryNotBeforeMilli
+	}
+	return next.RecoveryAttempt == previous.RecoveryAttempt+1 &&
+		next.RecoveryNotBeforeMilli > previous.RecoveryNotBeforeMilli
 }
 
 func sameSessionOperationRecord(left, right SessionOperationRecord) bool {
