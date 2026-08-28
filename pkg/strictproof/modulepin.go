@@ -10,17 +10,17 @@ import (
 // Reviewed qurl-go pin. These constants are independent of go.mod/go.sum so
 // the ordinary test lane catches unreviewed dependency-selection drift.
 //
-// This cutover selects the immutable qurl-go release produced only after its
-// exact-main CI and CodeQL gates passed. Source identity remains bound to one
-// exact reviewed commit in the LayerV-owned repository by both go.sum checksums
-// and the download origin's VCS revision; the toolchain cannot silently
-// substitute a different tag or commit.
+// This coordinated cutover selects one immutable signed qurl-go commit. That
+// exact head must pass qurl-go's cross-platform test, race, lint, vulnerability,
+// and CodeQL release gates. Source identity remains bound to the LayerV-owned
+// repository by both go.sum checksums and the download origin's VCS revision;
+// the toolchain cannot silently substitute a different tag or commit.
 const (
 	QurlGoModulePath        = "github.com/layervai/qurl-go"
 	QurlGoRepoURL           = "https://github.com/layervai/qurl-go"
-	QurlGoSelectedCommitSHA = "c5c54098e4cd76b14594250a652be2851f604c29"
-	QurlGoSelectedVersion   = "v0.8.1-0.20260826091545-c5c54098e4cd"
-	QurlGoSelectedSum       = "h1:XexQ1AQvwlrVR9sI5FkQpQ2/mFEdWTLAsZ1qRQ+/ECc="
+	QurlGoSelectedCommitSHA = "2c2ec1e4c22284607de051ae751bf5a1df414d0f"
+	QurlGoSelectedVersion   = "v0.8.1-0.20260828203444-2c2ec1e4c222"
+	QurlGoSelectedSum       = "h1:t/AJ+sT+qjOBjxCjiiEsQEnbqPLFh4N68ZFGCdhRAtU="
 	QurlGoSelectedGoModSum  = "h1:zujbZnolKJzJEDyKwgUqulhHSi0sZeU2w1x+nle/yeM="
 )
 

@@ -5,9 +5,11 @@ package pinnedfs
 import (
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 )
 
@@ -518,6 +520,39 @@ func (d *Directory) Lstat(name string) (os.FileInfo, error) {
 		return nil, err
 	}
 	return d.root.Lstat(name)
+}
+
+// ReadDirNames returns at most limit entry names from the retained directory.
+// The extra read distinguishes an exact-size result from a namespace that
+// exceeds the caller's bounded scan budget.
+func (d *Directory) ReadDirNames(limit int) (names []string, retErr error) {
+	if limit <= 0 {
+		return nil, errors.New("directory entry limit must be positive")
+	}
+	if err := d.ValidateCurrent(); err != nil {
+		return nil, err
+	}
+	dir, err := d.root.Open(".")
+	if err != nil {
+		return nil, fmt.Errorf("open pinned directory for enumeration: %w", err)
+	}
+	defer func() { retErr = errors.Join(retErr, dir.Close()) }()
+	entries, err := dir.ReadDir(limit + 1)
+	if err != nil && !errors.Is(err, io.EOF) {
+		return nil, fmt.Errorf("enumerate pinned directory: %w", err)
+	}
+	if len(entries) > limit {
+		return nil, fmt.Errorf("pinned directory contains more than %d entries", limit)
+	}
+	names = make([]string, 0, len(entries))
+	for _, entry := range entries {
+		names = append(names, entry.Name())
+	}
+	sort.Strings(names)
+	if err := d.ValidateCurrent(); err != nil {
+		return nil, err
+	}
+	return names, nil
 }
 
 // Rename atomically renames oldName to newName inside the pinned directory.

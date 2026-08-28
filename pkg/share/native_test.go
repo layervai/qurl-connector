@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"reflect"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -17,15 +19,18 @@ import (
 )
 
 type memoryNativeStore struct {
-	mu         sync.Mutex
-	marker     agentstate.RefreshMarker
-	present    bool
-	loadErr    error
-	successErr error
-	marks      int
-	succeeded  int
-	cleared    int
-	closed     int
+	mu               sync.Mutex
+	marker           agentstate.RefreshMarker
+	present          bool
+	loadErr          error
+	successErr       error
+	marks            int
+	succeeded        int
+	cleared          int
+	closed           int
+	operations       map[string][]agentstate.SessionOperationRecord
+	scanPermanentErr error
+	scanRetryableErr error
 }
 
 func (*memoryNativeStore) Handoff() (qurl.AgentStateStore, error) { return nil, nil }
@@ -74,6 +79,233 @@ func (s *memoryNativeStore) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.closed++
+	return nil
+}
+
+func (s *memoryNativeStore) LoadSessionOperations(_ context.Context, resourceID string) ([]agentstate.SessionOperationRecord, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]agentstate.SessionOperationRecord(nil), s.operations[resourceID]...), nil
+}
+
+func (s *memoryNativeStore) ScanSessionOperationResources(context.Context) agentstate.SessionOperationResourceScan {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	resources := make([]string, 0, len(s.operations))
+	for resourceID, records := range s.operations {
+		if len(records) > 0 {
+			resources = append(resources, resourceID)
+		}
+	}
+	sort.Strings(resources)
+	return agentstate.SessionOperationResourceScan{
+		ResourceIDs: resources, PermanentError: s.scanPermanentErr, RetryableError: s.scanRetryableErr,
+	}
+}
+
+func (s *memoryNativeStore) CreateSessionOperation(_ context.Context, record agentstate.SessionOperationRecord) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.operations == nil {
+		s.operations = make(map[string][]agentstate.SessionOperationRecord)
+	}
+	resourceID := record.Operation.ProtectedResourceID
+	for _, current := range s.operations[resourceID] {
+		if current.Operation.OperationID == record.Operation.OperationID {
+			return agentstate.ErrSessionOperationConflict
+		}
+	}
+	s.operations[resourceID] = append(s.operations[resourceID], record)
+	return nil
+}
+
+func (s *memoryNativeStore) TransitionSessionOperation(_ context.Context, previous, next agentstate.SessionOperationRecord) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	resourceID := previous.Operation.ProtectedResourceID
+	for index, current := range s.operations[resourceID] {
+		if reflect.DeepEqual(current, previous) {
+			s.operations[resourceID][index] = next
+			return nil
+		}
+	}
+	return agentstate.ErrSessionOperationConflict
+}
+
+func (s *memoryNativeStore) DeleteSessionOperation(_ context.Context, terminal agentstate.SessionOperationRecord) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	resourceID := terminal.Operation.ProtectedResourceID
+	for index, current := range s.operations[resourceID] {
+		if reflect.DeepEqual(current, terminal) {
+			s.operations[resourceID] = append(s.operations[resourceID][:index], s.operations[resourceID][index+1:]...)
+			return nil
+		}
+	}
+	return agentstate.ErrSessionOperationConflict
+}
+
+type testNativeSessionOperations struct{}
+
+func (testNativeSessionOperations) RecoverPending(context.Context, *qurl.AgentRuntimeBinding, []byte, string, map[string]struct{}, []qurl.AgentRuntimeUDPOption) error {
+	return nil
+}
+
+type recoveryFailureOperations struct {
+	testNativeSessionOperations
+	err error
+}
+
+type retirementFailureOperations struct {
+	testNativeSessionOperations
+	err error
+}
+
+func (o retirementFailureOperations) Retire(context.Context, *qurl.AgentRuntimeBinding, []byte,
+	string, string, qurl.NativeSessionReceipt, []qurl.AgentRuntimeUDPOption,
+) error {
+	return o.err
+}
+
+type cleanupFailureOperations struct {
+	testNativeSessionOperations
+	err error
+}
+
+func (o cleanupFailureOperations) RecoverOperation(context.Context, *qurl.AgentRuntimeBinding, []byte,
+	string, string, []qurl.AgentRuntimeUDPOption,
+) error {
+	return o.err
+}
+
+func (o recoveryFailureOperations) RecoverPending(context.Context, *qurl.AgentRuntimeBinding, []byte, string, map[string]struct{}, []qurl.AgentRuntimeUDPOption) error {
+	return o.err
+}
+
+func (testNativeSessionOperations) RecoverOperation(context.Context, *qurl.AgentRuntimeBinding, []byte, string, string, []qurl.AgentRuntimeUDPOption) error {
+	return nil
+}
+
+func (testNativeSessionOperations) PrepareDispatch(_ context.Context, _ *qurl.AgentRuntimeBinding, _ []byte,
+	knockResourceID, protectedResourceID, runID string, runAttempt uint64,
+) (*qurl.NativeSessionOperation, error) {
+	return &qurl.NativeSessionOperation{
+		ResourceID: knockResourceID, ProtectedResourceID: protectedResourceID,
+		OperationID: runID, RunID: runID, RunAttempt: runAttempt,
+	}, nil
+}
+
+func (testNativeSessionOperations) RecordMapped(context.Context, string, qurl.NativeSessionOperation, qurl.NativeSessionReceipt) error {
+	return nil
+}
+
+func (testNativeSessionOperations) Retire(ctx context.Context, binding *qurl.AgentRuntimeBinding, privateKey []byte,
+	_, _ string, receipt qurl.NativeSessionReceipt, options []qurl.AgentRuntimeUDPOption,
+) error {
+	_, err := retireNativeSession(ctx, binding, privateKey, receipt, options...)
+	return err
+}
+
+func testNativeSessionAuthority() NativeSessionOperationAuthority {
+	return NativeSessionOperationAuthority{OwnerID: "owner-one"}
+}
+
+type makeBeforeBreakTestOperations struct {
+	next      int
+	preserves []map[string]struct{}
+}
+
+type blockingRecoveryOperations struct {
+	testNativeSessionOperations
+	resource string
+	started  chan struct{}
+	release  chan struct{}
+	once     sync.Once
+}
+
+func (o *blockingRecoveryOperations) RecoverPending(ctx context.Context, _ *qurl.AgentRuntimeBinding, _ []byte,
+	resourceID string, _ map[string]struct{}, _ []qurl.AgentRuntimeUDPOption,
+) error {
+	if resourceID != o.resource {
+		return nil
+	}
+	o.once.Do(func() { close(o.started) })
+	select {
+	case <-o.release:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+type prepareFenceOperations struct {
+	testNativeSessionOperations
+	mu             sync.Mutex
+	prepares       int
+	secondPrepared chan struct{}
+	secondReady    chan struct{}
+	readyOnce      sync.Once
+	prepareOnce    sync.Once
+}
+
+func (o *prepareFenceOperations) RecoverPending(_ context.Context, _ *qurl.AgentRuntimeBinding, _ []byte,
+	resourceID string, _ map[string]struct{}, _ []qurl.AgentRuntimeUDPOption,
+) error {
+	if resourceID == "resource-two" {
+		o.readyOnce.Do(func() { close(o.secondReady) })
+	}
+	return nil
+}
+
+func (o *prepareFenceOperations) PrepareDispatch(_ context.Context, _ *qurl.AgentRuntimeBinding, _ []byte,
+	knockResourceID, protectedResourceID, runID string, runAttempt uint64,
+) (*qurl.NativeSessionOperation, error) {
+	o.mu.Lock()
+	o.prepares++
+	if o.prepares == 2 {
+		o.prepareOnce.Do(func() { close(o.secondPrepared) })
+	}
+	o.mu.Unlock()
+	return &qurl.NativeSessionOperation{
+		ResourceID: knockResourceID, ProtectedResourceID: protectedResourceID,
+		OperationID: runID, RunID: runID, RunAttempt: runAttempt,
+	}, nil
+}
+
+func (o *makeBeforeBreakTestOperations) RecoverPending(_ context.Context, _ *qurl.AgentRuntimeBinding, _ []byte,
+	_ string, preserve map[string]struct{}, _ []qurl.AgentRuntimeUDPOption,
+) error {
+	copySet := make(map[string]struct{}, len(preserve))
+	for operationID := range preserve {
+		copySet[operationID] = struct{}{}
+	}
+	o.preserves = append(o.preserves, copySet)
+	return nil
+}
+
+func (*makeBeforeBreakTestOperations) RecoverOperation(context.Context, *qurl.AgentRuntimeBinding, []byte,
+	string, string, []qurl.AgentRuntimeUDPOption,
+) error {
+	return nil
+}
+
+func (o *makeBeforeBreakTestOperations) PrepareDispatch(_ context.Context, _ *qurl.AgentRuntimeBinding, _ []byte,
+	knockResourceID, protectedResourceID, runID string, runAttempt uint64,
+) (*qurl.NativeSessionOperation, error) {
+	o.next++
+	return &qurl.NativeSessionOperation{
+		OperationID: fmt.Sprintf("operation-%d", o.next), ResourceID: knockResourceID,
+		ProtectedResourceID: protectedResourceID, RunID: runID, RunAttempt: runAttempt,
+	}, nil
+}
+
+func (*makeBeforeBreakTestOperations) RecordMapped(context.Context, string, qurl.NativeSessionOperation, qurl.NativeSessionReceipt) error {
+	return nil
+}
+
+func (*makeBeforeBreakTestOperations) Retire(context.Context, *qurl.AgentRuntimeBinding, []byte,
+	string, string, qurl.NativeSessionReceipt, []qurl.AgentRuntimeUDPOption,
+) error {
 	return nil
 }
 
@@ -127,6 +359,62 @@ func TestOpenNativeRuntimeAutomaticallyRetriesAssignmentRefresh(t *testing.T) {
 	}
 	if err := runtime.Close(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestNativeAdmitterKeepsSourceFencedRecoveryOutOfRefreshClassifier(t *testing.T) {
+	admitter := &NativeAdmitter{
+		binding: &qurl.AgentRuntimeBinding{AgentID: "agent-one"}, privateKey: make([]byte, 32),
+		operations: recoveryFailureOperations{err: nativeudp.ErrNoReply}, generation: 7,
+	}
+	admission, err, generation, refreshEligible := admitter.admitOnce(context.Background(), "q_catalog", "resource-one")
+	if !reflect.DeepEqual(admission, Admission{}) || err == nil || generation != 7 || refreshEligible || !refreshableKnockError(err) {
+		t.Fatalf("recovery refresh classification = %#v, %v, generation=%d, eligible=%t", admission, err, generation, refreshEligible)
+	}
+}
+
+func TestNativeAdmitterRetirementFailurePreservesPlacementFailureBudget(t *testing.T) {
+	want := errors.New("retirement failed")
+	receipt := testSessionReceipt(1, "run-one", 1)
+	key := admissionKey(receipt)
+	admitter := &NativeAdmitter{
+		binding: &qurl.AgentRuntimeBinding{AgentID: "agent-one"}, privateKey: make([]byte, 32),
+		operations: retirementFailureOperations{err: want}, generation: 7,
+		failureGen: 7, failures: 4,
+		live: map[nativeAdmissionKey]nativeLiveAdmission{
+			key: {resourceID: "resource-one", operationID: "operation-one", receipt: receipt},
+		},
+		pending: map[nativeAdmissionKey]bool{key: true},
+	}
+	if _, err := admitter.Admit(context.Background(), "q_catalog", "resource-one"); !errors.Is(err, want) {
+		t.Fatalf("Admit() = %v, want retirement failure", err)
+	}
+	if admitter.failureGen != 7 || admitter.failures != 4 {
+		t.Fatalf("placement budget after retirement failure = generation %d count %d, want 7/4", admitter.failureGen, admitter.failures)
+	}
+}
+
+func TestNativeAdmitterClassifiesKnockWithoutCleanupSentinels(t *testing.T) {
+	oldKnock := knockNativeRuntime
+	t.Cleanup(func() { knockNativeRuntime = oldKnock })
+	knockNativeRuntime = func(context.Context, *qurl.AgentRuntimeBinding, []byte, string,
+		qurl.NativeKnockOptions, ...qurl.AgentRuntimeUDPOption,
+	) (*qurl.NativeKnockResult, error) {
+		return nil, nativeudp.ErrNoReply
+	}
+	admitter := &NativeAdmitter{
+		binding: &qurl.AgentRuntimeBinding{AgentID: "agent-one"}, privateKey: make([]byte, 32),
+		operations: cleanupFailureOperations{err: qurl.ErrMalformedReply},
+	}
+	_, err := admitter.Admit(context.Background(), "q_catalog", "resource-one")
+	if !errors.Is(err, nativeudp.ErrNoReply) {
+		t.Fatalf("Admit() = %v, want primary no-reply sentinel", err)
+	}
+	if errors.Is(err, qurl.ErrMalformedReply) {
+		t.Fatalf("cleanup sentinel escaped into placement classification: %v", err)
+	}
+	if !strings.Contains(err.Error(), "durable native session cleanup also failed") {
+		t.Fatalf("cleanup diagnostic missing from %v", err)
 	}
 }
 
@@ -598,7 +886,8 @@ func TestNativeAdmitterRecoversSustainedStaleAssignmentWithoutOperatorInput(t *t
 	}
 	admitter := &NativeAdmitter{
 		binding: &qurl.AgentRuntimeBinding{AgentID: "agent-one"}, privateKey: make([]byte, 32),
-		store: store, refreshCfg: nativeRefreshConfig{AgentID: "agent-one", RefreshMode: "auto"},
+		operations: testNativeSessionOperations{},
+		store:      store, refreshCfg: nativeRefreshConfig{AgentID: "agent-one", RefreshMode: "auto"},
 	}
 	for attempt := 1; attempt < 5; attempt++ {
 		if _, err := admitter.Admit(context.Background(), "q_catalog_key", "public-resource"); !errors.Is(err, nativeudp.ErrTransport) {
@@ -630,8 +919,9 @@ func TestNativeAdmitterBindsProtectedResourceIntoKnock(t *testing.T) {
 	knockNativeRuntime = func(_ context.Context, _ *qurl.AgentRuntimeBinding, _ []byte, knockResourceID string,
 		opts qurl.NativeKnockOptions, _ ...qurl.AgentRuntimeUDPOption,
 	) (*qurl.NativeKnockResult, error) {
-		if knockResourceID != "q_catalog_key" || opts.ProtectedResourceID != want {
-			t.Fatalf("knock binding = catalog %q protected %q", knockResourceID, opts.ProtectedResourceID)
+		if knockResourceID != "q_catalog_key" || opts.ProtectedResourceID != want || opts.Operation == nil ||
+			opts.Operation.ResourceID != knockResourceID || opts.Operation.ProtectedResourceID != want {
+			t.Fatalf("knock binding = catalog %q protected %q operation %#v", knockResourceID, opts.ProtectedResourceID, opts.Operation)
 		}
 		return &qurl.NativeKnockResult{
 			ACToken: "token", ResourceHost: "127.0.0.1:7000", SessionID: 77, OpenTime: 60,
@@ -640,9 +930,330 @@ func TestNativeAdmitterBindsProtectedResourceIntoKnock(t *testing.T) {
 	}
 	admitter := &NativeAdmitter{
 		binding: &qurl.AgentRuntimeBinding{AgentID: "agent-one"}, privateKey: make([]byte, 32),
-		store: &memoryNativeStore{},
+		operations: testNativeSessionOperations{},
+		store:      &memoryNativeStore{},
 	}
 	if _, err := admitter.Admit(context.Background(), "q_catalog_key", want); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestNativeAdmitterSlowRecoveryDoesNotBlockSiblingResource(t *testing.T) {
+	oldKnock := knockNativeRuntime
+	t.Cleanup(func() { knockNativeRuntime = oldKnock })
+	var knockMu sync.Mutex
+	nextSession := uint64(90)
+	knockNativeRuntime = func(_ context.Context, _ *qurl.AgentRuntimeBinding, _ []byte, _ string,
+		opts qurl.NativeKnockOptions, _ ...qurl.AgentRuntimeUDPOption,
+	) (*qurl.NativeKnockResult, error) {
+		knockMu.Lock()
+		nextSession++
+		sessionID := nextSession
+		knockMu.Unlock()
+		return &qurl.NativeKnockResult{
+			ACToken: "token", ResourceHost: "127.0.0.1:7000", SessionID: sessionID, OpenTime: 60,
+			SessionReceipt: testSessionReceipt(sessionID, opts.RunID, opts.RunAttempt),
+		}, nil
+	}
+	operations := &blockingRecoveryOperations{
+		resource: "resource-one", started: make(chan struct{}), release: make(chan struct{}),
+	}
+	admitter := &NativeAdmitter{
+		binding: &qurl.AgentRuntimeBinding{AgentID: "agent-one"}, privateKey: make([]byte, 32),
+		operations: operations, store: &memoryNativeStore{},
+	}
+	defer admitter.Close()
+
+	firstDone := make(chan error, 1)
+	go func() {
+		_, err := admitter.Admit(context.Background(), "q_one", "resource-one")
+		firstDone <- err
+	}()
+	select {
+	case <-operations.started:
+	case <-time.After(time.Second):
+		t.Fatal("slow recovery did not start")
+	}
+	secondDone := make(chan error, 1)
+	go func() {
+		_, err := admitter.Admit(context.Background(), "q_two", "resource-two")
+		secondDone <- err
+	}()
+	select {
+	case err := <-secondDone:
+		if err != nil {
+			t.Fatalf("sibling admission = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("slow recovery blocked an unrelated resource")
+	}
+	close(operations.release)
+	if err := <-firstDone; err != nil {
+		t.Fatalf("released admission = %v", err)
+	}
+}
+
+func TestNativeAdmitterPreparedRefreshDoesNotBlockSiblingResource(t *testing.T) {
+	oldKnock := knockNativeRuntime
+	oldRefresh := refreshNativeRuntime
+	oldWait := waitNativeRefresh
+	oldTakeKey := takeNativeKey
+	t.Cleanup(func() {
+		knockNativeRuntime = oldKnock
+		refreshNativeRuntime = oldRefresh
+		waitNativeRefresh = oldWait
+		takeNativeKey = oldTakeKey
+	})
+
+	var knockMu sync.Mutex
+	nextSession := uint64(120)
+	knockNativeRuntime = func(_ context.Context, _ *qurl.AgentRuntimeBinding, _ []byte, _ string,
+		opts qurl.NativeKnockOptions, _ ...qurl.AgentRuntimeUDPOption,
+	) (*qurl.NativeKnockResult, error) {
+		knockMu.Lock()
+		nextSession++
+		sessionID := nextSession
+		knockMu.Unlock()
+		return &qurl.NativeKnockResult{
+			ACToken: "token", ResourceHost: "127.0.0.1:7000", SessionID: sessionID, OpenTime: 60,
+			SessionReceipt: testSessionReceipt(sessionID, opts.RunID, opts.RunAttempt),
+		}, nil
+	}
+	waitNativeRefresh = func(context.Context, time.Duration) error { return nil }
+	takeNativeKey = func(*qurl.AgentRuntimeBinding) []byte { return make([]byte, 32) }
+	refreshPrepared := make(chan struct{})
+	refreshNativeRuntime = func(context.Context, qurl.HubBootstrap, qurl.AgentStateStore,
+		...qurl.AgentRuntimeRefreshOption,
+	) (*qurl.Client, *qurl.AgentRuntimeBinding, error) {
+		close(refreshPrepared)
+		return &qurl.Client{}, &qurl.AgentRuntimeBinding{AgentID: "agent-one"}, nil
+	}
+
+	operations := &blockingRecoveryOperations{
+		resource: "resource-one", started: make(chan struct{}), release: make(chan struct{}),
+	}
+	admitter := &NativeAdmitter{
+		binding: &qurl.AgentRuntimeBinding{AgentID: "agent-one"}, privateKey: make([]byte, 32),
+		operations: operations, store: &memoryNativeStore{},
+		refreshCfg: nativeRefreshConfig{AgentID: "agent-one", RefreshMode: "auto"},
+	}
+	defer admitter.Close()
+
+	firstDone := make(chan error, 1)
+	go func() {
+		_, err := admitter.Admit(context.Background(), "q_one", "resource-one")
+		firstDone <- err
+	}()
+	select {
+	case <-operations.started:
+	case <-time.After(time.Second):
+		t.Fatal("slow recovery did not start")
+	}
+	refreshDone := make(chan error, 1)
+	go func() { refreshDone <- admitter.refresh(context.Background(), 0) }()
+	select {
+	case <-refreshPrepared:
+	case <-time.After(time.Second):
+		t.Fatal("replacement runtime was not prepared")
+	}
+
+	secondDone := make(chan error, 1)
+	go func() {
+		_, err := admitter.Admit(context.Background(), "q_two", "resource-two")
+		secondDone <- err
+	}()
+	select {
+	case err := <-secondDone:
+		if err != nil {
+			t.Fatalf("sibling admission = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("prepared refresh blocked an unrelated resource")
+	}
+	close(operations.release)
+	if err := <-firstDone; err != nil {
+		t.Fatalf("released admission = %v", err)
+	}
+	if err := <-refreshDone; err != nil {
+		t.Fatalf("refresh = %v", err)
+	}
+}
+
+func TestNativeAdmitterRefreshQueuesAfterBoundedReaderGrace(t *testing.T) {
+	admitter := &NativeAdmitter{}
+	admitter.runtimeMu.RLock()
+	refreshDone := make(chan error, 1)
+	go func() { refreshDone <- admitter.lockRuntimeForRefresh(context.Background()) }()
+
+	// After the bounded grace, the refresh has a real queued writer. A reader
+	// arriving now must wait instead of extending writer starvation.
+	time.Sleep(runtimeRefreshReaderGrace + 100*time.Millisecond)
+	readerAcquired := make(chan struct{})
+	go func() {
+		admitter.runtimeMu.RLock()
+		close(readerAcquired)
+		admitter.runtimeMu.RUnlock()
+	}()
+	select {
+	case <-readerAcquired:
+		t.Fatal("reader bypassed a queued runtime refresh")
+	case <-time.After(25 * time.Millisecond):
+	}
+
+	admitter.runtimeMu.RUnlock()
+	select {
+	case err := <-refreshDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("queued runtime refresh did not acquire the lock")
+	}
+	select {
+	case <-readerAcquired:
+		t.Fatal("reader acquired while refresh owned the runtime lock")
+	default:
+	}
+	admitter.runtimeMu.Unlock()
+	select {
+	case <-readerAcquired:
+	case <-time.After(time.Second):
+		t.Fatal("reader did not resume after refresh released the lock")
+	}
+}
+
+func TestNativeAdmitterRefreshLockHonorsCancellationDuringReaderGrace(t *testing.T) {
+	admitter := &NativeAdmitter{}
+	admitter.runtimeMu.RLock()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := admitter.lockRuntimeForRefresh(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled refresh lock = %v, want context cancellation", err)
+	}
+	admitter.runtimeMu.RUnlock()
+	admitter.runtimeMu.Lock()
+	admitter.runtimeMu.Unlock()
+}
+
+func TestNativeAdmitterSerializesOnlyPrepareCommitAndKnockAcrossResources(t *testing.T) {
+	oldKnock := knockNativeRuntime
+	t.Cleanup(func() { knockNativeRuntime = oldKnock })
+	firstKnock := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	var once sync.Once
+	var resultMu sync.Mutex
+	nextSession := uint64(100)
+	knockNativeRuntime = func(ctx context.Context, _ *qurl.AgentRuntimeBinding, _ []byte, _ string,
+		opts qurl.NativeKnockOptions, _ ...qurl.AgentRuntimeUDPOption,
+	) (*qurl.NativeKnockResult, error) {
+		blocked := false
+		once.Do(func() {
+			blocked = true
+			close(firstKnock)
+		})
+		if blocked {
+			select {
+			case <-releaseFirst:
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		}
+		resultMu.Lock()
+		nextSession++
+		sessionID := nextSession
+		resultMu.Unlock()
+		return &qurl.NativeKnockResult{
+			ACToken: "token", ResourceHost: "127.0.0.1:7000", SessionID: sessionID, OpenTime: 60,
+			SessionReceipt: testSessionReceipt(sessionID, opts.RunID, opts.RunAttempt),
+		}, nil
+	}
+	operations := &prepareFenceOperations{
+		secondPrepared: make(chan struct{}), secondReady: make(chan struct{}),
+	}
+	admitter := &NativeAdmitter{
+		binding: &qurl.AgentRuntimeBinding{AgentID: "agent-one"}, privateKey: make([]byte, 32),
+		operations: operations, store: &memoryNativeStore{},
+	}
+	defer admitter.Close()
+	firstDone := make(chan error, 1)
+	go func() {
+		_, err := admitter.Admit(context.Background(), "q_one", "resource-one")
+		firstDone <- err
+	}()
+	select {
+	case <-firstKnock:
+	case <-time.After(time.Second):
+		t.Fatal("first knock did not start")
+	}
+	secondDone := make(chan error, 1)
+	go func() {
+		_, err := admitter.Admit(context.Background(), "q_two", "resource-two")
+		secondDone <- err
+	}()
+	select {
+	case <-operations.secondReady:
+	case <-time.After(time.Second):
+		t.Fatal("sibling did not finish independent recovery")
+	}
+	select {
+	case <-operations.secondPrepared:
+		t.Fatal("sibling prepared while the first operation had not finished its knock")
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(releaseFirst)
+	if err := <-firstDone; err != nil {
+		t.Fatalf("first admission = %v", err)
+	}
+	if err := <-secondDone; err != nil {
+		t.Fatalf("second admission = %v", err)
+	}
+	select {
+	case <-operations.secondPrepared:
+	default:
+		t.Fatal("sibling did not prepare after the first knock completed")
+	}
+}
+
+func TestNativeAdmitterPreservesServingOperationDuringMakeBeforeBreak(t *testing.T) {
+	oldKnock := knockNativeRuntime
+	t.Cleanup(func() { knockNativeRuntime = oldKnock })
+	knocks := 0
+	knockNativeRuntime = func(_ context.Context, _ *qurl.AgentRuntimeBinding, _ []byte, _ string,
+		opts qurl.NativeKnockOptions, _ ...qurl.AgentRuntimeUDPOption,
+	) (*qurl.NativeKnockResult, error) {
+		knocks++
+		receipt := testSessionReceipt(uint64(knocks), opts.RunID, opts.RunAttempt)
+		return &qurl.NativeKnockResult{
+			ACToken: "token", ResourceHost: "127.0.0.1:7000", SessionID: uint64(knocks), OpenTime: 60,
+			SessionReceipt: receipt,
+		}, nil
+	}
+	operations := &makeBeforeBreakTestOperations{}
+	admitter := &NativeAdmitter{
+		binding: &qurl.AgentRuntimeBinding{AgentID: "agent-one"}, privateKey: make([]byte, 32),
+		store: &memoryNativeStore{}, operations: operations,
+	}
+	first, err := admitter.Admit(context.Background(), "q_catalog_key", "public-resource")
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := admitter.Admit(context.Background(), "q_catalog_key", "public-resource")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(admitter.live) != 2 || len(operations.preserves) != 2 {
+		t.Fatalf("make-before-break live=%d preserve calls=%d", len(admitter.live), len(operations.preserves))
+	}
+	if len(operations.preserves[0]) != 0 {
+		t.Fatalf("first admission preserved stale operations: %+v", operations.preserves[0])
+	}
+	if _, ok := operations.preserves[1]["operation-1"]; !ok || len(operations.preserves[1]) != 1 {
+		t.Fatalf("replacement did not preserve serving operation: %+v", operations.preserves[1])
+	}
+	if err := admitter.Retire(context.Background(), first); err != nil {
+		t.Fatal(err)
+	}
+	if err := admitter.Retire(context.Background(), second); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -725,7 +1336,8 @@ func TestNativeAdmitterRefreshesOnlySustainedPlacementFailures(t *testing.T) {
 			}
 			admitter := &NativeAdmitter{
 				binding: &qurl.AgentRuntimeBinding{AgentID: "agent-one"}, privateKey: make([]byte, 32),
-				store: store, refreshCfg: nativeRefreshConfig{AgentID: "agent-one", RefreshMode: "auto"},
+				operations: testNativeSessionOperations{},
+				store:      store, refreshCfg: nativeRefreshConfig{AgentID: "agent-one", RefreshMode: "auto"},
 			}
 			for attempt := 0; attempt < 5; attempt++ {
 				_, _ = admitter.Admit(context.Background(), "q_catalog_key", "public-resource")
@@ -762,7 +1374,8 @@ func TestNativeAdmitterDisabledModeDoesNotRefreshAfterLiveFailures(t *testing.T)
 	store := &memoryNativeStore{}
 	admitter := &NativeAdmitter{
 		binding: &qurl.AgentRuntimeBinding{AgentID: "agent-one"}, privateKey: make([]byte, 32),
-		store: store, refreshCfg: nativeRefreshConfig{AgentID: "agent-one", RefreshMode: "disabled"},
+		operations: testNativeSessionOperations{},
+		store:      store, refreshCfg: nativeRefreshConfig{AgentID: "agent-one", RefreshMode: "disabled"},
 	}
 	for attempt := 1; attempt <= 4; attempt++ {
 		if _, err := admitter.Admit(context.Background(), "q_catalog_key", "public-resource"); !errors.Is(err, nativeudp.ErrNoReply) {
@@ -804,7 +1417,8 @@ func TestNativeAdmitterCountsOnlyConsecutivePlacementFailures(t *testing.T) {
 	store := &memoryNativeStore{}
 	admitter := &NativeAdmitter{
 		binding: &qurl.AgentRuntimeBinding{AgentID: "agent-one"}, privateKey: make([]byte, 32),
-		store: store, refreshCfg: nativeRefreshConfig{AgentID: "agent-one", RefreshMode: "auto"},
+		operations: testNativeSessionOperations{},
+		store:      store, refreshCfg: nativeRefreshConfig{AgentID: "agent-one", RefreshMode: "auto"},
 	}
 	for attempt := 1; attempt <= 9; attempt++ {
 		_, _ = admitter.Admit(context.Background(), "q_catalog_key", "public-resource")
@@ -833,14 +1447,16 @@ func TestNativeAdmitterDoesNotRetainEnrollmentCredential(t *testing.T) {
 		return "enroll-token", nil
 	}
 	runtime := &NativeRuntime{
-		Binding: &qurl.AgentRuntimeBinding{AgentID: "agent-one"},
-		store:   &memoryNativeStore{},
+		Binding:           &qurl.AgentRuntimeBinding{AgentID: "agent-one"},
+		store:             &memoryNativeStore{},
+		SessionOperations: testNativeSessionAuthority(),
 		refreshCfg: refreshConfig(NativeRuntimeConfig{
 			StateDir: "/private/state", AgentID: "agent-one",
 			EnrollmentCredential: "secret", EnrollmentCredentialProvider: provider,
+			SessionOperations: testNativeSessionAuthority(),
 		}, "auto"),
 	}
-	admitter, err := NewNativeAdmitter(runtime)
+	admitter, err := NewNativeAdmitter(context.Background(), runtime)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -852,8 +1468,142 @@ func TestNativeAdmitterDoesNotRetainEnrollmentCredential(t *testing.T) {
 	// fields; this assertion also guards accidental retention via the runtime.
 	if runtime.refreshCfg.StateDir != "" || runtime.refreshCfg.AgentID != "" ||
 		runtime.refreshCfg.ClientBaseURL != "" || runtime.refreshCfg.RefreshMode != "" ||
-		len(runtime.refreshCfg.UDPOptions) != 0 {
+		len(runtime.refreshCfg.UDPOptions) != 0 || runtime.SessionOperations != (NativeSessionOperationAuthority{}) {
 		t.Fatalf("transferred runtime retained refresh config = %+v", runtime.refreshCfg)
+	}
+}
+
+func TestNewNativeAdmitterStartsWhileOrphanRecoveryRetriesAndCloseCancels(t *testing.T) {
+	oldTakeKey := takeNativeKey
+	oldRecover := recoverNativeSessionOperation
+	t.Cleanup(func() {
+		takeNativeKey = oldTakeKey
+		recoverNativeSessionOperation = oldRecover
+	})
+	takeNativeKey = func(*qurl.AgentRuntimeBinding) []byte { return make([]byte, 32) }
+	store := &memoryNativeStore{}
+	prepared := testPreparedDurableRecord(t)
+	if err := store.CreateSessionOperation(context.Background(), prepared); err != nil {
+		t.Fatal(err)
+	}
+	dispatching := prepared
+	dispatching.Status = agentstate.SessionOperationDispatching
+	if err := store.TransitionSessionOperation(context.Background(), prepared, dispatching); err != nil {
+		t.Fatal(err)
+	}
+	started := make(chan struct{})
+	var once sync.Once
+	recoverNativeSessionOperation = func(ctx context.Context, _ *qurl.AgentRuntimeBinding, _ []byte,
+		_ qurl.NativeSessionOperation, _ qurl.NHPUDPEndpoint, _ ...qurl.AgentRuntimeUDPOption,
+	) (*qurl.NativeSessionOperationRecovery, error) {
+		once.Do(func() { close(started) })
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	runtime := &NativeRuntime{
+		Binding: &qurl.AgentRuntimeBinding{AgentID: "agent-one"}, store: store,
+		SessionOperations: testNativeSessionAuthority(),
+	}
+	admitter, err := NewNativeAdmitter(context.Background(), runtime)
+	if err != nil {
+		t.Fatalf("NewNativeAdmitter blocked on orphan recovery: %v", err)
+	}
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("background orphan recovery did not start")
+	}
+	closed := make(chan error, 1)
+	go func() { closed <- admitter.Close() }()
+	select {
+	case err := <-closed:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Close did not cancel background orphan recovery")
+	}
+}
+
+func TestNewNativeAdmitterCallerCancellationStopsOrphanRecovery(t *testing.T) {
+	oldTakeKey := takeNativeKey
+	oldRecover := recoverNativeSessionOperation
+	t.Cleanup(func() {
+		takeNativeKey = oldTakeKey
+		recoverNativeSessionOperation = oldRecover
+	})
+	takeNativeKey = func(*qurl.AgentRuntimeBinding) []byte { return make([]byte, 32) }
+	store := &memoryNativeStore{}
+	prepared := testPreparedDurableRecord(t)
+	prepared.Status = agentstate.SessionOperationDispatching
+	if err := store.CreateSessionOperation(context.Background(), prepared); err != nil {
+		t.Fatal(err)
+	}
+	started := make(chan struct{})
+	stopped := make(chan struct{})
+	var once sync.Once
+	recoverNativeSessionOperation = func(ctx context.Context, _ *qurl.AgentRuntimeBinding, _ []byte,
+		_ qurl.NativeSessionOperation, _ qurl.NHPUDPEndpoint, _ ...qurl.AgentRuntimeUDPOption,
+	) (*qurl.NativeSessionOperationRecovery, error) {
+		once.Do(func() { close(started) })
+		<-ctx.Done()
+		close(stopped)
+		return nil, ctx.Err()
+	}
+	runtime := &NativeRuntime{
+		Binding: &qurl.AgentRuntimeBinding{AgentID: "agent-one"}, store: store,
+		SessionOperations: testNativeSessionAuthority(),
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	admitter, err := NewNativeAdmitter(ctx, runtime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("background orphan recovery did not start")
+	}
+	cancel()
+	select {
+	case <-stopped:
+	case <-time.After(2 * time.Second):
+		t.Fatal("caller cancellation did not stop background orphan recovery")
+	}
+	if err := admitter.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestNativeAdmitterCloseDoesNotRaceLifecycleBinding(t *testing.T) {
+	lifecycle, cancelLifecycle := context.WithCancel(context.Background())
+	admitter := &NativeAdmitter{
+		lifecycle: lifecycle,
+		cancel:    cancelLifecycle,
+		live:      make(map[nativeAdmissionKey]nativeLiveAdmission),
+		pending:   make(map[nativeAdmissionKey]bool),
+	}
+	started := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		close(started)
+		for {
+			ctx, cancel := admitter.withLifecycle(context.Background())
+			cancel()
+			if ctx.Err() != nil {
+				close(done)
+				return
+			}
+		}
+	}()
+	<-started
+	if err := admitter.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("lifecycle binding did not observe close cancellation")
 	}
 }
 
@@ -872,7 +1622,8 @@ func TestNativeAdmitterRetiresOnlyExactLiveSessions(t *testing.T) {
 	receipt2 := testSessionReceipt(2, "run-two", 1)
 	admitter := &NativeAdmitter{
 		binding: &qurl.AgentRuntimeBinding{AgentID: "agent-one"}, privateKey: make([]byte, 32),
-		store: &memoryNativeStore{},
+		operations: testNativeSessionOperations{},
+		store:      &memoryNativeStore{},
 		live: map[nativeAdmissionKey]nativeLiveAdmission{
 			admissionKey(receipt1): {resourceID: "resource-one", receipt: receipt1},
 			admissionKey(receipt2): {resourceID: "resource-two", receipt: receipt2},
@@ -930,7 +1681,8 @@ func TestNativeAdmitterCloseAttemptsEveryLiveSessionWithinSharedBudget(t *testin
 
 	admitter := &NativeAdmitter{
 		binding: &qurl.AgentRuntimeBinding{AgentID: "agent-one"}, privateKey: make([]byte, 32),
-		store: &memoryNativeStore{},
+		operations: testNativeSessionOperations{},
+		store:      &memoryNativeStore{},
 		live: map[nativeAdmissionKey]nativeLiveAdmission{
 			admissionKey(firstReceipt):  {resourceID: "resource-one", receipt: firstReceipt},
 			admissionKey(secondReceipt): {resourceID: "resource-two", receipt: secondReceipt},
@@ -978,7 +1730,8 @@ func TestNativeAdmitterKeepsSameNumericSessionIDsFromDifferentCellsDistinct(t *t
 
 	admitter := &NativeAdmitter{
 		binding: &qurl.AgentRuntimeBinding{AgentID: "agent-one"}, privateKey: make([]byte, 32),
-		store: &memoryNativeStore{},
+		operations: testNativeSessionOperations{},
+		store:      &memoryNativeStore{},
 	}
 	first, err := admitter.Admit(context.Background(), "q_one", "resource-one")
 	if err != nil {
@@ -1038,7 +1791,8 @@ func TestNativeAdmitterRetiresPostACKAdmissionRejectedByLocalValidation(t *testi
 	newAdmitter := func() *NativeAdmitter {
 		return &NativeAdmitter{
 			binding: &qurl.AgentRuntimeBinding{AgentID: "agent-one"}, privateKey: make([]byte, 32),
-			store: &memoryNativeStore{},
+			operations: testNativeSessionOperations{},
+			store:      &memoryNativeStore{},
 		}
 	}
 	t.Run("successful cleanup", func(t *testing.T) {
@@ -1060,8 +1814,9 @@ func TestNativeAdmitterRetiresPostACKAdmissionRejectedByLocalValidation(t *testi
 		malformed = true
 		admitter := newAdmitter()
 		_, err := admitter.Admit(context.Background(), "q_one", "resource-one")
-		if err == nil || !errors.Is(err, nativeudp.ErrNoReply) {
-			t.Fatalf("Admit() = %v, want joined local-validation and retirement failure", err)
+		if err == nil || errors.Is(err, nativeudp.ErrNoReply) ||
+			!strings.Contains(err.Error(), "durable native session cleanup also failed") {
+			t.Fatalf("Admit() = %v, want primary local-validation error with secondary retirement diagnostic", err)
 		}
 		if retireCalls != 1 || len(admitter.live) != 1 || len(admitter.pending) != 1 {
 			t.Fatalf("retained cleanup calls=%d live=%d pending=%d", retireCalls, len(admitter.live), len(admitter.pending))
@@ -1116,9 +1871,10 @@ func TestNativeAdmitterRetriesFailedRetirementBeforeSameResourceReplacement(t *t
 	}
 	admitter := &NativeAdmitter{
 		binding: &qurl.AgentRuntimeBinding{AgentID: "agent-one"}, privateKey: make([]byte, 32),
-		store:   &memoryNativeStore{},
-		live:    map[nativeAdmissionKey]nativeLiveAdmission{admissionKey(receipt): {resourceID: "resource-one", receipt: receipt}},
-		pending: make(map[nativeAdmissionKey]bool),
+		operations: testNativeSessionOperations{},
+		store:      &memoryNativeStore{},
+		live:       map[nativeAdmissionKey]nativeLiveAdmission{admissionKey(receipt): {resourceID: "resource-one", receipt: receipt}},
+		pending:    make(map[nativeAdmissionKey]bool),
 	}
 	defer admitter.Close()
 
