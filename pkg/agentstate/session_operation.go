@@ -37,7 +37,13 @@ const (
 	SessionOperationClosed      = "CLOSED"
 )
 
-var ErrSessionOperationConflict = errors.New("native session operation state conflict")
+var (
+	ErrSessionOperationConflict = errors.New("native session operation state conflict")
+	// ErrSessionOperationJournalCorrupt means durable ambiguity cannot be
+	// resolved safely. Callers must not delete the journal or open a replacement
+	// session because the prior admission may still be live.
+	ErrSessionOperationJournalCorrupt = errors.New("native session operation journal is corrupt")
+)
 
 // SessionOperationAdmission is the non-secret exact-session receipt retained
 // after an authenticated admission. It carries no AC token.
@@ -266,7 +272,8 @@ func loadSessionOperationJournal(namespace *pinnedfs.Directory, name string) (jo
 	}
 	journal, err = decodeSessionOperationJournal(raw)
 	if err != nil {
-		return sessionOperationJournal{}, false, fmt.Errorf("decode native session operation %s: %w", path, err)
+		return sessionOperationJournal{}, false, fmt.Errorf("%w: decode %s: %w",
+			ErrSessionOperationJournalCorrupt, path, err)
 	}
 	return journal, true, nil
 }

@@ -373,6 +373,83 @@ func TestDurableNativeSessionRecoveryRejectsNilResult(t *testing.T) {
 	}
 }
 
+func TestDurableNativeSessionRecoveryContinuesAfterAdmissionExpiry(t *testing.T) {
+	oldRecover := recoverNativeSessionOperation
+	t.Cleanup(func() { recoverNativeSessionOperation = oldRecover })
+	store := &memoryNativeStore{}
+	prepared := testPreparedDurableRecord(t)
+	if err := store.CreateSessionOperation(context.Background(), prepared); err != nil {
+		t.Fatal(err)
+	}
+	dispatching := prepared
+	dispatching.Status = agentstate.SessionOperationDispatching
+	if err := store.TransitionSessionOperation(context.Background(), prepared, dispatching); err != nil {
+		t.Fatal(err)
+	}
+	controller, err := newDurableNativeSessionOperations(store, testNativeSessionAuthority())
+	if err != nil {
+		t.Fatal(err)
+	}
+	controller.clock = func() time.Time { return time.UnixMilli(dispatching.Operation.ExpiresAtMillis + 1).UTC() }
+	recoverNativeSessionOperation = func(_ context.Context, _ *qurl.AgentRuntimeBinding, _ []byte,
+		operation qurl.NativeSessionOperation, _ qurl.NHPUDPEndpoint, _ ...qurl.AgentRuntimeUDPOption,
+	) (*qurl.NativeSessionOperationRecovery, error) {
+		if operation.ExpiresAtMillis >= controller.clock().UnixMilli() {
+			t.Fatal("fixture did not cross the admission expiry")
+		}
+		return &qurl.NativeSessionOperationRecovery{Complete: true}, nil
+	}
+	if err := controller.RecoverOperation(context.Background(), &qurl.AgentRuntimeBinding{AgentID: "agent-one"},
+		make([]byte, 32), testProtectedResourceID, dispatching.Operation.OperationID, nil); err != nil {
+		t.Fatal(err)
+	}
+	if records, err := store.LoadSessionOperations(context.Background(), testProtectedResourceID); err != nil || len(records) != 0 {
+		t.Fatalf("expired operation recovery records=%+v err=%v", records, err)
+	}
+}
+
+func TestDurableNativeSessionRecoveryHonorsCallerBudget(t *testing.T) {
+	oldRecover := recoverNativeSessionOperation
+	oldWait := waitNativeSessionRecovery
+	t.Cleanup(func() {
+		recoverNativeSessionOperation = oldRecover
+		waitNativeSessionRecovery = oldWait
+	})
+	store := &memoryNativeStore{}
+	prepared := testPreparedDurableRecord(t)
+	if err := store.CreateSessionOperation(context.Background(), prepared); err != nil {
+		t.Fatal(err)
+	}
+	dispatching := prepared
+	dispatching.Status = agentstate.SessionOperationDispatching
+	if err := store.TransitionSessionOperation(context.Background(), prepared, dispatching); err != nil {
+		t.Fatal(err)
+	}
+	controller, err := newDurableNativeSessionOperations(store, testNativeSessionAuthority())
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.UnixMilli(1_800_000_011_000).UTC()
+	controller.clock = func() time.Time { return now }
+	recoverNativeSessionOperation = func(context.Context, *qurl.AgentRuntimeBinding, []byte,
+		qurl.NativeSessionOperation, qurl.NHPUDPEndpoint, ...qurl.AgentRuntimeUDPOption,
+	) (*qurl.NativeSessionOperationRecovery, error) {
+		return &qurl.NativeSessionOperationRecovery{}, nil
+	}
+	waitNativeSessionRecovery = sleepWithContext
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	err = controller.RecoverOperation(ctx, &qurl.AgentRuntimeBinding{AgentID: "agent-one"},
+		make([]byte, 32), testProtectedResourceID, dispatching.Operation.OperationID, nil)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("pending recovery budget = %v, want deadline", err)
+	}
+	records, loadErr := store.LoadSessionOperations(context.Background(), testProtectedResourceID)
+	if loadErr != nil || len(records) != 1 || records[0].Status != agentstate.SessionOperationDispatching {
+		t.Fatalf("budgeted recovery lost durable state: records=%+v err=%v", records, loadErr)
+	}
+}
+
 func TestDurableNativeSessionRecoveryMapsUnexpectedAdmissionBeforeClose(t *testing.T) {
 	oldRecover := recoverNativeSessionOperation
 	oldWait := waitNativeSessionRecovery
@@ -414,7 +491,8 @@ func TestDurableNativeSessionRecoveryMapsUnexpectedAdmissionBeforeClose(t *testi
 			if current.Status != agentstate.SessionOperationDispatching {
 				t.Fatalf("unexpected admission record = %+v", current)
 			}
-			return nil, &qurl.NativeSessionOperationUnexpectedAdmissionError{SessionReceipt: receipt}
+			return &qurl.NativeSessionOperationRecovery{UnexpectedAdmission: &receipt},
+				&qurl.NativeSessionOperationUnexpectedAdmissionError{SessionReceipt: receipt}
 		}
 		if current.Status != agentstate.SessionOperationClosing || current.Admission == nil || current.Admission.SessionID != receipt.SessionID {
 			t.Fatalf("unexpected admission was not fenced before recovery: %+v", current)
@@ -430,6 +508,44 @@ func TestDurableNativeSessionRecoveryMapsUnexpectedAdmissionBeforeClose(t *testi
 	}
 	if records, err := store.LoadSessionOperations(context.Background(), testProtectedResourceID); err != nil || len(records) != 0 {
 		t.Fatalf("unexpected admission terminal records=%+v err=%v", records, err)
+	}
+}
+
+func TestDurableNativeSessionRecoveryRejectsIncompleteUnexpectedAdmission(t *testing.T) {
+	oldRecover := recoverNativeSessionOperation
+	t.Cleanup(func() { recoverNativeSessionOperation = oldRecover })
+	store := &memoryNativeStore{}
+	prepared := testPreparedDurableRecord(t)
+	if err := store.CreateSessionOperation(context.Background(), prepared); err != nil {
+		t.Fatal(err)
+	}
+	dispatching := prepared
+	dispatching.Status = agentstate.SessionOperationDispatching
+	if err := store.TransitionSessionOperation(context.Background(), prepared, dispatching); err != nil {
+		t.Fatal(err)
+	}
+	controller, err := newDurableNativeSessionOperations(store, testNativeSessionAuthority())
+	if err != nil {
+		t.Fatal(err)
+	}
+	controller.clock = func() time.Time { return time.UnixMilli(1_800_000_011_000).UTC() }
+	receipt := qurl.NativeSessionReceipt{
+		CellID: dispatching.Operation.CellID, SessionID: 91, SessionIssuedAtMillis: 1_800_000_010_000,
+		RunID: dispatching.Operation.RunID, RunAttempt: dispatching.Operation.RunAttempt,
+	}
+	recoverNativeSessionOperation = func(context.Context, *qurl.AgentRuntimeBinding, []byte,
+		qurl.NativeSessionOperation, qurl.NHPUDPEndpoint, ...qurl.AgentRuntimeUDPOption,
+	) (*qurl.NativeSessionOperationRecovery, error) {
+		return nil, &qurl.NativeSessionOperationUnexpectedAdmissionError{SessionReceipt: receipt}
+	}
+	err = controller.RecoverOperation(context.Background(), &qurl.AgentRuntimeBinding{AgentID: "agent-one"},
+		make([]byte, 32), testProtectedResourceID, dispatching.Operation.OperationID, nil)
+	if !errors.Is(err, agentstate.ErrSessionOperationConflict) {
+		t.Fatalf("incomplete unexpected admission = %v, want state conflict", err)
+	}
+	records, loadErr := store.LoadSessionOperations(context.Background(), testProtectedResourceID)
+	if loadErr != nil || len(records) != 1 || records[0].Status != agentstate.SessionOperationDispatching {
+		t.Fatalf("incomplete admission mutated journal: records=%+v err=%v", records, loadErr)
 	}
 }
 

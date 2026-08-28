@@ -213,6 +213,9 @@ func (d *durableNativeSessionOperations) RecoverOperation(ctx context.Context, b
 			if !errors.As(err, &unexpected) {
 				return fmt.Errorf("recover native session operation: %w", err)
 			}
+			if result == nil || !sameNativeSessionReceipt(result.UnexpectedAdmission, unexpected.SessionReceipt) {
+				return fmt.Errorf("%w: unexpected recovery admission receipt is incomplete", agentstate.ErrSessionOperationConflict)
+			}
 			// A recovery KNK must not admit. If a compatible authority regresses,
 			// preserve the authenticated receipt as MAPPED before any retry. The
 			// next loop moves it to CLOSING and asks the same durable server
@@ -222,7 +225,7 @@ func (d *durableNativeSessionOperations) RecoverOperation(ctx context.Context, b
 			}
 			mapped := record
 			mapped.Status = agentstate.SessionOperationMapped
-			mapped.Admission = admissionFromReceipt(unexpected.SessionReceipt)
+			mapped.Admission = admissionFromReceipt(*result.UnexpectedAdmission)
 			if transitionErr := d.store.TransitionSessionOperation(ctx, record, mapped); transitionErr != nil {
 				return fmt.Errorf("persist unexpected recovery admission: %w", transitionErr)
 			}
@@ -274,6 +277,12 @@ func (d *durableNativeSessionOperations) Retire(ctx context.Context, binding *qu
 		record = closing
 	}
 	return d.RecoverOperation(ctx, binding, privateKey, protectedResourceID, operationID, udpOptions)
+}
+
+func sameNativeSessionReceipt(left *qurl.NativeSessionReceipt, right qurl.NativeSessionReceipt) bool {
+	return left != nil && left.CellID == right.CellID && left.SessionID == right.SessionID &&
+		left.SessionIssuedAtMillis == right.SessionIssuedAtMillis && left.RunID == right.RunID &&
+		left.RunAttempt == right.RunAttempt
 }
 
 func nativeSessionRecoveryBackoff(attempt uint32) time.Duration {

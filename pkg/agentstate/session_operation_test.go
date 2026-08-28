@@ -291,6 +291,32 @@ func TestSessionOperationRecordRejectsNoncanonicalOrTamperedState(t *testing.T) 
 	}
 }
 
+func TestSDKStoreSessionOperationRetainsCorruptJournal(t *testing.T) {
+	dir := filepath.Join(realSDKTempDir(t), "state")
+	store, err := NewSDKStore(dir, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	record := testSessionOperationRecord(SessionOperationPrepared)
+	name, err := sessionOperationFileName(record.Operation.ProtectedResourceID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, name)
+	const corrupt = `{"schema":2,"protected_resource_id":"incomplete"}`
+	if err := os.WriteFile(path, []byte(corrupt), sessionOperationFileMode); err != nil {
+		t.Fatal(err)
+	}
+	if records, err := store.LoadSessionOperations(context.Background(), record.Operation.ProtectedResourceID); records != nil || !errors.Is(err, ErrSessionOperationJournalCorrupt) {
+		t.Fatalf("corrupt journal load = (%+v, %v), want retained corruption", records, err)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil || string(raw) != corrupt {
+		t.Fatalf("corrupt journal was changed: %q, %v", raw, err)
+	}
+}
+
 func TestNewSessionOperationRecordRejectsGenericTrustBoundaryDrift(t *testing.T) {
 	valid := testSessionOperationRecord(SessionOperationPrepared)
 	for name, mutate := range map[string]func(*SessionOperationRecord){
