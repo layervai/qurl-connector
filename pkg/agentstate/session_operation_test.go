@@ -11,6 +11,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	qurl "github.com/layervai/qurl-go/qurl"
@@ -148,6 +149,70 @@ func TestSDKStoreSessionOperationLifecycleIsCrashSafe(t *testing.T) {
 	}
 	if records, err := reopened.LoadSessionOperations(context.Background(), prepared.Operation.ProtectedResourceID); err != nil || len(records) != 0 {
 		t.Fatalf("terminal cleanup records=%+v err=%v", records, err)
+	}
+}
+
+func TestSDKStoreEnumeratesJournalsAndRemovesCrashTemporaries(t *testing.T) {
+	dir := filepath.Join(realSDKTempDir(t), "state")
+	store, err := NewSDKStore(dir, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	record := testSessionOperationRecord(SessionOperationPrepared)
+	if err := store.CreateSessionOperation(context.Background(), record); err != nil {
+		t.Fatal(err)
+	}
+	name, err := sessionOperationFileName(record.Operation.ProtectedResourceID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	temporaryName := "." + name + ".tmp-" + strings.Repeat("a", 16)
+	if err := os.WriteFile(filepath.Join(dir, temporaryName), []byte("partial"), sessionOperationFileMode); err != nil {
+		t.Fatal(err)
+	}
+	resources, err := store.ListSessionOperationResources(context.Background())
+	if err != nil || len(resources) != 1 || resources[0] != record.Operation.ProtectedResourceID {
+		t.Fatalf("enumerated resources = %v, %v", resources, err)
+	}
+	if _, err := os.Lstat(filepath.Join(dir, temporaryName)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("orphaned temporary file remains: %v", err)
+	}
+}
+
+func TestSDKStoreRejectsJournalWhoseHashedFilenameDoesNotMatchResource(t *testing.T) {
+	dir := filepath.Join(realSDKTempDir(t), "state")
+	store, err := NewSDKStore(dir, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	record := testSessionOperationRecord(SessionOperationPrepared)
+	if err := store.CreateSessionOperation(context.Background(), record); err != nil {
+		t.Fatal(err)
+	}
+	name, err := sessionOperationFileName(record.Operation.ProtectedResourceID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(filepath.Join(dir, name))
+	if err != nil {
+		t.Fatal(err)
+	}
+	spoofedName, err := sessionOperationFileName("different-protected-resource")
+	if err != nil {
+		t.Fatal(err)
+	}
+	spoofedPath := filepath.Join(dir, spoofedName)
+	if err := os.WriteFile(spoofedPath, raw, sessionOperationFileMode); err != nil {
+		t.Fatal(err)
+	}
+	if resources, err := store.ListSessionOperationResources(context.Background()); resources != nil ||
+		!errors.Is(err, ErrSessionOperationJournalCorrupt) {
+		t.Fatalf("spoofed journal enumeration = (%v, %v)", resources, err)
+	}
+	if _, err := os.Stat(spoofedPath); err != nil {
+		t.Fatalf("unsafe journal was not retained for diagnosis: %v", err)
 	}
 }
 

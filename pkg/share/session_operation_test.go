@@ -2,6 +2,9 @@ package share
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"path/filepath"
 	"strings"
@@ -26,6 +29,42 @@ func testDurableOperation() qurl.NativeSessionOperation {
 		ProtectedResourceID: testProtectedResourceID,
 		ResourceID:          "resource-a", RunID: "0123456789abcdef", RunAttempt: 7, Schema: 2,
 	}
+}
+
+func testDurableOperationForProtectedResource(resourceID string) qurl.NativeSessionOperation {
+	operation := testDurableOperation()
+	operation.ProtectedResourceID = resourceID
+	canonical := struct {
+		AgentID             string `json:"agent_id"`
+		AgentKeySchema      int    `json:"agent_key_schema_version"`
+		AgentPublicKeyB64   string `json:"agent_public_key_b64"`
+		AuthServiceID       string `json:"auth_service_id"`
+		BindingSchema       int    `json:"binding_schema"`
+		CellID              string `json:"cell_id"`
+		ConnectorIDClaim    string `json:"connector_id_claim"`
+		CredentialKind      string `json:"enrollment_credential_kind"`
+		ExpiresAtMillis     int64  `json:"expires_at_ms"`
+		OperationID         string `json:"operation_id"`
+		OwnerID             string `json:"owner_id"`
+		PreparedAtMillis    int64  `json:"prepared_at_ms"`
+		ProtectedResourceID string `json:"protected_resource_id"`
+		ResourceID          string `json:"resource_id"`
+		RunAttempt          uint64 `json:"run_attempt"`
+		RunID               string `json:"run_id"`
+	}{
+		AgentID: operation.AgentID, AgentKeySchema: operation.AgentKeySchema,
+		AgentPublicKeyB64: operation.AgentPublicKeyB64, AuthServiceID: operation.AuthServiceID,
+		BindingSchema: operation.BindingSchema, CellID: operation.CellID,
+		ConnectorIDClaim: operation.ConnectorIDClaim, CredentialKind: operation.CredentialKind,
+		ExpiresAtMillis: operation.ExpiresAtMillis, OperationID: operation.OperationID,
+		OwnerID: operation.OwnerID, PreparedAtMillis: operation.PreparedAtMillis,
+		ProtectedResourceID: operation.ProtectedResourceID, ResourceID: operation.ResourceID,
+		RunAttempt: operation.RunAttempt, RunID: operation.RunID,
+	}
+	raw, _ := json.Marshal(canonical)
+	digest := sha256.Sum256(raw)
+	operation.BindingSHA256 = hex.EncodeToString(digest[:])
+	return operation
 }
 
 func testDurableRecoveryEndpoint() qurl.NHPUDPEndpoint {
@@ -205,6 +244,53 @@ func TestDurableNativeSessionOperationSurvivesSDKStoreRestart(t *testing.T) {
 	}
 	if records, err := reopened.LoadSessionOperations(context.Background(), testProtectedResourceID); err != nil || len(records) != 0 {
 		t.Fatalf("restarted terminal records=%+v err=%v", records, err)
+	}
+}
+
+func TestDurableNativeSessionOperationRecoversEveryEnumeratedResource(t *testing.T) {
+	oldRecover := recoverNativeSessionOperation
+	t.Cleanup(func() { recoverNativeSessionOperation = oldRecover })
+	store := &memoryNativeStore{}
+	first := testPreparedDurableRecord(t)
+	secondOperation := testDurableOperationForProtectedResource("MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE2vPoafaVb5Lue-bfcCuoL-_CnVBKf8YvV94G8ozebA6RHEQUPsnguSt1yx2mTzDSogBmb9WYEVBDgX7vc2NKTg")
+	second, err := agentstate.NewSessionOperationRecord(secondOperation, testDurableRecoveryEndpoint())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CreateSessionOperation(context.Background(), first); err != nil {
+		t.Fatal(err)
+	}
+	firstDispatching := first
+	firstDispatching.Status = agentstate.SessionOperationDispatching
+	if err := store.TransitionSessionOperation(context.Background(), first, firstDispatching); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CreateSessionOperation(context.Background(), second); err != nil {
+		t.Fatal(err)
+	}
+	recoverCalls := 0
+	recoverNativeSessionOperation = func(_ context.Context, _ *qurl.AgentRuntimeBinding, _ []byte,
+		operation qurl.NativeSessionOperation, _ qurl.NHPUDPEndpoint, _ ...qurl.AgentRuntimeUDPOption,
+	) (*qurl.NativeSessionOperationRecovery, error) {
+		recoverCalls++
+		if operation.ProtectedResourceID != first.Operation.ProtectedResourceID {
+			t.Fatalf("recovered unexpected resource %q", operation.ProtectedResourceID)
+		}
+		return &qurl.NativeSessionOperationRecovery{Complete: true}, nil
+	}
+	controller, err := newDurableNativeSessionOperations(store, testNativeSessionAuthority())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := controller.RecoverAllPending(context.Background(), &qurl.AgentRuntimeBinding{AgentID: "agent-one"},
+		make([]byte, 32), nil); err != nil {
+		t.Fatal(err)
+	}
+	if len(store.operations[first.Operation.ProtectedResourceID]) != 0 || len(store.operations[second.Operation.ProtectedResourceID]) != 0 {
+		t.Fatalf("startup recovery retained operations: %+v", store.operations)
+	}
+	if recoverCalls != 1 {
+		t.Fatalf("startup network recoveries = %d, want 1", recoverCalls)
 	}
 }
 

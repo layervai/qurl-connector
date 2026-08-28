@@ -311,7 +311,7 @@ func prepareConnectorRun(ctx context.Context, cfgPath string) (_ *nhpconfig.Conf
 	if runtime.shared == nil {
 		return nil, connectorRuntime{}, nil, errors.Join(errors.New("shared native runtime is unavailable"), runtime.Close())
 	}
-	admitter, err := share.NewNativeAdmitter(runtime.shared)
+	admitter, err := share.NewNativeAdmitter(ctx, runtime.shared)
 	if err != nil {
 		return nil, connectorRuntime{}, nil, errors.Join(err, runtime.Close())
 	}

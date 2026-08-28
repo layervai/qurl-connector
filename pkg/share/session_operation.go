@@ -144,6 +144,25 @@ func (d *durableNativeSessionOperations) RecoverPending(ctx context.Context, bin
 	return recoveryErr
 }
 
+func (d *durableNativeSessionOperations) RecoverAllPending(ctx context.Context, binding *qurl.AgentRuntimeBinding,
+	privateKey []byte, udpOptions []qurl.AgentRuntimeUDPOption,
+) error {
+	if ctx == nil || binding == nil || len(privateKey) != 32 {
+		return errors.New("recover native session operations: runtime is incomplete")
+	}
+	resources, err := d.store.ListSessionOperationResources(ctx)
+	if err != nil {
+		return fmt.Errorf("enumerate native session operations: %w", err)
+	}
+	var recoveryErr error
+	for _, resourceID := range resources {
+		if err := d.RecoverPending(ctx, binding, privateKey, resourceID, nil, udpOptions); err != nil {
+			recoveryErr = errors.Join(recoveryErr, err)
+		}
+	}
+	return recoveryErr
+}
+
 func (d *durableNativeSessionOperations) RecoverOperation(ctx context.Context, binding *qurl.AgentRuntimeBinding,
 	privateKey []byte, protectedResourceID, operationID string, udpOptions []qurl.AgentRuntimeUDPOption,
 ) error {

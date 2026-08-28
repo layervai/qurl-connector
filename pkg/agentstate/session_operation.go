@@ -28,6 +28,9 @@ const (
 	sessionOperationFileMode      = 0o600
 	sessionOperationLockFile      = ".native_session_operations.lock"
 	sessionOperationMaxRecords    = 8
+	sessionOperationMaxStateFiles = 4096
+	sessionOperationFilePrefix    = "native_session_operation-"
+	sessionOperationFileSuffix    = ".json"
 
 	SessionOperationPrepared    = "PREPARED"
 	SessionOperationDispatching = "DISPATCHING"
@@ -115,6 +118,59 @@ func (s *SDKStore) LoadSessionOperations(ctx context.Context, resourceID string)
 	return records, err
 }
 
+// ListSessionOperationResources returns every self-describing durable
+// operation journal in the private SDK namespace. It also removes temporary
+// journal files left by a process crash. The stable cross-process lock proves
+// that a matching temporary file has no live writer.
+func (s *SDKStore) ListSessionOperationResources(ctx context.Context) (resources []string, retErr error) {
+	err := s.withSessionOperationNamespaceLock(ctx, func(namespace *pinnedfs.Directory) error {
+		names, err := namespace.ReadDirNames(sessionOperationMaxStateFiles)
+		if err != nil {
+			return err
+		}
+		removedTemporary := false
+		for _, name := range names {
+			switch {
+			case validSessionOperationFileName(name):
+				journal, present, err := loadSessionOperationJournal(namespace, name)
+				if err != nil {
+					return err
+				}
+				if !present {
+					return fmt.Errorf("%w: enumerated journal disappeared", ErrSessionOperationConflict)
+				}
+				expected, err := sessionOperationFileName(journal.ProtectedResourceID)
+				if err != nil || expected != name {
+					return errors.Join(fmt.Errorf("%w: resource journal filename mismatch", ErrSessionOperationJournalCorrupt), err)
+				}
+				resources = append(resources, journal.ProtectedResourceID)
+			case validSessionOperationTemporaryFileName(name):
+				entry, err := namespace.Lstat(name)
+				if err != nil {
+					return fmt.Errorf("stat orphaned native session operation temporary file: %w", err)
+				}
+				if entry.Mode()&os.ModeSymlink != 0 || !entry.Mode().IsRegular() {
+					return fmt.Errorf("orphaned native session operation temporary file %s has an unsafe shape", filepath.Join(namespace.Path(), name))
+				}
+				if err := namespace.Remove(name); err != nil {
+					return fmt.Errorf("remove orphaned native session operation temporary file: %w", err)
+				}
+				removedTemporary = true
+			}
+		}
+		if removedTemporary {
+			if err := namespace.Sync(); err != nil {
+				return fmt.Errorf("sync orphaned native session operation cleanup: %w", err)
+			}
+		}
+		return namespace.ValidateCurrent()
+	})
+	if err != nil {
+		return nil, err
+	}
+	return resources, nil
+}
+
 // CreateSessionOperation appends a distinct PREPARED operation. A resource may
 // have an old serving admission and one replacement during make-before-break.
 func (s *SDKStore) CreateSessionOperation(ctx context.Context, record SessionOperationRecord) error {
@@ -195,12 +251,18 @@ func (s *SDKStore) DeleteSessionOperation(ctx context.Context, terminal SessionO
 }
 
 func (s *SDKStore) withSessionOperationLock(ctx context.Context, resourceID string, fn func(*pinnedfs.Directory, string) error) (retErr error) {
-	if s == nil || ctx == nil {
-		return fmt.Errorf("%w: Connector SDK state store is not open", qurl.ErrAgentStateContinuity)
-	}
 	name, err := sessionOperationFileName(resourceID)
 	if err != nil {
 		return err
+	}
+	return s.withSessionOperationNamespaceLock(ctx, func(namespace *pinnedfs.Directory) error {
+		return fn(namespace, name)
+	})
+}
+
+func (s *SDKStore) withSessionOperationNamespaceLock(ctx context.Context, fn func(*pinnedfs.Directory) error) (retErr error) {
+	if s == nil || ctx == nil || fn == nil {
+		return fmt.Errorf("%w: Connector SDK state store is not open", qurl.ErrAgentStateContinuity)
 	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -215,7 +277,7 @@ func (s *SDKStore) withSessionOperationLock(ctx context.Context, resourceID stri
 		return fmt.Errorf("lock native session operation: %w", err)
 	}
 	defer func() { retErr = errors.Join(retErr, lock.Close()) }()
-	if err := fn(s.namespace, name); err != nil {
+	if err := fn(s.namespace); err != nil {
 		return err
 	}
 	if err := lock.ValidateCurrent(); err != nil {
@@ -229,7 +291,33 @@ func sessionOperationFileName(resourceID string) (string, error) {
 		return "", fmt.Errorf("%w: invalid protected resource", ErrSessionOperationConflict)
 	}
 	digest := sha256.Sum256([]byte("layerv/qurl-connector/native-session-operation/v1\x00" + resourceID))
-	return "native_session_operation-" + hex.EncodeToString(digest[:]) + ".json", nil
+	return sessionOperationFilePrefix + hex.EncodeToString(digest[:]) + sessionOperationFileSuffix, nil
+}
+
+func validSessionOperationFileName(name string) bool {
+	if !strings.HasPrefix(name, sessionOperationFilePrefix) || !strings.HasSuffix(name, sessionOperationFileSuffix) {
+		return false
+	}
+	digest := strings.TrimSuffix(strings.TrimPrefix(name, sessionOperationFilePrefix), sessionOperationFileSuffix)
+	if len(digest) != sha256.Size*2 {
+		return false
+	}
+	decoded, err := hex.DecodeString(digest)
+	return err == nil && hex.EncodeToString(decoded) == digest
+}
+
+func validSessionOperationTemporaryFileName(name string) bool {
+	const temporaryMarker = ".tmp-"
+	if !strings.HasPrefix(name, "."+sessionOperationFilePrefix) {
+		return false
+	}
+	marker := strings.LastIndex(name, temporaryMarker)
+	if marker < 0 || !validSessionOperationFileName(strings.TrimPrefix(name[:marker], ".")) {
+		return false
+	}
+	suffix := name[marker+len(temporaryMarker):]
+	decoded, err := hex.DecodeString(suffix)
+	return err == nil && len(decoded) == 8 && hex.EncodeToString(decoded) == suffix
 }
 
 func loadSessionOperationJournal(namespace *pinnedfs.Directory, name string) (journal sessionOperationJournal, present bool, retErr error) {

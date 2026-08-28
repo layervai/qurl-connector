@@ -81,6 +81,7 @@ type nativeStateStore interface {
 	MarkRegistrationRefreshAttempted() error
 	MarkRegistrationRefreshSucceeded() error
 	ClearRegistrationRefreshMarker() error
+	ListSessionOperationResources(context.Context) ([]string, error)
 	LoadSessionOperations(context.Context, string) ([]agentstate.SessionOperationRecord, error)
 	CreateSessionOperation(context.Context, agentstate.SessionOperationRecord) error
 	TransitionSessionOperation(context.Context, agentstate.SessionOperationRecord, agentstate.SessionOperationRecord) error
@@ -542,6 +543,8 @@ type NativeAdmitter struct {
 	pending    map[nativeAdmissionKey]bool
 }
 
+const runtimeRefreshReaderGrace = 250 * time.Millisecond
+
 type keyedResourceLocks struct {
 	mu    sync.Mutex
 	locks map[string]*keyedResourceLock
@@ -593,7 +596,10 @@ type nativeLiveAdmission struct {
 	receipt     qurl.NativeSessionReceipt
 }
 
-func NewNativeAdmitter(runtime *NativeRuntime) (*NativeAdmitter, error) {
+func NewNativeAdmitter(ctx context.Context, runtime *NativeRuntime) (*NativeAdmitter, error) {
+	if ctx == nil {
+		return nil, errors.New("build native admitter: context is nil")
+	}
 	if runtime == nil || runtime.Binding == nil || runtime.store == nil {
 		return nil, errors.New("build native admitter: runtime is incomplete")
 	}
@@ -605,6 +611,13 @@ func NewNativeAdmitter(runtime *NativeRuntime) (*NativeAdmitter, error) {
 	if len(key) != 32 {
 		clear(key)
 		return nil, fmt.Errorf("build native admitter: device key is %d bytes, want 32", len(key))
+	}
+	recoveryCtx, cancelRecovery := context.WithTimeout(ctx, nativeSessionCleanupBudget)
+	err = operations.RecoverAllPending(recoveryCtx, runtime.Binding, key, runtime.UDPOptions)
+	cancelRecovery()
+	if err != nil {
+		clear(key)
+		return nil, fmt.Errorf("recover durable native session operations at startup: %w", err)
 	}
 	admitter := &NativeAdmitter{
 		binding: runtime.Binding, privateKey: key, store: runtime.store,
@@ -858,17 +871,38 @@ func (a *NativeAdmitter) lockRuntimeForRefresh(ctx context.Context) error {
 	if ctx == nil {
 		return errors.New("refresh native admission runtime: context is nil")
 	}
-	ticker := time.NewTicker(time.Millisecond)
-	defer ticker.Stop()
-	for {
-		if a.runtimeMu.TryLock() {
-			return nil
-		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-ticker.C:
-		}
+	if a.runtimeMu.TryLock() {
+		return nil
+	}
+	// Give already-admitted sibling work one short grace period to finish
+	// without a queued writer stopping new readers. The grace is fixed, so a
+	// continuous reader stream cannot starve the refresh.
+	grace := time.NewTimer(runtimeRefreshReaderGrace)
+	defer grace.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-grace.C:
+	}
+	if a.runtimeMu.TryLock() {
+		return nil
+	}
+	acquired := make(chan struct{})
+	go func() {
+		a.runtimeMu.Lock()
+		close(acquired)
+	}()
+	select {
+	case <-acquired:
+		return nil
+	case <-ctx.Done():
+		// The queued writer must eventually take and release the lock. Abandoning
+		// it would leak ownership and deadlock the next operation.
+		go func() {
+			<-acquired
+			a.runtimeMu.Unlock()
+		}()
+		return ctx.Err()
 	}
 }
 

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"reflect"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -83,6 +84,19 @@ func (s *memoryNativeStore) LoadSessionOperations(_ context.Context, resourceID 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return append([]agentstate.SessionOperationRecord(nil), s.operations[resourceID]...), nil
+}
+
+func (s *memoryNativeStore) ListSessionOperationResources(context.Context) ([]string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	resources := make([]string, 0, len(s.operations))
+	for resourceID, records := range s.operations {
+		if len(records) > 0 {
+			resources = append(resources, resourceID)
+		}
+	}
+	sort.Strings(resources)
+	return resources, nil
 }
 
 func (s *memoryNativeStore) CreateSessionOperation(_ context.Context, record agentstate.SessionOperationRecord) error {
@@ -994,6 +1008,62 @@ func TestNativeAdmitterPreparedRefreshDoesNotBlockSiblingResource(t *testing.T) 
 	}
 }
 
+func TestNativeAdmitterRefreshQueuesAfterBoundedReaderGrace(t *testing.T) {
+	admitter := &NativeAdmitter{}
+	admitter.runtimeMu.RLock()
+	refreshDone := make(chan error, 1)
+	go func() { refreshDone <- admitter.lockRuntimeForRefresh(context.Background()) }()
+
+	// After the bounded grace, the refresh has a real queued writer. A reader
+	// arriving now must wait instead of extending writer starvation.
+	time.Sleep(runtimeRefreshReaderGrace + 100*time.Millisecond)
+	readerAcquired := make(chan struct{})
+	go func() {
+		admitter.runtimeMu.RLock()
+		close(readerAcquired)
+		admitter.runtimeMu.RUnlock()
+	}()
+	select {
+	case <-readerAcquired:
+		t.Fatal("reader bypassed a queued runtime refresh")
+	case <-time.After(25 * time.Millisecond):
+	}
+
+	admitter.runtimeMu.RUnlock()
+	select {
+	case err := <-refreshDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("queued runtime refresh did not acquire the lock")
+	}
+	select {
+	case <-readerAcquired:
+		t.Fatal("reader acquired while refresh owned the runtime lock")
+	default:
+	}
+	admitter.runtimeMu.Unlock()
+	select {
+	case <-readerAcquired:
+	case <-time.After(time.Second):
+		t.Fatal("reader did not resume after refresh released the lock")
+	}
+}
+
+func TestNativeAdmitterRefreshLockHonorsCancellationDuringReaderGrace(t *testing.T) {
+	admitter := &NativeAdmitter{}
+	admitter.runtimeMu.RLock()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := admitter.lockRuntimeForRefresh(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled refresh lock = %v, want context cancellation", err)
+	}
+	admitter.runtimeMu.RUnlock()
+	admitter.runtimeMu.Lock()
+	admitter.runtimeMu.Unlock()
+}
+
 func TestNativeAdmitterSerializesOnlyPrepareCommitAndKnockAcrossResources(t *testing.T) {
 	oldKnock := knockNativeRuntime
 	t.Cleanup(func() { knockNativeRuntime = oldKnock })
@@ -1315,7 +1385,7 @@ func TestNativeAdmitterDoesNotRetainEnrollmentCredential(t *testing.T) {
 			SessionOperations: testNativeSessionAuthority(),
 		}, "auto"),
 	}
-	admitter, err := NewNativeAdmitter(runtime)
+	admitter, err := NewNativeAdmitter(context.Background(), runtime)
 	if err != nil {
 		t.Fatal(err)
 	}
