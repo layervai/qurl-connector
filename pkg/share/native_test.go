@@ -26,6 +26,7 @@ type memoryNativeStore struct {
 	succeeded  int
 	cleared    int
 	closed     int
+	operations map[string][]agentstate.SessionOperationRecord
 }
 
 func (*memoryNativeStore) Handoff() (qurl.AgentStateStore, error) { return nil, nil }
@@ -74,6 +75,133 @@ func (s *memoryNativeStore) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.closed++
+	return nil
+}
+
+func (s *memoryNativeStore) LoadSessionOperations(_ context.Context, resourceID string) ([]agentstate.SessionOperationRecord, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]agentstate.SessionOperationRecord(nil), s.operations[resourceID]...), nil
+}
+
+func (s *memoryNativeStore) CreateSessionOperation(_ context.Context, record agentstate.SessionOperationRecord) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.operations == nil {
+		s.operations = make(map[string][]agentstate.SessionOperationRecord)
+	}
+	resourceID := record.Operation.ProtectedResourceID
+	for _, current := range s.operations[resourceID] {
+		if current.Operation.OperationID == record.Operation.OperationID {
+			return agentstate.ErrSessionOperationConflict
+		}
+	}
+	s.operations[resourceID] = append(s.operations[resourceID], record)
+	return nil
+}
+
+func (s *memoryNativeStore) TransitionSessionOperation(_ context.Context, previous, next agentstate.SessionOperationRecord) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	resourceID := previous.Operation.ProtectedResourceID
+	for index, current := range s.operations[resourceID] {
+		if current == previous {
+			s.operations[resourceID][index] = next
+			return nil
+		}
+	}
+	return agentstate.ErrSessionOperationConflict
+}
+
+func (s *memoryNativeStore) DeleteSessionOperation(_ context.Context, terminal agentstate.SessionOperationRecord) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	resourceID := terminal.Operation.ProtectedResourceID
+	for index, current := range s.operations[resourceID] {
+		if current == terminal {
+			s.operations[resourceID] = append(s.operations[resourceID][:index], s.operations[resourceID][index+1:]...)
+			return nil
+		}
+	}
+	return agentstate.ErrSessionOperationConflict
+}
+
+type testNativeSessionOperations struct{}
+
+func (testNativeSessionOperations) RecoverPending(context.Context, *qurl.AgentRuntimeBinding, []byte, string, map[string]struct{}, []qurl.AgentRuntimeUDPOption) error {
+	return nil
+}
+
+func (testNativeSessionOperations) RecoverOperation(context.Context, *qurl.AgentRuntimeBinding, []byte, string, string, []qurl.AgentRuntimeUDPOption) error {
+	return nil
+}
+
+func (testNativeSessionOperations) PrepareDispatch(_ context.Context, _ *qurl.AgentRuntimeBinding, _ []byte,
+	knockResourceID, protectedResourceID, runID string, runAttempt uint64,
+) (*qurl.NativeSessionOperation, error) {
+	return &qurl.NativeSessionOperation{
+		ResourceID: knockResourceID, ProtectedResourceID: protectedResourceID,
+		OperationID: runID, RunID: runID, RunAttempt: runAttempt,
+	}, nil
+}
+
+func (testNativeSessionOperations) RecordMapped(context.Context, string, qurl.NativeSessionOperation, qurl.NativeSessionReceipt) error {
+	return nil
+}
+
+func (testNativeSessionOperations) Retire(ctx context.Context, binding *qurl.AgentRuntimeBinding, privateKey []byte,
+	_, _ string, receipt qurl.NativeSessionReceipt, options []qurl.AgentRuntimeUDPOption,
+) error {
+	_, err := retireNativeSession(ctx, binding, privateKey, receipt, options...)
+	return err
+}
+
+func testNativeSessionAuthority() NativeSessionOperationAuthority {
+	return NativeSessionOperationAuthority{
+		AWSAccountID: "111122223333", AWSRegion: "us-east-2", OwnerID: "owner-one",
+		QURLAgentKeysTable: "agent-keys", SessionControlTable: "session-control",
+	}
+}
+
+type makeBeforeBreakTestOperations struct {
+	next      int
+	preserves []map[string]struct{}
+}
+
+func (o *makeBeforeBreakTestOperations) RecoverPending(_ context.Context, _ *qurl.AgentRuntimeBinding, _ []byte,
+	_ string, preserve map[string]struct{}, _ []qurl.AgentRuntimeUDPOption,
+) error {
+	copySet := make(map[string]struct{}, len(preserve))
+	for operationID := range preserve {
+		copySet[operationID] = struct{}{}
+	}
+	o.preserves = append(o.preserves, copySet)
+	return nil
+}
+
+func (*makeBeforeBreakTestOperations) RecoverOperation(context.Context, *qurl.AgentRuntimeBinding, []byte,
+	string, string, []qurl.AgentRuntimeUDPOption,
+) error {
+	return nil
+}
+
+func (o *makeBeforeBreakTestOperations) PrepareDispatch(_ context.Context, _ *qurl.AgentRuntimeBinding, _ []byte,
+	knockResourceID, protectedResourceID, runID string, runAttempt uint64,
+) (*qurl.NativeSessionOperation, error) {
+	o.next++
+	return &qurl.NativeSessionOperation{
+		OperationID: fmt.Sprintf("operation-%d", o.next), ResourceID: knockResourceID,
+		ProtectedResourceID: protectedResourceID, RunID: runID, RunAttempt: runAttempt,
+	}, nil
+}
+
+func (*makeBeforeBreakTestOperations) RecordMapped(context.Context, string, qurl.NativeSessionOperation, qurl.NativeSessionReceipt) error {
+	return nil
+}
+
+func (*makeBeforeBreakTestOperations) Retire(context.Context, *qurl.AgentRuntimeBinding, []byte,
+	string, string, qurl.NativeSessionReceipt, []qurl.AgentRuntimeUDPOption,
+) error {
 	return nil
 }
 
@@ -598,7 +726,8 @@ func TestNativeAdmitterRecoversSustainedStaleAssignmentWithoutOperatorInput(t *t
 	}
 	admitter := &NativeAdmitter{
 		binding: &qurl.AgentRuntimeBinding{AgentID: "agent-one"}, privateKey: make([]byte, 32),
-		store: store, refreshCfg: nativeRefreshConfig{AgentID: "agent-one", RefreshMode: "auto"},
+		operations: testNativeSessionOperations{},
+		store:      store, refreshCfg: nativeRefreshConfig{AgentID: "agent-one", RefreshMode: "auto"},
 	}
 	for attempt := 1; attempt < 5; attempt++ {
 		if _, err := admitter.Admit(context.Background(), "q_catalog_key", "public-resource"); !errors.Is(err, nativeudp.ErrTransport) {
@@ -630,8 +759,9 @@ func TestNativeAdmitterBindsProtectedResourceIntoKnock(t *testing.T) {
 	knockNativeRuntime = func(_ context.Context, _ *qurl.AgentRuntimeBinding, _ []byte, knockResourceID string,
 		opts qurl.NativeKnockOptions, _ ...qurl.AgentRuntimeUDPOption,
 	) (*qurl.NativeKnockResult, error) {
-		if knockResourceID != "q_catalog_key" || opts.ProtectedResourceID != want {
-			t.Fatalf("knock binding = catalog %q protected %q", knockResourceID, opts.ProtectedResourceID)
+		if knockResourceID != "q_catalog_key" || opts.ProtectedResourceID != want || opts.Operation == nil ||
+			opts.Operation.ResourceID != knockResourceID || opts.Operation.ProtectedResourceID != want {
+			t.Fatalf("knock binding = catalog %q protected %q operation %#v", knockResourceID, opts.ProtectedResourceID, opts.Operation)
 		}
 		return &qurl.NativeKnockResult{
 			ACToken: "token", ResourceHost: "127.0.0.1:7000", SessionID: 77, OpenTime: 60,
@@ -640,9 +770,54 @@ func TestNativeAdmitterBindsProtectedResourceIntoKnock(t *testing.T) {
 	}
 	admitter := &NativeAdmitter{
 		binding: &qurl.AgentRuntimeBinding{AgentID: "agent-one"}, privateKey: make([]byte, 32),
-		store: &memoryNativeStore{},
+		operations: testNativeSessionOperations{},
+		store:      &memoryNativeStore{},
 	}
 	if _, err := admitter.Admit(context.Background(), "q_catalog_key", want); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestNativeAdmitterPreservesServingOperationDuringMakeBeforeBreak(t *testing.T) {
+	oldKnock := knockNativeRuntime
+	t.Cleanup(func() { knockNativeRuntime = oldKnock })
+	knocks := 0
+	knockNativeRuntime = func(_ context.Context, _ *qurl.AgentRuntimeBinding, _ []byte, _ string,
+		opts qurl.NativeKnockOptions, _ ...qurl.AgentRuntimeUDPOption,
+	) (*qurl.NativeKnockResult, error) {
+		knocks++
+		receipt := testSessionReceipt(uint64(knocks), opts.RunID, opts.RunAttempt)
+		return &qurl.NativeKnockResult{
+			ACToken: "token", ResourceHost: "127.0.0.1:7000", SessionID: uint64(knocks), OpenTime: 60,
+			SessionReceipt: receipt,
+		}, nil
+	}
+	operations := &makeBeforeBreakTestOperations{}
+	admitter := &NativeAdmitter{
+		binding: &qurl.AgentRuntimeBinding{AgentID: "agent-one"}, privateKey: make([]byte, 32),
+		store: &memoryNativeStore{}, operations: operations,
+	}
+	first, err := admitter.Admit(context.Background(), "q_catalog_key", "public-resource")
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := admitter.Admit(context.Background(), "q_catalog_key", "public-resource")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(admitter.live) != 2 || len(operations.preserves) != 2 {
+		t.Fatalf("make-before-break live=%d preserve calls=%d", len(admitter.live), len(operations.preserves))
+	}
+	if len(operations.preserves[0]) != 0 {
+		t.Fatalf("first admission preserved stale operations: %+v", operations.preserves[0])
+	}
+	if _, ok := operations.preserves[1]["operation-1"]; !ok || len(operations.preserves[1]) != 1 {
+		t.Fatalf("replacement did not preserve serving operation: %+v", operations.preserves[1])
+	}
+	if err := admitter.Retire(context.Background(), first); err != nil {
+		t.Fatal(err)
+	}
+	if err := admitter.Retire(context.Background(), second); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -725,7 +900,8 @@ func TestNativeAdmitterRefreshesOnlySustainedPlacementFailures(t *testing.T) {
 			}
 			admitter := &NativeAdmitter{
 				binding: &qurl.AgentRuntimeBinding{AgentID: "agent-one"}, privateKey: make([]byte, 32),
-				store: store, refreshCfg: nativeRefreshConfig{AgentID: "agent-one", RefreshMode: "auto"},
+				operations: testNativeSessionOperations{},
+				store:      store, refreshCfg: nativeRefreshConfig{AgentID: "agent-one", RefreshMode: "auto"},
 			}
 			for attempt := 0; attempt < 5; attempt++ {
 				_, _ = admitter.Admit(context.Background(), "q_catalog_key", "public-resource")
@@ -762,7 +938,8 @@ func TestNativeAdmitterDisabledModeDoesNotRefreshAfterLiveFailures(t *testing.T)
 	store := &memoryNativeStore{}
 	admitter := &NativeAdmitter{
 		binding: &qurl.AgentRuntimeBinding{AgentID: "agent-one"}, privateKey: make([]byte, 32),
-		store: store, refreshCfg: nativeRefreshConfig{AgentID: "agent-one", RefreshMode: "disabled"},
+		operations: testNativeSessionOperations{},
+		store:      store, refreshCfg: nativeRefreshConfig{AgentID: "agent-one", RefreshMode: "disabled"},
 	}
 	for attempt := 1; attempt <= 4; attempt++ {
 		if _, err := admitter.Admit(context.Background(), "q_catalog_key", "public-resource"); !errors.Is(err, nativeudp.ErrNoReply) {
@@ -804,7 +981,8 @@ func TestNativeAdmitterCountsOnlyConsecutivePlacementFailures(t *testing.T) {
 	store := &memoryNativeStore{}
 	admitter := &NativeAdmitter{
 		binding: &qurl.AgentRuntimeBinding{AgentID: "agent-one"}, privateKey: make([]byte, 32),
-		store: store, refreshCfg: nativeRefreshConfig{AgentID: "agent-one", RefreshMode: "auto"},
+		operations: testNativeSessionOperations{},
+		store:      store, refreshCfg: nativeRefreshConfig{AgentID: "agent-one", RefreshMode: "auto"},
 	}
 	for attempt := 1; attempt <= 9; attempt++ {
 		_, _ = admitter.Admit(context.Background(), "q_catalog_key", "public-resource")
@@ -833,11 +1011,13 @@ func TestNativeAdmitterDoesNotRetainEnrollmentCredential(t *testing.T) {
 		return "enroll-token", nil
 	}
 	runtime := &NativeRuntime{
-		Binding: &qurl.AgentRuntimeBinding{AgentID: "agent-one"},
-		store:   &memoryNativeStore{},
+		Binding:           &qurl.AgentRuntimeBinding{AgentID: "agent-one"},
+		store:             &memoryNativeStore{},
+		SessionOperations: testNativeSessionAuthority(),
 		refreshCfg: refreshConfig(NativeRuntimeConfig{
 			StateDir: "/private/state", AgentID: "agent-one",
 			EnrollmentCredential: "secret", EnrollmentCredentialProvider: provider,
+			SessionOperations: testNativeSessionAuthority(),
 		}, "auto"),
 	}
 	admitter, err := NewNativeAdmitter(runtime)
@@ -852,7 +1032,7 @@ func TestNativeAdmitterDoesNotRetainEnrollmentCredential(t *testing.T) {
 	// fields; this assertion also guards accidental retention via the runtime.
 	if runtime.refreshCfg.StateDir != "" || runtime.refreshCfg.AgentID != "" ||
 		runtime.refreshCfg.ClientBaseURL != "" || runtime.refreshCfg.RefreshMode != "" ||
-		len(runtime.refreshCfg.UDPOptions) != 0 {
+		len(runtime.refreshCfg.UDPOptions) != 0 || runtime.SessionOperations != (NativeSessionOperationAuthority{}) {
 		t.Fatalf("transferred runtime retained refresh config = %+v", runtime.refreshCfg)
 	}
 }
@@ -872,7 +1052,8 @@ func TestNativeAdmitterRetiresOnlyExactLiveSessions(t *testing.T) {
 	receipt2 := testSessionReceipt(2, "run-two", 1)
 	admitter := &NativeAdmitter{
 		binding: &qurl.AgentRuntimeBinding{AgentID: "agent-one"}, privateKey: make([]byte, 32),
-		store: &memoryNativeStore{},
+		operations: testNativeSessionOperations{},
+		store:      &memoryNativeStore{},
 		live: map[nativeAdmissionKey]nativeLiveAdmission{
 			admissionKey(receipt1): {resourceID: "resource-one", receipt: receipt1},
 			admissionKey(receipt2): {resourceID: "resource-two", receipt: receipt2},
@@ -930,7 +1111,8 @@ func TestNativeAdmitterCloseAttemptsEveryLiveSessionWithinSharedBudget(t *testin
 
 	admitter := &NativeAdmitter{
 		binding: &qurl.AgentRuntimeBinding{AgentID: "agent-one"}, privateKey: make([]byte, 32),
-		store: &memoryNativeStore{},
+		operations: testNativeSessionOperations{},
+		store:      &memoryNativeStore{},
 		live: map[nativeAdmissionKey]nativeLiveAdmission{
 			admissionKey(firstReceipt):  {resourceID: "resource-one", receipt: firstReceipt},
 			admissionKey(secondReceipt): {resourceID: "resource-two", receipt: secondReceipt},
@@ -978,7 +1160,8 @@ func TestNativeAdmitterKeepsSameNumericSessionIDsFromDifferentCellsDistinct(t *t
 
 	admitter := &NativeAdmitter{
 		binding: &qurl.AgentRuntimeBinding{AgentID: "agent-one"}, privateKey: make([]byte, 32),
-		store: &memoryNativeStore{},
+		operations: testNativeSessionOperations{},
+		store:      &memoryNativeStore{},
 	}
 	first, err := admitter.Admit(context.Background(), "q_one", "resource-one")
 	if err != nil {
@@ -1038,7 +1221,8 @@ func TestNativeAdmitterRetiresPostACKAdmissionRejectedByLocalValidation(t *testi
 	newAdmitter := func() *NativeAdmitter {
 		return &NativeAdmitter{
 			binding: &qurl.AgentRuntimeBinding{AgentID: "agent-one"}, privateKey: make([]byte, 32),
-			store: &memoryNativeStore{},
+			operations: testNativeSessionOperations{},
+			store:      &memoryNativeStore{},
 		}
 	}
 	t.Run("successful cleanup", func(t *testing.T) {
@@ -1116,9 +1300,10 @@ func TestNativeAdmitterRetriesFailedRetirementBeforeSameResourceReplacement(t *t
 	}
 	admitter := &NativeAdmitter{
 		binding: &qurl.AgentRuntimeBinding{AgentID: "agent-one"}, privateKey: make([]byte, 32),
-		store:   &memoryNativeStore{},
-		live:    map[nativeAdmissionKey]nativeLiveAdmission{admissionKey(receipt): {resourceID: "resource-one", receipt: receipt}},
-		pending: make(map[nativeAdmissionKey]bool),
+		operations: testNativeSessionOperations{},
+		store:      &memoryNativeStore{},
+		live:       map[nativeAdmissionKey]nativeLiveAdmission{admissionKey(receipt): {resourceID: "resource-one", receipt: receipt}},
+		pending:    make(map[nativeAdmissionKey]bool),
 	}
 	defer admitter.Close()
 

@@ -1,0 +1,451 @@
+package agentstate
+
+import (
+	"bytes"
+	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"os"
+	"path/filepath"
+	"strings"
+
+	qurl "github.com/layervai/qurl-go/qurl"
+
+	"github.com/layervai/qurl-connector/internal/pinnedfs"
+)
+
+const (
+	sessionOperationRecordSchema  = 1
+	sessionOperationJournalSchema = 1
+	sessionOperationFileMaxBytes  = 64 << 10
+	sessionOperationFileMode      = 0o600
+	sessionOperationLockFile      = ".native_session_operations.lock"
+	sessionOperationMaxRecords    = 8
+
+	SessionOperationPrepared    = "PREPARED"
+	SessionOperationDispatching = "DISPATCHING"
+	SessionOperationMapped      = "MAPPED"
+	SessionOperationClosing     = "CLOSING"
+	SessionOperationCanceled    = "CANCELED"
+	SessionOperationClosed      = "CLOSED"
+)
+
+var ErrSessionOperationConflict = errors.New("native session operation state conflict")
+
+// SessionOperationAdmission is the non-secret exact-session receipt retained
+// after an authenticated admission. It carries no AC token.
+type SessionOperationAdmission struct {
+	CellID                string `json:"cell_id"`
+	SessionID             uint64 `json:"session_id"`
+	SessionIssuedAtMillis int64  `json:"session_issued_at_ms"`
+	RunID                 string `json:"run_id"`
+	RunAttempt            uint64 `json:"run_attempt"`
+}
+
+// SessionOperationRecord is one crash-safe native admission lifecycle. The
+// exact operation and its source endpoint are committed before network I/O.
+// A restarted process therefore recovers this operation instead of guessing
+// whether the prior UDP exchange crossed the server boundary.
+type SessionOperationRecord struct {
+	Schema           int                         `json:"schema"`
+	Operation        qurl.NativeSessionOperation `json:"operation"`
+	RecoveryEndpoint qurl.NHPUDPEndpoint         `json:"recovery_endpoint"`
+	Status           string                      `json:"status"`
+	Admission        *SessionOperationAdmission  `json:"admission,omitempty"`
+}
+
+type sessionOperationJournal struct {
+	Schema              int                      `json:"schema"`
+	ProtectedResourceID string                   `json:"protected_resource_id"`
+	Records             []SessionOperationRecord `json:"records"`
+}
+
+// LoadSessionOperations reads every active operation for one protected
+// resource while holding its cross-process lock. The list stays small because
+// it contains only crash-recovery state and make-before-break admissions.
+func (s *SDKStore) LoadSessionOperations(ctx context.Context, resourceID string) ([]SessionOperationRecord, error) {
+	var records []SessionOperationRecord
+	err := s.withSessionOperationLock(ctx, resourceID, func(namespace *pinnedfs.Directory, name string) error {
+		journal, present, err := loadSessionOperationJournal(namespace, name)
+		if err != nil || !present {
+			return err
+		}
+		if journal.ProtectedResourceID != resourceID {
+			return fmt.Errorf("%w: resource journal mismatch", ErrSessionOperationConflict)
+		}
+		records = append(records, journal.Records...)
+		return nil
+	})
+	return records, err
+}
+
+// CreateSessionOperation appends a distinct PREPARED operation. A resource may
+// have an old serving admission and one replacement during make-before-break.
+func (s *SDKStore) CreateSessionOperation(ctx context.Context, record SessionOperationRecord) error {
+	if record.Status != SessionOperationPrepared || !validSessionOperationRecord(record) {
+		return fmt.Errorf("%w: invalid initial record", ErrSessionOperationConflict)
+	}
+	return s.withSessionOperationLock(ctx, record.Operation.ProtectedResourceID, func(namespace *pinnedfs.Directory, name string) error {
+		journal, present, err := loadSessionOperationJournal(namespace, name)
+		if err != nil {
+			return err
+		}
+		if !present {
+			journal = sessionOperationJournal{Schema: sessionOperationJournalSchema,
+				ProtectedResourceID: record.Operation.ProtectedResourceID}
+		}
+		if journal.ProtectedResourceID != record.Operation.ProtectedResourceID || len(journal.Records) >= sessionOperationMaxRecords {
+			return fmt.Errorf("%w: operation journal is full or mismatched", ErrSessionOperationConflict)
+		}
+		for _, current := range journal.Records {
+			if current.Operation.OperationID == record.Operation.OperationID {
+				return fmt.Errorf("%w: operation already exists", ErrSessionOperationConflict)
+			}
+		}
+		journal.Records = append(journal.Records, record)
+		return writeSessionOperationJournal(namespace, name, journal)
+	})
+}
+
+// TransitionSessionOperation atomically replaces one exact record. The prior
+// value is a compare-and-swap guard against another daemon or process.
+func (s *SDKStore) TransitionSessionOperation(ctx context.Context, previous, next SessionOperationRecord) error {
+	if previous.Operation.ProtectedResourceID == "" ||
+		previous.Operation.ProtectedResourceID != next.Operation.ProtectedResourceID ||
+		!validSessionOperationTransition(previous, next) {
+		return fmt.Errorf("%w: invalid transition", ErrSessionOperationConflict)
+	}
+	return s.withSessionOperationLock(ctx, previous.Operation.ProtectedResourceID, func(namespace *pinnedfs.Directory, name string) error {
+		journal, present, err := loadSessionOperationJournal(namespace, name)
+		if err != nil {
+			return err
+		}
+		index := findSessionOperationRecord(journal.Records, previous)
+		if !present || journal.ProtectedResourceID != previous.Operation.ProtectedResourceID || index < 0 {
+			return fmt.Errorf("%w: prior record changed", ErrSessionOperationConflict)
+		}
+		journal.Records[index] = next
+		return writeSessionOperationJournal(namespace, name, journal)
+	})
+}
+
+// DeleteSessionOperation removes one exact terminal record. Keeping the
+// compare-and-swap guard prevents cleanup from deleting a replacement.
+func (s *SDKStore) DeleteSessionOperation(ctx context.Context, terminal SessionOperationRecord) error {
+	if terminal.Status != SessionOperationCanceled && terminal.Status != SessionOperationClosed {
+		return fmt.Errorf("%w: record is not terminal", ErrSessionOperationConflict)
+	}
+	return s.withSessionOperationLock(ctx, terminal.Operation.ProtectedResourceID, func(namespace *pinnedfs.Directory, name string) error {
+		journal, present, err := loadSessionOperationJournal(namespace, name)
+		if err != nil {
+			return err
+		}
+		index := findSessionOperationRecord(journal.Records, terminal)
+		if !present || journal.ProtectedResourceID != terminal.Operation.ProtectedResourceID || index < 0 {
+			return fmt.Errorf("%w: terminal record changed", ErrSessionOperationConflict)
+		}
+		journal.Records = append(journal.Records[:index], journal.Records[index+1:]...)
+		if len(journal.Records) > 0 {
+			return writeSessionOperationJournal(namespace, name, journal)
+		}
+		if err := namespace.Remove(name); err != nil {
+			return fmt.Errorf("remove native session operation: %w", err)
+		}
+		if err := namespace.Sync(); err != nil {
+			return fmt.Errorf("sync native session operation removal: %w", err)
+		}
+		return namespace.ValidateCurrent()
+	})
+}
+
+func (s *SDKStore) withSessionOperationLock(ctx context.Context, resourceID string, fn func(*pinnedfs.Directory, string) error) (retErr error) {
+	if s == nil || ctx == nil {
+		return fmt.Errorf("%w: Connector SDK state store is not open", qurl.ErrAgentStateContinuity)
+	}
+	name, err := sessionOperationFileName(resourceID)
+	if err != nil {
+		return err
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if err := s.validateContinuityLocked(); err != nil {
+		return err
+	}
+	// One stable lock prevents an unbounded set of lock files. Each journal is
+	// capped, so record search and rewrite stay bounded. Network I/O never runs
+	// while this lock is held.
+	lock, err := pinnedfs.AcquireExclusiveFileLock(ctx, s.namespace, sessionOperationLockFile, "native session operation lock", sessionOperationFileMode)
+	if err != nil {
+		return fmt.Errorf("lock native session operation: %w", err)
+	}
+	defer func() { retErr = errors.Join(retErr, lock.Close()) }()
+	if err := fn(s.namespace, name); err != nil {
+		return err
+	}
+	if err := lock.ValidateCurrent(); err != nil {
+		return fmt.Errorf("validate native session operation lock: %w", err)
+	}
+	return s.validateContinuityLocked()
+}
+
+func sessionOperationFileName(resourceID string) (string, error) {
+	if resourceID == "" || strings.TrimSpace(resourceID) != resourceID || len(resourceID) > 4096 {
+		return "", fmt.Errorf("%w: invalid protected resource", ErrSessionOperationConflict)
+	}
+	digest := sha256.Sum256([]byte("layerv/qurl-connector/native-session-operation/v1\x00" + resourceID))
+	return "native_session_operation-" + hex.EncodeToString(digest[:]) + ".json", nil
+}
+
+func loadSessionOperationJournal(namespace *pinnedfs.Directory, name string) (journal sessionOperationJournal, present bool, retErr error) {
+	path := filepath.Join(namespace.Path(), name)
+	entry, err := namespace.Lstat(name)
+	if err != nil {
+		if pinnedfs.IsNotExist(err) {
+			return sessionOperationJournal{}, false, nil
+		}
+		return sessionOperationJournal{}, false, fmt.Errorf("stat native session operation %s: %w", path, err)
+	}
+	if entry.Mode()&os.ModeSymlink != 0 || !entry.Mode().IsRegular() {
+		return sessionOperationJournal{}, false, fmt.Errorf("native session operation %s must be a non-symlink regular file", path)
+	}
+	file, err := namespace.OpenFile(name, os.O_RDONLY|pinnedfs.SafeOpenFlags(), 0)
+	if err != nil {
+		return sessionOperationJournal{}, false, fmt.Errorf("open native session operation %s: %w", path, err)
+	}
+	defer func() {
+		retErr = errors.Join(retErr, file.Close())
+		if retErr != nil {
+			journal = sessionOperationJournal{}
+			present = false
+		}
+	}()
+	info, err := pinnedfs.ValidateRegularFile(namespace, name, file, "native session operation", sessionOperationFileMode)
+	if err != nil {
+		return sessionOperationJournal{}, false, err
+	}
+	if info.Size() <= 0 || info.Size() > sessionOperationFileMaxBytes {
+		return sessionOperationJournal{}, false, fmt.Errorf("native session operation %s has invalid size %d", path, info.Size())
+	}
+	raw, err := io.ReadAll(io.LimitReader(file, sessionOperationFileMaxBytes+1))
+	if err != nil {
+		return sessionOperationJournal{}, false, fmt.Errorf("read native session operation %s: %w", path, err)
+	}
+	if len(raw) > sessionOperationFileMaxBytes {
+		return sessionOperationJournal{}, false, fmt.Errorf("native session operation %s exceeds %d bytes", path, sessionOperationFileMaxBytes)
+	}
+	if _, err := pinnedfs.ValidateRegularFile(namespace, name, file, "native session operation after read", sessionOperationFileMode); err != nil {
+		return sessionOperationJournal{}, false, err
+	}
+	journal, err = decodeSessionOperationJournal(raw)
+	if err != nil {
+		return sessionOperationJournal{}, false, fmt.Errorf("decode native session operation %s: %w", path, err)
+	}
+	return journal, true, nil
+}
+
+func decodeSessionOperationJournal(raw []byte) (sessionOperationJournal, error) {
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	var journal sessionOperationJournal
+	if err := decoder.Decode(&journal); err != nil {
+		return sessionOperationJournal{}, err
+	}
+	if err := rejectTrailingJSON(decoder); err != nil {
+		return sessionOperationJournal{}, err
+	}
+	canonical, err := json.Marshal(journal)
+	if err != nil || !bytes.Equal(canonical, raw) || !validSessionOperationJournal(journal) {
+		return sessionOperationJournal{}, errors.New("native session operation journal is not canonical")
+	}
+	return journal, nil
+}
+
+func validSessionOperationJournal(journal sessionOperationJournal) bool {
+	if journal.Schema != sessionOperationJournalSchema || journal.ProtectedResourceID == "" ||
+		len(journal.Records) == 0 || len(journal.Records) > sessionOperationMaxRecords {
+		return false
+	}
+	seen := make(map[string]struct{}, len(journal.Records))
+	for _, record := range journal.Records {
+		if !validSessionOperationRecord(record) || record.Operation.ProtectedResourceID != journal.ProtectedResourceID {
+			return false
+		}
+		if _, duplicate := seen[record.Operation.OperationID]; duplicate {
+			return false
+		}
+		seen[record.Operation.OperationID] = struct{}{}
+	}
+	return true
+}
+
+func validSessionOperationRecord(record SessionOperationRecord) bool {
+	if record.Schema != sessionOperationRecordSchema || !validOperation(record.Operation) ||
+		!validRecoveryEndpoint(record.RecoveryEndpoint) {
+		return false
+	}
+	switch record.Status {
+	case SessionOperationPrepared, SessionOperationDispatching:
+		return record.Admission == nil
+	case SessionOperationMapped, SessionOperationClosing, SessionOperationClosed:
+		return validSessionOperationAdmission(record.Admission, record.Operation)
+	case SessionOperationCanceled:
+		return record.Admission == nil
+	default:
+		return false
+	}
+}
+
+func validOperation(operation qurl.NativeSessionOperation) bool {
+	raw, err := json.Marshal(operation)
+	if err != nil {
+		return false
+	}
+	var checked qurl.NativeSessionOperation
+	return json.Unmarshal(raw, &checked) == nil && checked == operation
+}
+
+func validRecoveryEndpoint(endpoint qurl.NHPUDPEndpoint) bool {
+	if !validRecoveryEndpointHost(endpoint.Host) || endpoint.Port != 443 {
+		return false
+	}
+	key, err := base64.StdEncoding.Strict().DecodeString(endpoint.ServerPublicKeyB64)
+	return err == nil && len(key) == 32 && base64.StdEncoding.EncodeToString(key) == endpoint.ServerPublicKeyB64
+}
+
+func validRecoveryEndpointHost(host string) bool {
+	if host == "" || len(host) > 253 || strings.HasSuffix(host, ".") || net.ParseIP(host) != nil ||
+		(!strings.HasSuffix(host, ".layerv.ai") && !strings.HasSuffix(host, ".layerv.xyz")) {
+		return false
+	}
+	for _, label := range strings.Split(host, ".") {
+		if len(label) == 0 || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
+			return false
+		}
+		for _, char := range label {
+			if (char < 'a' || char > 'z') && (char < '0' || char > '9') && char != '-' {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func validSessionOperationAdmission(admission *SessionOperationAdmission, operation qurl.NativeSessionOperation) bool {
+	return admission != nil && admission.CellID == operation.CellID && admission.SessionID != 0 &&
+		admission.SessionIssuedAtMillis > 0 && admission.RunID == operation.RunID &&
+		admission.RunAttempt == operation.RunAttempt
+}
+
+func validSessionOperationTransition(previous, next SessionOperationRecord) bool {
+	if !validSessionOperationRecord(previous) || !validSessionOperationRecord(next) ||
+		previous.Schema != next.Schema || previous.Operation != next.Operation || previous.RecoveryEndpoint != next.RecoveryEndpoint {
+		return false
+	}
+	if previous.Admission != nil && (next.Admission == nil || *previous.Admission != *next.Admission) {
+		return false
+	}
+	switch previous.Status {
+	case SessionOperationPrepared:
+		return next.Status == SessionOperationDispatching
+	case SessionOperationDispatching:
+		return next.Status == SessionOperationMapped || next.Status == SessionOperationCanceled || next.Status == SessionOperationClosing || next.Status == SessionOperationClosed
+	case SessionOperationMapped:
+		return next.Status == SessionOperationClosing || next.Status == SessionOperationClosed
+	case SessionOperationClosing:
+		return next.Status == SessionOperationClosing || next.Status == SessionOperationClosed
+	default:
+		return false
+	}
+}
+
+func sameSessionOperationRecord(left, right SessionOperationRecord) bool {
+	lraw, lerr := json.Marshal(left)
+	rraw, rerr := json.Marshal(right)
+	return lerr == nil && rerr == nil && bytes.Equal(lraw, rraw)
+}
+
+func findSessionOperationRecord(records []SessionOperationRecord, target SessionOperationRecord) int {
+	for index, record := range records {
+		if sameSessionOperationRecord(record, target) {
+			return index
+		}
+	}
+	return -1
+}
+
+func writeSessionOperationJournal(namespace *pinnedfs.Directory, name string, journal sessionOperationJournal) (retErr error) {
+	if !validSessionOperationJournal(journal) {
+		return fmt.Errorf("%w: invalid journal", ErrSessionOperationConflict)
+	}
+	data, err := json.Marshal(journal)
+	if err != nil {
+		return fmt.Errorf("encode native session operation: %w", err)
+	}
+	if len(data) > sessionOperationFileMaxBytes {
+		return fmt.Errorf("native session operation exceeds %d bytes", sessionOperationFileMaxBytes)
+	}
+	if info, err := namespace.Lstat(name); err == nil {
+		if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() || info.Mode().Perm() != sessionOperationFileMode {
+			return fmt.Errorf("native session operation %s has an unsafe file shape", filepath.Join(namespace.Path(), name))
+		}
+	} else if !pinnedfs.IsNotExist(err) {
+		return err
+	}
+	var suffix [8]byte
+	if _, err := rand.Read(suffix[:]); err != nil {
+		return fmt.Errorf("generate native session operation temporary name: %w", err)
+	}
+	tmpName := "." + name + ".tmp-" + hex.EncodeToString(suffix[:])
+	tmp, err := namespace.OpenFile(tmpName, os.O_WRONLY|os.O_CREATE|os.O_EXCL|pinnedfs.SafeOpenFlags(), sessionOperationFileMode)
+	if err != nil {
+		return fmt.Errorf("create native session operation temporary file: %w", err)
+	}
+	committed := false
+	tmpOpen := true
+	defer func() {
+		if committed {
+			if tmpOpen {
+				retErr = errors.Join(retErr, tmp.Close())
+			}
+			return
+		}
+		var closeErr error
+		if tmpOpen {
+			closeErr = tmp.Close()
+		}
+		removeErr := namespace.Remove(tmpName)
+		if pinnedfs.IsNotExist(removeErr) {
+			removeErr = nil
+		}
+		retErr = errors.Join(retErr, closeErr, removeErr, namespace.Sync())
+	}()
+	if err := tmp.Chmod(sessionOperationFileMode); err != nil {
+		return err
+	}
+	if _, err := tmp.Write(data); err != nil {
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		return err
+	}
+	if _, err := pinnedfs.ValidateRegularFile(namespace, tmpName, tmp, "temporary native session operation", sessionOperationFileMode); err != nil {
+		return err
+	}
+	if err := namespace.Rename(tmpName, name); err != nil {
+		return fmt.Errorf("commit native session operation: %w", err)
+	}
+	committed = true
+	_, validationErr := pinnedfs.ValidateRegularFile(namespace, name, tmp, "committed native session operation", sessionOperationFileMode)
+	closeErr := tmp.Close()
+	tmpOpen = false
+	syncErr := namespace.Sync()
+	continuityErr := namespace.ValidateCurrent()
+	return errors.Join(validationErr, closeErr, syncErr, continuityErr)
+}
