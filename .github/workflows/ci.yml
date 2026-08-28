@@ -69,6 +69,19 @@ jobs:
       - name: Run Darwin bridge tests
         run: CGO_ENABLED=0 go test -count=1 ./pkg/agentstate ./pkg/config ./cmd/frpc ./internal/pinnedfs
 
+  windows-test:
+    name: Test (Windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - name: Run Windows user-job tests
+        env:
+          QURL_WINDOWS_USER_JOB_INTEGRATION: "1"
+        run: go test -count=1 ./pkg/service
+
   # The race detector requires cgo, so this lane builds with CGO_ENABLED=1 —
   # the only place in CI that does. `make test` keeps proving the CGO_ENABLED=0
   # build; this lane exists because a suite that is never run under -race
@@ -109,7 +122,7 @@ jobs:
 
   notify-main-failure:
     name: Notify Slack of main CI failure
-    needs: [lint, test, darwin-test, race, security, shellcheck]
+    needs: [lint, test, darwin-test, windows-test, race, security, shellcheck]
     if: ${{ always() && !cancelled() && github.event_name == 'push' && contains(needs.*.result, 'failure') }}
     uses: ./.github/workflows/slack-notify.yml
     with:

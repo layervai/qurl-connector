@@ -8,14 +8,14 @@ admits each shared resource with the Network-invisible Handshake Protocol
 local service -> qURL Connector -> qURL -> recipient
 ```
 
-Users install only the `qurl` CLI. It embeds this module. On macOS, the CLI
-manages a per-user LaunchAgent when a local share is first published or
-started. The daemon resumes desired-on shares after login and recovers
-automatically across sleep, wake, network changes, assignment refreshes, and
-session rotation. Background lifecycle is not yet supported on Linux or
-Windows; those platforms must use the explicit foreground path, which remains
-supported. The module fails closed instead of pretending that a background job
-was installed on an unsupported platform.
+Users install only the `qurl` CLI. It embeds this module. On macOS and Windows,
+the CLI uses the native per-user job manager when a local share is first
+published or started. The daemon resumes desired-on shares after login and
+recovers automatically across sleep, wake, network changes, assignment
+refreshes, and session rotation. Background lifecycle is not yet supported on
+Linux, where the explicit foreground path remains supported. The module fails
+closed instead of pretending that a background job was installed on an
+unsupported platform.
 
 `cmd/frpc` is retained for development and diagnostics. It is not a supported
 customer distribution, Homebrew formula, release binary, or container image.
