@@ -5,6 +5,7 @@ package pinnedfs
 import (
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -537,7 +538,7 @@ func (d *Directory) ReadDirNames(limit int) (names []string, retErr error) {
 	}
 	defer func() { retErr = errors.Join(retErr, dir.Close()) }()
 	entries, err := dir.ReadDir(limit + 1)
-	if err != nil {
+	if err != nil && !errors.Is(err, io.EOF) {
 		return nil, fmt.Errorf("enumerate pinned directory: %w", err)
 	}
 	if len(entries) > limit {

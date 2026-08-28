@@ -281,6 +281,36 @@ func TestEnsurePrivateDetectsAncestorSwapDuringTraversal(t *testing.T) {
 	}
 }
 
+func TestDirectoryReadDirNamesHandlesEmptySortedAndBoundedNamespaces(t *testing.T) {
+	root := realTempDir(t)
+	path := filepath.Join(root, "state")
+	dir, err := EnsurePrivate(path, 0o700)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dir.Close()
+
+	names, err := dir.ReadDirNames(2)
+	if err != nil || len(names) != 0 {
+		t.Fatalf("empty ReadDirNames = %v, %v, want empty success", names, err)
+	}
+	for _, name := range []string{"zeta", "alpha"} {
+		if err := os.WriteFile(filepath.Join(path, name), []byte(name), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	names, err = dir.ReadDirNames(2)
+	if err != nil || strings.Join(names, ",") != "alpha,zeta" {
+		t.Fatalf("sorted ReadDirNames = %v, %v", names, err)
+	}
+	if err := os.WriteFile(filepath.Join(path, "third"), []byte("third"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if names, err := dir.ReadDirNames(2); err == nil || !strings.Contains(err.Error(), "more than 2") {
+		t.Fatalf("over-limit ReadDirNames = %v, %v", names, err)
+	}
+}
+
 func countPath(paths []string, want string) int {
 	count := 0
 	for _, path := range paths {

@@ -128,7 +128,12 @@ func (d *durableNativeSessionOperations) RecoverPending(ctx context.Context, bin
 	if ctx == nil || binding == nil || len(privateKey) != 32 {
 		return errors.New("recover native session operation: runtime is incomplete")
 	}
-	records, err := d.store.LoadSessionOperations(ctx, protectedResourceID)
+	// A resource gets one aggregate cleanup budget. RecoverOperation also
+	// bounds direct callers, but its child deadline cannot extend this parent
+	// while the journal contains several records.
+	recoveryCtx, cancelRecovery := context.WithTimeout(ctx, nativeSessionCleanupBudget)
+	defer cancelRecovery()
+	records, err := d.store.LoadSessionOperations(recoveryCtx, protectedResourceID)
 	if err != nil {
 		return err
 	}
@@ -137,26 +142,7 @@ func (d *durableNativeSessionOperations) RecoverPending(ctx context.Context, bin
 		if _, keep := preserve[record.Operation.OperationID]; keep {
 			continue
 		}
-		if err := d.RecoverOperation(ctx, binding, privateKey, protectedResourceID, record.Operation.OperationID, udpOptions); err != nil {
-			recoveryErr = errors.Join(recoveryErr, err)
-		}
-	}
-	return recoveryErr
-}
-
-func (d *durableNativeSessionOperations) RecoverAllPending(ctx context.Context, binding *qurl.AgentRuntimeBinding,
-	privateKey []byte, udpOptions []qurl.AgentRuntimeUDPOption,
-) error {
-	if ctx == nil || binding == nil || len(privateKey) != 32 {
-		return errors.New("recover native session operations: runtime is incomplete")
-	}
-	resources, err := d.store.ListSessionOperationResources(ctx)
-	if err != nil {
-		return fmt.Errorf("enumerate native session operations: %w", err)
-	}
-	var recoveryErr error
-	for _, resourceID := range resources {
-		if err := d.RecoverPending(ctx, binding, privateKey, resourceID, nil, udpOptions); err != nil {
+		if err := d.RecoverOperation(recoveryCtx, binding, privateKey, protectedResourceID, record.Operation.OperationID, udpOptions); err != nil {
 			recoveryErr = errors.Join(recoveryErr, err)
 		}
 	}
@@ -340,8 +326,4 @@ func admissionFromReceipt(receipt qurl.NativeSessionReceipt) *agentstate.Session
 		SessionIssuedAtMillis: receipt.SessionIssuedAtMillis,
 		RunID:                 receipt.RunID, RunAttempt: receipt.RunAttempt,
 	}
-}
-
-func nativeSessionCleanupContext() (context.Context, context.CancelFunc) {
-	return context.WithTimeout(context.Background(), nativeSessionCleanupBudget)
 }

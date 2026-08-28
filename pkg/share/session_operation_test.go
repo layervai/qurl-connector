@@ -282,8 +282,11 @@ func TestDurableNativeSessionOperationRecoversEveryEnumeratedResource(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := controller.RecoverAllPending(context.Background(), &qurl.AgentRuntimeBinding{AgentID: "agent-one"},
-		make([]byte, 32), nil); err != nil {
+	admitter := &NativeAdmitter{
+		binding: &qurl.AgentRuntimeBinding{AgentID: "agent-one"}, privateKey: make([]byte, 32),
+		store: store, operations: controller,
+	}
+	if err := admitter.recoverAllPending(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	if len(store.operations[first.Operation.ProtectedResourceID]) != 0 || len(store.operations[second.Operation.ProtectedResourceID]) != 0 {
@@ -291,6 +294,83 @@ func TestDurableNativeSessionOperationRecoversEveryEnumeratedResource(t *testing
 	}
 	if recoverCalls != 1 {
 		t.Fatalf("startup network recoveries = %d, want 1", recoverCalls)
+	}
+}
+
+func TestNativeAdmitterOrphanRecoveryIsolatesSiblingResources(t *testing.T) {
+	oldRecover := recoverNativeSessionOperation
+	t.Cleanup(func() { recoverNativeSessionOperation = oldRecover })
+	store := &memoryNativeStore{}
+	failed := testPreparedDurableRecord(t)
+	failed.Status = agentstate.SessionOperationDispatching
+	healthyOperation := testDurableOperationForProtectedResource("MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE2vPoafaVb5Lue-bfcCuoL-_CnVBKf8YvV94G8ozebA6RHEQUPsnguSt1yx2mTzDSogBmb9WYEVBDgX7vc2NKTg")
+	healthy, err := agentstate.NewSessionOperationRecord(healthyOperation, testDurableRecoveryEndpoint())
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.operations = map[string][]agentstate.SessionOperationRecord{
+		failed.Operation.ProtectedResourceID:  {failed},
+		healthy.Operation.ProtectedResourceID: {healthy},
+	}
+	want := errors.New("issuing cell unavailable")
+	recoverNativeSessionOperation = func(context.Context, *qurl.AgentRuntimeBinding, []byte,
+		qurl.NativeSessionOperation, qurl.NHPUDPEndpoint, ...qurl.AgentRuntimeUDPOption,
+	) (*qurl.NativeSessionOperationRecovery, error) {
+		return nil, want
+	}
+	controller, err := newDurableNativeSessionOperations(store, testNativeSessionAuthority())
+	if err != nil {
+		t.Fatal(err)
+	}
+	admitter := &NativeAdmitter{
+		binding: &qurl.AgentRuntimeBinding{AgentID: "agent-one"}, privateKey: make([]byte, 32),
+		store: store, operations: controller,
+	}
+	err = admitter.recoverAllPending(context.Background())
+	if !errors.Is(err, want) {
+		t.Fatalf("recoverAllPending() = %v, want failed resource error", err)
+	}
+	if len(store.operations[failed.Operation.ProtectedResourceID]) != 1 {
+		t.Fatalf("failed resource journal was discarded: %+v", store.operations)
+	}
+	if len(store.operations[healthy.Operation.ProtectedResourceID]) != 0 {
+		t.Fatalf("healthy sibling recovery did not continue: %+v", store.operations)
+	}
+}
+
+func TestDurableNativeSessionRecoverySharesOneResourceDeadline(t *testing.T) {
+	oldRecover := recoverNativeSessionOperation
+	t.Cleanup(func() { recoverNativeSessionOperation = oldRecover })
+	store := &memoryNativeStore{}
+	first := testPreparedDurableRecord(t)
+	first.Status = agentstate.SessionOperationDispatching
+	second := first
+	second.Operation.OperationID = strings.Repeat("4", 64)
+	store.operations = map[string][]agentstate.SessionOperationRecord{
+		testProtectedResourceID: {first, second},
+	}
+	controller, err := newDurableNativeSessionOperations(store, testNativeSessionAuthority())
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadlines := make([]time.Time, 0, 2)
+	recoverNativeSessionOperation = func(ctx context.Context, _ *qurl.AgentRuntimeBinding, _ []byte,
+		_ qurl.NativeSessionOperation, _ qurl.NHPUDPEndpoint, _ ...qurl.AgentRuntimeUDPOption,
+	) (*qurl.NativeSessionOperationRecovery, error) {
+		deadline, ok := ctx.Deadline()
+		if !ok {
+			t.Fatal("recovery call has no cleanup deadline")
+		}
+		deadlines = append(deadlines, deadline)
+		return nil, errors.New("retry later")
+	}
+	err = controller.RecoverPending(context.Background(), &qurl.AgentRuntimeBinding{AgentID: "agent-one"},
+		make([]byte, 32), testProtectedResourceID, nil, nil)
+	if err == nil || len(deadlines) != 2 {
+		t.Fatalf("RecoverPending() = %v, deadlines=%v", err, deadlines)
+	}
+	if !deadlines[0].Equal(deadlines[1]) {
+		t.Fatalf("per-operation deadlines differ: %v", deadlines)
 	}
 }
 

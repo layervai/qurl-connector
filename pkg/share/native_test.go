@@ -152,6 +152,28 @@ type recoveryFailureOperations struct {
 	err error
 }
 
+type retirementFailureOperations struct {
+	testNativeSessionOperations
+	err error
+}
+
+func (o retirementFailureOperations) Retire(context.Context, *qurl.AgentRuntimeBinding, []byte,
+	string, string, qurl.NativeSessionReceipt, []qurl.AgentRuntimeUDPOption,
+) error {
+	return o.err
+}
+
+type cleanupFailureOperations struct {
+	testNativeSessionOperations
+	err error
+}
+
+func (o cleanupFailureOperations) RecoverOperation(context.Context, *qurl.AgentRuntimeBinding, []byte,
+	string, string, []qurl.AgentRuntimeUDPOption,
+) error {
+	return o.err
+}
+
 func (o recoveryFailureOperations) RecoverPending(context.Context, *qurl.AgentRuntimeBinding, []byte, string, map[string]struct{}, []qurl.AgentRuntimeUDPOption) error {
 	return o.err
 }
@@ -336,14 +358,59 @@ func TestOpenNativeRuntimeAutomaticallyRetriesAssignmentRefresh(t *testing.T) {
 	}
 }
 
-func TestNativeAdmitterLetsRecoveryTransportFailureReachRefreshClassifier(t *testing.T) {
+func TestNativeAdmitterKeepsSourceFencedRecoveryOutOfRefreshClassifier(t *testing.T) {
 	admitter := &NativeAdmitter{
 		binding: &qurl.AgentRuntimeBinding{AgentID: "agent-one"}, privateKey: make([]byte, 32),
 		operations: recoveryFailureOperations{err: nativeudp.ErrNoReply}, generation: 7,
 	}
 	admission, err, generation, refreshEligible := admitter.admitOnce(context.Background(), "q_catalog", "resource-one")
-	if !reflect.DeepEqual(admission, Admission{}) || err == nil || generation != 7 || !refreshEligible || !refreshableKnockError(err) {
+	if !reflect.DeepEqual(admission, Admission{}) || err == nil || generation != 7 || refreshEligible || !refreshableKnockError(err) {
 		t.Fatalf("recovery refresh classification = %#v, %v, generation=%d, eligible=%t", admission, err, generation, refreshEligible)
+	}
+}
+
+func TestNativeAdmitterRetirementFailurePreservesPlacementFailureBudget(t *testing.T) {
+	want := errors.New("retirement failed")
+	receipt := testSessionReceipt(1, "run-one", 1)
+	key := admissionKey(receipt)
+	admitter := &NativeAdmitter{
+		binding: &qurl.AgentRuntimeBinding{AgentID: "agent-one"}, privateKey: make([]byte, 32),
+		operations: retirementFailureOperations{err: want}, generation: 7,
+		failureGen: 7, failures: 4,
+		live: map[nativeAdmissionKey]nativeLiveAdmission{
+			key: {resourceID: "resource-one", operationID: "operation-one", receipt: receipt},
+		},
+		pending: map[nativeAdmissionKey]bool{key: true},
+	}
+	if _, err := admitter.Admit(context.Background(), "q_catalog", "resource-one"); !errors.Is(err, want) {
+		t.Fatalf("Admit() = %v, want retirement failure", err)
+	}
+	if admitter.failureGen != 7 || admitter.failures != 4 {
+		t.Fatalf("placement budget after retirement failure = generation %d count %d, want 7/4", admitter.failureGen, admitter.failures)
+	}
+}
+
+func TestNativeAdmitterClassifiesKnockWithoutCleanupSentinels(t *testing.T) {
+	oldKnock := knockNativeRuntime
+	t.Cleanup(func() { knockNativeRuntime = oldKnock })
+	knockNativeRuntime = func(context.Context, *qurl.AgentRuntimeBinding, []byte, string,
+		qurl.NativeKnockOptions, ...qurl.AgentRuntimeUDPOption,
+	) (*qurl.NativeKnockResult, error) {
+		return nil, nativeudp.ErrNoReply
+	}
+	admitter := &NativeAdmitter{
+		binding: &qurl.AgentRuntimeBinding{AgentID: "agent-one"}, privateKey: make([]byte, 32),
+		operations: cleanupFailureOperations{err: qurl.ErrMalformedReply},
+	}
+	_, err := admitter.Admit(context.Background(), "q_catalog", "resource-one")
+	if !errors.Is(err, nativeudp.ErrNoReply) {
+		t.Fatalf("Admit() = %v, want primary no-reply sentinel", err)
+	}
+	if errors.Is(err, qurl.ErrMalformedReply) {
+		t.Fatalf("cleanup sentinel escaped into placement classification: %v", err)
+	}
+	if !strings.Contains(err.Error(), "durable native session cleanup also failed") {
+		t.Fatalf("cleanup diagnostic missing from %v", err)
 	}
 }
 
@@ -1402,6 +1469,58 @@ func TestNativeAdmitterDoesNotRetainEnrollmentCredential(t *testing.T) {
 	}
 }
 
+func TestNewNativeAdmitterStartsWhileOrphanRecoveryRetriesAndCloseCancels(t *testing.T) {
+	oldTakeKey := takeNativeKey
+	oldRecover := recoverNativeSessionOperation
+	t.Cleanup(func() {
+		takeNativeKey = oldTakeKey
+		recoverNativeSessionOperation = oldRecover
+	})
+	takeNativeKey = func(*qurl.AgentRuntimeBinding) []byte { return make([]byte, 32) }
+	store := &memoryNativeStore{}
+	prepared := testPreparedDurableRecord(t)
+	if err := store.CreateSessionOperation(context.Background(), prepared); err != nil {
+		t.Fatal(err)
+	}
+	dispatching := prepared
+	dispatching.Status = agentstate.SessionOperationDispatching
+	if err := store.TransitionSessionOperation(context.Background(), prepared, dispatching); err != nil {
+		t.Fatal(err)
+	}
+	started := make(chan struct{})
+	var once sync.Once
+	recoverNativeSessionOperation = func(ctx context.Context, _ *qurl.AgentRuntimeBinding, _ []byte,
+		_ qurl.NativeSessionOperation, _ qurl.NHPUDPEndpoint, _ ...qurl.AgentRuntimeUDPOption,
+	) (*qurl.NativeSessionOperationRecovery, error) {
+		once.Do(func() { close(started) })
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	runtime := &NativeRuntime{
+		Binding: &qurl.AgentRuntimeBinding{AgentID: "agent-one"}, store: store,
+		SessionOperations: testNativeSessionAuthority(),
+	}
+	admitter, err := NewNativeAdmitter(context.Background(), runtime)
+	if err != nil {
+		t.Fatalf("NewNativeAdmitter blocked on orphan recovery: %v", err)
+	}
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("background orphan recovery did not start")
+	}
+	closed := make(chan error, 1)
+	go func() { closed <- admitter.Close() }()
+	select {
+	case err := <-closed:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Close did not cancel background orphan recovery")
+	}
+}
+
 func TestNativeAdmitterRetiresOnlyExactLiveSessions(t *testing.T) {
 	oldRetire := retireNativeSession
 	t.Cleanup(func() { retireNativeSession = oldRetire })
@@ -1609,8 +1728,9 @@ func TestNativeAdmitterRetiresPostACKAdmissionRejectedByLocalValidation(t *testi
 		malformed = true
 		admitter := newAdmitter()
 		_, err := admitter.Admit(context.Background(), "q_one", "resource-one")
-		if err == nil || !errors.Is(err, nativeudp.ErrNoReply) {
-			t.Fatalf("Admit() = %v, want joined local-validation and retirement failure", err)
+		if err == nil || errors.Is(err, nativeudp.ErrNoReply) ||
+			!strings.Contains(err.Error(), "durable native session cleanup also failed") {
+			t.Fatalf("Admit() = %v, want primary local-validation error with secondary retirement diagnostic", err)
 		}
 		if retireCalls != 1 || len(admitter.live) != 1 || len(admitter.pending) != 1 {
 			t.Fatalf("retained cleanup calls=%d live=%d pending=%d", retireCalls, len(admitter.live), len(admitter.pending))
