@@ -10,10 +10,10 @@ contributors should also read [CONTRIBUTING.md](CONTRIBUTING.md).
   grow another native registration, refresh, knock, or FRP supervisor.
 - NHP admission is resource-bound. Keep public resource ID, knock resource ID,
   connector/routing ID, session ID, and serving epoch distinct.
-- The macOS managed daemon is credential-free. Account-authenticated
-  desired-state changes belong to the foreground `qurl` command. Linux and
-  Windows use the explicit foreground path until a reviewed per-user service
-  manager exists for those platforms.
+- The macOS and Windows managed daemons are credential-free. Account-
+  authenticated desired-state changes belong to the foreground `qurl`
+  command. Linux uses the explicit foreground path until a reviewed per-user
+  service manager exists for that platform.
 - Session renewal is make-before-break and becomes ready only when every
   configured FRP proxy reaches its running phase.
 - Per-resource failures must not tear down healthy sibling shares.
@@ -36,8 +36,8 @@ endpoints, cloud account identifiers, customer data, or live rollout evidence.
 
 ## State and security
 
-- Persistent state, IPC directories, and macOS LaunchAgent state are owner-only
-  and reject symlinked or permissive parents.
+- Persistent state, IPC directories, macOS LaunchAgent state, and Windows Task
+  Scheduler staging and log paths are owner-only.
 - Persisted lifecycle updates are monotonic: serving epochs cannot regress and
   immutable resource identities cannot change in place.
 - Automatic assignment recovery uses bounded persisted backoff. Authenticated

@@ -82,13 +82,18 @@ type windowsRenderedUserJob struct {
 }
 
 type windowsUserJobManager struct {
-	run        func(string, ...string) (string, error)
-	currentSID func() (string, error)
+	run           func(string, ...string) (string, error)
+	currentSID    func() (string, error)
+	powerShell    func() (string, error)
+	taskScheduler func() (string, error)
 }
 
 // NewUserJobManager returns a per-user Windows Task Scheduler manager.
 func NewUserJobManager() UserJobManager {
-	return &windowsUserJobManager{run: windowsJobCommandOutput, currentSID: currentWindowsUserSID}
+	return &windowsUserJobManager{
+		run: windowsJobCommandOutput, currentSID: currentWindowsUserSID,
+		powerShell: windowsPowerShellExecutable, taskScheduler: windowsTaskSchedulerExecutable,
+	}
 }
 
 func (m *windowsUserJobManager) Ensure(job UserJob) error {
@@ -100,55 +105,68 @@ func (m *windowsUserJobManager) Replace(job UserJob) error {
 }
 
 func (m *windowsUserJobManager) ensure(job UserJob, forceReplace bool) error {
-	content, marker, err := m.render(job)
+	job, err := normalizeUserJob(job)
+	if err != nil {
+		return err
+	}
+	sid, taskName, err := m.identity(job.Label)
+	if err != nil {
+		return err
+	}
+	content, marker, err := m.render(job, sid)
 	if err != nil {
 		return err
 	}
 	for _, dir := range []string{filepath.Dir(job.StandardOut), filepath.Dir(job.StandardErr)} {
-		if err := os.MkdirAll(dir, 0o700); err != nil {
+		if err := ensureWindowsPrivateDirectory(dir, sid); err != nil {
 			return fmt.Errorf("create Windows user job directory %s: %w", dir, err)
 		}
 	}
-	installed, err := m.installed(job.Label)
+	installed, err := m.installed(taskName)
 	if err != nil {
 		return fmt.Errorf("inspect Windows user job %s: %w", job.Label, err)
 	}
 	var existing string
 	if installed {
-		existing, err = m.run("schtasks.exe", "/Query", "/TN", job.Label, "/XML")
+		existing, err = m.runTaskScheduler("/Query", "/TN", taskName, "/XML")
 		if err != nil {
 			return fmt.Errorf("read Windows user job %s: %w", job.Label, err)
 		}
+		existing = decodeWindowsCommandText(existing)
 	}
 	if installed && !forceReplace && strings.Contains(existing, marker) {
-		running, stateErr := m.running(job.Label)
+		running, stateErr := m.running(taskName)
 		if stateErr != nil {
 			return fmt.Errorf("inspect Windows user job %s: %w", job.Label, stateErr)
 		}
 		if running {
 			return nil
 		}
-		return m.start(job.Label)
+		return m.start(job.Label, taskName)
 	}
 	if installed {
 		// A changed definition or explicit replacement must stop the old process
 		// before Task Scheduler replaces the durable task.
-		running, stateErr := m.running(job.Label)
+		running, stateErr := m.running(taskName)
 		if stateErr != nil {
 			return fmt.Errorf("inspect Windows user job %s before replacement: %w", job.Label, stateErr)
 		}
 		if running {
-			if _, err := m.run("schtasks.exe", "/End", "/TN", job.Label); err != nil {
+			if _, err := m.runTaskScheduler("/End", "/TN", taskName); err != nil {
 				return fmt.Errorf("stop Windows user job %s before replacement: %w", job.Label, err)
 			}
 		}
 	}
-	definition, err := os.CreateTemp("", "qurl-user-job-*.xml")
+	definition, err := os.CreateTemp(filepath.Dir(job.StandardOut), ".qurl-user-job-*.xml")
 	if err != nil {
 		return fmt.Errorf("create temporary Windows user job definition: %w", err)
 	}
 	definitionPath := definition.Name()
 	defer func() { _ = os.Remove(definitionPath) }()
+	if err := protectWindowsUserJobPath(definitionPath, sid); err != nil {
+		_ = definition.Close()
+		return fmt.Errorf("protect temporary Windows user job definition: %w", err)
+	}
 	if _, err := definition.Write(windowsTaskXMLBytes(content)); err != nil {
 		_ = definition.Close()
 		return fmt.Errorf("write temporary Windows user job definition: %w", err)
@@ -160,14 +178,14 @@ func (m *windowsUserJobManager) ensure(job UserJob, forceReplace bool) error {
 	if err := definition.Close(); err != nil {
 		return fmt.Errorf("close temporary Windows user job definition: %w", err)
 	}
-	if _, err := m.run("schtasks.exe", "/Create", "/TN", job.Label, "/XML", definitionPath, "/F"); err != nil {
+	if _, err := m.runTaskScheduler("/Create", "/TN", taskName, "/XML", definitionPath, "/F"); err != nil {
 		return fmt.Errorf("install Windows user job %s: %w", job.Label, err)
 	}
-	return m.start(job.Label)
+	return m.start(job.Label, taskName)
 }
 
-func (m *windowsUserJobManager) start(label string) error {
-	if _, err := m.run("schtasks.exe", "/Run", "/TN", label); err != nil {
+func (m *windowsUserJobManager) start(label, taskName string) error {
+	if _, err := m.runTaskScheduler("/Run", "/TN", taskName); err != nil {
 		return fmt.Errorf("start Windows user job %s: %w", label, err)
 	}
 	return nil
@@ -177,23 +195,27 @@ func (m *windowsUserJobManager) Remove(label string) error {
 	if !userJobLabelPattern.MatchString(label) {
 		return fmt.Errorf("invalid Windows user job label %q", label)
 	}
-	installed, err := m.installed(label)
+	_, taskName, err := m.identity(label)
+	if err != nil {
+		return err
+	}
+	installed, err := m.installed(taskName)
 	if err != nil {
 		return fmt.Errorf("inspect Windows user job %s: %w", label, err)
 	}
 	if !installed {
 		return nil
 	}
-	running, err := m.running(label)
+	running, err := m.running(taskName)
 	if err != nil {
 		return fmt.Errorf("inspect Windows user job %s before removal: %w", label, err)
 	}
 	if running {
-		if _, err := m.run("schtasks.exe", "/End", "/TN", label); err != nil {
+		if _, err := m.runTaskScheduler("/End", "/TN", taskName); err != nil {
 			return fmt.Errorf("stop Windows user job %s before removal: %w", label, err)
 		}
 	}
-	if _, err := m.run("schtasks.exe", "/Delete", "/TN", label, "/F"); err != nil {
+	if _, err := m.runTaskScheduler("/Delete", "/TN", taskName, "/F"); err != nil {
 		return fmt.Errorf("remove Windows user job %s: %w", label, err)
 	}
 	return nil
@@ -203,14 +225,18 @@ func (m *windowsUserJobManager) Status(label string) (ServiceStatus, error) {
 	if !userJobLabelPattern.MatchString(label) {
 		return ServiceStatus{}, fmt.Errorf("invalid Windows user job label %q", label)
 	}
-	installed, err := m.installed(label)
+	_, taskName, err := m.identity(label)
+	if err != nil {
+		return ServiceStatus{}, err
+	}
+	installed, err := m.installed(taskName)
 	if err != nil {
 		return ServiceStatus{}, fmt.Errorf("inspect Windows user job %s: %w", label, err)
 	}
 	if !installed {
 		return ServiceStatus{}, nil
 	}
-	running, err := m.running(label)
+	running, err := m.running(taskName)
 	if err != nil {
 		return ServiceStatus{Installed: true}, err
 	}
@@ -221,7 +247,7 @@ func (m *windowsUserJobManager) installed(label string) (bool, error) {
 	command := "$ErrorActionPreference='Stop'; $tasks = @(Get-ScheduledTask -TaskPath '\\' -ErrorAction Stop | " +
 		"Where-Object { $_.TaskName -eq '" + label + "' }); if ($tasks.Count -eq 0) { '0' } " +
 		"elseif ($tasks.Count -eq 1) { '1' } else { throw 'duplicate task name' }"
-	output, err := m.run("powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", command)
+	output, err := m.runPowerShell(command)
 	if err != nil {
 		return false, err
 	}
@@ -239,7 +265,7 @@ func (m *windowsUserJobManager) running(label string) (bool, error) {
 	// ScheduledTaskState is a stable numeric enum: Running is 4. Numeric output
 	// avoids localized schtasks status strings.
 	command := "$task = Get-ScheduledTask -TaskName '" + label + "' -TaskPath '\\' -ErrorAction Stop; [int]$task.State"
-	output, err := m.run("powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", command)
+	output, err := m.runPowerShell(command)
 	if err != nil {
 		return false, err
 	}
@@ -250,27 +276,23 @@ func (m *windowsUserJobManager) running(label string) (bool, error) {
 	return state == 4, nil
 }
 
-func (m *windowsUserJobManager) render(job UserJob) (string, string, error) {
-	job, err := normalizeUserJob(job)
-	if err != nil {
-		return "", "", err
-	}
-	if m == nil || m.currentSID == nil {
-		return "", "", errors.New("Windows user job manager is incomplete")
-	}
-	sid, err := m.currentSID()
-	if err != nil {
-		return "", "", err
-	}
-	canonical, err := json.Marshal(job)
+func (m *windowsUserJobManager) render(job UserJob, sid string) (string, string, error) {
+	canonical, err := json.Marshal(struct {
+		Job UserJob `json:"job"`
+		SID string  `json:"sid"`
+	}{Job: job, SID: sid})
 	if err != nil {
 		return "", "", fmt.Errorf("encode Windows user job definition: %w", err)
 	}
 	digest := sha256.Sum256(canonical)
 	marker := windowsTaskDefinitionPrefix + hex.EncodeToString(digest[:])
 	launcher := windowsPowerShellLauncher(job)
+	powerShell, err := m.powerShellExecutable()
+	if err != nil {
+		return "", "", err
+	}
 	view := windowsRenderedUserJob{
-		UserSID: sid, DefinitionMarker: marker, BinaryPath: "powershell.exe",
+		UserSID: sid, DefinitionMarker: marker, BinaryPath: powerShell,
 		CommandLine:      "-NoLogo -NoProfile -NonInteractive -WindowStyle Hidden -EncodedCommand " + launcher,
 		WorkingDirectory: filepath.Dir(job.BinaryPath),
 		RunAtLoad:        job.RunAtLoad, KeepAlive: job.KeepAlive,
@@ -284,6 +306,54 @@ func (m *windowsUserJobManager) render(job UserJob) (string, string, error) {
 		return "", "", fmt.Errorf("render Windows user job: %w", err)
 	}
 	return buffer.String(), marker, nil
+}
+
+func (m *windowsUserJobManager) identity(label string) (string, string, error) {
+	if m == nil || m.currentSID == nil {
+		return "", "", errors.New("Windows user job manager is incomplete")
+	}
+	sid, err := m.currentSID()
+	if err != nil {
+		return "", "", err
+	}
+	return sid, windowsScopedTaskName(label, sid), nil
+}
+
+func (m *windowsUserJobManager) powerShellExecutable() (string, error) {
+	if m != nil && m.powerShell != nil {
+		return m.powerShell()
+	}
+	return windowsPowerShellExecutable()
+}
+
+func (m *windowsUserJobManager) runPowerShell(command string) (string, error) {
+	executable, err := m.powerShellExecutable()
+	if err != nil {
+		return "", err
+	}
+	return m.run(executable, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", command)
+}
+
+func (m *windowsUserJobManager) runTaskScheduler(arguments ...string) (string, error) {
+	resolve := windowsTaskSchedulerExecutable
+	if m != nil && m.taskScheduler != nil {
+		resolve = m.taskScheduler
+	}
+	executable, err := resolve()
+	if err != nil {
+		return "", err
+	}
+	return m.run(executable, arguments...)
+}
+
+func windowsScopedTaskName(label, sid string) string {
+	digest := sha256.Sum256([]byte(sid))
+	suffix := hex.EncodeToString(digest[:8])
+	const maxTaskName = 128
+	if limit := maxTaskName - len(suffix) - 1; len(label) > limit {
+		label = label[:limit]
+	}
+	return label + "." + suffix
 }
 
 func windowsPowerShellLauncher(job UserJob) string {
@@ -322,10 +392,82 @@ func currentWindowsUserSID() (string, error) {
 	}
 	defer func() { _ = token.Close() }()
 	user, err := token.GetTokenUser()
-	if err != nil || user == nil || user.User.Sid == nil {
+	if err != nil {
 		return "", fmt.Errorf("read current Windows user SID: %w", err)
 	}
+	if user == nil || user.User.Sid == nil {
+		return "", errors.New("read current Windows user SID: token has no user SID")
+	}
 	return user.User.Sid.String(), nil
+}
+
+func windowsPowerShellExecutable() (string, error) {
+	systemDirectory, err := windows.GetSystemWindowsDirectory()
+	if err != nil {
+		return "", fmt.Errorf("locate Windows PowerShell: %w", err)
+	}
+	return filepath.Join(systemDirectory, "WindowsPowerShell", "v1.0", "powershell.exe"), nil
+}
+
+func windowsTaskSchedulerExecutable() (string, error) {
+	systemDirectory, err := windows.GetSystemDirectory()
+	if err != nil {
+		return "", fmt.Errorf("locate Windows Task Scheduler client: %w", err)
+	}
+	return filepath.Join(systemDirectory, "schtasks.exe"), nil
+}
+
+func ensureWindowsPrivateDirectory(path, sid string) error {
+	if err := os.MkdirAll(path, 0o700); err != nil {
+		return err
+	}
+	return protectWindowsUserJobPath(path, sid)
+}
+
+func protectWindowsUserJobPath(path, sid string) error {
+	descriptor, err := windows.SecurityDescriptorFromString(fmt.Sprintf(
+		"O:%sG:%sD:P(A;OICI;FA;;;%s)(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)", sid, sid, sid))
+	if err != nil {
+		return fmt.Errorf("build protected Windows user job ACL: %w", err)
+	}
+	dacl, _, err := descriptor.DACL()
+	if err != nil {
+		return fmt.Errorf("read protected Windows user job ACL: %w", err)
+	}
+	if err := windows.SetNamedSecurityInfo(path, windows.SE_FILE_OBJECT,
+		windows.DACL_SECURITY_INFORMATION|windows.PROTECTED_DACL_SECURITY_INFORMATION,
+		nil, nil, dacl, nil); err != nil {
+		return fmt.Errorf("apply protected Windows user job ACL: %w", err)
+	}
+	return nil
+}
+
+func decodeWindowsCommandText(value string) string {
+	raw := []byte(value)
+	if len(raw) < 2 {
+		return value
+	}
+	offset := 0
+	switch {
+	case raw[0] == 0xff && raw[1] == 0xfe:
+		offset = 2
+	case raw[0] == 0xfe && raw[1] == 0xff:
+		units := make([]uint16, (len(raw)-2)/2)
+		for index := range units {
+			units[index] = binary.BigEndian.Uint16(raw[2+index*2:])
+		}
+		return string(utf16.Decode(units))
+	case raw[1] != 0:
+		return value
+	}
+	if (len(raw)-offset)%2 != 0 {
+		return value
+	}
+	units := make([]uint16, (len(raw)-offset)/2)
+	for index := range units {
+		units[index] = binary.LittleEndian.Uint16(raw[offset+index*2:])
+	}
+	return string(utf16.Decode(units))
 }
 
 func windowsJobCommandOutput(name string, args ...string) (string, error) {

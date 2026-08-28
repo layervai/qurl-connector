@@ -80,7 +80,9 @@ jobs:
       - name: Run Windows user-job tests
         env:
           QURL_WINDOWS_USER_JOB_INTEGRATION: "1"
-        run: go test -count=1 ./pkg/service
+        run: |
+          go vet ./pkg/service
+          go test -count=1 ./pkg/service
 
   # The race detector requires cgo, so this lane builds with CGO_ENABLED=1 —
   # the only place in CI that does. `make test` keeps proving the CGO_ENABLED=0
