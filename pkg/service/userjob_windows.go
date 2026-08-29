@@ -4,11 +4,14 @@ package service
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
+	"encoding/xml"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -112,7 +115,7 @@ func (m *windowsUserJobManager) Replace(job UserJob) error {
 	return m.ensure(job, true)
 }
 
-func (m *windowsUserJobManager) ensure(job UserJob, forceReplace bool) error {
+func (m *windowsUserJobManager) ensure(job UserJob, forceReplace bool) (retErr error) {
 	job, err := normalizeUserJob(job)
 	if err != nil {
 		return err
@@ -121,7 +124,7 @@ func (m *windowsUserJobManager) ensure(job UserJob, forceReplace bool) error {
 	if err != nil {
 		return err
 	}
-	content, marker, err := m.render(job, sid)
+	content, _, err := m.render(job, sid)
 	if err != nil {
 		return err
 	}
@@ -148,37 +151,25 @@ func (m *windowsUserJobManager) ensure(job UserJob, forceReplace bool) error {
 		}
 		existing = decodeWindowsCommandText(existing)
 	}
-	if installed && !forceReplace && strings.Contains(existing, marker) && state != windowsTaskStateDisabled {
+	definitionMatches := false
+	if installed && !forceReplace && state != windowsTaskStateDisabled {
+		definitionMatches, err = matchingWindowsUserJobDefinition(existing, content)
+		if err != nil {
+			return fmt.Errorf("validate Windows user job %s definition: %w", job.Label, err)
+		}
+	}
+	if definitionMatches {
 		if state == windowsTaskStateRunning {
 			return nil
 		}
 		return m.start(job.Label, taskName)
-	}
-	if installed {
-		// A changed definition or explicit replacement must stop the old process
-		// before Task Scheduler replaces the durable task. Disable it first so a
-		// KeepAlive task cannot restart between /End and /Create.
-		wasRunning := state == windowsTaskStateRunning
-		if _, err := m.runTaskScheduler("/Change", "/TN", taskName, "/Disable"); err != nil {
-			return fmt.Errorf("disable Windows user job %s before replacement: %w", job.Label, err)
-		}
-		if wasRunning {
-			if _, endErr := m.runTaskScheduler("/End", "/TN", taskName); endErr != nil {
-				current, stateErr := m.state(taskName)
-				if stateErr != nil || current == windowsTaskStateRunning {
-					return errors.Join(fmt.Errorf("stop Windows user job %s before replacement: %w", job.Label, endErr), stateErr)
-				}
-			} else if err := m.waitUntilStopped(taskName); err != nil {
-				return fmt.Errorf("wait for Windows user job %s to stop before replacement: %w", job.Label, err)
-			}
-		}
 	}
 	definition, err := os.CreateTemp(filepath.Dir(job.StandardOut), ".qurl-user-job-*.xml")
 	if err != nil {
 		return fmt.Errorf("create temporary Windows user job definition: %w", err)
 	}
 	definitionPath := definition.Name()
-	defer func() { _ = os.Remove(definitionPath) }()
+	defer func() { retErr = errors.Join(retErr, removeWindowsUserJobDefinition(definitionPath)) }()
 	if err := ensureWindowsPrivateFile(definitionPath, sid); err != nil {
 		_ = definition.Close()
 		return fmt.Errorf("protect temporary Windows user job definition: %w", err)
@@ -194,10 +185,59 @@ func (m *windowsUserJobManager) ensure(job UserJob, forceReplace bool) error {
 	if err := definition.Close(); err != nil {
 		return fmt.Errorf("close temporary Windows user job definition: %w", err)
 	}
+
+	wasRunning := false
+	restoreNeeded := false
+	defer func() {
+		if retErr != nil && restoreNeeded {
+			retErr = errors.Join(retErr, m.restore(job.Label, taskName, wasRunning))
+		}
+	}()
+	if installed {
+		// A changed definition or explicit replacement must stop the old process
+		// before Task Scheduler replaces the durable task. Disable it first so a
+		// KeepAlive task cannot restart between /End and /Create.
+		wasRunning = state == windowsTaskStateRunning
+		restoreNeeded = true
+		if _, err := m.runTaskScheduler("/Change", "/TN", taskName, "/Disable"); err != nil {
+			return fmt.Errorf("disable Windows user job %s before replacement: %w", job.Label, err)
+		}
+		if wasRunning {
+			if _, endErr := m.runTaskScheduler("/End", "/TN", taskName); endErr != nil {
+				current, stateErr := m.state(taskName)
+				if stateErr != nil || current == windowsTaskStateRunning {
+					return errors.Join(fmt.Errorf("stop Windows user job %s before replacement: %w", job.Label, endErr), stateErr)
+				}
+			} else if err := m.waitUntilStopped(taskName); err != nil {
+				return fmt.Errorf("wait for Windows user job %s to stop before replacement: %w", job.Label, err)
+			}
+		}
+	}
 	if _, err := m.runTaskScheduler("/Create", "/TN", taskName, "/XML", definitionPath, "/F"); err != nil {
 		return fmt.Errorf("install Windows user job %s: %w", job.Label, err)
 	}
+	restoreNeeded = false
 	return m.start(job.Label, taskName)
+}
+
+func removeWindowsUserJobDefinition(path string) error {
+	err := os.Remove(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	return err
+}
+
+func (m *windowsUserJobManager) restore(label, taskName string, wasRunning bool) error {
+	if _, err := m.runTaskScheduler("/Change", "/TN", taskName, "/Enable"); err != nil {
+		return fmt.Errorf("restore Windows user job %s after failed change: %w", label, err)
+	}
+	if wasRunning {
+		if _, err := m.runTaskScheduler("/Run", "/TN", taskName); err != nil {
+			return fmt.Errorf("restart Windows user job %s after failed change: %w", label, err)
+		}
+	}
+	return nil
 }
 
 func (m *windowsUserJobManager) start(label, taskName string) error {
@@ -207,7 +247,7 @@ func (m *windowsUserJobManager) start(label, taskName string) error {
 	return nil
 }
 
-func (m *windowsUserJobManager) Remove(label string) error {
+func (m *windowsUserJobManager) Remove(label string) (retErr error) {
 	if !userJobLabelPattern.MatchString(label) {
 		return fmt.Errorf("invalid Windows user job label %q", label)
 	}
@@ -224,6 +264,12 @@ func (m *windowsUserJobManager) Remove(label string) error {
 	}
 	// Disable before /End so restart-on-failure cannot race task deletion.
 	wasRunning := state == windowsTaskStateRunning
+	restoreNeeded := true
+	defer func() {
+		if retErr != nil && restoreNeeded {
+			retErr = errors.Join(retErr, m.restore(label, taskName, wasRunning))
+		}
+	}()
 	if _, err := m.runTaskScheduler("/Change", "/TN", taskName, "/Disable"); err != nil {
 		return fmt.Errorf("disable Windows user job %s before removal: %w", label, err)
 	}
@@ -240,6 +286,7 @@ func (m *windowsUserJobManager) Remove(label string) error {
 	if _, err := m.runTaskScheduler("/Delete", "/TN", taskName, "/F"); err != nil {
 		return fmt.Errorf("remove Windows user job %s: %w", label, err)
 	}
+	restoreNeeded = false
 	return nil
 }
 
@@ -336,6 +383,81 @@ func renderWindowsUserJobDefinition(job UserJob, sid, templateText string) (stri
 		return "", "", fmt.Errorf("render Windows user job: %w", err)
 	}
 	return content, marker, nil
+}
+
+type windowsUserJobDefinition struct {
+	Registration struct {
+		Description string `xml:"Description"`
+	} `xml:"RegistrationInfo"`
+	Triggers struct {
+		Logon struct {
+			Enabled string `xml:"Enabled"`
+			UserID  string `xml:"UserId"`
+		} `xml:"LogonTrigger"`
+	} `xml:"Triggers"`
+	Principals struct {
+		Principal struct {
+			ID        string `xml:"id,attr"`
+			UserID    string `xml:"UserId"`
+			LogonType string `xml:"LogonType"`
+			RunLevel  string `xml:"RunLevel"`
+		} `xml:"Principal"`
+	} `xml:"Principals"`
+	Settings struct {
+		MultipleInstancesPolicy      string `xml:"MultipleInstancesPolicy"`
+		DisallowStartIfOnBatteries   string `xml:"DisallowStartIfOnBatteries"`
+		StopIfGoingOnBatteries       string `xml:"StopIfGoingOnBatteries"`
+		AllowHardTerminate           string `xml:"AllowHardTerminate"`
+		StartWhenAvailable           string `xml:"StartWhenAvailable"`
+		RunOnlyIfNetworkAvailable    string `xml:"RunOnlyIfNetworkAvailable"`
+		AllowStartOnDemand           string `xml:"AllowStartOnDemand"`
+		Enabled                      string `xml:"Enabled"`
+		Hidden                       string `xml:"Hidden"`
+		RunOnlyIfIdle                string `xml:"RunOnlyIfIdle"`
+		WakeToRun                    string `xml:"WakeToRun"`
+		ExecutionTimeLimit           string `xml:"ExecutionTimeLimit"`
+		Priority                     string `xml:"Priority"`
+		RestartOnFailureInterval     string `xml:"RestartOnFailure>Interval"`
+		RestartOnFailureAttemptCount string `xml:"RestartOnFailure>Count"`
+	} `xml:"Settings"`
+	Actions struct {
+		Context string `xml:"Context,attr"`
+		Exec    struct {
+			Command          string `xml:"Command"`
+			Arguments        string `xml:"Arguments"`
+			WorkingDirectory string `xml:"WorkingDirectory"`
+		} `xml:"Exec"`
+	} `xml:"Actions"`
+}
+
+func matchingWindowsUserJobDefinition(registered, expected string) (bool, error) {
+	registeredDefinition, err := parseWindowsUserJobDefinition(registered)
+	if err != nil {
+		return false, fmt.Errorf("parse registered task: %w", err)
+	}
+	expectedDefinition, err := parseWindowsUserJobDefinition(expected)
+	if err != nil {
+		return false, fmt.Errorf("parse expected task: %w", err)
+	}
+	return registeredDefinition == expectedDefinition, nil
+}
+
+func parseWindowsUserJobDefinition(content string) (windowsUserJobDefinition, error) {
+	var definition windowsUserJobDefinition
+	decoder := xml.NewDecoder(strings.NewReader(content))
+	// schtasks reports UTF-16 XML. decodeWindowsCommandText already converted
+	// its bytes to Go's UTF-8 string representation, so keep the decoded byte
+	// stream when encoding/xml sees the original declaration.
+	decoder.CharsetReader = func(label string, input io.Reader) (io.Reader, error) {
+		if strings.EqualFold(label, "utf-16") || strings.EqualFold(label, "utf-8") {
+			return input, nil
+		}
+		return nil, fmt.Errorf("unsupported Windows task XML encoding %q", label)
+	}
+	if err := decoder.Decode(&definition); err != nil {
+		return windowsUserJobDefinition{}, err
+	}
+	return definition, nil
 }
 
 func (m *windowsUserJobManager) identity(label string) (string, string, error) {
@@ -638,9 +760,6 @@ func validateAndProtectWindowsDirectory(path, sidText string, protectCreatedLeaf
 				}
 				continue
 			}
-			if ace.Header.AceFlags&windows.INHERIT_ONLY_ACE != 0 {
-				continue
-			}
 			if ace.Header.AceType != windows.ACCESS_ALLOWED_ACE_TYPE {
 				return errors.New("Windows user job directory has an unsupported DACL entry")
 			}
@@ -654,7 +773,7 @@ func validateAndProtectWindowsDirectory(path, sidText string, protectCreatedLeaf
 			if !leaf && !trustedAncestor(principal) && ace.Mask&windowsUserJobAncestorMutation != 0 {
 				return errors.New("Windows user job directory grants unsafe access to another principal")
 			}
-			if leaf && principal.Equals(currentSID) {
+			if leaf && principal.Equals(currentSID) && ace.Header.AceFlags&windows.INHERIT_ONLY_ACE == 0 {
 				currentMask |= ace.Mask
 			}
 		}
@@ -694,10 +813,19 @@ func decodeWindowsCommandText(value string) string {
 }
 
 func windowsJobCommandOutput(name string, args ...string) (string, error) {
-	command := exec.Command(name, args...)
+	return windowsJobCommandOutputWithin(20*time.Second, name, args...)
+}
+
+func windowsJobCommandOutputWithin(timeout time.Duration, name string, args ...string) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	command := exec.CommandContext(ctx, name, args...) //nolint:gosec // G702: production callers resolve fixed System32 executables; tests inject exact helper paths.
 	output, err := command.Output()
 	if err == nil {
 		return string(output), nil
+	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return "", fmt.Errorf("%s: %w", name, ctxErr)
 	}
 	var exitError *exec.ExitError
 	if errors.As(err, &exitError) {

@@ -3,6 +3,7 @@
 package service
 
 import (
+	"context"
 	"encoding/binary"
 	"errors"
 	"os"
@@ -59,6 +60,7 @@ func TestWindowsUserJobEnsureCreateReuseReplaceAndRemove(t *testing.T) {
 	existing := ""
 	running := false
 	enabled := true
+	failCreate := false
 	manager := &windowsUserJobManager{
 		currentSID: currentWindowsUserSID,
 		powerShell: func() (string, error) { return "powershell.exe", nil },
@@ -84,6 +86,9 @@ func TestWindowsUserJobEnsureCreateReuseReplaceAndRemove(t *testing.T) {
 			}
 			return string(windowsTaskXMLBytes(existing)), nil
 		case strings.HasPrefix(joined, "/Create"):
+			if failCreate {
+				return "", errors.New("injected create failure")
+			}
 			for index, arg := range args {
 				if arg == "/XML" && index+1 < len(args) {
 					raw, err := os.ReadFile(args[index+1])
@@ -100,6 +105,9 @@ func TestWindowsUserJobEnsureCreateReuseReplaceAndRemove(t *testing.T) {
 			return "", nil
 		case strings.HasPrefix(joined, "/Change") && strings.Contains(joined, "/Disable"):
 			enabled = false
+			return "", nil
+		case strings.HasPrefix(joined, "/Change") && strings.Contains(joined, "/Enable"):
+			enabled = true
 			return "", nil
 		case strings.HasPrefix(joined, "/End"):
 			running = false
@@ -125,6 +133,23 @@ func TestWindowsUserJobEnsureCreateReuseReplaceAndRemove(t *testing.T) {
 	}
 	if len(calls) != createdCalls+2 { // One state query and one XML definition query.
 		t.Fatalf("matching running Ensure made %d new calls, want 2", len(calls)-createdCalls)
+	}
+	existing = strings.Replace(existing, job.BinaryPath, filepath.Join(filepath.Dir(job.BinaryPath), "other.exe"), 1)
+	if err := manager.Ensure(job); err != nil {
+		t.Fatalf("Ensure did not replace a marker-matching task with a changed command: %v", err)
+	}
+	if !strings.Contains(existing, job.BinaryPath) || strings.Contains(existing, "other.exe") {
+		t.Fatal("Ensure retained a marker-matching task with a changed command")
+	}
+	changed := job
+	changed.Arguments = append(append([]string(nil), job.Arguments...), "--changed")
+	failCreate = true
+	if err := manager.Ensure(changed); err == nil || !strings.Contains(err.Error(), "injected create failure") {
+		t.Fatalf("replacement create failure = %v, want injected failure", err)
+	}
+	failCreate = false
+	if !enabled || !running {
+		t.Fatal("failed replacement left the prior task disabled or stopped")
 	}
 	enabled, running = false, false
 	if err := manager.Ensure(job); err != nil {
@@ -212,6 +237,21 @@ func TestWindowsUserJobCommandOutputKeepsStdoutAndStderrSeparate(t *testing.T) {
 	if !strings.Contains(err.Error(), "scheduler-stderr") || strings.Contains(err.Error(), "scheduler-stdout") {
 		t.Fatalf("failing Windows command error mixed stdout and stderr: %v", err)
 	}
+}
+
+func TestWindowsUserJobCommandOutputHasBoundedWait(t *testing.T) {
+	_, err := windowsJobCommandOutputWithin(100*time.Millisecond, os.Args[0],
+		"-test.run=^TestWindowsUserJobCommandTimeoutHelper$", "--", "windows-command-timeout-helper")
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("bounded Windows command error = %v, want deadline exceeded", err)
+	}
+}
+
+func TestWindowsUserJobCommandTimeoutHelper(t *testing.T) {
+	if len(os.Args) < 2 || os.Args[len(os.Args)-1] != "windows-command-timeout-helper" {
+		return
+	}
+	time.Sleep(time.Minute)
 }
 
 func TestWindowsUserJobDirectoryRejectsReparsePoint(t *testing.T) {
@@ -325,6 +365,37 @@ func TestWindowsUserJobDoesNotRewriteExistingBroadLogDirectory(t *testing.T) {
 		if err := ensureWindowsPrivateDirectory(logDir, sid); err == nil || !strings.Contains(err.Error(), "unsafe access") {
 			t.Fatalf("broad existing directory attempt %d = %v, want fail-closed without ACL rewrite", attempt, err)
 		}
+	}
+	inheritOnly, err := windows.SecurityDescriptorFromString(
+		"O:" + sid + "G:" + sid + "D:P(A;OICI;FA;;;" + sid + ")(A;OICIIO;FA;;;WD)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	inheritOnlyDACL, _, err := inheritOnly.DACL()
+	if err != nil {
+		t.Fatal(err)
+	}
+	path16, err = windows.UTF16PtrFromString(logDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handle, err = windows.CreateFile(path16, windows.READ_CONTROL|windows.WRITE_DAC,
+		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE, nil,
+		windows.OPEN_EXISTING, windows.FILE_FLAG_BACKUP_SEMANTICS|windows.FILE_FLAG_OPEN_REPARSE_POINT, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := windows.SetSecurityInfo(handle, windows.SE_FILE_OBJECT,
+		windows.DACL_SECURITY_INFORMATION|windows.PROTECTED_DACL_SECURITY_INFORMATION,
+		nil, nil, inheritOnlyDACL, nil); err != nil {
+		_ = windows.CloseHandle(handle)
+		t.Fatal(err)
+	}
+	if err := windows.CloseHandle(handle); err != nil {
+		t.Fatal(err)
+	}
+	if err := ensureWindowsPrivateDirectory(logDir, sid); err == nil || !strings.Contains(err.Error(), "unsafe access") {
+		t.Fatalf("inherit-only broad existing directory = %v, want fail-closed", err)
 	}
 }
 
