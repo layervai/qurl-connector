@@ -24,10 +24,11 @@ type windowsJobCall struct {
 func testWindowsUserJob(t *testing.T) UserJob {
 	t.Helper()
 	dir := t.TempDir()
+	logDir := filepath.Join(dir, "logs")
 	return UserJob{
 		Label: "ai.layerv.qurl.daemon", BinaryPath: filepath.Join(dir, "qurl.exe"),
 		Arguments:   []string{"--endpoint", "https://api.example.com", "daemon", "run", "--state-dir", filepath.Join(dir, "state with space")},
-		StandardOut: filepath.Join(dir, "out.log"), StandardErr: filepath.Join(dir, "err.log"),
+		StandardOut: filepath.Join(logDir, "out.log"), StandardErr: filepath.Join(logDir, "err.log"),
 		RunAtLoad: true, KeepAlive: true,
 	}
 }
@@ -57,6 +58,7 @@ func TestWindowsUserJobEnsureCreateReuseReplaceAndRemove(t *testing.T) {
 	var calls []windowsJobCall
 	existing := ""
 	running := false
+	enabled := true
 	manager := &windowsUserJobManager{
 		currentSID: currentWindowsUserSID,
 		powerShell: func() (string, error) { return "powershell.exe", nil },
@@ -66,15 +68,16 @@ func TestWindowsUserJobEnsureCreateReuseReplaceAndRemove(t *testing.T) {
 		joined := strings.Join(args, " ")
 		switch {
 		case strings.HasSuffix(strings.ToLower(name), "powershell.exe") && strings.Contains(joined, "$task.State"):
+			if existing == "" {
+				return "-1\r\n", nil
+			}
 			if running {
 				return "4\r\n", nil
 			}
-			return "3\r\n", nil
-		case strings.HasSuffix(strings.ToLower(name), "powershell.exe"):
-			if existing == "" {
-				return "0\r\n", nil
+			if !enabled {
+				return "1\r\n", nil
 			}
-			return "1\r\n", nil
+			return "3\r\n", nil
 		case strings.HasPrefix(joined, "/Query"):
 			if existing == "" {
 				return "", errors.New("not found")
@@ -90,17 +93,20 @@ func TestWindowsUserJobEnsureCreateReuseReplaceAndRemove(t *testing.T) {
 					existing = decodeWindowsTaskXML(t, raw)
 				}
 			}
+			enabled = true
 			return "", nil
 		case strings.HasPrefix(joined, "/Run"):
 			running = true
 			return "", nil
-		case strings.HasPrefix(joined, "/Change"):
+		case strings.HasPrefix(joined, "/Change") && strings.Contains(joined, "/Disable"):
+			enabled = false
 			return "", nil
 		case strings.HasPrefix(joined, "/End"):
 			running = false
 			return "", nil
 		case strings.HasPrefix(joined, "/Delete"):
 			existing = ""
+			enabled = true
 			return "", nil
 		default:
 			return "", errors.New("unexpected command")
@@ -117,8 +123,15 @@ func TestWindowsUserJobEnsureCreateReuseReplaceAndRemove(t *testing.T) {
 	if err := manager.Ensure(job); err != nil {
 		t.Fatal(err)
 	}
-	if len(calls) != createdCalls+3 { // Presence, XML, and numeric running-state queries.
-		t.Fatalf("matching running Ensure made %d new calls, want 3", len(calls)-createdCalls)
+	if len(calls) != createdCalls+2 { // One state query and one XML definition query.
+		t.Fatalf("matching running Ensure made %d new calls, want 2", len(calls)-createdCalls)
+	}
+	enabled, running = false, false
+	if err := manager.Ensure(job); err != nil {
+		t.Fatalf("Ensure did not repair a disabled matching task: %v", err)
+	}
+	if !enabled || !running {
+		t.Fatal("Ensure did not re-register and start a disabled matching task")
 	}
 	if err := manager.Replace(job); err != nil {
 		t.Fatal(err)
@@ -159,6 +172,21 @@ func TestWindowsScopedTaskNameIsPerUserAndBounded(t *testing.T) {
 	third := windowsScopedTaskName(strings.Repeat("a", 127)+"b", "S-1-5-21-1000")
 	if first == third {
 		t.Fatal("overlong Windows task labels with the same retained prefix collide")
+	}
+}
+
+func TestWindowsUserJobMarkerChangesWithRenderedTemplate(t *testing.T) {
+	job := testWindowsUserJob(t)
+	_, first, err := renderWindowsUserJobDefinition(job, "S-1-5-21-1000", windowsUserJobTemplate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, second, err := renderWindowsUserJobDefinition(job, "S-1-5-21-1000", windowsUserJobTemplate+"\n<!-- definition revision -->")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first == second {
+		t.Fatal("Windows user job marker did not change with the rendered task template")
 	}
 }
 
@@ -252,6 +280,54 @@ func TestWindowsUserJobDirectoryRejectsMutableAncestor(t *testing.T) {
 	}
 }
 
+func TestWindowsUserJobDoesNotRewriteExistingBroadLogDirectory(t *testing.T) {
+	sid, err := currentWindowsUserSID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	logDir := filepath.Join(t.TempDir(), "existing-logs")
+	if err := os.Mkdir(logDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	descriptor, err := windows.SecurityDescriptorFromString(
+		"O:" + sid + "G:" + sid + "D:P(A;OICI;FA;;;" + sid + ")(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;WD)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dacl, _, err := descriptor.DACL()
+	if err != nil {
+		t.Fatal(err)
+	}
+	owner, _, err := descriptor.Owner()
+	if err != nil || owner == nil {
+		t.Fatalf("read broad-directory owner: %v", err)
+	}
+	path16, err := windows.UTF16PtrFromString(logDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handle, err := windows.CreateFile(path16, windows.READ_CONTROL|windows.WRITE_DAC|windows.WRITE_OWNER,
+		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE, nil,
+		windows.OPEN_EXISTING, windows.FILE_FLAG_BACKUP_SEMANTICS|windows.FILE_FLAG_OPEN_REPARSE_POINT, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := windows.SetSecurityInfo(handle, windows.SE_FILE_OBJECT,
+		windows.OWNER_SECURITY_INFORMATION|windows.DACL_SECURITY_INFORMATION|windows.PROTECTED_DACL_SECURITY_INFORMATION,
+		owner, nil, dacl, nil); err != nil {
+		_ = windows.CloseHandle(handle)
+		t.Fatal(err)
+	}
+	if err := windows.CloseHandle(handle); err != nil {
+		t.Fatal(err)
+	}
+	for attempt := 1; attempt <= 2; attempt++ {
+		if err := ensureWindowsPrivateDirectory(logDir, sid); err == nil || !strings.Contains(err.Error(), "unsafe access") {
+			t.Fatalf("broad existing directory attempt %d = %v, want fail-closed without ACL rewrite", attempt, err)
+		}
+	}
+}
+
 func TestWindowsUserJobIntegration(t *testing.T) {
 	if os.Getenv("QURL_WINDOWS_USER_JOB_INTEGRATION") != "1" {
 		t.Skip("set QURL_WINDOWS_USER_JOB_INTEGRATION=1 to exercise Task Scheduler")
@@ -265,6 +341,7 @@ func TestWindowsUserJobIntegration(t *testing.T) {
 		t.Fatal(err)
 	}
 	readyPath := filepath.Join(dir, "ready")
+	logDir := filepath.Join(dir, "logs")
 	label := "ai.layerv.qurl.test." + strconv.Itoa(os.Getpid())
 	manager := NewUserJobManager()
 	t.Cleanup(func() {
@@ -275,7 +352,7 @@ func TestWindowsUserJobIntegration(t *testing.T) {
 	job := UserJob{
 		Label: label, BinaryPath: binaryPath,
 		Arguments:   []string{"-test.run=^TestWindowsUserJobHelperProcess$", "--", readyPath},
-		StandardOut: filepath.Join(dir, "stdout.log"), StandardErr: filepath.Join(dir, "stderr.log"),
+		StandardOut: filepath.Join(logDir, "stdout.log"), StandardErr: filepath.Join(logDir, "stderr.log"),
 		RunAtLoad: true, KeepAlive: true,
 	}
 	if err := manager.Ensure(job); err != nil {

@@ -23,7 +23,10 @@ import (
 // stops the real application process. The manager creates StandardOut and
 // StandardErr with protected ACLs; a Windows application must open those paths
 // itself when it needs file logging because Task Scheduler has no native
-// stdout/stderr redirection fields.
+// stdout/stderr redirection fields. Each Windows log parent must be a dedicated
+// directory below an existing safe parent. The manager creates and protects a
+// missing log directory, but it only validates an existing directory and never
+// rewrites that caller-owned directory's owner or ACL.
 type UserJob struct {
 	Label       string
 	BinaryPath  string
