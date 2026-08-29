@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.8.6](https://github.com/layervai/qurl-connector/compare/v0.8.5...v0.8.6) (2026-08-29)
+
+
+### Bug Fixes
+
+* **share:** report bounded session retry failures ([#22](https://github.com/layervai/qurl-connector/issues/22)) ([9c876a1](https://github.com/layervai/qurl-connector/commit/9c876a1cde65c016a009849e54dcaf2e3afee7b5))
+
 ## [0.8.5](https://github.com/layervai/qurl-connector/compare/v0.8.4...v0.8.5) (2026-08-29)
 
 
