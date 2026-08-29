@@ -13,6 +13,8 @@ import (
 	"testing"
 	"time"
 	"unicode/utf16"
+
+	"golang.org/x/sys/windows"
 )
 
 type windowsJobCall struct {
@@ -229,15 +231,39 @@ func TestWindowsUserJobIntegration(t *testing.T) {
 	if got := len(strings.Fields(string(starts))); got != 1 {
 		t.Fatalf("matching second Ensure started helper %d times, want 1", got)
 	}
+	helperPID, err := strconv.Atoi(strings.Fields(string(starts))[0])
+	if err != nil {
+		t.Fatalf("parse helper PID: %v", err)
+	}
 	if err := manager.Remove(label); err != nil {
 		t.Fatal(err)
 	}
+	waitForWindowsProcessExit(t, uint32(helperPID))
 	status, err = manager.Status(label)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if status != (ServiceStatus{}) {
 		t.Fatalf("removed status = %#v, want absent", status)
+	}
+}
+
+func waitForWindowsProcessExit(t *testing.T, pid uint32) {
+	t.Helper()
+	process, err := windows.OpenProcess(windows.SYNCHRONIZE, false, pid)
+	if errors.Is(err, windows.ERROR_INVALID_PARAMETER) {
+		return // The process exited before OpenProcess observed it.
+	}
+	if err != nil {
+		t.Fatalf("open Windows helper process %d: %v", pid, err)
+	}
+	defer func() { _ = windows.CloseHandle(process) }()
+	status, err := windows.WaitForSingleObject(process, 10_000)
+	if err != nil {
+		t.Fatalf("wait for Windows helper process %d: %v", pid, err)
+	}
+	if status != windows.WAIT_OBJECT_0 {
+		t.Fatalf("Windows helper process %d did not exit after task removal (wait status %#x)", pid, status)
 	}
 }
 

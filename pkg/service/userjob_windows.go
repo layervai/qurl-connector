@@ -17,6 +17,7 @@ import (
 	"strconv"
 	"strings"
 	"text/template"
+	"time"
 	"unicode/utf16"
 
 	"golang.org/x/sys/windows"
@@ -155,6 +156,9 @@ func (m *windowsUserJobManager) ensure(job UserJob, forceReplace bool) error {
 			if _, err := m.runTaskScheduler("/End", "/TN", taskName); err != nil {
 				return fmt.Errorf("stop Windows user job %s before replacement: %w", job.Label, err)
 			}
+			if err := m.waitUntilStopped(taskName); err != nil {
+				return fmt.Errorf("wait for Windows user job %s to stop before replacement: %w", job.Label, err)
+			}
 		}
 	}
 	definition, err := os.CreateTemp(filepath.Dir(job.StandardOut), ".qurl-user-job-*.xml")
@@ -213,6 +217,9 @@ func (m *windowsUserJobManager) Remove(label string) error {
 	if running {
 		if _, err := m.runTaskScheduler("/End", "/TN", taskName); err != nil {
 			return fmt.Errorf("stop Windows user job %s before removal: %w", label, err)
+		}
+		if err := m.waitUntilStopped(taskName); err != nil {
+			return fmt.Errorf("wait for Windows user job %s to stop before removal: %w", label, err)
 		}
 	}
 	if _, err := m.runTaskScheduler("/Delete", "/TN", taskName, "/F"); err != nil {
@@ -274,6 +281,23 @@ func (m *windowsUserJobManager) running(label string) (bool, error) {
 		return false, fmt.Errorf("parse Windows user job state %q: %w", strings.TrimSpace(output), err)
 	}
 	return state == 4, nil
+}
+
+func (m *windowsUserJobManager) waitUntilStopped(label string) error {
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		running, err := m.running(label)
+		if err != nil {
+			return err
+		}
+		if !running {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return errors.New("Task Scheduler still reports the task as running after 10 seconds")
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
 }
 
 func (m *windowsUserJobManager) render(job UserJob, sid string) (string, string, error) {
