@@ -767,6 +767,13 @@ func validateAndProtectWindowsDirectory(path, sidText string, protectCreatedLeaf
 			if principal == nil || !principal.IsValid() {
 				return errors.New("Windows user job directory has an invalid DACL identity")
 			}
+			// Inherit-only entries on an ancestor do not grant access to that
+			// component, and each descendant is opened and checked independently.
+			// On the leaf they can grant unsafe access to files created later, so
+			// they must pass the same trusted-principal fence as direct entries.
+			if !leaf && ace.Header.AceFlags&windows.INHERIT_ONLY_ACE != 0 {
+				continue
+			}
 			if leaf && !trustedLeaf(principal) {
 				return errors.New("Windows user job directory grants unsafe access to another principal")
 			}
