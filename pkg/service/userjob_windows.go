@@ -1081,6 +1081,9 @@ func validateWindowsUserJobDirectoryPath(path, sidText string, strictLeaf, prote
 		}
 		if owner == nil || (leaf && strictLeaf && !owner.Equals(currentSID)) ||
 			((!leaf || !strictLeaf) && !trustedAncestor(owner)) {
+			if leaf && strictLeaf {
+				return fmt.Errorf("Windows user job directory %s has an untrusted owner; move or remove it so qurl can recreate an owner-only directory", candidate)
+			}
 			return fmt.Errorf("Windows user job directory %s has an untrusted owner", candidate)
 		}
 		control, _, controlErr := descriptor.Control()
