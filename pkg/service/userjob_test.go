@@ -7,12 +7,13 @@ import (
 )
 
 func TestRenderLaunchdUserJobCredentialFreeContract(t *testing.T) {
+	dir := t.TempDir()
 	job := UserJob{
 		Label:       "ai.layerv.qurl.daemon",
-		BinaryPath:  "/opt/homebrew/bin/qurl",
+		BinaryPath:  filepath.Join(dir, "qurl"),
 		Arguments:   []string{"daemon", "run"},
-		StandardOut: "/Users/dev/Library/Logs/qurl/daemon.log",
-		StandardErr: "/Users/dev/Library/Logs/qurl/daemon.err",
+		StandardOut: filepath.Join(dir, "daemon.log"),
+		StandardErr: filepath.Join(dir, "daemon.err"),
 		RunAtLoad:   true,
 		KeepAlive:   true,
 	}
@@ -22,7 +23,7 @@ func TestRenderLaunchdUserJobCredentialFreeContract(t *testing.T) {
 	}
 	for _, want := range []string{
 		"<string>ai.layerv.qurl.daemon</string>",
-		"<string>/opt/homebrew/bin/qurl</string>",
+		"<string>" + job.BinaryPath + "</string>",
 		"<string>daemon</string>",
 		"<string>run</string>",
 		"<key>RunAtLoad</key>\n    <true/>",
@@ -43,12 +44,13 @@ func TestRenderLaunchdUserJobCredentialFreeContract(t *testing.T) {
 }
 
 func TestRenderLaunchdUserJobEscapesXML(t *testing.T) {
+	dir := t.TempDir()
 	got, err := RenderLaunchdUserJob(UserJob{
 		Label:       "ai.layerv.qurl.daemon",
-		BinaryPath:  "/Applications/qurl & tools/qurl",
+		BinaryPath:  filepath.Join(dir, "qurl & tools", "qurl"),
 		Arguments:   []string{"daemon", "run", "a<b"},
-		StandardOut: "/tmp/qurl & daemon/out.log",
-		StandardErr: "/tmp/qurl & daemon/err.log",
+		StandardOut: filepath.Join(dir, "qurl & daemon", "out.log"),
+		StandardErr: filepath.Join(dir, "qurl & daemon", "err.log"),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -62,11 +64,12 @@ func TestRenderLaunchdUserJobEscapesXML(t *testing.T) {
 }
 
 func TestRenderLaunchdUserJobRejectsUnsafeShape(t *testing.T) {
+	dir := t.TempDir()
 	base := UserJob{
 		Label:       "ai.layerv.qurl.daemon",
-		BinaryPath:  "/usr/local/bin/qurl",
-		StandardOut: "/tmp/out.log",
-		StandardErr: "/tmp/err.log",
+		BinaryPath:  filepath.Join(dir, "qurl"),
+		StandardOut: filepath.Join(dir, "out.log"),
+		StandardErr: filepath.Join(dir, "err.log"),
 	}
 	cases := []struct {
 		name string
@@ -91,7 +94,7 @@ func TestRenderLaunchdUserJobRejectsUnsafeShape(t *testing.T) {
 }
 
 func TestUserJobPlistPath(t *testing.T) {
-	home := filepath.Join(string(filepath.Separator), "Users", "dev")
+	home := t.TempDir()
 	got, err := UserJobPlistPath(home, "ai.layerv.qurl.daemon")
 	if err != nil {
 		t.Fatal(err)

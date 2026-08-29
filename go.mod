@@ -10,7 +10,7 @@ require (
 	github.com/denisbrodbeck/machineid v1.0.1
 	github.com/fatedier/frp v0.71.0
 	github.com/googleapis/gax-go/v2 v2.24.0
-	github.com/layervai/qurl-go v0.8.1-0.20260828203444-2c2ec1e4c222
+	github.com/layervai/qurl-go v0.8.1-0.20260829030108-b7cc9df3ac5c
 	github.com/spf13/cobra v1.10.2
 	golang.org/x/crypto v0.55.0
 	golang.org/x/sys v0.47.0
