@@ -257,6 +257,29 @@ func TestWindowsUserJobMarkerChangesWithRenderedTemplate(t *testing.T) {
 	}
 }
 
+func TestWindowsUserJobDefinitionRejectsAddedBehavior(t *testing.T) {
+	job := testWindowsUserJob(t)
+	expected, _, err := renderWindowsUserJobDefinition(job, "S-1-5-21-1000", windowsUserJobTemplate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, registered := range map[string]string{
+		"action":    strings.Replace(expected, `<Actions Context="Author">`, `<Actions Context="Author"><Exec><Command>C:\\extra.exe</Command></Exec>`, 1),
+		"principal": strings.Replace(expected, `<Principals>`, `<Principals><Principal id="Extra"><UserId>S-1-5-21-1000</UserId></Principal>`, 1),
+		"trigger":   strings.Replace(expected, `<Triggers>`, `<Triggers><TimeTrigger><Enabled>true</Enabled></TimeTrigger>`, 1),
+	} {
+		t.Run(name, func(t *testing.T) {
+			matches, err := matchingWindowsUserJobDefinition(registered, expected)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if matches {
+				t.Fatal("task definition with added behavior matched the expected definition")
+			}
+		})
+	}
+}
+
 func TestDecodeWindowsCommandText(t *testing.T) {
 	want := "<Description>layerv-qurl-user-job-sha256:abc</Description>"
 	if got := decodeWindowsCommandText(string(windowsTaskXMLBytes(want))); got != want {

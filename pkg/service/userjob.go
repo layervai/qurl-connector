@@ -26,7 +26,9 @@ import (
 // stdout/stderr redirection fields. Each Windows log parent must be a dedicated
 // directory below an existing safe parent. The manager creates and protects a
 // missing log directory, but it only validates an existing directory and never
-// rewrites that caller-owned directory's owner or ACL.
+// rewrites that caller-owned directory's owner or ACL. On Windows, the stdout
+// log directory is also the process working directory and must remain present
+// while the job runs.
 type UserJob struct {
 	Label       string
 	BinaryPath  string

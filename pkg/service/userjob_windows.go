@@ -128,7 +128,13 @@ func (m *windowsUserJobManager) ensure(job UserJob, forceReplace bool) (retErr e
 	if err != nil {
 		return err
 	}
+	seenDirectories := make(map[string]struct{}, 2)
 	for _, dir := range []string{filepath.Dir(job.StandardOut), filepath.Dir(job.StandardErr)} {
+		identity := strings.ToLower(filepath.Clean(dir))
+		if _, seen := seenDirectories[identity]; seen {
+			continue
+		}
+		seenDirectories[identity] = struct{}{}
 		if err := ensureWindowsPrivateDirectory(dir, sid); err != nil {
 			return fmt.Errorf("create Windows user job directory %s: %w", dir, err)
 		}
@@ -437,6 +443,17 @@ type windowsUserJobDefinition struct {
 }
 
 func matchingWindowsUserJobDefinition(registered, expected string) (bool, error) {
+	registeredShape, err := windowsUserJobShape(registered)
+	if err != nil {
+		return false, fmt.Errorf("inspect registered task structure: %w", err)
+	}
+	expectedShape, err := windowsUserJobShape(expected)
+	if err != nil {
+		return false, fmt.Errorf("inspect expected task structure: %w", err)
+	}
+	if !equalWindowsUserJobShapes(registeredShape, expectedShape) {
+		return false, nil
+	}
 	registeredDefinition, err := parseWindowsUserJobDefinition(registered)
 	if err != nil {
 		return false, fmt.Errorf("parse registered task: %w", err)
@@ -452,6 +469,58 @@ func matchingWindowsUserJobDefinition(registered, expected string) (bool, error)
 		return false, fmt.Errorf("normalize expected task: %w", err)
 	}
 	return registeredDefinition == expectedDefinition, nil
+}
+
+// windowsUserJobShape records the direct children whose cardinality changes
+// task behavior. The field projection below compares their contents, while
+// this shape check rejects extra actions, principals, or trigger types that
+// encoding/xml would otherwise overwrite or ignore.
+func windowsUserJobShape(content string) (map[string]int, error) {
+	decoder := xml.NewDecoder(strings.NewReader(content))
+	decoder.CharsetReader = func(label string, input io.Reader) (io.Reader, error) {
+		if strings.EqualFold(label, "utf-16") || strings.EqualFold(label, "utf-8") {
+			return input, nil
+		}
+		return nil, fmt.Errorf("unsupported Windows task XML encoding %q", label)
+	}
+	shape := make(map[string]int)
+	stack := make([]string, 0, 4)
+	for {
+		token, err := decoder.Token()
+		if errors.Is(err, io.EOF) {
+			return shape, nil
+		}
+		if err != nil {
+			return nil, err
+		}
+		switch element := token.(type) {
+		case xml.StartElement:
+			stack = append(stack, element.Name.Local)
+			if len(stack) == 3 && stack[0] == "Task" {
+				switch stack[1] {
+				case "Triggers", "Principals", "Actions":
+					shape[stack[1]+"/"+stack[2]]++
+				}
+			}
+		case xml.EndElement:
+			if len(stack) == 0 || stack[len(stack)-1] != element.Name.Local {
+				return nil, fmt.Errorf("unexpected closing element %q", element.Name.Local)
+			}
+			stack = stack[:len(stack)-1]
+		}
+	}
+}
+
+func equalWindowsUserJobShapes(first, second map[string]int) bool {
+	if len(first) != len(second) {
+		return false
+	}
+	for element, count := range first {
+		if second[element] != count {
+			return false
+		}
+	}
+	return true
 }
 
 func normalizeWindowsUserJobDefinition(definition *windowsUserJobDefinition) error {
