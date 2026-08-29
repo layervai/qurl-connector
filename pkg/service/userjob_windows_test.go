@@ -206,9 +206,11 @@ func TestWindowsUserJobEnsureCreateReuseReplaceAndRemove(t *testing.T) {
 			return "", nil
 		case strings.HasPrefix(joined, "/Change") && strings.Contains(joined, "/Disable"):
 			enabled = false
+			existing = strings.Replace(existing, "<Enabled>true</Enabled>\n    <Hidden>", "<Enabled>false</Enabled>\n    <Hidden>", 1)
 			return "", nil
 		case strings.HasPrefix(joined, "/Change") && strings.Contains(joined, "/Enable"):
 			enabled = true
+			existing = strings.Replace(existing, "<Enabled>false</Enabled>\n    <Hidden>", "<Enabled>true</Enabled>\n    <Hidden>", 1)
 			return "", nil
 		case strings.HasPrefix(joined, "/End"):
 			running = false
@@ -303,18 +305,42 @@ func TestWindowsUserJobEnsureCreateReuseReplaceAndRemove(t *testing.T) {
 	if !enabled || !running {
 		t.Fatal("failed replacement left the prior task disabled or stopped")
 	}
+	enabled, running = false, true
+	existing = strings.Replace(existing, "<Enabled>true</Enabled>\n    <Hidden>", "<Enabled>false</Enabled>\n    <Hidden>", 1)
+	if err := manager.Ensure(job); err != nil {
+		t.Fatalf("Ensure did not repair a disabled but still-running task: %v", err)
+	}
+	if !enabled || !running || strings.Contains(existing, "<Enabled>false</Enabled>\n    <Hidden>") {
+		t.Fatal("Ensure did not re-register a disabled but still-running task")
+	}
 	enabled, running = false, false
+	existing = strings.Replace(existing, "<Enabled>true</Enabled>\n    <Hidden>", "<Enabled>false</Enabled>\n    <Hidden>", 1)
 	if err := manager.Ensure(job); err != nil {
 		t.Fatalf("Ensure did not repair a disabled matching task: %v", err)
 	}
 	if !enabled || !running {
 		t.Fatal("Ensure did not re-register and start a disabled matching task")
 	}
+	replaceCalls := len(calls)
 	if err := manager.Replace(job); err != nil {
 		t.Fatal(err)
 	}
 	if !running {
 		t.Fatal("Replace did not restart the task")
+	}
+	replaceOperations := map[string]bool{"/End": false, "/Create": false, "/Run": false}
+	for _, call := range calls[replaceCalls:] {
+		joined := strings.Join(call.args, " ")
+		for operation := range replaceOperations {
+			if strings.HasPrefix(joined, operation) {
+				replaceOperations[operation] = true
+			}
+		}
+	}
+	for operation, called := range replaceOperations {
+		if !called {
+			t.Fatalf("Replace did not issue %s", operation)
+		}
 	}
 	if err := manager.Remove(job.Label); err != nil {
 		t.Fatal(err)
