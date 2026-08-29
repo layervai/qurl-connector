@@ -402,7 +402,7 @@ func currentWindowsUserSID() (string, error) {
 }
 
 func windowsPowerShellExecutable() (string, error) {
-	systemDirectory, err := windows.GetSystemWindowsDirectory()
+	systemDirectory, err := windows.GetSystemDirectory()
 	if err != nil {
 		return "", fmt.Errorf("locate Windows PowerShell: %w", err)
 	}
