@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.8.4](https://github.com/layervai/qurl-connector/compare/v0.8.3...v0.8.4) (2026-08-29)
+
+
+### Features
+
+* **service:** manage per-user jobs on Windows ([#19](https://github.com/layervai/qurl-connector/issues/19)) ([8856bd4](https://github.com/layervai/qurl-connector/commit/8856bd4b43079bdd1fb20b31e59c9cc152dbf80a))
+
+
+### Bug Fixes
+
+* **share:** persist native session operations ([#18](https://github.com/layervai/qurl-connector/issues/18)) ([6baecad](https://github.com/layervai/qurl-connector/commit/6baecad67bf3f7d5ae7c8256f1cd7b689498d98a))
+
+
+### Continuous Integration
+
+* drop Task from the review, keep code search ([#17](https://github.com/layervai/qurl-connector/issues/17)) ([0f61a86](https://github.com/layervai/qurl-connector/commit/0f61a8649c59dd3919b765bff7670450bc568b58))
+* enable code search and delegation in the PR review ([#15](https://github.com/layervai/qurl-connector/issues/15)) ([168dca5](https://github.com/layervai/qurl-connector/commit/168dca53cf8b4fdcc07d86679b15f977d82de9e6))
+
 ## [0.8.3](https://github.com/layervai/qurl-connector/compare/v0.8.2...v0.8.3) (2026-08-27)
 
 
