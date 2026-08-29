@@ -3,7 +3,6 @@
 package service
 
 import (
-	"encoding/base64"
 	"encoding/binary"
 	"errors"
 	"os"
@@ -34,26 +33,20 @@ func testWindowsUserJob(t *testing.T) UserJob {
 }
 
 func TestWindowsUserJobRenderIsCredentialFreeAndEscaped(t *testing.T) {
-	manager := &windowsUserJobManager{powerShell: func() (string, error) { return `C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe`, nil }}
+	manager := &windowsUserJobManager{}
 	job := testWindowsUserJob(t)
+	job.Arguments = append(job.Arguments, `value with spaces`, `quote"and\slash`)
 	content, marker, err := manager.render(job, "S-1-5-21-1000")
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{marker, "S-1-5-21-1000", "InteractiveToken", "LeastPrivilege", "RestartOnFailure", "powershell.exe", "-EncodedCommand"} {
+	for _, want := range []string{marker, "S-1-5-21-1000", "InteractiveToken", "LeastPrivilege", "RestartOnFailure", job.BinaryPath, xmlText(windows.EscapeArg("value with spaces"))} {
 		if !strings.Contains(content, want) {
 			t.Fatalf("Windows task XML missing %q\n%s", want, content)
 		}
 	}
-	encoded := strings.Split(strings.Split(content, "-EncodedCommand ")[1], "</Arguments>")[0]
-	launcher := decodeWindowsPowerShellCommand(t, encoded)
-	for _, want := range append([]string{job.BinaryPath, job.StandardOut, job.StandardErr}, job.Arguments...) {
-		if !strings.Contains(launcher, windowsPowerShellLiteral(want)) {
-			t.Fatalf("PowerShell launcher missing literal %q: %s", want, launcher)
-		}
-	}
-	for _, forbidden := range []string{"QURL_API_KEY", "Authorization: Bearer", "example-secret-value"} {
-		if strings.Contains(strings.ToLower(launcher), strings.ToLower(forbidden)) {
+	for _, forbidden := range []string{"powershell.exe", "-EncodedCommand", "QURL_API_KEY", "Authorization: Bearer", "example-secret-value"} {
+		if strings.Contains(strings.ToLower(content), strings.ToLower(forbidden)) {
 			t.Fatalf("Windows task launcher contains forbidden %q", forbidden)
 		}
 	}
@@ -181,7 +174,10 @@ func TestWindowsUserJobIntegration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	dir := t.TempDir()
+	dir := filepath.Join(t.TempDir(), "path with spaces")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
 	readyPath := filepath.Join(dir, "ready")
 	label := "ai.layerv.qurl.test." + strconv.Itoa(os.Getpid())
 	manager := NewUserJobManager()
@@ -290,22 +286,6 @@ func TestWindowsUserJobHelperProcess(t *testing.T) {
 		t.Fatal(err)
 	}
 	time.Sleep(30 * time.Second)
-}
-
-func decodeWindowsPowerShellCommand(t *testing.T, encoded string) string {
-	t.Helper()
-	raw, err := base64.StdEncoding.DecodeString(encoded)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(raw)%2 != 0 {
-		t.Fatalf("encoded command byte count = %d, want even", len(raw))
-	}
-	units := make([]uint16, len(raw)/2)
-	for index := range units {
-		units[index] = binary.LittleEndian.Uint16(raw[index*2:])
-	}
-	return string(utf16.Decode(units))
 }
 
 func decodeWindowsTaskXML(t *testing.T, raw []byte) string {

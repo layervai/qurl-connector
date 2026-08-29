@@ -5,7 +5,6 @@ package service
 import (
 	"bytes"
 	"crypto/sha256"
-	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
@@ -19,6 +18,7 @@ import (
 	"text/template"
 	"time"
 	"unicode/utf16"
+	"unsafe"
 
 	"golang.org/x/sys/windows"
 )
@@ -121,6 +121,11 @@ func (m *windowsUserJobManager) ensure(job UserJob, forceReplace bool) error {
 	for _, dir := range []string{filepath.Dir(job.StandardOut), filepath.Dir(job.StandardErr)} {
 		if err := ensureWindowsPrivateDirectory(dir, sid); err != nil {
 			return fmt.Errorf("create Windows user job directory %s: %w", dir, err)
+		}
+	}
+	for _, path := range []string{job.StandardOut, job.StandardErr} {
+		if err := ensureWindowsPrivateFile(path, sid); err != nil {
+			return fmt.Errorf("create Windows user job log %s: %w", path, err)
 		}
 	}
 	installed, err := m.installed(taskName)
@@ -310,14 +315,13 @@ func (m *windowsUserJobManager) render(job UserJob, sid string) (string, string,
 	}
 	digest := sha256.Sum256(canonical)
 	marker := windowsTaskDefinitionPrefix + hex.EncodeToString(digest[:])
-	launcher := windowsPowerShellLauncher(job)
-	powerShell, err := m.powerShellExecutable()
-	if err != nil {
-		return "", "", err
+	arguments := make([]string, 0, len(job.Arguments))
+	for _, argument := range job.Arguments {
+		arguments = append(arguments, windows.EscapeArg(argument))
 	}
 	view := windowsRenderedUserJob{
-		UserSID: sid, DefinitionMarker: marker, BinaryPath: powerShell,
-		CommandLine:      "-NoLogo -NoProfile -NonInteractive -WindowStyle Hidden -EncodedCommand " + launcher,
+		UserSID: sid, DefinitionMarker: marker, BinaryPath: job.BinaryPath,
+		CommandLine:      strings.Join(arguments, " "),
 		WorkingDirectory: filepath.Dir(job.BinaryPath),
 		RunAtLoad:        job.RunAtLoad, KeepAlive: job.KeepAlive,
 	}
@@ -380,21 +384,6 @@ func windowsScopedTaskName(label, sid string) string {
 	return label + "." + suffix
 }
 
-func windowsPowerShellLauncher(job UserJob) string {
-	parts := []string{"&", windowsPowerShellLiteral(job.BinaryPath)}
-	for _, argument := range job.Arguments {
-		parts = append(parts, windowsPowerShellLiteral(argument))
-	}
-	script := strings.Join(parts, " ") + " 1>> " + windowsPowerShellLiteral(job.StandardOut) +
-		" 2>> " + windowsPowerShellLiteral(job.StandardErr) + "; exit $LASTEXITCODE"
-	units := utf16.Encode([]rune(script))
-	raw := make([]byte, len(units)*2)
-	for index, unit := range units {
-		binary.LittleEndian.PutUint16(raw[index*2:], unit)
-	}
-	return base64.StdEncoding.EncodeToString(raw)
-}
-
 func windowsTaskXMLBytes(content string) []byte {
 	units := utf16.Encode([]rune(content))
 	raw := make([]byte, 2+len(units)*2)
@@ -403,10 +392,6 @@ func windowsTaskXMLBytes(content string) []byte {
 		binary.LittleEndian.PutUint16(raw[2+index*2:], unit)
 	}
 	return raw
-}
-
-func windowsPowerShellLiteral(value string) string {
-	return "'" + strings.ReplaceAll(value, "'", "''") + "'"
 }
 
 func currentWindowsUserSID() (string, error) {
@@ -446,6 +431,48 @@ func ensureWindowsPrivateDirectory(path, sid string) error {
 		return err
 	}
 	return protectWindowsUserJobPath(path, sid)
+}
+
+func ensureWindowsPrivateFile(path, sid string) error {
+	descriptor, err := windows.SecurityDescriptorFromString(fmt.Sprintf(
+		"O:%sG:%sD:P(A;;FA;;;%s)(A;;FA;;;SY)(A;;FA;;;BA)", sid, sid, sid))
+	if err != nil {
+		return fmt.Errorf("build protected Windows user job file ACL: %w", err)
+	}
+	security := &windows.SecurityAttributes{
+		Length:             uint32(unsafe.Sizeof(windows.SecurityAttributes{})),
+		SecurityDescriptor: descriptor,
+	}
+	path16, err := windows.UTF16PtrFromString(path)
+	if err != nil {
+		return err
+	}
+	handle, err := windows.CreateFile(path16,
+		windows.FILE_APPEND_DATA|windows.READ_CONTROL|windows.WRITE_DAC|windows.SYNCHRONIZE,
+		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE,
+		security, windows.OPEN_ALWAYS,
+		windows.FILE_ATTRIBUTE_NORMAL|windows.FILE_FLAG_OPEN_REPARSE_POINT, 0)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = windows.CloseHandle(handle) }()
+	var info windows.ByHandleFileInformation
+	if err := windows.GetFileInformationByHandle(handle, &info); err != nil {
+		return err
+	}
+	if info.FileAttributes&(windows.FILE_ATTRIBUTE_DIRECTORY|windows.FILE_ATTRIBUTE_REPARSE_POINT) != 0 || info.NumberOfLinks != 1 {
+		return errors.New("Windows user job log must be a non-reparse, single-link file")
+	}
+	dacl, _, err := descriptor.DACL()
+	if err != nil {
+		return fmt.Errorf("read protected Windows user job file ACL: %w", err)
+	}
+	if err := windows.SetSecurityInfo(handle, windows.SE_FILE_OBJECT,
+		windows.DACL_SECURITY_INFORMATION|windows.PROTECTED_DACL_SECURITY_INFORMATION,
+		nil, nil, dacl, nil); err != nil {
+		return fmt.Errorf("apply protected Windows user job file ACL: %w", err)
+	}
+	return nil
 }
 
 func protectWindowsUserJobPath(path, sid string) error {

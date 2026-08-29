@@ -19,6 +19,11 @@ import (
 //
 // Environment variables are deliberately not part of this contract. A plist
 // is durable, inspectable state and must never become a bearer-token store.
+// Windows Task Scheduler starts BinaryPath directly so stopping the task also
+// stops the real application process. The manager creates StandardOut and
+// StandardErr with protected ACLs; a Windows application must open those paths
+// itself when it needs file logging because Task Scheduler has no native
+// stdout/stderr redirection fields.
 type UserJob struct {
 	Label       string
 	BinaryPath  string
