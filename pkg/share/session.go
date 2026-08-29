@@ -117,6 +117,13 @@ type ResourceConfig struct {
 	RotationLead time.Duration
 	StopTimeout  time.Duration
 	OnServing    func(Admission)
+	// OnRetry reports a failed admission or connection attempt and the
+	// bounded delay before the next attempt. The error may come from the
+	// configured Admitter or SessionFactory, connector-side validation, cleanup,
+	// or deadline handling; it is not guaranteed to be safe for persistent logs.
+	// It does not report terminal rotation expiry or a serving session exit. The
+	// callback must return promptly.
+	OnRetry func(error, time.Duration)
 }
 
 // ResourceRunner maintains one resource-bound NHP/FRP route. Renewal is
@@ -180,8 +187,9 @@ func (r *ResourceRunner) Run(ctx context.Context) (retErr error) {
 				if errors.Is(err, ErrResourceGone) {
 					return err
 				}
-				if err := sleepWithContext(ctx, jitter(backoff)); err != nil {
-					return err
+				wait := jitter(backoff)
+				if retryErr := r.waitToRetry(ctx, err, wait); retryErr != nil {
+					return retryErr
 				}
 				backoff = nextBackoff(backoff, r.cfg.MaxBackoff)
 				continue
@@ -332,10 +340,27 @@ func (r *ResourceRunner) startReadyCycle(ctx context.Context, old *resourceCycle
 		if wait > remaining {
 			wait = remaining
 		}
-		if err := sleepWithContext(ctx, wait); err != nil {
-			return nil, err
+		if retryErr := r.waitToRetry(ctx, err, wait); retryErr != nil {
+			return nil, retryErr
 		}
 		backoff = nextBackoff(backoff, r.cfg.MaxBackoff)
+	}
+}
+
+func (r *ResourceRunner) waitToRetry(ctx context.Context, attemptErr error, wait time.Duration) error {
+	retryAt := time.Now().Add(wait)
+	r.reportRetry(ctx, attemptErr, wait)
+	remaining := time.Until(retryAt)
+	if remaining <= 0 {
+		// The callback consumed the delay, so the next attempt can start now.
+		return ctx.Err()
+	}
+	return sleepWithContext(ctx, remaining)
+}
+
+func (r *ResourceRunner) reportRetry(ctx context.Context, err error, wait time.Duration) {
+	if ctx.Err() == nil && err != nil && r.cfg.OnRetry != nil {
+		r.cfg.OnRetry(err, wait)
 	}
 }
 
