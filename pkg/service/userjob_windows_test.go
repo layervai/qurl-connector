@@ -204,6 +204,28 @@ func TestWindowsUserJobStatusDoesNotHideSchedulerErrors(t *testing.T) {
 	}
 }
 
+func TestWindowsUserJobStatusDoesNotTreatEmptySchedulerOutputAsAbsent(t *testing.T) {
+	manager := &windowsUserJobManager{
+		run: func(_ string, args ...string) (string, error) {
+			command := strings.Join(args, " ")
+			for _, want := range []string{"-ErrorAction Stop", "ObjectNotFound", "throw"} {
+				if !strings.Contains(command, want) {
+					t.Fatalf("scheduler query missing %q: %s", want, command)
+				}
+			}
+			if strings.Contains(command, "SilentlyContinue") {
+				t.Fatalf("scheduler query can hide provider failures: %s", command)
+			}
+			return "", nil
+		},
+		currentSID: func() (string, error) { return "S-1-5-21-1000", nil },
+		powerShell: func() (string, error) { return "powershell.exe", nil },
+	}
+	if _, err := manager.Status("ai.layerv.qurl.daemon"); err == nil || !strings.Contains(err.Error(), "parse Windows user job state") {
+		t.Fatalf("Status error = %v, want empty scheduler output to fail visibly", err)
+	}
+}
+
 func TestWindowsScopedTaskNameIsPerUserAndBounded(t *testing.T) {
 	label := strings.Repeat("a", 128)
 	first := windowsScopedTaskName(label, "S-1-5-21-1000")

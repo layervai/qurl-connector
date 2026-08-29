@@ -317,8 +317,9 @@ func (m *windowsUserJobManager) state(taskName string) (int, error) {
 	// taskName is derived from userJobLabelPattern plus a hex digest. The
 	// pattern excludes PowerShell quoting and wildcard characters, so this is
 	// one exact root-folder lookup rather than an enumeration.
-	command := "$ErrorActionPreference='Stop'; $task = Get-ScheduledTask -TaskName '" + taskName +
-		"' -TaskPath '\\' -ErrorAction SilentlyContinue; if ($null -eq $task) { '-1' } else { [int]$task.State }"
+	command := "$ErrorActionPreference='Stop'; try { $task = Get-ScheduledTask -TaskName '" + taskName +
+		"' -TaskPath '\\' -ErrorAction Stop } catch { if ($_.CategoryInfo.Category -ne 'ObjectNotFound') { throw }; $task = $null }; " +
+		"if ($null -eq $task) { '-1' } else { [int]$task.State }"
 	output, err := m.runPowerShell(command)
 	if err != nil {
 		return 0, err
