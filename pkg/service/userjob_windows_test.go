@@ -134,6 +134,26 @@ func TestWindowsUserJobEnsureCreateReuseReplaceAndRemove(t *testing.T) {
 	if len(calls) != createdCalls+2 { // One state query and one XML definition query.
 		t.Fatalf("matching running Ensure made %d new calls, want 2", len(calls)-createdCalls)
 	}
+	onDemand := job
+	onDemand.RunAtLoad = false
+	if err := manager.Ensure(onDemand); err != nil {
+		t.Fatalf("install on-demand-only job: %v", err)
+	}
+	onDemandCalls := len(calls)
+	if err := manager.Ensure(onDemand); err != nil {
+		t.Fatalf("reuse on-demand-only job: %v", err)
+	}
+	if len(calls) != onDemandCalls+2 { // One state query and one XML definition query.
+		t.Fatalf("matching on-demand Ensure made %d new calls, want 2", len(calls)-onDemandCalls)
+	}
+	existing = strings.Replace(existing, "<StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>",
+		"<StopIfGoingOnBatteries>true</StopIfGoingOnBatteries>", 1)
+	if err := manager.Ensure(onDemand); err != nil {
+		t.Fatalf("repair drifted battery policy: %v", err)
+	}
+	if strings.Contains(existing, "<StopIfGoingOnBatteries>true</StopIfGoingOnBatteries>") {
+		t.Fatal("Ensure retained a marker-matching task with a changed battery policy")
+	}
 	existing = strings.Replace(existing, job.BinaryPath, filepath.Join(filepath.Dir(job.BinaryPath), "other.exe"), 1)
 	if err := manager.Ensure(job); err != nil {
 		t.Fatalf("Ensure did not replace a marker-matching task with a changed command: %v", err)
@@ -314,9 +334,13 @@ func TestWindowsUserJobDirectoryRejectsMutableAncestor(t *testing.T) {
 	if err := windows.CloseHandle(handle); err != nil {
 		t.Fatal(err)
 	}
-	if err := ensureWindowsPrivateDirectory(filepath.Join(ancestor, "logs"), sid); err == nil ||
+	logDir := filepath.Join(ancestor, "logs")
+	if err := ensureWindowsPrivateDirectory(logDir, sid); err == nil ||
 		!strings.Contains(err.Error(), "unsafe access") {
 		t.Fatalf("mutable ancestor error = %v, want unsafe-access rejection", err)
+	}
+	if _, err := os.Lstat(logDir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("rejected new log directory remained on disk: %v", err)
 	}
 }
 

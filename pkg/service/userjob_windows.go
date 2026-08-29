@@ -143,16 +143,13 @@ func (m *windowsUserJobManager) ensure(job UserJob, forceReplace bool) (retErr e
 		return fmt.Errorf("inspect Windows user job %s: %w", job.Label, err)
 	}
 	installed := state != windowsTaskStateAbsent
-	var existing string
-	if installed {
-		existing, err = m.runTaskScheduler("/Query", "/TN", taskName, "/XML")
-		if err != nil {
-			return fmt.Errorf("read Windows user job %s: %w", job.Label, err)
-		}
-		existing = decodeWindowsCommandText(existing)
-	}
 	definitionMatches := false
 	if installed && !forceReplace && state != windowsTaskStateDisabled {
+		existing, queryErr := m.runTaskScheduler("/Query", "/TN", taskName, "/XML")
+		if queryErr != nil {
+			return fmt.Errorf("read Windows user job %s: %w", job.Label, queryErr)
+		}
+		existing = decodeWindowsCommandText(existing)
 		definitionMatches, err = matchingWindowsUserJobDefinition(existing, content)
 		if err != nil {
 			return fmt.Errorf("validate Windows user job %s definition: %w", job.Label, err)
@@ -169,7 +166,15 @@ func (m *windowsUserJobManager) ensure(job UserJob, forceReplace bool) (retErr e
 		return fmt.Errorf("create temporary Windows user job definition: %w", err)
 	}
 	definitionPath := definition.Name()
-	defer func() { retErr = errors.Join(retErr, removeWindowsUserJobDefinition(definitionPath)) }()
+	defer func() {
+		cleanupErr := removeWindowsUserJobDefinition(definitionPath)
+		// A protected stale definition is inert. Do not report an established,
+		// running task as failed only because an indexer or scanner still held the
+		// temporary file after Task Scheduler consumed it.
+		if retErr != nil {
+			retErr = errors.Join(retErr, cleanupErr)
+		}
+	}()
 	if err := ensureWindowsPrivateFile(definitionPath, sid); err != nil {
 		_ = definition.Close()
 		return fmt.Errorf("protect temporary Windows user job definition: %w", err)
@@ -405,7 +410,18 @@ type windowsUserJobDefinition struct {
 	} `xml:"Principals"`
 	Settings struct {
 		MultipleInstancesPolicy      string `xml:"MultipleInstancesPolicy"`
+		DisallowStartIfOnBatteries   string `xml:"DisallowStartIfOnBatteries"`
+		StopIfGoingOnBatteries       string `xml:"StopIfGoingOnBatteries"`
+		AllowHardTerminate           string `xml:"AllowHardTerminate"`
+		StartWhenAvailable           string `xml:"StartWhenAvailable"`
+		RunOnlyIfNetworkAvailable    string `xml:"RunOnlyIfNetworkAvailable"`
+		AllowStartOnDemand           string `xml:"AllowStartOnDemand"`
 		Enabled                      string `xml:"Enabled"`
+		Hidden                       string `xml:"Hidden"`
+		RunOnlyIfIdle                string `xml:"RunOnlyIfIdle"`
+		WakeToRun                    string `xml:"WakeToRun"`
+		ExecutionTimeLimit           string `xml:"ExecutionTimeLimit"`
+		Priority                     string `xml:"Priority"`
 		RestartOnFailureInterval     string `xml:"RestartOnFailure>Interval"`
 		RestartOnFailureAttemptCount string `xml:"RestartOnFailure>Count"`
 	} `xml:"Settings"`
@@ -441,27 +457,50 @@ func normalizeWindowsUserJobDefinition(definition *windowsUserJobDefinition) err
 	if definition == nil {
 		return errors.New("Windows task definition is nil")
 	}
-	for name, value := range map[string]*string{
-		"logon trigger user": &definition.Triggers.Logon.UserID,
-		"principal user":     &definition.Principals.Principal.UserID,
-	} {
-		canonical, err := canonicalWindowsTaskUserID(*value)
+	// An on-demand-only job has no LogonTrigger. Canonicalize that identity
+	// only when the trigger exists; the principal identity is always required.
+	if definition.Triggers.Logon.UserID != "" {
+		canonical, err := canonicalWindowsTaskUserID(definition.Triggers.Logon.UserID)
 		if err != nil {
-			return fmt.Errorf("resolve %s: %w", name, err)
+			return fmt.Errorf("resolve logon trigger user: %w", err)
 		}
-		*value = canonical
+		definition.Triggers.Logon.UserID = canonical
 	}
+	canonical, err := canonicalWindowsTaskUserID(definition.Principals.Principal.UserID)
+	if err != nil {
+		return fmt.Errorf("resolve principal user: %w", err)
+	}
+	definition.Principals.Principal.UserID = canonical
 	// Task Scheduler omits these fields when they hold their schema defaults.
-	// Normalize only defaults whose omission was observed in the real query
-	// response; every other compared field must remain explicit and exact.
-	if definition.Triggers.Logon.Enabled == "" {
+	// Normalize the documented Task Scheduler schema defaults before comparing
+	// the registered behavior with the complete expected behavior.
+	if definition.Triggers.Logon.UserID != "" && definition.Triggers.Logon.Enabled == "" {
 		definition.Triggers.Logon.Enabled = "true"
 	}
 	if definition.Principals.Principal.RunLevel == "" {
 		definition.Principals.Principal.RunLevel = "LeastPrivilege"
 	}
-	if definition.Settings.Enabled == "" {
-		definition.Settings.Enabled = "true"
+	for _, field := range []struct {
+		value        *string
+		defaultValue string
+	}{
+		{&definition.Settings.MultipleInstancesPolicy, "IgnoreNew"},
+		{&definition.Settings.DisallowStartIfOnBatteries, "true"},
+		{&definition.Settings.StopIfGoingOnBatteries, "true"},
+		{&definition.Settings.AllowHardTerminate, "true"},
+		{&definition.Settings.StartWhenAvailable, "false"},
+		{&definition.Settings.RunOnlyIfNetworkAvailable, "false"},
+		{&definition.Settings.AllowStartOnDemand, "true"},
+		{&definition.Settings.Enabled, "true"},
+		{&definition.Settings.Hidden, "false"},
+		{&definition.Settings.RunOnlyIfIdle, "false"},
+		{&definition.Settings.WakeToRun, "false"},
+		{&definition.Settings.ExecutionTimeLimit, "PT72H"},
+		{&definition.Settings.Priority, "7"},
+	} {
+		if *field.value == "" {
+			*field.value = field.defaultValue
+		}
 	}
 	return nil
 }
@@ -609,7 +648,16 @@ func ensureWindowsPrivateDirectory(path, sid string) error {
 	default:
 		return err
 	}
-	return validateAndProtectWindowsDirectory(path, sid, created)
+	if err := validateAndProtectWindowsDirectory(path, sid, created); err != nil {
+		if created {
+			removeErr := os.Remove(path)
+			if removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+				return errors.Join(err, fmt.Errorf("remove rejected Windows user job directory: %w", removeErr))
+			}
+		}
+		return err
+	}
+	return nil
 }
 
 func ensureWindowsPrivateFile(path, sid string) error {
