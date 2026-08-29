@@ -40,8 +40,10 @@ endpoints, cloud account identifiers, customer data, or live rollout evidence.
   Scheduler staging and log paths are owner-only. Windows directory walks must
   reject reparse points and ancestors that an untrusted principal can replace.
 - On Windows, `RunAtLoad` is a logon trigger and `KeepAlive` restarts failed
-  tasks. Task Scheduler hard-stops the direct child during replacement/removal;
-  `ExitTimeout` and `Umask` are launchd-only controls.
+  tasks. The next logon or foreground `qurl` command repairs a clean exit. Task
+  Scheduler hard-stops the direct child during replacement/removal;
+  `ExitTimeout` and `Umask` are launchd-only controls. The executable and its
+  ancestors must not be replaceable by an untrusted principal.
 - Persisted lifecycle updates are monotonic: serving epochs cannot regress and
   immutable resource identities cannot change in place.
 - Automatic assignment recovery uses bounded persisted backoff. Authenticated

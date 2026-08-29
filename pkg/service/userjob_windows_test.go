@@ -27,11 +27,68 @@ func testWindowsUserJob(t *testing.T) UserJob {
 	t.Helper()
 	dir := t.TempDir()
 	logDir := filepath.Join(dir, "logs")
+	binaryPath := filepath.Join(dir, "qurl.exe")
+	if err := os.WriteFile(binaryPath, []byte("test executable"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	return UserJob{
-		Label: "ai.layerv.qurl.daemon", BinaryPath: filepath.Join(dir, "qurl.exe"),
+		Label: "ai.layerv.qurl.daemon", BinaryPath: binaryPath,
 		Arguments:   []string{"--endpoint", "https://api.example.com", "daemon", "run", "--state-dir", filepath.Join(dir, "state with space")},
 		StandardOut: filepath.Join(logDir, "out.log"), StandardErr: filepath.Join(logDir, "err.log"),
 		RunAtLoad: true, KeepAlive: true,
+	}
+}
+
+func TestWindowsUserJobRejectsMultiplyLinkedExecutable(t *testing.T) {
+	job := testWindowsUserJob(t)
+	if err := os.Link(job.BinaryPath, filepath.Join(filepath.Dir(job.BinaryPath), "other.exe")); err != nil {
+		t.Fatal(err)
+	}
+	manager := &windowsUserJobManager{currentSID: currentWindowsUserSID}
+	if err := manager.Ensure(job); err == nil || !strings.Contains(err.Error(), "single-link") {
+		t.Fatalf("multiply-linked executable error = %v, want single-link rejection", err)
+	}
+}
+
+func TestWindowsUserJobRejectsMutableExecutableDirectory(t *testing.T) {
+	job := testWindowsUserJob(t)
+	sid, err := currentWindowsUserSID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	directory16, err := windows.UTF16PtrFromString(filepath.Dir(job.BinaryPath))
+	if err != nil {
+		t.Fatal(err)
+	}
+	handle, err := windows.CreateFile(directory16, windows.READ_CONTROL|windows.WRITE_DAC,
+		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE, nil,
+		windows.OPEN_EXISTING, windows.FILE_FLAG_BACKUP_SEMANTICS|windows.FILE_FLAG_OPEN_REPARSE_POINT, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	descriptor, err := windows.SecurityDescriptorFromString(
+		"D:P(A;OICI;FA;;;" + sid + ")(A;OICI;FA;;;WD)")
+	if err != nil {
+		_ = windows.CloseHandle(handle)
+		t.Fatal(err)
+	}
+	dacl, _, err := descriptor.DACL()
+	if err != nil {
+		_ = windows.CloseHandle(handle)
+		t.Fatal(err)
+	}
+	if err := windows.SetSecurityInfo(handle, windows.SE_FILE_OBJECT,
+		windows.DACL_SECURITY_INFORMATION|windows.PROTECTED_DACL_SECURITY_INFORMATION,
+		nil, nil, dacl, nil); err != nil {
+		_ = windows.CloseHandle(handle)
+		t.Fatal(err)
+	}
+	if err := windows.CloseHandle(handle); err != nil {
+		t.Fatal(err)
+	}
+	manager := &windowsUserJobManager{currentSID: currentWindowsUserSID}
+	if err := manager.Ensure(job); err == nil || !strings.Contains(err.Error(), "unsafe access") {
+		t.Fatalf("mutable executable directory error = %v, want unsafe-access rejection", err)
 	}
 }
 

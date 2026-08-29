@@ -124,6 +124,9 @@ func (m *windowsUserJobManager) ensure(job UserJob, forceReplace bool) (retErr e
 	if err != nil {
 		return err
 	}
+	if err := validateWindowsUserJobExecutable(job.BinaryPath, sid); err != nil {
+		return fmt.Errorf("validate Windows user job executable %s: %w", job.BinaryPath, err)
+	}
 	content, _, err := m.render(job, sid)
 	if err != nil {
 		return err
@@ -737,6 +740,74 @@ func ensureWindowsPrivateDirectory(path, sid string) error {
 	return nil
 }
 
+func validateWindowsUserJobExecutable(path, sidText string) error { //nolint:gocyclo // One no-follow executable authority fence.
+	if err := validateWindowsUserJobDirectoryPath(filepath.Dir(path), sidText, false, false); err != nil {
+		return fmt.Errorf("validate executable directory: %w", err)
+	}
+	currentSID, adminSID, systemSID, installerSID, err := windowsUserJobTrustedSIDs(sidText)
+	if err != nil {
+		return err
+	}
+	trusted := func(candidate *windows.SID) bool {
+		return candidate != nil && (candidate.Equals(currentSID) || candidate.Equals(adminSID) ||
+			candidate.Equals(systemSID) || candidate.Equals(installerSID))
+	}
+	path16, err := windows.UTF16PtrFromString(path)
+	if err != nil {
+		return err
+	}
+	handle, err := windows.CreateFile(path16,
+		windows.GENERIC_READ|windows.FILE_READ_ATTRIBUTES|windows.READ_CONTROL|windows.SYNCHRONIZE,
+		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE, nil, windows.OPEN_EXISTING,
+		windows.FILE_ATTRIBUTE_NORMAL|windows.FILE_FLAG_OPEN_REPARSE_POINT, 0)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = windows.CloseHandle(handle) }()
+	var info windows.ByHandleFileInformation
+	if err := windows.GetFileInformationByHandle(handle, &info); err != nil {
+		return err
+	}
+	if info.FileAttributes&(windows.FILE_ATTRIBUTE_DIRECTORY|windows.FILE_ATTRIBUTE_REPARSE_POINT) != 0 ||
+		info.NumberOfLinks != 1 {
+		return errors.New("Windows user job executable must be a non-reparse, single-link file")
+	}
+	descriptor, err := windows.GetSecurityInfo(handle, windows.SE_FILE_OBJECT,
+		windows.OWNER_SECURITY_INFORMATION|windows.DACL_SECURITY_INFORMATION)
+	if err != nil || descriptor == nil {
+		return fmt.Errorf("read Windows user job executable ACL: %w", err)
+	}
+	owner, _, err := descriptor.Owner()
+	if err != nil || !trusted(owner) {
+		return errors.New("Windows user job executable has an untrusted owner")
+	}
+	dacl, _, err := descriptor.DACL()
+	if err != nil || dacl == nil {
+		return errors.New("Windows user job executable has no restrictive DACL")
+	}
+	header := (*windowsUserJobACLHeader)(unsafe.Pointer(dacl))
+	for aceIndex := uint32(0); aceIndex < uint32(header.ACECount); aceIndex++ {
+		var ace *windows.ACCESS_ALLOWED_ACE
+		if aceErr := windows.GetAce(dacl, aceIndex, &ace); aceErr != nil || ace == nil {
+			return fmt.Errorf("inspect Windows user job executable DACL: %w", aceErr)
+		}
+		switch classifyWindowsDirectoryACE(ace.Header.AceType, false) {
+		case windowsDirectoryACEDeny:
+			continue
+		case windowsDirectoryACEUnsupported:
+			return fmt.Errorf("Windows user job executable has unsupported ACE type %d", ace.Header.AceType)
+		}
+		principal := (*windows.SID)(unsafe.Pointer(&ace.SidStart))
+		if principal == nil || !principal.IsValid() {
+			return errors.New("Windows user job executable has an invalid DACL identity")
+		}
+		if !trusted(principal) && ace.Mask&windowsUserJobExecutableMutation != 0 {
+			return errors.New("Windows user job executable grants unsafe access to another principal")
+		}
+	}
+	return nil
+}
+
 func ensureWindowsPrivateFile(path, sid string) error {
 	descriptor, err := windowsUserJobSecurityDescriptor(sid, false)
 	if err != nil {
@@ -809,7 +880,10 @@ func protectWindowsUserJobHandle(handle windows.Handle, sid string, directory bo
 
 const windowsUserJobAncestorMutation = windows.ACCESS_MASK(
 	windows.DELETE | windows.WRITE_DAC | windows.WRITE_OWNER | windows.GENERIC_WRITE |
-		windows.GENERIC_ALL | 0x00000040) // FILE_DELETE_CHILD
+		windows.GENERIC_ALL | windows.FILE_WRITE_DATA | windows.FILE_APPEND_DATA |
+		windows.FILE_WRITE_EA | windows.FILE_WRITE_ATTRIBUTES | 0x00000040) // FILE_DELETE_CHILD
+
+const windowsUserJobExecutableMutation = windowsUserJobAncestorMutation
 
 const windowsUserJobAllAccess = windows.ACCESS_MASK(0x001f01ff)
 
@@ -848,7 +922,25 @@ type windowsUserJobACLHeader struct {
 	Sbz2     uint16
 }
 
-func validateAndProtectWindowsDirectory(path, sidText string, protectCreatedLeaf bool) error { //nolint:gocyclo // One no-follow path and ACL authority fence.
+func validateAndProtectWindowsDirectory(path, sidText string, protectCreatedLeaf bool) error {
+	return validateWindowsUserJobDirectoryPath(path, sidText, true, protectCreatedLeaf)
+}
+
+func windowsUserJobTrustedSIDs(sidText string) (*windows.SID, *windows.SID, *windows.SID, *windows.SID, error) {
+	currentSID, err := windows.StringToSid(sidText)
+	if err != nil {
+		return nil, nil, nil, nil, fmt.Errorf("parse current Windows user SID: %w", err)
+	}
+	adminSID, adminErr := windows.CreateWellKnownSid(windows.WinBuiltinAdministratorsSid)
+	systemSID, systemErr := windows.CreateWellKnownSid(windows.WinLocalSystemSid)
+	installerSID, installerErr := windows.StringToSid(windowsTrustedInstallerSID)
+	if adminErr != nil || systemErr != nil || installerErr != nil {
+		return nil, nil, nil, nil, errors.New("build trusted Windows user job identities")
+	}
+	return currentSID, adminSID, systemSID, installerSID, nil
+}
+
+func validateWindowsUserJobDirectoryPath(path, sidText string, strictLeaf, protectLeaf bool) error { //nolint:gocyclo // One no-follow path and ACL authority fence.
 	clean := filepath.Clean(path)
 	volume := filepath.VolumeName(clean)
 	if volume == "" || !filepath.IsAbs(clean) || strings.HasPrefix(clean, `\\?\`) || strings.HasPrefix(clean, `\\.\`) {
@@ -859,15 +951,9 @@ func validateAndProtectWindowsDirectory(path, sidText string, protectCreatedLeaf
 	if err != nil || relative == "." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
 		return errors.New("Windows user job directory must be below a volume root")
 	}
-	currentSID, err := windows.StringToSid(sidText)
+	currentSID, adminSID, systemSID, installerSID, err := windowsUserJobTrustedSIDs(sidText)
 	if err != nil {
-		return fmt.Errorf("parse current Windows user SID: %w", err)
-	}
-	adminSID, adminErr := windows.CreateWellKnownSid(windows.WinBuiltinAdministratorsSid)
-	systemSID, systemErr := windows.CreateWellKnownSid(windows.WinLocalSystemSid)
-	installerSID, installerErr := windows.StringToSid(windowsTrustedInstallerSID)
-	if adminErr != nil || systemErr != nil || installerErr != nil {
-		return errors.New("build trusted Windows user job identities")
+		return err
 	}
 	trustedAncestor := func(candidate *windows.SID) bool {
 		return candidate != nil && (candidate.Equals(currentSID) || candidate.Equals(adminSID) ||
@@ -903,7 +989,7 @@ func validateAndProtectWindowsDirectory(path, sidText string, protectCreatedLeaf
 		}
 		leaf := index == len(paths)-1
 		access := uint32(windows.FILE_READ_ATTRIBUTES | windows.READ_CONTROL)
-		if leaf && protectCreatedLeaf {
+		if leaf && protectLeaf {
 			access |= windows.WRITE_DAC | windows.WRITE_OWNER
 		}
 		handle, openErr := windows.CreateFile(path16, access,
@@ -921,7 +1007,7 @@ func validateAndProtectWindowsDirectory(path, sidText string, protectCreatedLeaf
 			info.FileAttributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 {
 			return errors.New("Windows user job directory components must be non-reparse directories")
 		}
-		if leaf && protectCreatedLeaf {
+		if leaf && protectLeaf {
 			if protectErr := protectWindowsUserJobHandle(handle, sidText, true); protectErr != nil {
 				return protectErr
 			}
@@ -932,11 +1018,12 @@ func validateAndProtectWindowsDirectory(path, sidText string, protectCreatedLeaf
 			return fmt.Errorf("read Windows user job directory ACL: %w", securityErr)
 		}
 		owner, _, ownerErr := descriptor.Owner()
-		if ownerErr != nil || owner == nil || (!leaf && !trustedAncestor(owner)) || (leaf && !owner.Equals(currentSID)) {
+		if ownerErr != nil || owner == nil || (leaf && strictLeaf && !owner.Equals(currentSID)) ||
+			((!leaf || !strictLeaf) && !trustedAncestor(owner)) {
 			return fmt.Errorf("Windows user job directory %s has an untrusted owner", candidate)
 		}
 		control, _, controlErr := descriptor.Control()
-		if leaf && (controlErr != nil || control&windows.SE_DACL_PROTECTED == 0) {
+		if leaf && strictLeaf && (controlErr != nil || control&windows.SE_DACL_PROTECTED == 0) {
 			return fmt.Errorf("Windows user job directory %s has an inherited ACL; move or remove it so qurl can recreate an owner-only directory", candidate)
 		}
 		dacl, _, daclErr := descriptor.DACL()
@@ -952,7 +1039,7 @@ func validateAndProtectWindowsDirectory(path, sidText string, protectCreatedLeaf
 			}
 			switch classifyWindowsDirectoryACE(ace.Header.AceType, leaf) {
 			case windowsDirectoryACEDeny:
-				if leaf {
+				if leaf && strictLeaf {
 					return fmt.Errorf("Windows user job directory %s has unsupported deny ACE type %d", candidate, ace.Header.AceType)
 				}
 				continue
@@ -967,20 +1054,20 @@ func validateAndProtectWindowsDirectory(path, sidText string, protectCreatedLeaf
 			// component, and each descendant is opened and checked independently.
 			// On the leaf they can grant unsafe access to files created later, so
 			// they must pass the same trusted-principal fence as direct entries.
-			if !leaf && ace.Header.AceFlags&windows.INHERIT_ONLY_ACE != 0 {
+			if ace.Header.AceFlags&windows.INHERIT_ONLY_ACE != 0 && (!leaf || !strictLeaf) {
 				continue
 			}
-			if leaf && !trustedLeaf(principal) {
+			if leaf && strictLeaf && !trustedLeaf(principal) {
 				return errors.New("Windows user job directory grants unsafe access to another principal")
 			}
-			if !leaf && !trustedAncestor(principal) && ace.Mask&windowsUserJobAncestorMutation != 0 {
+			if (!leaf || !strictLeaf) && !trustedAncestor(principal) && ace.Mask&windowsUserJobAncestorMutation != 0 {
 				return errors.New("Windows user job directory grants unsafe access to another principal")
 			}
-			if leaf && principal.Equals(currentSID) && ace.Header.AceFlags&windows.INHERIT_ONLY_ACE == 0 {
+			if leaf && strictLeaf && principal.Equals(currentSID) && ace.Header.AceFlags&windows.INHERIT_ONLY_ACE == 0 {
 				currentMask |= ace.Mask
 			}
 		}
-		if leaf && currentMask&windowsUserJobAllAccess != windowsUserJobAllAccess && currentMask&windows.GENERIC_ALL == 0 {
+		if leaf && strictLeaf && currentMask&windowsUserJobAllAccess != windowsUserJobAllAccess && currentMask&windows.GENERIC_ALL == 0 {
 			return errors.New("Windows user job directory does not grant the current user full control")
 		}
 	}

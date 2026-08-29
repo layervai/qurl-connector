@@ -33,7 +33,9 @@ jobs:
       # The pinned action above installs its exact binary on PATH for this
       # same job; reuse it under GOOS=windows so Windows-only files are linted.
       - name: Cross-lint Windows service sources
-        run: GOOS=windows GOARCH=amd64 CGO_ENABLED=0 golangci-lint run ./pkg/service
+        run: |
+          command -v golangci-lint
+          GOOS=windows GOARCH=amd64 CGO_ENABLED=0 golangci-lint run ./pkg/service
 
   test:
     name: Test

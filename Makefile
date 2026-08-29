@@ -41,6 +41,7 @@ verify-deps:
 
 lint:
 	golangci-lint run ./pkg/... ./cmd/... ./internal/...
+	GOOS=windows GOARCH=amd64 CGO_ENABLED=0 golangci-lint run ./pkg/service
 
 frpc:
 	@printf "$(BLUE)[qURL Connector] Building developer command...$(RESET)\n"
@@ -59,6 +60,7 @@ test-race:
 
 vet:
 	go vet ./...
+	GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go vet ./pkg/service
 
 clean:
 	rm -f ./bin/qurl-connector

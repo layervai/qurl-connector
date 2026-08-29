@@ -30,7 +30,11 @@ import (
 // log directory is also the process working directory and must remain present
 // while the job runs.
 type UserJob struct {
-	Label      string
+	Label string
+	// BinaryPath is durable executable authority. On Windows the manager
+	// requires one non-reparse, single-link file whose owner and every path
+	// ancestor are trusted and whose ACL does not let another principal replace
+	// or modify the executable.
 	BinaryPath string
 	// Arguments are durable and process-visible. They must not contain API
 	// keys, enrollment credentials, tokens, or other bearer secrets.
