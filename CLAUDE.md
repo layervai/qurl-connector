@@ -37,7 +37,11 @@ endpoints, cloud account identifiers, customer data, or live rollout evidence.
 ## State and security
 
 - Persistent state, IPC directories, macOS LaunchAgent state, and Windows Task
-  Scheduler staging and log paths are owner-only.
+  Scheduler staging and log paths are owner-only. Windows directory walks must
+  reject reparse points and ancestors that an untrusted principal can replace.
+- On Windows, `RunAtLoad` is a logon trigger and `KeepAlive` restarts failed
+  tasks. Task Scheduler hard-stops the direct child during replacement/removal;
+  `ExitTimeout` and `Umask` are launchd-only controls.
 - Persisted lifecycle updates are monotonic: serving epochs cannot regress and
   immutable resource identities cannot change in place.
 - Automatic assignment recovery uses bounded persisted backoff. Authenticated

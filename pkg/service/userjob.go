@@ -30,10 +30,14 @@ type UserJob struct {
 	Arguments   []string
 	StandardOut string
 	StandardErr string
+	// ExitTimeout and Umask are launchd controls. Windows Task Scheduler
+	// terminates the direct child process and relies on protected NTFS ACLs.
 	ExitTimeout int
 	Umask       int
 	RunAtLoad   bool
-	KeepAlive   bool
+	// KeepAlive maps to launchd KeepAlive on macOS and restart-on-failure on
+	// Windows. Task Scheduler does not restart a process after a successful exit.
+	KeepAlive bool
 }
 
 // UserJobManager manages a native per-user background job. Ensure atomically

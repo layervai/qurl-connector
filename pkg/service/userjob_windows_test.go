@@ -94,6 +94,8 @@ func TestWindowsUserJobEnsureCreateReuseReplaceAndRemove(t *testing.T) {
 		case strings.HasPrefix(joined, "/Run"):
 			running = true
 			return "", nil
+		case strings.HasPrefix(joined, "/Change"):
+			return "", nil
 		case strings.HasPrefix(joined, "/End"):
 			running = false
 			return "", nil
@@ -154,6 +156,10 @@ func TestWindowsScopedTaskNameIsPerUserAndBounded(t *testing.T) {
 	if len(first) > 128 || !userJobLabelPattern.MatchString(first) {
 		t.Fatalf("scoped Windows task name %q is invalid", first)
 	}
+	third := windowsScopedTaskName(strings.Repeat("a", 127)+"b", "S-1-5-21-1000")
+	if first == third {
+		t.Fatal("overlong Windows task labels with the same retained prefix collide")
+	}
 }
 
 func TestDecodeWindowsCommandText(t *testing.T) {
@@ -163,6 +169,86 @@ func TestDecodeWindowsCommandText(t *testing.T) {
 	}
 	if got := decodeWindowsCommandText(want); got != want {
 		t.Fatalf("decoded UTF-8 task XML = %q, want %q", got, want)
+	}
+}
+
+func TestWindowsUserJobCommandOutputKeepsStdoutAndStderrSeparate(t *testing.T) {
+	output, err := windowsJobCommandOutput("cmd.exe", "/d", "/s", "/c",
+		`(echo scheduler-stdout)&(echo scheduler-stderr 1>&2)&exit /b 7`)
+	if err == nil {
+		t.Fatal("failing Windows command returned no error")
+	}
+	if output != "" {
+		t.Fatalf("failing Windows command output = %q, want empty", output)
+	}
+	if !strings.Contains(err.Error(), "scheduler-stderr") || strings.Contains(err.Error(), "scheduler-stdout") {
+		t.Fatalf("failing Windows command error mixed stdout and stderr: %v", err)
+	}
+}
+
+func TestWindowsUserJobDirectoryRejectsReparsePoint(t *testing.T) {
+	sid, err := currentWindowsUserSID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(t.TempDir(), "target")
+	if err := os.Mkdir(target, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(t.TempDir(), "link")
+	if err := os.Symlink(target, link); err != nil {
+		if errors.Is(err, windows.ERROR_PRIVILEGE_NOT_HELD) {
+			t.Skip("Windows runner cannot create symlinks")
+		}
+		t.Fatal(err)
+	}
+	if err := ensureWindowsPrivateDirectory(link, sid); err == nil || !strings.Contains(err.Error(), "non-reparse") {
+		t.Fatalf("reparse directory error = %v, want non-reparse rejection", err)
+	}
+}
+
+func TestWindowsUserJobDirectoryRejectsMutableAncestor(t *testing.T) {
+	sid, err := currentWindowsUserSID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ancestor := filepath.Join(t.TempDir(), "mutable")
+	if err := os.Mkdir(ancestor, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path16, err := windows.UTF16PtrFromString(ancestor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handle, err := windows.CreateFile(path16, windows.READ_CONTROL|windows.WRITE_DAC,
+		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE, nil,
+		windows.OPEN_EXISTING, windows.FILE_FLAG_BACKUP_SEMANTICS|windows.FILE_FLAG_OPEN_REPARSE_POINT, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	descriptor, err := windows.SecurityDescriptorFromString(
+		"D:P(A;OICI;FA;;;" + sid + ")(A;OICI;FA;;;WD)")
+	if err != nil {
+		_ = windows.CloseHandle(handle)
+		t.Fatal(err)
+	}
+	dacl, _, err := descriptor.DACL()
+	if err != nil {
+		_ = windows.CloseHandle(handle)
+		t.Fatal(err)
+	}
+	if err := windows.SetSecurityInfo(handle, windows.SE_FILE_OBJECT,
+		windows.DACL_SECURITY_INFORMATION|windows.PROTECTED_DACL_SECURITY_INFORMATION,
+		nil, nil, dacl, nil); err != nil {
+		_ = windows.CloseHandle(handle)
+		t.Fatal(err)
+	}
+	if err := windows.CloseHandle(handle); err != nil {
+		t.Fatal(err)
+	}
+	if err := ensureWindowsPrivateDirectory(filepath.Join(ancestor, "logs"), sid); err == nil ||
+		!strings.Contains(err.Error(), "unsafe access") {
+		t.Fatalf("mutable ancestor error = %v, want unsafe-access rejection", err)
 	}
 }
 
@@ -190,10 +276,28 @@ func TestWindowsUserJobIntegration(t *testing.T) {
 		Label: label, BinaryPath: binaryPath,
 		Arguments:   []string{"-test.run=^TestWindowsUserJobHelperProcess$", "--", readyPath},
 		StandardOut: filepath.Join(dir, "stdout.log"), StandardErr: filepath.Join(dir, "stderr.log"),
-		KeepAlive: false,
+		RunAtLoad: true, KeepAlive: true,
 	}
 	if err := manager.Ensure(job); err != nil {
 		t.Fatal(err)
+	}
+	sid, err := currentWindowsUserSID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	scheduler, err := windowsTaskSchedulerExecutable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	registered, err := windowsJobCommandOutput(scheduler, "/Query", "/TN", windowsScopedTaskName(label, sid), "/XML")
+	if err != nil {
+		t.Fatal(err)
+	}
+	registered = decodeWindowsCommandText(registered)
+	for _, want := range []string{"<LogonTrigger>", "<RestartOnFailure>", "<Count>999</Count>"} {
+		if !strings.Contains(registered, want) {
+			t.Fatalf("registered production task XML missing %q", want)
+		}
 	}
 	deadline := time.Now().Add(20 * time.Second)
 	for {
@@ -285,7 +389,7 @@ func TestWindowsUserJobHelperProcess(t *testing.T) {
 	if err := file.Close(); err != nil {
 		t.Fatal(err)
 	}
-	time.Sleep(30 * time.Second)
+	time.Sleep(2 * time.Minute)
 }
 
 func decodeWindowsTaskXML(t *testing.T, raw []byte) string {

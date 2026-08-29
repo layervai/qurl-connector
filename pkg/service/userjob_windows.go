@@ -25,6 +25,8 @@ import (
 
 const windowsTaskDefinitionPrefix = "layerv-qurl-user-job-sha256:"
 
+const windowsTrustedInstallerSID = "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464"
+
 const windowsUserJobTemplate = `<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <RegistrationInfo>
@@ -152,7 +154,11 @@ func (m *windowsUserJobManager) ensure(job UserJob, forceReplace bool) error {
 	}
 	if installed {
 		// A changed definition or explicit replacement must stop the old process
-		// before Task Scheduler replaces the durable task.
+		// before Task Scheduler replaces the durable task. Disable it first so a
+		// KeepAlive task cannot restart between /End and /Create.
+		if _, err := m.runTaskScheduler("/Change", "/TN", taskName, "/Disable"); err != nil {
+			return fmt.Errorf("disable Windows user job %s before replacement: %w", job.Label, err)
+		}
 		running, stateErr := m.running(taskName)
 		if stateErr != nil {
 			return fmt.Errorf("inspect Windows user job %s before replacement: %w", job.Label, stateErr)
@@ -172,7 +178,7 @@ func (m *windowsUserJobManager) ensure(job UserJob, forceReplace bool) error {
 	}
 	definitionPath := definition.Name()
 	defer func() { _ = os.Remove(definitionPath) }()
-	if err := protectWindowsUserJobPath(definitionPath, sid); err != nil {
+	if err := ensureWindowsPrivateFile(definitionPath, sid); err != nil {
 		_ = definition.Close()
 		return fmt.Errorf("protect temporary Windows user job definition: %w", err)
 	}
@@ -214,6 +220,10 @@ func (m *windowsUserJobManager) Remove(label string) error {
 	}
 	if !installed {
 		return nil
+	}
+	// Disable before /End so restart-on-failure cannot race task deletion.
+	if _, err := m.runTaskScheduler("/Change", "/TN", taskName, "/Disable"); err != nil {
+		return fmt.Errorf("disable Windows user job %s before removal: %w", label, err)
 	}
 	running, err := m.running(taskName)
 	if err != nil {
@@ -375,7 +385,9 @@ func (m *windowsUserJobManager) runTaskScheduler(arguments ...string) (string, e
 }
 
 func windowsScopedTaskName(label, sid string) string {
-	digest := sha256.Sum256([]byte(sid))
+	// Include the complete label in the digest so two overlong labels with the
+	// same retained prefix cannot address the same scheduled task.
+	digest := sha256.Sum256([]byte(sid + "\x00" + label))
 	suffix := hex.EncodeToString(digest[:8])
 	const maxTaskName = 128
 	if limit := maxTaskName - len(suffix) - 1; len(label) > limit {
@@ -430,7 +442,7 @@ func ensureWindowsPrivateDirectory(path, sid string) error {
 	if err := os.MkdirAll(path, 0o700); err != nil {
 		return err
 	}
-	return protectWindowsUserJobPath(path, sid)
+	return validateAndProtectWindowsDirectory(path, sid)
 }
 
 func ensureWindowsPrivateFile(path, sid string) error {
@@ -475,20 +487,155 @@ func ensureWindowsPrivateFile(path, sid string) error {
 	return nil
 }
 
-func protectWindowsUserJobPath(path, sid string) error {
+func windowsUserJobSecurityDescriptor(sid string, directory bool) (*windows.SECURITY_DESCRIPTOR, error) {
+	inheritance := ""
+	if directory {
+		inheritance = "OICI"
+	}
 	descriptor, err := windows.SecurityDescriptorFromString(fmt.Sprintf(
-		"O:%sG:%sD:P(A;OICI;FA;;;%s)(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)", sid, sid, sid))
+		"O:%sG:%sD:P(A;%s;FA;;;%s)(A;%s;FA;;;SY)(A;%s;FA;;;BA)",
+		sid, sid, inheritance, sid, inheritance, inheritance))
 	if err != nil {
-		return fmt.Errorf("build protected Windows user job ACL: %w", err)
+		return nil, fmt.Errorf("build protected Windows user job ACL: %w", err)
+	}
+	return descriptor, nil
+}
+
+func protectWindowsUserJobHandle(handle windows.Handle, sid string, directory bool) error {
+	descriptor, err := windowsUserJobSecurityDescriptor(sid, directory)
+	if err != nil {
+		return err
 	}
 	dacl, _, err := descriptor.DACL()
 	if err != nil {
 		return fmt.Errorf("read protected Windows user job ACL: %w", err)
 	}
-	if err := windows.SetNamedSecurityInfo(path, windows.SE_FILE_OBJECT,
+	if err := windows.SetSecurityInfo(handle, windows.SE_FILE_OBJECT,
 		windows.DACL_SECURITY_INFORMATION|windows.PROTECTED_DACL_SECURITY_INFORMATION,
 		nil, nil, dacl, nil); err != nil {
 		return fmt.Errorf("apply protected Windows user job ACL: %w", err)
+	}
+	return nil
+}
+
+const windowsUserJobAncestorMutation = windows.ACCESS_MASK(
+	windows.DELETE | windows.WRITE_DAC | windows.WRITE_OWNER | windows.GENERIC_WRITE |
+		windows.GENERIC_ALL | 0x00000040) // FILE_DELETE_CHILD
+
+type windowsUserJobACLHeader struct {
+	Revision byte
+	Sbz1     byte
+	Size     uint16
+	ACECount uint16
+	Sbz2     uint16
+}
+
+func validateAndProtectWindowsDirectory(path, sidText string) error {
+	clean := filepath.Clean(path)
+	volume := filepath.VolumeName(clean)
+	if volume == "" || !filepath.IsAbs(clean) || strings.HasPrefix(clean, `\\?\`) || strings.HasPrefix(clean, `\\.\`) {
+		return errors.New("Windows user job directory must be an absolute filesystem path")
+	}
+	root := volume + string(filepath.Separator)
+	relative, err := filepath.Rel(root, clean)
+	if err != nil || relative == "." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+		return errors.New("Windows user job directory must be below a volume root")
+	}
+	currentSID, err := windows.StringToSid(sidText)
+	if err != nil {
+		return fmt.Errorf("parse current Windows user SID: %w", err)
+	}
+	adminSID, adminErr := windows.CreateWellKnownSid(windows.WinBuiltinAdministratorsSid)
+	systemSID, systemErr := windows.CreateWellKnownSid(windows.WinLocalSystemSid)
+	installerSID, installerErr := windows.StringToSid(windowsTrustedInstallerSID)
+	if adminErr != nil || systemErr != nil || installerErr != nil {
+		return errors.New("build trusted Windows user job identities")
+	}
+	trusted := func(candidate *windows.SID) bool {
+		return candidate != nil && (candidate.Equals(currentSID) || candidate.Equals(adminSID) ||
+			candidate.Equals(systemSID) || candidate.Equals(installerSID))
+	}
+	components := strings.Split(relative, string(filepath.Separator))
+	paths := make([]string, 0, len(components)+1)
+	paths = append(paths, root)
+	cursor := root
+	for _, component := range components {
+		if component == "" || component == "." || component == ".." {
+			return errors.New("Windows user job directory has an invalid component")
+		}
+		cursor = filepath.Join(cursor, component)
+		paths = append(paths, cursor)
+	}
+
+	handles := make([]windows.Handle, 0, len(paths))
+	defer func() {
+		for index := len(handles) - 1; index >= 0; index-- {
+			_ = windows.CloseHandle(handles[index])
+		}
+	}()
+	for index, candidate := range paths {
+		path16, conversionErr := windows.UTF16PtrFromString(candidate)
+		if conversionErr != nil {
+			return conversionErr
+		}
+		leaf := index == len(paths)-1
+		access := uint32(windows.FILE_READ_ATTRIBUTES | windows.READ_CONTROL)
+		if leaf {
+			access |= windows.WRITE_DAC
+		}
+		handle, openErr := windows.CreateFile(path16, access,
+			windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE, nil, windows.OPEN_EXISTING,
+			windows.FILE_FLAG_BACKUP_SEMANTICS|windows.FILE_FLAG_OPEN_REPARSE_POINT, 0)
+		if openErr != nil {
+			return fmt.Errorf("open Windows user job directory component: %w", openErr)
+		}
+		handles = append(handles, handle)
+		var info windows.ByHandleFileInformation
+		if statErr := windows.GetFileInformationByHandle(handle, &info); statErr != nil {
+			return fmt.Errorf("inspect Windows user job directory component: %w", statErr)
+		}
+		if info.FileAttributes&windows.FILE_ATTRIBUTE_DIRECTORY == 0 ||
+			info.FileAttributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+			return errors.New("Windows user job directory components must be non-reparse directories")
+		}
+		if leaf {
+			if protectErr := protectWindowsUserJobHandle(handle, sidText, true); protectErr != nil {
+				return protectErr
+			}
+		}
+		descriptor, securityErr := windows.GetSecurityInfo(handle, windows.SE_FILE_OBJECT,
+			windows.OWNER_SECURITY_INFORMATION|windows.DACL_SECURITY_INFORMATION)
+		if securityErr != nil || descriptor == nil {
+			return fmt.Errorf("read Windows user job directory ACL: %w", securityErr)
+		}
+		owner, _, ownerErr := descriptor.Owner()
+		if ownerErr != nil || owner == nil || (!leaf && !trusted(owner)) || (leaf && !owner.Equals(currentSID)) {
+			return errors.New("Windows user job directory has an untrusted owner")
+		}
+		dacl, _, daclErr := descriptor.DACL()
+		if daclErr != nil || dacl == nil {
+			return errors.New("Windows user job directory has no restrictive DACL")
+		}
+		header := (*windowsUserJobACLHeader)(unsafe.Pointer(dacl))
+		for aceIndex := uint32(0); aceIndex < uint32(header.ACECount); aceIndex++ {
+			var ace *windows.ACCESS_ALLOWED_ACE
+			if aceErr := windows.GetAce(dacl, aceIndex, &ace); aceErr != nil || ace == nil {
+				return fmt.Errorf("inspect Windows user job directory DACL: %w", aceErr)
+			}
+			if ace.Header.AceType == windows.ACCESS_DENIED_ACE_TYPE || ace.Header.AceFlags&windows.INHERIT_ONLY_ACE != 0 {
+				continue
+			}
+			if ace.Header.AceType != windows.ACCESS_ALLOWED_ACE_TYPE {
+				return errors.New("Windows user job directory has an unsupported DACL entry")
+			}
+			principal := (*windows.SID)(unsafe.Pointer(&ace.SidStart))
+			if principal == nil || !principal.IsValid() {
+				return errors.New("Windows user job directory has an invalid DACL identity")
+			}
+			if !trusted(principal) && (leaf || ace.Mask&windowsUserJobAncestorMutation != 0) {
+				return errors.New("Windows user job directory grants unsafe access to another principal")
+			}
+		}
 	}
 	return nil
 }
@@ -523,9 +670,13 @@ func decodeWindowsCommandText(value string) string {
 
 func windowsJobCommandOutput(name string, args ...string) (string, error) {
 	command := exec.Command(name, args...)
-	output, err := command.CombinedOutput()
+	output, err := command.Output()
 	if err == nil {
 		return string(output), nil
 	}
-	return "", fmt.Errorf("%s: %w: %s", name, err, strings.TrimSpace(string(output)))
+	var exitError *exec.ExitError
+	if errors.As(err, &exitError) {
+		return "", fmt.Errorf("%s: %w: %s", name, err, strings.TrimSpace(string(exitError.Stderr)))
+	}
+	return "", fmt.Errorf("%s: %w", name, err)
 }
