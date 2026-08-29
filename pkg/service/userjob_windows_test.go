@@ -208,7 +208,7 @@ func TestWindowsUserJobStatusDoesNotTreatEmptySchedulerOutputAsAbsent(t *testing
 	manager := &windowsUserJobManager{
 		run: func(_ string, args ...string) (string, error) {
 			command := strings.Join(args, " ")
-			for _, want := range []string{"-ErrorAction Stop", "ObjectNotFound", "throw"} {
+			for _, want := range []string{"-ErrorAction Stop", "[Microsoft.Management.Infrastructure.CimException]", "-isnot", "ObjectNotFound", "throw"} {
 				if !strings.Contains(command, want) {
 					t.Fatalf("scheduler query missing %q: %s", want, command)
 				}
