@@ -30,8 +30,10 @@ import (
 // log directory is also the process working directory and must remain present
 // while the job runs.
 type UserJob struct {
-	Label       string
-	BinaryPath  string
+	Label      string
+	BinaryPath string
+	// Arguments are durable and process-visible. They must not contain API
+	// keys, enrollment credentials, tokens, or other bearer secrets.
 	Arguments   []string
 	StandardOut string
 	StandardErr string

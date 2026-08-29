@@ -197,17 +197,19 @@ func (m *windowsUserJobManager) ensure(job UserJob, forceReplace bool) (retErr e
 		return fmt.Errorf("close temporary Windows user job definition: %w", err)
 	}
 
+	wasEnabled := false
 	wasRunning := false
 	restoreNeeded := false
 	defer func() {
 		if retErr != nil && restoreNeeded {
-			retErr = errors.Join(retErr, m.restore(job.Label, taskName, wasRunning))
+			retErr = errors.Join(retErr, m.restore(job.Label, taskName, wasEnabled, wasRunning))
 		}
 	}()
 	if installed {
 		// A changed definition or explicit replacement must stop the old process
 		// before Task Scheduler replaces the durable task. Disable it first so a
 		// KeepAlive task cannot restart between /End and /Create.
+		wasEnabled = state != windowsTaskStateDisabled
 		wasRunning = state == windowsTaskStateRunning
 		restoreNeeded = true
 		if _, err := m.runTaskScheduler("/Change", "/TN", taskName, "/Disable"); err != nil {
@@ -239,7 +241,10 @@ func removeWindowsUserJobDefinition(path string) error {
 	return err
 }
 
-func (m *windowsUserJobManager) restore(label, taskName string, wasRunning bool) error {
+func (m *windowsUserJobManager) restore(label, taskName string, wasEnabled, wasRunning bool) error {
+	if !wasEnabled {
+		return nil
+	}
 	if _, err := m.runTaskScheduler("/Change", "/TN", taskName, "/Enable"); err != nil {
 		return fmt.Errorf("restore Windows user job %s after failed change: %w", label, err)
 	}
@@ -274,11 +279,12 @@ func (m *windowsUserJobManager) Remove(label string) (retErr error) {
 		return nil
 	}
 	// Disable before /End so restart-on-failure cannot race task deletion.
+	wasEnabled := state != windowsTaskStateDisabled
 	wasRunning := state == windowsTaskStateRunning
 	restoreNeeded := true
 	defer func() {
 		if retErr != nil && restoreNeeded {
-			retErr = errors.Join(retErr, m.restore(label, taskName, wasRunning))
+			retErr = errors.Join(retErr, m.restore(label, taskName, wasEnabled, wasRunning))
 		}
 	}()
 	if _, err := m.runTaskScheduler("/Change", "/TN", taskName, "/Disable"); err != nil {
@@ -343,20 +349,18 @@ func (m *windowsUserJobManager) state(taskName string) (int, error) {
 }
 
 func (m *windowsUserJobManager) waitUntilStopped(taskName string) error {
-	deadline := time.Now().Add(10 * time.Second)
-	for {
-		state, err := m.state(taskName)
-		if err != nil {
-			return err
-		}
-		if state != windowsTaskStateRunning {
-			return nil
-		}
-		if time.Now().After(deadline) {
-			return errors.New("Task Scheduler still reports the task as running after 10 seconds")
-		}
-		time.Sleep(500 * time.Millisecond)
-	}
+	// Keep the bounded wait inside one PowerShell process. Starting the
+	// ScheduledTasks provider for every poll is both slow and unnecessary.
+	command := "$ErrorActionPreference='Stop'; Get-Command Get-ScheduledTask -ErrorAction Stop | Out-Null; " +
+		"$deadline = [DateTime]::UtcNow.AddSeconds(10); do { " +
+		"try { $task = Get-ScheduledTask -TaskName '" + taskName +
+		"' -TaskPath '\\' -ErrorAction Stop } catch { if ($_.CategoryInfo.Category -ne 'ObjectNotFound' " +
+		"-or $_.FullyQualifiedErrorId -ne 'CmdletizationQuery_NotFound,Get-ScheduledTask') { throw }; return }; " +
+		"if ([int]$task.State -ne 4) { return }; Start-Sleep -Milliseconds 250 " +
+		"} while ([DateTime]::UtcNow -lt $deadline); " +
+		"throw 'Task Scheduler still reports the task as running after 10 seconds'"
+	_, err := m.runPowerShell(command)
+	return err
 }
 
 func (m *windowsUserJobManager) render(job UserJob, sid string) (string, string, error) {
@@ -473,10 +477,11 @@ func matchingWindowsUserJobDefinition(registered, expected string) (bool, error)
 	return registeredDefinition == expectedDefinition, nil
 }
 
-// windowsUserJobShape records the direct children whose cardinality changes
-// task behavior. The field projection below compares their contents, while
-// this shape check rejects extra actions, principals, or trigger types that
-// encoding/xml would otherwise overwrite or ignore.
+// windowsUserJobShape records the direct children whose cardinality can add a
+// process, principal, or trigger. The field projection below compares every
+// behavior-bearing Settings field that this manager emits. Task Scheduler may
+// add other default Settings nodes, so their cardinality is deliberately not
+// part of the shape fence.
 func windowsUserJobShape(content string) (map[string]int, error) {
 	decoder := xml.NewDecoder(strings.NewReader(content))
 	decoder.CharsetReader = func(label string, input io.Reader) (io.Reader, error) {
@@ -808,6 +813,33 @@ const windowsUserJobAncestorMutation = windows.ACCESS_MASK(
 
 const windowsUserJobAllAccess = windows.ACCESS_MASK(0x001f01ff)
 
+const (
+	windowsAccessAllowedCallbackACEType = 0x09
+	windowsAccessDeniedCallbackACEType  = 0x0a
+)
+
+type windowsDirectoryACEKind uint8
+
+const (
+	windowsDirectoryACEUnsupported windowsDirectoryACEKind = iota
+	windowsDirectoryACEAllow
+	windowsDirectoryACEDeny
+)
+
+func classifyWindowsDirectoryACE(aceType byte, leaf bool) windowsDirectoryACEKind {
+	switch aceType {
+	case windows.ACCESS_DENIED_ACE_TYPE, windowsAccessDeniedCallbackACEType:
+		return windowsDirectoryACEDeny
+	case windows.ACCESS_ALLOWED_ACE_TYPE:
+		return windowsDirectoryACEAllow
+	case windowsAccessAllowedCallbackACEType:
+		if !leaf {
+			return windowsDirectoryACEAllow
+		}
+	}
+	return windowsDirectoryACEUnsupported
+}
+
 type windowsUserJobACLHeader struct {
 	Revision byte
 	Sbz1     byte
@@ -857,6 +889,8 @@ func validateAndProtectWindowsDirectory(path, sidText string, protectCreatedLeaf
 	}
 
 	handles := make([]windows.Handle, 0, len(paths))
+	// The handles give each ACL read an exact no-follow object. FILE_SHARE_DELETE
+	// means they do not pin names against a trusted-principal rename.
 	defer func() {
 		for index := len(handles) - 1; index >= 0; index-- {
 			_ = windows.CloseHandle(handles[index])
@@ -903,7 +937,7 @@ func validateAndProtectWindowsDirectory(path, sidText string, protectCreatedLeaf
 		}
 		control, _, controlErr := descriptor.Control()
 		if leaf && (controlErr != nil || control&windows.SE_DACL_PROTECTED == 0) {
-			return errors.New("Windows user job directory ACL must be protected from inheritance")
+			return fmt.Errorf("Windows user job directory %s has an inherited ACL; move or remove it so qurl can recreate an owner-only directory", candidate)
 		}
 		dacl, _, daclErr := descriptor.DACL()
 		if daclErr != nil || dacl == nil {
@@ -916,14 +950,14 @@ func validateAndProtectWindowsDirectory(path, sidText string, protectCreatedLeaf
 			if aceErr := windows.GetAce(dacl, aceIndex, &ace); aceErr != nil || ace == nil {
 				return fmt.Errorf("inspect Windows user job directory DACL: %w", aceErr)
 			}
-			if ace.Header.AceType == windows.ACCESS_DENIED_ACE_TYPE {
+			switch classifyWindowsDirectoryACE(ace.Header.AceType, leaf) {
+			case windowsDirectoryACEDeny:
 				if leaf {
-					return errors.New("Windows user job directory has an unsupported deny entry")
+					return fmt.Errorf("Windows user job directory %s has unsupported deny ACE type %d", candidate, ace.Header.AceType)
 				}
 				continue
-			}
-			if ace.Header.AceType != windows.ACCESS_ALLOWED_ACE_TYPE {
-				return errors.New("Windows user job directory has an unsupported DACL entry")
+			case windowsDirectoryACEUnsupported:
+				return fmt.Errorf("Windows user job directory %s has unsupported ACE type %d", candidate, ace.Header.AceType)
 			}
 			principal := (*windows.SID)(unsafe.Pointer(&ace.SidStart))
 			if principal == nil || !principal.IsValid() {
@@ -988,7 +1022,7 @@ func windowsJobCommandOutput(name string, args ...string) (string, error) {
 func windowsJobCommandOutputWithin(timeout time.Duration, name string, args ...string) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
-	command := exec.CommandContext(ctx, name, args...) //nolint:gosec // G702: production callers resolve fixed System32 executables; tests inject exact helper paths.
+	command := exec.CommandContext(ctx, name, args...) //nolint:gosec // G204: production callers resolve fixed System32 executables; tests inject exact helper paths.
 	output, err := command.Output()
 	if err == nil {
 		return string(output), nil

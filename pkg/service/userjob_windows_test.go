@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -223,6 +224,84 @@ func TestWindowsUserJobStatusDoesNotTreatEmptySchedulerOutputAsAbsent(t *testing
 	}
 	if _, err := manager.Status("ai.layerv.qurl.daemon"); err == nil || !strings.Contains(err.Error(), "parse Windows user job state") {
 		t.Fatalf("Status error = %v, want empty scheduler output to fail visibly", err)
+	}
+}
+
+func TestWindowsUserJobRemoveFailurePreservesDisabledState(t *testing.T) {
+	deleteErr := errors.New("injected delete failure")
+	var enabled bool
+	manager := &windowsUserJobManager{
+		run: func(_ string, args ...string) (string, error) {
+			command := strings.Join(args, " ")
+			switch {
+			case strings.Contains(command, "$task.State"):
+				return strconv.Itoa(windowsTaskStateDisabled), nil
+			case strings.HasPrefix(command, "/Change") && strings.Contains(command, "/Disable"):
+				enabled = false
+				return "", nil
+			case strings.HasPrefix(command, "/Change") && strings.Contains(command, "/Enable"):
+				enabled = true
+				return "", nil
+			case strings.HasPrefix(command, "/Delete"):
+				return "", deleteErr
+			default:
+				return "", fmt.Errorf("unexpected command: %s", command)
+			}
+		},
+		currentSID: func() (string, error) { return "S-1-5-21-1000", nil },
+		powerShell: func() (string, error) { return "powershell.exe", nil },
+	}
+	if err := manager.Remove("ai.layerv.qurl.daemon"); !errors.Is(err, deleteErr) {
+		t.Fatalf("Remove error = %v, want delete failure", err)
+	}
+	if enabled {
+		t.Fatal("failed Remove re-enabled a task that was disabled before removal")
+	}
+}
+
+func TestWindowsUserJobStopWaitUsesOneBoundedProviderProcess(t *testing.T) {
+	var calls int
+	manager := &windowsUserJobManager{
+		run: func(_ string, args ...string) (string, error) {
+			calls++
+			command := strings.Join(args, " ")
+			for _, want := range []string{"Get-ScheduledTask", "AddSeconds(10)", "Start-Sleep -Milliseconds 250", "CmdletizationQuery_NotFound,Get-ScheduledTask"} {
+				if !strings.Contains(command, want) {
+					t.Fatalf("bounded stop wait is missing %q: %s", want, command)
+				}
+			}
+			return "", nil
+		},
+		powerShell: func() (string, error) { return "powershell.exe", nil },
+	}
+	if err := manager.waitUntilStopped("ai.layerv.qurl.daemon.0123456789abcdef"); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 1 {
+		t.Fatalf("bounded stop wait started %d provider processes, want 1", calls)
+	}
+}
+
+func TestWindowsDirectoryACEClassification(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		aceType byte
+		leaf    bool
+		want    windowsDirectoryACEKind
+	}{
+		{name: "plain allow ancestor", aceType: windows.ACCESS_ALLOWED_ACE_TYPE, want: windowsDirectoryACEAllow},
+		{name: "plain deny ancestor", aceType: windows.ACCESS_DENIED_ACE_TYPE, want: windowsDirectoryACEDeny},
+		{name: "callback allow ancestor", aceType: windowsAccessAllowedCallbackACEType, want: windowsDirectoryACEAllow},
+		{name: "callback deny ancestor", aceType: windowsAccessDeniedCallbackACEType, want: windowsDirectoryACEDeny},
+		{name: "callback allow leaf", aceType: windowsAccessAllowedCallbackACEType, leaf: true, want: windowsDirectoryACEUnsupported},
+		{name: "callback deny leaf", aceType: windowsAccessDeniedCallbackACEType, leaf: true, want: windowsDirectoryACEDeny},
+		{name: "unknown", aceType: 0xff, want: windowsDirectoryACEUnsupported},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := classifyWindowsDirectoryACE(tc.aceType, tc.leaf); got != tc.want {
+				t.Fatalf("classifyWindowsDirectoryACE(%d, %v) = %d, want %d", tc.aceType, tc.leaf, got, tc.want)
+			}
+		})
 	}
 }
 
@@ -468,6 +547,21 @@ func TestWindowsUserJobDoesNotRewriteExistingBroadLogDirectory(t *testing.T) {
 	}
 }
 
+func TestWindowsUserJobExistingInheritedLogDirectoryHasActionableError(t *testing.T) {
+	sid, err := currentWindowsUserSID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	logDir := filepath.Join(t.TempDir(), "existing-inherited-logs")
+	if err := os.Mkdir(logDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := ensureWindowsPrivateDirectory(logDir, sid); err == nil ||
+		!strings.Contains(err.Error(), logDir) || !strings.Contains(err.Error(), "move or remove") {
+		t.Fatalf("existing inherited log directory error = %v, want path and remediation", err)
+	}
+}
+
 func TestWindowsUserJobIntegration(t *testing.T) {
 	if os.Getenv("QURL_WINDOWS_USER_JOB_INTEGRATION") != "1" {
 		t.Skip("set QURL_WINDOWS_USER_JOB_INTEGRATION=1 to exercise Task Scheduler")
@@ -498,8 +592,16 @@ func TestWindowsUserJobIntegration(t *testing.T) {
 					t.Errorf("remove integration task: %v", err)
 				}
 			})
+			copiedBinaryPath := filepath.Join(dir, "qurl test helper.exe")
+			rawBinary, err := os.ReadFile(binaryPath) //nolint:gosec // Exact current test executable copied into a test-owned directory with spaces.
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(copiedBinaryPath, rawBinary, 0o700); err != nil { //nolint:gosec // Test-owned executable needs owner execute permission on non-Windows tooling too.
+				t.Fatal(err)
+			}
 			job := UserJob{
-				Label: label, BinaryPath: binaryPath,
+				Label: label, BinaryPath: copiedBinaryPath,
 				Arguments:   []string{"-test.run=^TestWindowsUserJobHelperProcess$", "--", readyPath},
 				StandardOut: filepath.Join(logDir, "stdout.log"), StandardErr: filepath.Join(logDir, "stderr.log"),
 				RunAtLoad: tc.runAtLoad, KeepAlive: tc.keepAlive,
