@@ -453,105 +453,118 @@ func TestWindowsUserJobIntegration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	dir := filepath.Join(t.TempDir(), "path with spaces")
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	readyPath := filepath.Join(dir, "ready")
-	logDir := filepath.Join(dir, "logs")
-	label := "ai.layerv.qurl.test." + strconv.Itoa(os.Getpid())
-	manager := NewUserJobManager()
-	t.Cleanup(func() {
-		if err := manager.Remove(label); err != nil {
-			t.Errorf("remove integration task: %v", err)
-		}
-	})
-	job := UserJob{
-		Label: label, BinaryPath: binaryPath,
-		Arguments:   []string{"-test.run=^TestWindowsUserJobHelperProcess$", "--", readyPath},
-		StandardOut: filepath.Join(logDir, "stdout.log"), StandardErr: filepath.Join(logDir, "stderr.log"),
-		RunAtLoad: true, KeepAlive: true,
-	}
-	if err := manager.Ensure(job); err != nil {
-		t.Fatal(err)
-	}
-	sid, err := currentWindowsUserSID()
-	if err != nil {
-		t.Fatal(err)
-	}
-	scheduler, err := windowsTaskSchedulerExecutable()
-	if err != nil {
-		t.Fatal(err)
-	}
-	registered, err := windowsJobCommandOutput(scheduler, "/Query", "/TN", windowsScopedTaskName(label, sid), "/XML")
-	if err != nil {
-		t.Fatal(err)
-	}
-	registered = decodeWindowsCommandText(registered)
-	for _, want := range []string{"<LogonTrigger>", "<RestartOnFailure>", "<Count>999</Count>"} {
-		if !strings.Contains(registered, want) {
-			t.Fatalf("registered production task XML missing %q", want)
-		}
-	}
-	expected, _, err := manager.(*windowsUserJobManager).render(job, sid)
-	if err != nil {
-		t.Fatal(err)
-	}
-	matches, err := matchingWindowsUserJobDefinition(registered, expected)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !matches {
-		registeredDefinition, _ := parseWindowsUserJobDefinition(registered)
-		expectedDefinition, _ := parseWindowsUserJobDefinition(expected)
-		t.Fatalf("registered Task Scheduler definition differs from the expected job\nregistered: %#v\nexpected:   %#v", registeredDefinition, expectedDefinition)
-	}
-	deadline := time.Now().Add(20 * time.Second)
-	for {
-		if _, err := os.Stat(readyPath); err == nil {
-			break
-		} else if !errors.Is(err, os.ErrNotExist) {
-			t.Fatal(err)
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("Windows user job did not start")
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
-	status, err := manager.Status(label)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !status.Installed || !status.Running {
-		t.Fatalf("running status = %#v, want installed and running", status)
-	}
-	if err := manager.Ensure(job); err != nil {
-		t.Fatalf("second Ensure: %v", err)
-	}
-	// A changed-definition false positive stops and restarts the helper. Give
-	// Task Scheduler enough time to expose that restart, then require one start.
-	time.Sleep(2 * time.Second)
-	starts, err := os.ReadFile(readyPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := len(strings.Fields(string(starts))); got != 1 {
-		t.Fatalf("matching second Ensure started helper %d times, want 1", got)
-	}
-	helperPID, err := strconv.Atoi(strings.Fields(string(starts))[0])
-	if err != nil {
-		t.Fatalf("parse helper PID: %v", err)
-	}
-	if err := manager.Remove(label); err != nil {
-		t.Fatal(err)
-	}
-	waitForWindowsProcessExit(t, uint32(helperPID))
-	status, err = manager.Status(label)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if status != (ServiceStatus{}) {
-		t.Fatalf("removed status = %#v, want absent", status)
+	for _, tc := range []struct {
+		name      string
+		runAtLoad bool
+		keepAlive bool
+	}{
+		{name: "durable", runAtLoad: true, keepAlive: true},
+		{name: "on-demand", runAtLoad: false, keepAlive: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := filepath.Join(t.TempDir(), "path with spaces")
+			if err := os.MkdirAll(dir, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			readyPath := filepath.Join(dir, "ready")
+			logDir := filepath.Join(dir, "logs")
+			label := "ai.layerv.qurl.test." + tc.name + "." + strconv.Itoa(os.Getpid())
+			manager := NewUserJobManager()
+			t.Cleanup(func() {
+				if err := manager.Remove(label); err != nil {
+					t.Errorf("remove integration task: %v", err)
+				}
+			})
+			job := UserJob{
+				Label: label, BinaryPath: binaryPath,
+				Arguments:   []string{"-test.run=^TestWindowsUserJobHelperProcess$", "--", readyPath},
+				StandardOut: filepath.Join(logDir, "stdout.log"), StandardErr: filepath.Join(logDir, "stderr.log"),
+				RunAtLoad: tc.runAtLoad, KeepAlive: tc.keepAlive,
+			}
+			if err := manager.Ensure(job); err != nil {
+				t.Fatal(err)
+			}
+			sid, err := currentWindowsUserSID()
+			if err != nil {
+				t.Fatal(err)
+			}
+			scheduler, err := windowsTaskSchedulerExecutable()
+			if err != nil {
+				t.Fatal(err)
+			}
+			registered, err := windowsJobCommandOutput(scheduler, "/Query", "/TN", windowsScopedTaskName(label, sid), "/XML")
+			if err != nil {
+				t.Fatal(err)
+			}
+			registered = decodeWindowsCommandText(registered)
+			for element, present := range map[string]bool{
+				"<LogonTrigger>": tc.runAtLoad, "<RestartOnFailure>": tc.keepAlive, "<Count>999</Count>": tc.keepAlive,
+			} {
+				if got := strings.Contains(registered, element); got != present {
+					t.Fatalf("registered production task XML contains %q = %v, want %v", element, got, present)
+				}
+			}
+			expected, _, err := manager.(*windowsUserJobManager).render(job, sid)
+			if err != nil {
+				t.Fatal(err)
+			}
+			matches, err := matchingWindowsUserJobDefinition(registered, expected)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !matches {
+				registeredDefinition, _ := parseWindowsUserJobDefinition(registered)
+				expectedDefinition, _ := parseWindowsUserJobDefinition(expected)
+				t.Fatalf("registered Task Scheduler definition differs from the expected job\nregistered: %#v\nexpected:   %#v", registeredDefinition, expectedDefinition)
+			}
+			deadline := time.Now().Add(30 * time.Second)
+			for {
+				if _, err := os.Stat(readyPath); err == nil {
+					break
+				} else if !errors.Is(err, os.ErrNotExist) {
+					t.Fatal(err)
+				}
+				if time.Now().After(deadline) {
+					t.Fatal("Windows user job did not start")
+				}
+				time.Sleep(100 * time.Millisecond)
+			}
+			status, err := manager.Status(label)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !status.Installed || !status.Running {
+				t.Fatalf("running status = %#v, want installed and running", status)
+			}
+			if err := manager.Ensure(job); err != nil {
+				t.Fatalf("second Ensure: %v", err)
+			}
+			// A changed-definition false positive stops and restarts the helper. Give
+			// Task Scheduler enough time to expose that restart, then require one start.
+			time.Sleep(2 * time.Second)
+			starts, err := os.ReadFile(readyPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := len(strings.Fields(string(starts))); got != 1 {
+				t.Fatalf("matching second Ensure started helper %d times, want 1", got)
+			}
+			helperPID, err := strconv.Atoi(strings.Fields(string(starts))[0])
+			if err != nil {
+				t.Fatalf("parse helper PID: %v", err)
+			}
+			if err := manager.Remove(label); err != nil {
+				t.Fatal(err)
+			}
+			waitForWindowsProcessExit(t, uint32(helperPID))
+			status, err = manager.Status(label)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if status != (ServiceStatus{}) {
+				t.Fatalf("removed status = %#v, want absent", status)
+			}
+		})
 	}
 }
 
