@@ -40,7 +40,7 @@ const windowsTrustedInstallerSID = "S-1-5-80-956008885-3418522649-1831038044-185
 const windowsUserJobTemplate = `<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <RegistrationInfo>
-    <Description>{{xml .DefinitionMarker}}</Description>
+    <Description>qURL background daemon - managed by qurl, do not edit. {{xml .DefinitionMarker}}</Description>
   </RegistrationInfo>
   <Triggers>{{if .RunAtLoad}}
     <LogonTrigger>
@@ -366,13 +366,13 @@ func (m *windowsUserJobManager) waitUntilStopped(taskName string) error {
 	// Keep the bounded wait inside one PowerShell process. Starting the
 	// ScheduledTasks provider for every poll is both slow and unnecessary.
 	command := "$ErrorActionPreference='Stop'; Get-Command Get-ScheduledTask -ErrorAction Stop | Out-Null; " +
-		"$deadline = [DateTime]::UtcNow.AddSeconds(10); do { " +
+		"$deadline = [DateTime]::UtcNow.AddSeconds(6); do { " +
 		"try { $task = Get-ScheduledTask -TaskName '" + taskName +
 		"' -TaskPath '\\' -ErrorAction Stop } catch { if ($_.CategoryInfo.Category -ne 'ObjectNotFound' " +
 		"-or $_.FullyQualifiedErrorId -ne 'CmdletizationQuery_NotFound,Get-ScheduledTask') { throw }; return }; " +
 		"if ([int]$task.State -ne 4) { return }; Start-Sleep -Milliseconds 250 " +
 		"} while ([DateTime]::UtcNow -lt $deadline); " +
-		"throw 'Task Scheduler still reports the task as running after 10 seconds'"
+		"throw 'Task Scheduler still reports the task as running after 6 seconds'"
 	_, err := m.runPowerShell(command)
 	return err
 }
@@ -807,22 +807,34 @@ func validateWindowsUserJobExecutable(path, sidText string) error { //nolint:goc
 	}
 	descriptor, err := windows.GetSecurityInfo(handle, windows.SE_FILE_OBJECT,
 		windows.OWNER_SECURITY_INFORMATION|windows.DACL_SECURITY_INFORMATION)
-	if err != nil || descriptor == nil {
+	if err != nil {
 		return fmt.Errorf("read Windows user job executable ACL: %w", err)
 	}
+	if descriptor == nil {
+		return errors.New("read Windows user job executable ACL: security descriptor is nil")
+	}
 	owner, _, err := descriptor.Owner()
-	if err != nil || !trusted(owner) {
+	if err != nil {
+		return fmt.Errorf("read Windows user job executable owner: %w", err)
+	}
+	if !trusted(owner) {
 		return errors.New("Windows user job executable has an untrusted owner")
 	}
 	dacl, _, err := descriptor.DACL()
-	if err != nil || dacl == nil {
+	if err != nil {
+		return fmt.Errorf("read Windows user job executable DACL: %w", err)
+	}
+	if dacl == nil {
 		return errors.New("Windows user job executable has no restrictive DACL")
 	}
 	header := (*windowsUserJobACLHeader)(unsafe.Pointer(dacl))
 	for aceIndex := uint32(0); aceIndex < uint32(header.ACECount); aceIndex++ {
 		var ace *windows.ACCESS_ALLOWED_ACE
-		if aceErr := windows.GetAce(dacl, aceIndex, &ace); aceErr != nil || ace == nil {
+		if aceErr := windows.GetAce(dacl, aceIndex, &ace); aceErr != nil {
 			return fmt.Errorf("inspect Windows user job executable DACL: %w", aceErr)
+		}
+		if ace == nil {
+			return errors.New("inspect Windows user job executable DACL: ACE is nil")
 		}
 		switch classifyWindowsDirectoryACE(ace.Header.AceType, false) {
 		case windowsDirectoryACEDeny:
@@ -900,7 +912,10 @@ func protectWindowsUserJobHandle(handle windows.Handle, sid string, directory bo
 		return fmt.Errorf("read protected Windows user job ACL: %w", err)
 	}
 	owner, _, err := descriptor.Owner()
-	if err != nil || owner == nil {
+	if err != nil {
+		return fmt.Errorf("read protected Windows user job owner: %w", err)
+	}
+	if owner == nil {
 		return errors.New("read protected Windows user job owner")
 	}
 	if err := windows.SetSecurityInfo(handle, windows.SE_FILE_OBJECT,
@@ -1054,28 +1069,43 @@ func validateWindowsUserJobDirectoryPath(path, sidText string, strictLeaf, prote
 		}
 		descriptor, securityErr := windows.GetSecurityInfo(handle, windows.SE_FILE_OBJECT,
 			windows.OWNER_SECURITY_INFORMATION|windows.DACL_SECURITY_INFORMATION)
-		if securityErr != nil || descriptor == nil {
+		if securityErr != nil {
 			return fmt.Errorf("read Windows user job directory ACL: %w", securityErr)
 		}
+		if descriptor == nil {
+			return errors.New("read Windows user job directory ACL: security descriptor is nil")
+		}
 		owner, _, ownerErr := descriptor.Owner()
-		if ownerErr != nil || owner == nil || (leaf && strictLeaf && !owner.Equals(currentSID)) ||
+		if ownerErr != nil {
+			return fmt.Errorf("read Windows user job directory owner: %w", ownerErr)
+		}
+		if owner == nil || (leaf && strictLeaf && !owner.Equals(currentSID)) ||
 			((!leaf || !strictLeaf) && !trustedAncestor(owner)) {
 			return fmt.Errorf("Windows user job directory %s has an untrusted owner", candidate)
 		}
 		control, _, controlErr := descriptor.Control()
-		if leaf && strictLeaf && (controlErr != nil || control&windows.SE_DACL_PROTECTED == 0) {
+		if controlErr != nil {
+			return fmt.Errorf("read Windows user job directory ACL control: %w", controlErr)
+		}
+		if leaf && strictLeaf && control&windows.SE_DACL_PROTECTED == 0 {
 			return fmt.Errorf("Windows user job directory %s has an inherited ACL; move or remove it so qurl can recreate an owner-only directory", candidate)
 		}
 		dacl, _, daclErr := descriptor.DACL()
-		if daclErr != nil || dacl == nil {
+		if daclErr != nil {
+			return fmt.Errorf("read Windows user job directory DACL: %w", daclErr)
+		}
+		if dacl == nil {
 			return errors.New("Windows user job directory has no restrictive DACL")
 		}
 		header := (*windowsUserJobACLHeader)(unsafe.Pointer(dacl))
 		var currentMask windows.ACCESS_MASK
 		for aceIndex := uint32(0); aceIndex < uint32(header.ACECount); aceIndex++ {
 			var ace *windows.ACCESS_ALLOWED_ACE
-			if aceErr := windows.GetAce(dacl, aceIndex, &ace); aceErr != nil || ace == nil {
+			if aceErr := windows.GetAce(dacl, aceIndex, &ace); aceErr != nil {
 				return fmt.Errorf("inspect Windows user job directory DACL: %w", aceErr)
+			}
+			if ace == nil {
+				return errors.New("inspect Windows user job directory DACL: ACE is nil")
 			}
 			switch classifyWindowsDirectoryACE(ace.Header.AceType, leaf) {
 			case windowsDirectoryACEDeny:

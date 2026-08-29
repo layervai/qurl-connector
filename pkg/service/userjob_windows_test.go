@@ -111,7 +111,7 @@ func TestWindowsUserJobAllowsExecutableDirectorySiblingCreationWithoutReplacemen
 	// FILE_ADD_FILE and FILE_ADD_SUBDIRECTORY allow new sibling names. They do
 	// not permit deletion, renaming, ACL changes, or mutation of qurl.exe.
 	descriptor, err := windows.SecurityDescriptorFromString(
-		"D:P(A;OICI;FA;;;" + sid + ")(A;CI;0x00000003;;;WD)")
+		"D:P(A;OICI;FA;;;" + sid + ")(A;CI;0x00000006;;;WD)")
 	if err != nil {
 		_ = windows.CloseHandle(handle)
 		t.Fatal(err)
@@ -430,7 +430,7 @@ func TestWindowsUserJobStopWaitUsesOneBoundedProviderProcess(t *testing.T) {
 		run: func(_ string, args ...string) (string, error) {
 			calls++
 			command := strings.Join(args, " ")
-			for _, want := range []string{"Get-ScheduledTask", "AddSeconds(10)", "Start-Sleep -Milliseconds 250", "CmdletizationQuery_NotFound,Get-ScheduledTask"} {
+			for _, want := range []string{"Get-ScheduledTask", "AddSeconds(6)", "Start-Sleep -Milliseconds 250", "CmdletizationQuery_NotFound,Get-ScheduledTask"} {
 				if !strings.Contains(command, want) {
 					t.Fatalf("bounded stop wait is missing %q: %s", want, command)
 				}

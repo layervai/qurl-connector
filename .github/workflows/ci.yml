@@ -89,6 +89,7 @@ jobs:
         env:
           QURL_WINDOWS_USER_JOB_INTEGRATION: "1"
         run: |
+          go build ./...
           go vet ./pkg/service
           CGO_ENABLED=0 go test -count=1 ./pkg/service
 

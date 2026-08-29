@@ -387,9 +387,7 @@ func describeConfigAccessContext(cfgPath string) string {
 			continue
 		}
 		fmt.Fprintf(&b, " %s=%s", label, info.Mode())
-		if st, ok := info.Sys().(*syscall.Stat_t); ok {
-			fmt.Fprintf(&b, ",uid=%d,gid=%d", st.Uid, st.Gid)
-		}
+		b.WriteString(describeFileOwnership(info))
 	}
 	b.WriteString("]")
 	return b.String()
