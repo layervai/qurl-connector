@@ -161,7 +161,10 @@ func (m *windowsUserJobManager) ensure(job UserJob, forceReplace bool) (retErr e
 		existing = decodeWindowsCommandText(existing)
 		definitionMatches, err = matchingWindowsUserJobDefinition(existing, content)
 		if err != nil {
-			return fmt.Errorf("validate Windows user job %s definition: %w", job.Label, err)
+			// The expected definition was rendered locally and already validated.
+			// If Task Scheduler returns an old or damaged definition that cannot
+			// be normalized, replace it instead of wedging automatic repair.
+			definitionMatches = false
 		}
 	}
 	if definitionMatches {
@@ -721,7 +724,7 @@ func ensureWindowsPrivateDirectory(path, sid string) error {
 	case errors.Is(err, os.ErrNotExist):
 		// The caller must provide an existing safe parent. Creating only the
 		// dedicated leaf avoids taking ownership of a caller-supplied ancestor.
-		if err := os.Mkdir(path, 0o700); err != nil {
+		if err := createWindowsPrivateDirectory(path, sid); err != nil {
 			return err
 		}
 		created = true
@@ -735,6 +738,25 @@ func ensureWindowsPrivateDirectory(path, sid string) error {
 				return errors.Join(err, fmt.Errorf("remove rejected Windows user job directory: %w", removeErr))
 			}
 		}
+		return err
+	}
+	return nil
+}
+
+func createWindowsPrivateDirectory(path, sid string) error {
+	descriptor, err := windowsUserJobSecurityDescriptor(sid, true)
+	if err != nil {
+		return fmt.Errorf("build protected Windows user job directory ACL: %w", err)
+	}
+	security := &windows.SecurityAttributes{
+		Length:             uint32(unsafe.Sizeof(windows.SecurityAttributes{})),
+		SecurityDescriptor: descriptor,
+	}
+	path16, err := windows.UTF16PtrFromString(path)
+	if err != nil {
+		return err
+	}
+	if err := windows.CreateDirectory(path16, security); err != nil {
 		return err
 	}
 	return nil

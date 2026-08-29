@@ -235,6 +235,37 @@ func TestWindowsUserJobEnsureCreateReuseReplaceAndRemove(t *testing.T) {
 	if len(calls) != createdCalls+2 { // One state query and one XML definition query.
 		t.Fatalf("matching running Ensure made %d new calls, want 2", len(calls)-createdCalls)
 	}
+	running = false
+	stoppedCalls := len(calls)
+	if err := manager.Ensure(job); err != nil {
+		t.Fatalf("restart matching stopped task: %v", err)
+	}
+	if !running || len(calls) != stoppedCalls+3 { // State, matching XML query, then /Run.
+		t.Fatalf("matching stopped Ensure made %d calls with running=%t, want 3 calls and running", len(calls)-stoppedCalls, running)
+	}
+	for _, call := range calls[stoppedCalls:] {
+		joined := strings.Join(call.args, " ")
+		if strings.HasPrefix(joined, "/Create") || strings.HasPrefix(joined, "/End") {
+			t.Fatalf("matching stopped Ensure replaced the task via %q", joined)
+		}
+	}
+	existing = "<Task><unreadable>"
+	unreadableCalls := len(calls)
+	if err := manager.Ensure(job); err != nil {
+		t.Fatalf("repair unreadable registered definition: %v", err)
+	}
+	if !strings.Contains(existing, windowsTaskDefinitionPrefix) {
+		t.Fatal("Ensure did not replace an unreadable registered definition")
+	}
+	created := false
+	for _, call := range calls[unreadableCalls:] {
+		if strings.HasPrefix(strings.Join(call.args, " "), "/Create") {
+			created = true
+		}
+	}
+	if !created {
+		t.Fatal("Ensure did not run /Create for an unreadable registered definition")
+	}
 	onDemand := job
 	onDemand.RunAtLoad = false
 	if err := manager.Ensure(onDemand); err != nil {
