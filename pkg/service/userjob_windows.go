@@ -428,7 +428,60 @@ func matchingWindowsUserJobDefinition(registered, expected string) (bool, error)
 	if err != nil {
 		return false, fmt.Errorf("parse expected task: %w", err)
 	}
+	if err := normalizeWindowsUserJobDefinition(&registeredDefinition); err != nil {
+		return false, fmt.Errorf("normalize registered task: %w", err)
+	}
+	if err := normalizeWindowsUserJobDefinition(&expectedDefinition); err != nil {
+		return false, fmt.Errorf("normalize expected task: %w", err)
+	}
 	return registeredDefinition == expectedDefinition, nil
+}
+
+func normalizeWindowsUserJobDefinition(definition *windowsUserJobDefinition) error {
+	if definition == nil {
+		return errors.New("Windows task definition is nil")
+	}
+	for name, value := range map[string]*string{
+		"logon trigger user": &definition.Triggers.Logon.UserID,
+		"principal user":     &definition.Principals.Principal.UserID,
+	} {
+		canonical, err := canonicalWindowsTaskUserID(*value)
+		if err != nil {
+			return fmt.Errorf("resolve %s: %w", name, err)
+		}
+		*value = canonical
+	}
+	// Task Scheduler omits these fields when they hold their schema defaults.
+	// Normalize only defaults whose omission was observed in the real query
+	// response; every other compared field must remain explicit and exact.
+	if definition.Triggers.Logon.Enabled == "" {
+		definition.Triggers.Logon.Enabled = "true"
+	}
+	if definition.Principals.Principal.RunLevel == "" {
+		definition.Principals.Principal.RunLevel = "LeastPrivilege"
+	}
+	if definition.Settings.Enabled == "" {
+		definition.Settings.Enabled = "true"
+	}
+	return nil
+}
+
+func canonicalWindowsTaskUserID(value string) (string, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "", errors.New("Windows task user is empty")
+	}
+	if sid, err := windows.StringToSid(value); err == nil {
+		return sid.String(), nil
+	}
+	sid, _, _, err := windows.LookupSID("", value)
+	if err != nil {
+		return "", err
+	}
+	if sid == nil || !sid.IsValid() {
+		return "", errors.New("Windows account resolved without a valid SID")
+	}
+	return sid.String(), nil
 }
 
 func parseWindowsUserJobDefinition(content string) (windowsUserJobDefinition, error) {
