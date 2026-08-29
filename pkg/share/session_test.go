@@ -50,6 +50,11 @@ type rotatingAdmitter struct {
 	openTime time.Duration
 }
 
+type retryReport struct {
+	err  error
+	wait time.Duration
+}
+
 func (a *rotatingAdmitter) Admit(_ context.Context, knockResourceID, resourceID string) (Admission, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -419,6 +424,7 @@ func TestResourceRunnerTracksDrainUntilBoundedFinalShutdown(t *testing.T) {
 func TestResourceRunnerRejectsInvalidNativeLifetimeBeforeFRP(t *testing.T) {
 	admitter := &rotatingAdmitter{openTime: 0}
 	factory := &overlapFactory{}
+	retries := make(chan retryReport, 1)
 	runner, err := NewResourceRunner(ResourceConfig{
 		KnockResourceID: "q_catalog_key",
 		ResourceID:      "public-resource-id",
@@ -426,20 +432,142 @@ func TestResourceRunnerRejectsInvalidNativeLifetimeBeforeFRP(t *testing.T) {
 		Sessions:        factory,
 		MinBackoff:      time.Millisecond,
 		MaxBackoff:      time.Millisecond,
+		OnRetry: func(err error, wait time.Duration) {
+			select {
+			case retries <- retryReport{err: err, wait: wait}:
+			default:
+			}
+		},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Millisecond)
-	defer cancel()
-	if err := runner.Run(ctx); !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("Run() = %v, want context deadline after bounded retries", err)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- runner.Run(ctx) }()
+	var retry retryReport
+	select {
+	case retry = <-retries:
+	case <-time.After(time.Second):
+		t.Fatal("retry callback was not called")
+	}
+	cancel()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run() = %v, want context cancellation", err)
 	}
 	factory.mu.Lock()
 	starts := factory.next
 	factory.mu.Unlock()
 	if starts != 0 {
 		t.Fatalf("FRP starts = %d, want zero for open_time=0", starts)
+	}
+	if retry.err == nil || !strings.Contains(retry.err.Error(), "open time is not positive") ||
+		retry.wait <= 0 || retry.wait > time.Millisecond {
+		t.Fatalf("retry callback = (%v, %s), want bounded invalid-admission report", retry.err, retry.wait)
+	}
+}
+
+func TestResourceRunnerReportsClampedReplacementRetryDelay(t *testing.T) {
+	const backoff = 10 * time.Second
+	admitter := &rotatingAdmitter{openTime: 2 * time.Second}
+	factory := &overlapFactory{failStartOnce: true}
+	retries := make(chan retryReport, 1)
+	runner, err := NewResourceRunner(ResourceConfig{
+		KnockResourceID: "q_catalog_key",
+		ResourceID:      "public-resource-id",
+		Admitter:        admitter,
+		Sessions:        factory,
+		MinBackoff:      backoff,
+		MaxBackoff:      backoff,
+		RotationLead:    1900 * time.Millisecond,
+		OnRetry: func(err error, wait time.Duration) {
+			select {
+			case retries <- retryReport{err: err, wait: wait}:
+			default:
+			}
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- runner.Run(ctx) }()
+	var retry retryReport
+	select {
+	case retry = <-retries:
+	case <-time.After(time.Second):
+		t.Fatal("replacement retry callback was not called")
+	}
+	if retry.err == nil || !strings.Contains(retry.err.Error(), "replacement network unavailable") ||
+		retry.wait <= 0 || retry.wait >= backoff/2 {
+		t.Fatalf("replacement retry callback = (%v, %s), want expiry-clamped delay", retry.err, retry.wait)
+	}
+	admitter.mu.Lock()
+	retired := append([]uint64(nil), admitter.retired...)
+	admitter.mu.Unlock()
+	if len(retired) != 1 || retired[0] != 2 {
+		t.Fatalf("retired admissions before shutdown = %v, want only failed replacement 2", retired)
+	}
+	cancel()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run() = %v, want context cancellation", err)
+	}
+}
+
+func TestResourceRunnerRetryCallbackOverrunDoesNotAddBackoff(t *testing.T) {
+	const (
+		wait          = time.Second
+		callbackDelay = 1500 * time.Millisecond
+		maxElapsed    = 2 * time.Second
+	)
+	runner := &ResourceRunner{cfg: ResourceConfig{OnRetry: func(error, time.Duration) {
+		timer := time.NewTimer(callbackDelay)
+		defer timer.Stop()
+		<-timer.C
+	}}}
+	started := time.Now()
+	if err := runner.waitToRetry(context.Background(), errors.New("retry attempt failed"), wait); err != nil {
+		t.Fatalf("waitToRetry() = %v, want retry without a context error", err)
+	}
+	if elapsed := time.Since(started); elapsed >= maxElapsed {
+		t.Fatalf("waitToRetry() elapsed = %s, want callback time to consume the retry delay", elapsed)
+	}
+}
+
+type canceledAttemptAdmitter struct{ entered chan struct{} }
+
+func (a *canceledAttemptAdmitter) Admit(ctx context.Context, _, _ string) (Admission, error) {
+	close(a.entered)
+	<-ctx.Done()
+	return Admission{}, ctx.Err()
+}
+
+func (*canceledAttemptAdmitter) Retire(context.Context, Admission) error { return nil }
+
+func TestResourceRunnerDoesNotReportCanceledAttemptAsRetry(t *testing.T) {
+	admitter := &canceledAttemptAdmitter{entered: make(chan struct{})}
+	var retries atomic.Int32
+	runner, err := NewResourceRunner(ResourceConfig{
+		KnockResourceID: "q_catalog_key",
+		ResourceID:      "public-resource-id",
+		Admitter:        admitter,
+		Sessions:        &overlapFactory{},
+		OnRetry:         func(error, time.Duration) { retries.Add(1) },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- runner.Run(ctx) }()
+	<-admitter.entered
+	cancel()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run() = %v, want context cancellation", err)
+	}
+	if got := retries.Load(); got != 0 {
+		t.Fatalf("retry callbacks = %d, want zero during shutdown", got)
 	}
 }
 
