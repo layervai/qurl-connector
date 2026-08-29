@@ -27,6 +27,8 @@ import (
 
 const windowsTaskDefinitionPrefix = "layerv-qurl-user-job-sha256:"
 
+var errWindowsTaskUserResolution = errors.New("Windows task user identity could not be resolved")
+
 const (
 	windowsTaskStateAbsent   = -1
 	windowsTaskStateDisabled = 1
@@ -161,6 +163,11 @@ func (m *windowsUserJobManager) ensure(job UserJob, forceReplace bool) (retErr e
 		existing = decodeWindowsCommandText(existing)
 		definitionMatches, err = matchingWindowsUserJobDefinition(existing, content)
 		if err != nil {
+			if errors.Is(err, errWindowsTaskUserResolution) {
+				// Do not stop a healthy daemon only because an offline domain or
+				// identity provider made Task Scheduler's account name indeterminate.
+				return fmt.Errorf("compare Windows user job %s without restarting it: %w", job.Label, err)
+			}
 			// The expected definition was rendered locally and already validated.
 			// If Task Scheduler returns an old or damaged definition that cannot
 			// be normalized, replace it instead of wedging automatic repair.
@@ -334,7 +341,8 @@ func (m *windowsUserJobManager) Status(label string) (ServiceStatus, error) {
 func (m *windowsUserJobManager) state(taskName string) (int, error) {
 	// taskName is derived from userJobLabelPattern plus a hex digest. The
 	// pattern excludes PowerShell quoting and wildcard characters, so this is
-	// one exact root-folder lookup rather than an enumeration.
+	// one exact root-folder lookup rather than an enumeration. Use the numeric
+	// ScheduledTaskState value because schtasks.exe reports localized status text.
 	command := "$ErrorActionPreference='Stop'; Get-Command Get-ScheduledTask -ErrorAction Stop | Out-Null; " +
 		"try { $task = Get-ScheduledTask -TaskName '" + taskName +
 		"' -TaskPath '\\' -ErrorAction Stop } catch { if ($_.CategoryInfo.Category -ne 'ObjectNotFound' " +
@@ -598,7 +606,7 @@ func canonicalWindowsTaskUserID(value string) (string, error) {
 	}
 	sid, _, _, err := windows.LookupSID("", value)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("%w for %q: %w", errWindowsTaskUserResolution, value, err)
 	}
 	if sid == nil || !sid.IsValid() {
 		return "", errors.New("Windows account resolved without a valid SID")
@@ -757,6 +765,9 @@ func createWindowsPrivateDirectory(path, sid string) error {
 		return err
 	}
 	if err := windows.CreateDirectory(path16, security); err != nil {
+		if errors.Is(err, windows.ERROR_PATH_NOT_FOUND) {
+			return fmt.Errorf("parent directory does not exist; create it first: %w", err)
+		}
 		return err
 	}
 	return nil
@@ -1105,6 +1116,9 @@ func validateWindowsUserJobDirectoryPath(path, sidText string, strictLeaf, prote
 
 func decodeWindowsCommandText(value string) string {
 	raw := []byte(value)
+	if len(raw) >= 3 && raw[0] == 0xef && raw[1] == 0xbb && raw[2] == 0xbf {
+		return string(raw[3:])
+	}
 	if len(raw) < 2 {
 		return value
 	}

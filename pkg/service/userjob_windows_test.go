@@ -336,6 +336,40 @@ func TestWindowsUserJobStatusDoesNotHideSchedulerErrors(t *testing.T) {
 	}
 }
 
+func TestWindowsUserJobDoesNotRestartWhenRegisteredIdentityIsIndeterminate(t *testing.T) {
+	job := testWindowsUserJob(t)
+	sid, err := currentWindowsUserSID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	registered, _, err := renderWindowsUserJobDefinition(job, sid, windowsUserJobTemplate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	registered = strings.ReplaceAll(registered, ">"+sid+"</UserId>", `>.\qurl-user-job-account-that-does-not-exist</UserId>`)
+	manager := &windowsUserJobManager{
+		currentSID:    currentWindowsUserSID,
+		powerShell:    func() (string, error) { return "powershell.exe", nil },
+		taskScheduler: func() (string, error) { return "schtasks.exe", nil },
+	}
+	manager.run = func(name string, args ...string) (string, error) {
+		command := strings.Join(args, " ")
+		switch {
+		case strings.HasSuffix(strings.ToLower(name), "powershell.exe") && strings.Contains(command, "$task.State"):
+			return strconv.Itoa(windowsTaskStateRunning), nil
+		case strings.HasPrefix(command, "/Query"):
+			return string(windowsTaskXMLBytes(registered)), nil
+		default:
+			t.Fatalf("indeterminate registered identity caused mutating command %s %s", name, command)
+			return "", nil
+		}
+	}
+	err = manager.Ensure(job)
+	if !errors.Is(err, errWindowsTaskUserResolution) || !strings.Contains(err.Error(), "without restarting it") {
+		t.Fatalf("indeterminate registered identity error = %v, want fail-safe resolution error", err)
+	}
+}
+
 func TestWindowsUserJobStatusDoesNotTreatEmptySchedulerOutputAsAbsent(t *testing.T) {
 	manager := &windowsUserJobManager{
 		run: func(_ string, args ...string) (string, error) {
@@ -497,6 +531,22 @@ func TestDecodeWindowsCommandText(t *testing.T) {
 	}
 	if got := decodeWindowsCommandText(want); got != want {
 		t.Fatalf("decoded UTF-8 task XML = %q, want %q", got, want)
+	}
+	if got := decodeWindowsCommandText("\ufeff" + want); got != want {
+		t.Fatalf("decoded BOM-prefixed UTF-8 task XML = %q, want %q", got, want)
+	}
+}
+
+func TestWindowsUserJobMissingParentHasActionableError(t *testing.T) {
+	sid, err := currentWindowsUserSID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "missing", "logs")
+	err = ensureWindowsPrivateDirectory(path, sid)
+	if err == nil || !strings.Contains(err.Error(), "parent directory does not exist") ||
+		!strings.Contains(err.Error(), "create it first") {
+		t.Fatalf("missing parent error = %v, want actionable parent-directory guidance", err)
 	}
 }
 
