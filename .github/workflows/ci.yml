@@ -30,6 +30,10 @@ jobs:
         with:
           version: v2.12.2
           args: ./pkg/... ./cmd/... ./internal/...
+      - name: Cross-lint Windows service sources
+        run: |
+          go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2
+          GOOS=windows GOARCH=amd64 CGO_ENABLED=0 golangci-lint run ./pkg/service
 
   test:
     name: Test
@@ -83,10 +87,6 @@ jobs:
         run: |
           go vet ./pkg/service
           go test -count=1 ./pkg/service
-      - uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
-        with:
-          version: v2.12.2
-          args: ./pkg/service
 
   # The race detector requires cgo, so this lane builds with CGO_ENABLED=1 —
   # the only place in CI that does. `make test` keeps proving the CGO_ENABLED=0
