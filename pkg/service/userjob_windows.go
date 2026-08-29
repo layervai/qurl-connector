@@ -405,18 +405,7 @@ type windowsUserJobDefinition struct {
 	} `xml:"Principals"`
 	Settings struct {
 		MultipleInstancesPolicy      string `xml:"MultipleInstancesPolicy"`
-		DisallowStartIfOnBatteries   string `xml:"DisallowStartIfOnBatteries"`
-		StopIfGoingOnBatteries       string `xml:"StopIfGoingOnBatteries"`
-		AllowHardTerminate           string `xml:"AllowHardTerminate"`
-		StartWhenAvailable           string `xml:"StartWhenAvailable"`
-		RunOnlyIfNetworkAvailable    string `xml:"RunOnlyIfNetworkAvailable"`
-		AllowStartOnDemand           string `xml:"AllowStartOnDemand"`
 		Enabled                      string `xml:"Enabled"`
-		Hidden                       string `xml:"Hidden"`
-		RunOnlyIfIdle                string `xml:"RunOnlyIfIdle"`
-		WakeToRun                    string `xml:"WakeToRun"`
-		ExecutionTimeLimit           string `xml:"ExecutionTimeLimit"`
-		Priority                     string `xml:"Priority"`
 		RestartOnFailureInterval     string `xml:"RestartOnFailure>Interval"`
 		RestartOnFailureAttemptCount string `xml:"RestartOnFailure>Count"`
 	} `xml:"Settings"`

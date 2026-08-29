@@ -447,6 +447,19 @@ func TestWindowsUserJobIntegration(t *testing.T) {
 			t.Fatalf("registered production task XML missing %q", want)
 		}
 	}
+	expected, _, err := manager.(*windowsUserJobManager).render(job, sid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	matches, err := matchingWindowsUserJobDefinition(registered, expected)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !matches {
+		registeredDefinition, _ := parseWindowsUserJobDefinition(registered)
+		expectedDefinition, _ := parseWindowsUserJobDefinition(expected)
+		t.Fatalf("registered Task Scheduler definition differs from the expected job\nregistered: %#v\nexpected:   %#v", registeredDefinition, expectedDefinition)
+	}
 	deadline := time.Now().Add(20 * time.Second)
 	for {
 		if _, err := os.Stat(readyPath); err == nil {
