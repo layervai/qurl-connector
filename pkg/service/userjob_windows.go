@@ -878,12 +878,19 @@ func protectWindowsUserJobHandle(handle windows.Handle, sid string, directory bo
 	return nil
 }
 
+// An untrusted principal can replace a named descendant only when it can
+// delete that descendant (or rewrite the directory ACL). Directory add/write
+// rights alone only permit new siblings and are common on Windows volume and
+// temporary-directory ancestors; treating those rights as replacement rights
+// rejects standard user-owned executable paths without protecting the binary.
 const windowsUserJobAncestorMutation = windows.ACCESS_MASK(
+	windows.DELETE | windows.WRITE_DAC | windows.WRITE_OWNER | windows.GENERIC_ALL |
+		0x00000040) // FILE_DELETE_CHILD
+
+const windowsUserJobExecutableMutation = windows.ACCESS_MASK(
 	windows.DELETE | windows.WRITE_DAC | windows.WRITE_OWNER | windows.GENERIC_WRITE |
 		windows.GENERIC_ALL | windows.FILE_WRITE_DATA | windows.FILE_APPEND_DATA |
-		windows.FILE_WRITE_EA | windows.FILE_WRITE_ATTRIBUTES | 0x00000040) // FILE_DELETE_CHILD
-
-const windowsUserJobExecutableMutation = windowsUserJobAncestorMutation
+		windows.FILE_WRITE_EA | windows.FILE_WRITE_ATTRIBUTES)
 
 const windowsUserJobAllAccess = windows.ACCESS_MASK(0x001f01ff)
 

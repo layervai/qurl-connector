@@ -92,6 +92,49 @@ func TestWindowsUserJobRejectsMutableExecutableDirectory(t *testing.T) {
 	}
 }
 
+func TestWindowsUserJobAllowsExecutableDirectorySiblingCreationWithoutReplacement(t *testing.T) {
+	job := testWindowsUserJob(t)
+	sid, err := currentWindowsUserSID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	directory16, err := windows.UTF16PtrFromString(filepath.Dir(job.BinaryPath))
+	if err != nil {
+		t.Fatal(err)
+	}
+	handle, err := windows.CreateFile(directory16, windows.READ_CONTROL|windows.WRITE_DAC,
+		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE, nil,
+		windows.OPEN_EXISTING, windows.FILE_FLAG_BACKUP_SEMANTICS|windows.FILE_FLAG_OPEN_REPARSE_POINT, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// FILE_ADD_FILE and FILE_ADD_SUBDIRECTORY allow new sibling names. They do
+	// not permit deletion, renaming, ACL changes, or mutation of qurl.exe.
+	descriptor, err := windows.SecurityDescriptorFromString(
+		"D:P(A;OICI;FA;;;" + sid + ")(A;CI;0x00000003;;;WD)")
+	if err != nil {
+		_ = windows.CloseHandle(handle)
+		t.Fatal(err)
+	}
+	dacl, _, err := descriptor.DACL()
+	if err != nil {
+		_ = windows.CloseHandle(handle)
+		t.Fatal(err)
+	}
+	if err := windows.SetSecurityInfo(handle, windows.SE_FILE_OBJECT,
+		windows.DACL_SECURITY_INFORMATION|windows.PROTECTED_DACL_SECURITY_INFORMATION,
+		nil, nil, dacl, nil); err != nil {
+		_ = windows.CloseHandle(handle)
+		t.Fatal(err)
+	}
+	if err := windows.CloseHandle(handle); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateWindowsUserJobExecutable(job.BinaryPath, sid); err != nil {
+		t.Fatalf("non-replacing sibling creation rights rejected: %v", err)
+	}
+}
+
 func TestWindowsUserJobRenderIsCredentialFreeAndEscaped(t *testing.T) {
 	manager := &windowsUserJobManager{}
 	job := testWindowsUserJob(t)
