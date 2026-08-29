@@ -460,7 +460,7 @@ func ensureWindowsPrivateFile(path, sid string) error {
 		return err
 	}
 	handle, err := windows.CreateFile(path16,
-		windows.FILE_APPEND_DATA|windows.READ_CONTROL|windows.WRITE_DAC|windows.SYNCHRONIZE,
+		windows.FILE_APPEND_DATA|windows.READ_CONTROL|windows.WRITE_DAC|windows.WRITE_OWNER|windows.SYNCHRONIZE,
 		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE,
 		security, windows.OPEN_ALWAYS,
 		windows.FILE_ATTRIBUTE_NORMAL|windows.FILE_FLAG_OPEN_REPARSE_POINT, 0)
@@ -475,14 +475,8 @@ func ensureWindowsPrivateFile(path, sid string) error {
 	if info.FileAttributes&(windows.FILE_ATTRIBUTE_DIRECTORY|windows.FILE_ATTRIBUTE_REPARSE_POINT) != 0 || info.NumberOfLinks != 1 {
 		return errors.New("Windows user job log must be a non-reparse, single-link file")
 	}
-	dacl, _, err := descriptor.DACL()
-	if err != nil {
-		return fmt.Errorf("read protected Windows user job file ACL: %w", err)
-	}
-	if err := windows.SetSecurityInfo(handle, windows.SE_FILE_OBJECT,
-		windows.DACL_SECURITY_INFORMATION|windows.PROTECTED_DACL_SECURITY_INFORMATION,
-		nil, nil, dacl, nil); err != nil {
-		return fmt.Errorf("apply protected Windows user job file ACL: %w", err)
+	if err := protectWindowsUserJobHandle(handle, sid, false); err != nil {
+		return fmt.Errorf("apply protected Windows user job file identity: %w", err)
 	}
 	return nil
 }
@@ -510,9 +504,13 @@ func protectWindowsUserJobHandle(handle windows.Handle, sid string, directory bo
 	if err != nil {
 		return fmt.Errorf("read protected Windows user job ACL: %w", err)
 	}
+	owner, _, err := descriptor.Owner()
+	if err != nil || owner == nil {
+		return errors.New("read protected Windows user job owner")
+	}
 	if err := windows.SetSecurityInfo(handle, windows.SE_FILE_OBJECT,
-		windows.DACL_SECURITY_INFORMATION|windows.PROTECTED_DACL_SECURITY_INFORMATION,
-		nil, nil, dacl, nil); err != nil {
+		windows.OWNER_SECURITY_INFORMATION|windows.DACL_SECURITY_INFORMATION|windows.PROTECTED_DACL_SECURITY_INFORMATION,
+		owner, nil, dacl, nil); err != nil {
 		return fmt.Errorf("apply protected Windows user job ACL: %w", err)
 	}
 	return nil
@@ -581,7 +579,7 @@ func validateAndProtectWindowsDirectory(path, sidText string) error {
 		leaf := index == len(paths)-1
 		access := uint32(windows.FILE_READ_ATTRIBUTES | windows.READ_CONTROL)
 		if leaf {
-			access |= windows.WRITE_DAC
+			access |= windows.WRITE_DAC | windows.WRITE_OWNER
 		}
 		handle, openErr := windows.CreateFile(path16, access,
 			windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE, nil, windows.OPEN_EXISTING,
@@ -610,7 +608,7 @@ func validateAndProtectWindowsDirectory(path, sidText string) error {
 		}
 		owner, _, ownerErr := descriptor.Owner()
 		if ownerErr != nil || owner == nil || (!leaf && !trusted(owner)) || (leaf && !owner.Equals(currentSID)) {
-			return errors.New("Windows user job directory has an untrusted owner")
+			return fmt.Errorf("Windows user job directory %s has an untrusted owner", candidate)
 		}
 		dacl, _, daclErr := descriptor.DACL()
 		if daclErr != nil || dacl == nil {
