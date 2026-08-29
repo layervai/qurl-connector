@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.8.5](https://github.com/layervai/qurl-connector/compare/v0.8.4...v0.8.5) (2026-08-29)
+
+
+### Bug Fixes
+
+* **service:** explain unsafe Windows log recovery ([#20](https://github.com/layervai/qurl-connector/issues/20)) ([02a32c6](https://github.com/layervai/qurl-connector/commit/02a32c65596b832e8d3fe64feb7ec4bdbe7ed7f8))
+
 ## [0.8.4](https://github.com/layervai/qurl-connector/compare/v0.8.3...v0.8.4) (2026-08-29)
 
 
