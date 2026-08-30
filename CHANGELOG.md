@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.8.7](https://github.com/layervai/qurl-connector/compare/v0.8.6...v0.8.7) (2026-08-30)
+
+
+### Bug Fixes
+
+* recover native lifecycle transients ([#24](https://github.com/layervai/qurl-connector/issues/24)) ([6775522](https://github.com/layervai/qurl-connector/commit/6775522e1a38fe49cd9bcafe8f1c265963862e12))
+
 ## [0.8.6](https://github.com/layervai/qurl-connector/compare/v0.8.5...v0.8.6) (2026-08-29)
 
 
