@@ -36,6 +36,8 @@ jobs:
         run: |
           command -v golangci-lint
           GOOS=windows GOARCH=amd64 CGO_ENABLED=0 golangci-lint run ./pkg/... ./cmd/... ./internal/...
+      - name: Cross-lint Darwin sources
+        run: GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 golangci-lint run ./pkg/... ./cmd/... ./internal/...
 
   test:
     name: Test
@@ -72,8 +74,10 @@ jobs:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
-      - name: Run Darwin bridge tests
-        run: CGO_ENABLED=0 go test -count=1 ./pkg/agentstate ./pkg/config ./cmd/frpc ./internal/pinnedfs
+      - name: Run Darwin tests
+        run: |
+          CGO_ENABLED=0 go vet ./pkg/service
+          CGO_ENABLED=0 go test -count=1 ./pkg/agentstate ./pkg/config ./pkg/service ./cmd/frpc ./internal/pinnedfs
 
   windows-test:
     name: Test (Windows)

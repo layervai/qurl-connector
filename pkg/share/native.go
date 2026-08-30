@@ -102,6 +102,13 @@ var (
 	takeNativeKey        = func(binding *qurl.AgentRuntimeBinding) []byte { return binding.TakeDeviceStaticPrivateKey() }
 )
 
+var errNativeRefreshBackoffPending = errors.New("native assignment refresh backoff is pending")
+
+const (
+	nativeRefreshReasonImmediate = "stale or expired native assignment placement"
+	nativeRefreshReasonSustained = "sustained native NHP knock failures"
+)
+
 func OpenNativeRuntime(ctx context.Context, cfg NativeRuntimeConfig) (_ *NativeRuntime, retErr error) {
 	if ctx == nil {
 		return nil, errors.New("open native runtime: context is nil")
@@ -531,20 +538,33 @@ type NativeAdmitter struct {
 	recoveryWG            sync.WaitGroup
 	recoveryPermanentOnce sync.Once
 
-	binding    *qurl.AgentRuntimeBinding
-	privateKey []byte
-	udpOpts    []qurl.AgentRuntimeUDPOption
-	store      nativeStateStore
-	refreshCfg nativeRefreshConfig
-	operations nativeSessionOperationController
-	failures   int
-	failureGen uint64
+	binding           *qurl.AgentRuntimeBinding
+	privateKey        []byte
+	udpOpts           []qurl.AgentRuntimeUDPOption
+	store             nativeStateStore
+	refreshCfg        nativeRefreshConfig
+	operations        nativeSessionOperationController
+	placementFailures map[string]nativePlacementFailureState
+	generation        uint64
+	closed            bool
+	live              map[nativeAdmissionKey]nativeLiveAdmission
+	pending           map[nativeAdmissionKey]bool
+	lifecycle         context.Context
+	cancel            context.CancelFunc
+}
+
+type nativePlacementFailureState struct {
 	generation uint64
-	closed     bool
-	live       map[nativeAdmissionKey]nativeLiveAdmission
-	pending    map[nativeAdmissionKey]bool
-	lifecycle  context.Context
-	cancel     context.CancelFunc
+	failures   int
+	// immediateUsed survives assignment-generation changes and a successful
+	// refresh handoff. It is cleared after this resource admits successfully,
+	// or released when the refresh itself fails. The agent-global durable marker
+	// bounds all later Hub attempts within the same unresolved serving episode.
+	// A confirmed healthy route ends that episode; a later lease failure can
+	// start a new immediate refresh. A spent entry can remain until success or
+	// Close. Its practical bound is the caller's configured resource set;
+	// NativeAdmitter does not enforce a separate key-count limit.
+	immediateUsed bool
 }
 
 const (
@@ -740,27 +760,50 @@ func (a *NativeAdmitter) Admit(ctx context.Context, knockResourceID, resourceID 
 
 	admission, err, generation, refreshEligible := a.admitOnce(ctx, knockResourceID, resourceID)
 	if err == nil {
-		a.resetPlacementFailures(generation)
+		a.resetPlacementFailures(resourceID)
 		return admission, nil
 	}
 	if !refreshEligible {
 		return Admission{}, err
 	}
 	if !refreshableKnockError(err) {
-		a.resetPlacementFailures(generation)
+		a.clearPlacementFailureCount(resourceID)
 		return Admission{}, err
 	}
-	if !a.recordPlacementFailure(generation) {
+	thresholdReached := a.recordPlacementFailure(resourceID, generation)
+	immediate := !thresholdReached && immediatePlacementRefresh(err) && a.claimImmediatePlacementRefresh(resourceID)
+	if !immediate && !thresholdReached {
 		return Admission{}, err
 	}
-	if refreshErr := a.refresh(ctx, generation); refreshErr != nil {
+	refreshReason := nativeRefreshReasonSustained
+	if immediate {
+		refreshReason = nativeRefreshReasonImmediate
+	}
+	if refreshErr := a.refresh(ctx, generation, refreshReason); refreshErr != nil {
+		// A failed refresh produced no usable assignment for this admitter. Restore
+		// its one-shot credit; the agent-global durable marker still preserves the
+		// backoff for every Hub attempt, including authenticated rejections.
+		if immediate {
+			a.releaseImmediatePlacementRefresh(resourceID)
+		}
 		return Admission{}, errors.Join(err, refreshErr)
 	}
-	admission, retryErr, retryGeneration, _ := a.admitOnce(ctx, knockResourceID, resourceID)
+	admission, retryErr, _, _ := a.admitOnce(ctx, knockResourceID, resourceID)
 	if retryErr == nil {
-		a.resetPlacementFailures(retryGeneration)
+		a.resetPlacementFailures(resourceID)
 	}
 	return admission, retryErr
+}
+
+// immediatePlacementRefresh identifies authenticated local placement state
+// that cannot admit another durable session without a Hub refresh. Waiting for
+// several identical attempts only consumes the remaining lease margin; the
+// sustained-failure threshold remains for transport and reply-path failures.
+func immediatePlacementRefresh(err error) bool {
+	return errors.Is(err, qurl.ErrAssignmentLeaseExpired) ||
+		errors.Is(err, qurl.ErrNativeSessionOperationLeaseMargin) ||
+		errors.Is(err, qurl.ErrAssignmentRecoveryRequired) ||
+		errors.Is(err, qurl.ErrAssignmentReassignmentRequired)
 }
 
 func (a *NativeAdmitter) admitOnce(ctx context.Context, knockResourceID,
@@ -902,10 +945,7 @@ func refreshableKnockError(err error) bool {
 	// These sentinels are produced when the binding's live placement can no
 	// longer admit a session. They deliberately take precedence over the
 	// invalid-input/deadline errors a bounded renewal may also wrap.
-	if errors.Is(err, qurl.ErrAssignmentLeaseExpired) ||
-		errors.Is(err, qurl.ErrNativeSessionOperationLeaseMargin) ||
-		errors.Is(err, qurl.ErrAssignmentRecoveryRequired) ||
-		errors.Is(err, qurl.ErrAssignmentReassignmentRequired) {
+	if immediatePlacementRefresh(err) {
 		return true
 	}
 	if errors.Is(err, qurl.ErrInvalidNativeKnockInput) ||
@@ -921,7 +961,7 @@ func refreshableKnockError(err error) bool {
 		errors.Is(err, nativeudp.ErrServerUnauthenticated)
 }
 
-func (a *NativeAdmitter) refresh(ctx context.Context, failedGeneration uint64) error {
+func (a *NativeAdmitter) refresh(ctx context.Context, failedGeneration uint64, reason string) error {
 	a.refreshMu.Lock()
 	defer a.refreshMu.Unlock()
 	a.runtimeMu.RLock()
@@ -937,7 +977,7 @@ func (a *NativeAdmitter) refresh(ctx context.Context, failedGeneration uint64) e
 	refreshCfg := a.refreshCfg
 	a.runtimeMu.RUnlock()
 
-	runtime, key, err := prepareRefreshedRuntime(ctx, store, refreshCfg)
+	runtime, key, err := prepareRefreshedRuntime(ctx, store, refreshCfg, reason)
 	if err != nil {
 		return err
 	}
@@ -962,24 +1002,23 @@ func (a *NativeAdmitter) refresh(ctx context.Context, failedGeneration uint64) e
 	runtime.Binding = nil
 	runtime.store = nil
 	a.generation++
-	a.resetPlacementFailures(a.generation)
 	clear(oldKey)
 	oldBinding.Destroy()
 	return nil
 }
 
-func prepareRefreshedRuntime(ctx context.Context, store nativeStateStore, cfg nativeRefreshConfig) (*NativeRuntime, []byte, error) {
+func prepareRefreshedRuntime(ctx context.Context, store nativeStateStore, cfg nativeRefreshConfig, reason string) (*NativeRuntime, []byte, error) {
 	if store == nil {
 		return nil, nil, errors.New("refresh native admission runtime: state store is closed")
 	}
-	if err := store.RequestRegistrationRefresh("sustained native NHP knock failures"); err != nil {
+	if err := store.RequestRegistrationRefresh(reason); err != nil {
 		return nil, nil, fmt.Errorf("request assignment refresh: %w", err)
 	}
 	marker, present, err := store.LoadRegistrationRefreshMarker()
 	if err != nil || !present {
-		return nil, nil, errors.Join(errors.New("assignment refresh state missing after sustained knock failures"), err)
+		return nil, nil, errors.Join(fmt.Errorf("assignment refresh state missing after %s", reason), err)
 	}
-	runtime, err := refreshUntilOpen(ctx, cfg, store, marker, cfg.RefreshMode)
+	runtime, err := refreshReadyOnce(ctx, cfg, store, marker, cfg.RefreshMode)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -990,6 +1029,42 @@ func prepareRefreshedRuntime(ctx context.Context, store nativeStateStore, cfg na
 		return nil, nil, fmt.Errorf("refreshed native runtime key is %d bytes, want 32", got)
 	}
 	return runtime, key, nil
+}
+
+// refreshReadyOnce is the live-admission refresh boundary. It never sleeps
+// through persisted backoff and makes at most one Hub request. The daemon can
+// therefore reconcile another resource or close a confirmed-healthy episode
+// while the durable marker controls when the next request is allowed. Startup
+// recovery uses refreshUntilOpen because no serving sibling exists there.
+func refreshReadyOnce(ctx context.Context, cfg nativeRefreshConfig, store nativeStateStore, marker agentstate.RefreshMarker, mode string) (*NativeRuntime, error) {
+	if mode == "disabled" {
+		return nil, fmt.Errorf("native assignment refresh is disabled while recovery is required: %s", marker.Reason)
+	}
+	if marker.NextAttemptUnixMilli > 0 && time.Now().Before(time.UnixMilli(marker.NextAttemptUnixMilli)) {
+		return nil, errNativeRefreshBackoffPending
+	}
+	if err := store.MarkRegistrationRefreshAttempted(); err != nil {
+		return nil, fmt.Errorf("advance assignment refresh retry state: %w", err)
+	}
+	state, err := store.Handoff()
+	if err != nil {
+		return nil, err
+	}
+	options := make([]qurl.AgentRuntimeRefreshOption, 0, len(cfg.UDPOptions)+1)
+	if cfg.ClientBaseURL != "" {
+		options = append(options, qurl.WithAgentClientBaseURL(cfg.ClientBaseURL))
+	}
+	for _, option := range cfg.UDPOptions {
+		options = append(options, option)
+	}
+	client, binding, err := refreshNativeRuntime(ctx, cfg.Hub, state, options...)
+	if err != nil {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		return nil, err
+	}
+	return assembleRefreshedNativeRuntime(ctx, client, binding, store, cfg, NativeOpenRefresh)
 }
 
 func (a *NativeAdmitter) lockRuntimeForRefresh(ctx context.Context) error {
@@ -1044,21 +1119,69 @@ func discardRefreshedRuntime(runtime *NativeRuntime, key []byte) {
 	runtime.Client = nil
 }
 
-func (a *NativeAdmitter) recordPlacementFailure(generation uint64) bool {
+func (a *NativeAdmitter) recordPlacementFailure(resourceID string, generation uint64) bool {
 	a.stateMu.Lock()
 	defer a.stateMu.Unlock()
-	if a.failureGen != generation {
-		a.failureGen = generation
-		a.failures = 0
+	if a.placementFailures == nil {
+		a.placementFailures = make(map[string]nativePlacementFailureState)
 	}
-	a.failures++
-	return a.failures >= 5
+	state := a.placementFailures[resourceID]
+	if state.generation != generation {
+		state.generation = generation
+		state.failures = 0
+	}
+	state.failures++
+	a.placementFailures[resourceID] = state
+	return state.failures >= 5
 }
 
-func (a *NativeAdmitter) resetPlacementFailures(generation uint64) {
+func (a *NativeAdmitter) claimImmediatePlacementRefresh(resourceID string) bool {
 	a.stateMu.Lock()
-	a.failureGen = generation
-	a.failures = 0
+	defer a.stateMu.Unlock()
+	if a.placementFailures == nil {
+		a.placementFailures = make(map[string]nativePlacementFailureState)
+	}
+	state := a.placementFailures[resourceID]
+	if state.immediateUsed {
+		return false
+	}
+	state.immediateUsed = true
+	a.placementFailures[resourceID] = state
+	return true
+}
+
+func (a *NativeAdmitter) releaseImmediatePlacementRefresh(resourceID string) {
+	a.stateMu.Lock()
+	defer a.stateMu.Unlock()
+	state, ok := a.placementFailures[resourceID]
+	if !ok || !state.immediateUsed {
+		return
+	}
+	state.immediateUsed = false
+	a.placementFailures[resourceID] = state
+}
+
+// clearPlacementFailureCount resets only the sustained-failure budget. It
+// does not re-arm the once-per-resource immediate refresh; only a successful
+// admission can start a new immediate-refresh episode.
+func (a *NativeAdmitter) clearPlacementFailureCount(resourceID string) {
+	a.stateMu.Lock()
+	defer a.stateMu.Unlock()
+	state, ok := a.placementFailures[resourceID]
+	if !ok {
+		return
+	}
+	if !state.immediateUsed {
+		delete(a.placementFailures, resourceID)
+		return
+	}
+	state.failures = 0
+	a.placementFailures[resourceID] = state
+}
+
+func (a *NativeAdmitter) resetPlacementFailures(resourceID string) {
+	a.stateMu.Lock()
+	delete(a.placementFailures, resourceID)
 	a.stateMu.Unlock()
 }
 
@@ -1295,6 +1418,7 @@ func (a *NativeAdmitter) Close() error {
 	a.stateMu.Lock()
 	a.live = nil
 	a.pending = nil
+	a.placementFailures = nil
 	a.stateMu.Unlock()
 	a.runtimeMu.Unlock()
 	clear(privateKey)

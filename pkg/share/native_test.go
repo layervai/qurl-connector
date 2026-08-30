@@ -23,7 +23,9 @@ type memoryNativeStore struct {
 	marker           agentstate.RefreshMarker
 	present          bool
 	loadErr          error
+	requestErr       error
 	successErr       error
+	attemptBackoff   time.Duration
 	marks            int
 	succeeded        int
 	cleared          int
@@ -43,6 +45,14 @@ func (s *memoryNativeStore) LoadRegistrationRefreshMarker() (agentstate.RefreshM
 func (s *memoryNativeStore) RequestRegistrationRefresh(reason string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.requestErr != nil {
+		return s.requestErr
+	}
+	// Match the production store's presence gate: opening the same episode again
+	// must preserve its attempt count and next-at time.
+	if s.present {
+		return nil
+	}
 	s.present = true
 	s.marker = agentstate.RefreshMarker{Version: 2, Reason: reason}
 	return nil
@@ -52,8 +62,18 @@ func (s *memoryNativeStore) MarkRegistrationRefreshAttempted() error {
 	defer s.mu.Unlock()
 	s.marks++
 	s.marker.AttemptCount++
-	s.marker.LastAttemptUnixMilli = time.Now().UnixMilli()
-	s.marker.NextAttemptUnixMilli = s.marker.LastAttemptUnixMilli + 1
+	now := time.Now()
+	s.marker.LastAttemptUnixMilli = now.UnixMilli()
+	base := s.attemptBackoff
+	if base <= 0 {
+		base = time.Millisecond
+	}
+	shift := min(s.marker.AttemptCount-1, uint32(8))
+	delay := base * time.Duration(1<<shift)
+	if delay > 5*time.Minute {
+		delay = 5 * time.Minute
+	}
+	s.marker.NextAttemptUnixMilli = now.Add(delay).UnixMilli()
 	s.marker.RefreshSucceededUnixMilli = 0
 	return nil
 }
@@ -159,6 +179,42 @@ type recoveryFailureOperations struct {
 type retirementFailureOperations struct {
 	testNativeSessionOperations
 	err error
+}
+
+type dispatchFailureOperations struct {
+	testNativeSessionOperations
+	err error
+}
+
+type fanoutDispatchFailureOperations struct {
+	testNativeSessionOperations
+	mu    sync.Mutex
+	calls int
+	ready chan<- struct{}
+	err   error
+}
+
+type missingRefreshMarkerStore struct{ *memoryNativeStore }
+
+func (missingRefreshMarkerStore) RequestRegistrationRefresh(string) error { return nil }
+
+func (o dispatchFailureOperations) PrepareDispatch(context.Context, *qurl.AgentRuntimeBinding, []byte,
+	string, string, string, uint64,
+) (*qurl.NativeSessionOperation, error) {
+	return nil, o.err
+}
+
+func (o *fanoutDispatchFailureOperations) PrepareDispatch(context.Context, *qurl.AgentRuntimeBinding, []byte,
+	string, string, string, uint64,
+) (*qurl.NativeSessionOperation, error) {
+	o.mu.Lock()
+	o.calls++
+	call := o.calls
+	o.mu.Unlock()
+	if call <= cap(o.ready) {
+		o.ready <- struct{}{}
+	}
+	return nil, o.err
 }
 
 func (o retirementFailureOperations) Retire(context.Context, *qurl.AgentRuntimeBinding, []byte,
@@ -380,7 +436,9 @@ func TestNativeAdmitterRetirementFailurePreservesPlacementFailureBudget(t *testi
 	admitter := &NativeAdmitter{
 		binding: &qurl.AgentRuntimeBinding{AgentID: "agent-one"}, privateKey: make([]byte, 32),
 		operations: retirementFailureOperations{err: want}, generation: 7,
-		failureGen: 7, failures: 4,
+		placementFailures: map[string]nativePlacementFailureState{
+			"resource-one": {generation: 7, failures: 4},
+		},
 		live: map[nativeAdmissionKey]nativeLiveAdmission{
 			key: {resourceID: "resource-one", operationID: "operation-one", receipt: receipt},
 		},
@@ -389,8 +447,8 @@ func TestNativeAdmitterRetirementFailurePreservesPlacementFailureBudget(t *testi
 	if _, err := admitter.Admit(context.Background(), "q_catalog", "resource-one"); !errors.Is(err, want) {
 		t.Fatalf("Admit() = %v, want retirement failure", err)
 	}
-	if admitter.failureGen != 7 || admitter.failures != 4 {
-		t.Fatalf("placement budget after retirement failure = generation %d count %d, want 7/4", admitter.failureGen, admitter.failures)
+	if state := admitter.placementFailures["resource-one"]; state.generation != 7 || state.failures != 4 {
+		t.Fatalf("placement budget after retirement failure = %+v, want generation 7 count 4", state)
 	}
 }
 
@@ -862,13 +920,16 @@ func TestNativeAdmitterRecoversSustainedStaleAssignmentWithoutOperatorInput(t *t
 		waitNativeRefresh = oldWait
 		takeNativeKey = oldTakeKey
 	})
-	store := &memoryNativeStore{}
-	waitNativeRefresh = func(context.Context, time.Duration) error { return nil }
+	store := &memoryNativeStore{attemptBackoff: time.Second}
+	waitNativeRefresh = func(_ context.Context, delay time.Duration) error {
+		return fmt.Errorf("live refresh waited %s through persisted backoff", delay)
+	}
 	takeNativeKey = func(*qurl.AgentRuntimeBinding) []byte { return make([]byte, 32) }
+	refreshes := 0
 	knocks := 0
 	knockNativeRuntime = func(_ context.Context, _ *qurl.AgentRuntimeBinding, _ []byte, _ string, opts qurl.NativeKnockOptions, _ ...qurl.AgentRuntimeUDPOption) (*qurl.NativeKnockResult, error) {
 		knocks++
-		if knocks <= 5 {
+		if refreshes < 3 {
 			return nil, nativeudp.ErrTransport
 		}
 		return &qurl.NativeKnockResult{
@@ -876,7 +937,6 @@ func TestNativeAdmitterRecoversSustainedStaleAssignmentWithoutOperatorInput(t *t
 			SessionReceipt: testSessionReceipt(77, opts.RunID, opts.RunAttempt),
 		}, nil
 	}
-	refreshes := 0
 	refreshNativeRuntime = func(context.Context, qurl.HubBootstrap, qurl.AgentStateStore, ...qurl.AgentRuntimeRefreshOption) (*qurl.Client, *qurl.AgentRuntimeBinding, error) {
 		refreshes++
 		if refreshes <= 2 {
@@ -894,6 +954,17 @@ func TestNativeAdmitterRecoversSustainedStaleAssignmentWithoutOperatorInput(t *t
 			t.Fatalf("knock %d = %v, want transport failure", attempt, err)
 		}
 	}
+	for attempt := 1; attempt <= 2; attempt++ {
+		if _, err := admitter.Admit(context.Background(), "q_catalog_key", "public-resource"); !errors.Is(err, nativeudp.ErrTransport) || !errors.Is(err, qurl.ErrAssignmentUnavailable) {
+			t.Fatalf("refresh attempt %d = %v, want transport and assignment unavailable", attempt, err)
+		}
+		if refreshes != attempt || store.marks != attempt {
+			t.Fatalf("after refresh attempt %d refreshes=%d marks=%d", attempt, refreshes, store.marks)
+		}
+		store.mu.Lock()
+		store.marker.NextAttemptUnixMilli = time.Now().Add(-time.Second).UnixMilli()
+		store.mu.Unlock()
+	}
 	admission, err := admitter.Admit(context.Background(), "q_catalog_key", "public-resource")
 	if err != nil {
 		t.Fatal(err)
@@ -901,8 +972,14 @@ func TestNativeAdmitterRecoversSustainedStaleAssignmentWithoutOperatorInput(t *t
 	if admission.SessionID != 77 || admission.KnockResourceID != "q_catalog_key" || admission.ResourceID != "public-resource" {
 		t.Fatalf("recovered admission = %+v", admission)
 	}
-	if refreshes != 3 || store.marks != 3 || knocks != 6 {
-		t.Fatalf("refreshes=%d persisted attempts=%d knocks=%d, want 3/3/6", refreshes, store.marks, knocks)
+	if refreshes != 3 || store.marks != 3 || knocks != 8 {
+		t.Fatalf("refreshes=%d persisted attempts=%d knocks=%d, want 3/3/8", refreshes, store.marks, knocks)
+	}
+	store.mu.Lock()
+	sustainedReason := store.marker.Reason
+	store.mu.Unlock()
+	if sustainedReason != nativeRefreshReasonSustained {
+		t.Fatalf("sustained refresh reason=%q, want %q", sustainedReason, nativeRefreshReasonSustained)
 	}
 	if store.cleared != 0 {
 		t.Fatal("assignment recovery cleared before a serving FRP session")
@@ -1050,7 +1127,7 @@ func TestNativeAdmitterPreparedRefreshDoesNotBlockSiblingResource(t *testing.T) 
 		t.Fatal("slow recovery did not start")
 	}
 	refreshDone := make(chan error, 1)
-	go func() { refreshDone <- admitter.refresh(context.Background(), 0) }()
+	go func() { refreshDone <- admitter.refresh(context.Background(), 0, nativeRefreshReasonSustained) }()
 	select {
 	case <-refreshPrepared:
 	case <-time.After(time.Second):
@@ -1291,6 +1368,480 @@ func TestRefreshableKnockErrorClassification(t *testing.T) {
 				t.Fatalf("refreshableKnockError(%v) = %t, want %t", test.err, got, test.want)
 			}
 		})
+	}
+}
+
+func TestImmediatePlacementRefreshClassification(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{name: "nil"},
+		{name: "transport", err: nativeudp.ErrTransport},
+		{name: "no reply", err: nativeudp.ErrNoReply},
+		{name: "assignment unavailable", err: qurl.ErrAssignmentUnavailable},
+		{name: "lease expired", err: qurl.ErrAssignmentLeaseExpired, want: true},
+		{name: "journal margin", err: qurl.ErrNativeSessionOperationLeaseMargin, want: true},
+		{name: "recovery required", err: qurl.ErrAssignmentRecoveryRequired, want: true},
+		{name: "reassignment required", err: qurl.ErrAssignmentReassignmentRequired, want: true},
+		{name: "wrapped margin", err: errors.Join(qurl.ErrNativeSessionOperationLeaseMargin, context.DeadlineExceeded), want: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := immediatePlacementRefresh(test.err); got != test.want {
+				t.Fatalf("immediatePlacementRefresh(%v) = %t, want %t", test.err, got, test.want)
+			}
+		})
+	}
+}
+
+func TestNativeAdmitterIsolatesSustainedFailuresByResource(t *testing.T) {
+	oldKnock := knockNativeRuntime
+	oldRefresh := refreshNativeRuntime
+	oldTakeKey := takeNativeKey
+	t.Cleanup(func() {
+		knockNativeRuntime = oldKnock
+		refreshNativeRuntime = oldRefresh
+		takeNativeKey = oldTakeKey
+	})
+	takeNativeKey = func(*qurl.AgentRuntimeBinding) []byte { return make([]byte, 32) }
+	knockNativeRuntime = func(context.Context, *qurl.AgentRuntimeBinding, []byte, string, qurl.NativeKnockOptions, ...qurl.AgentRuntimeUDPOption) (*qurl.NativeKnockResult, error) {
+		return nil, nativeudp.ErrTransport
+	}
+	refreshes := 0
+	refreshNativeRuntime = func(context.Context, qurl.HubBootstrap, qurl.AgentStateStore, ...qurl.AgentRuntimeRefreshOption) (*qurl.Client, *qurl.AgentRuntimeBinding, error) {
+		refreshes++
+		return &qurl.Client{}, &qurl.AgentRuntimeBinding{AgentID: "agent-one"}, nil
+	}
+	store := &memoryNativeStore{}
+	admitter := &NativeAdmitter{
+		binding: &qurl.AgentRuntimeBinding{AgentID: "agent-one"}, privateKey: make([]byte, 32),
+		operations: testNativeSessionOperations{}, store: store,
+		refreshCfg: nativeRefreshConfig{AgentID: "agent-one", RefreshMode: "auto"},
+	}
+	for attempt := 1; attempt <= 4; attempt++ {
+		if _, err := admitter.Admit(context.Background(), "q_catalog_key", "resource-a"); !errors.Is(err, nativeudp.ErrTransport) {
+			t.Fatalf("resource A attempt %d = %v, want transport failure", attempt, err)
+		}
+	}
+	if _, err := admitter.Admit(context.Background(), "q_catalog_key", "resource-b"); !errors.Is(err, nativeudp.ErrTransport) {
+		t.Fatalf("resource B first attempt = %v, want transport failure", err)
+	}
+	if refreshes != 0 {
+		t.Fatalf("resource B consumed resource A's failure budget: refreshes=%d", refreshes)
+	}
+	if _, err := admitter.Admit(context.Background(), "q_catalog_key", "resource-a"); !errors.Is(err, nativeudp.ErrTransport) {
+		t.Fatalf("resource A threshold attempt = %v, want transport failure", err)
+	}
+	if refreshes != 1 || store.marks != 1 {
+		t.Fatalf("resource A threshold refreshes=%d marks=%d, want 1/1", refreshes, store.marks)
+	}
+}
+
+func TestNativeAdmitterIsolatesImmediateCreditByResource(t *testing.T) {
+	oldRefresh := refreshNativeRuntime
+	oldTakeKey := takeNativeKey
+	t.Cleanup(func() {
+		refreshNativeRuntime = oldRefresh
+		takeNativeKey = oldTakeKey
+	})
+	takeNativeKey = func(*qurl.AgentRuntimeBinding) []byte { return make([]byte, 32) }
+	refreshes := 0
+	refreshNativeRuntime = func(context.Context, qurl.HubBootstrap, qurl.AgentStateStore, ...qurl.AgentRuntimeRefreshOption) (*qurl.Client, *qurl.AgentRuntimeBinding, error) {
+		refreshes++
+		return &qurl.Client{}, &qurl.AgentRuntimeBinding{AgentID: "agent-one"}, nil
+	}
+	store := &memoryNativeStore{attemptBackoff: time.Second}
+	admitter := &NativeAdmitter{
+		binding: &qurl.AgentRuntimeBinding{AgentID: "agent-one"}, privateKey: make([]byte, 32),
+		operations: dispatchFailureOperations{err: qurl.ErrNativeSessionOperationLeaseMargin},
+		store:      store, refreshCfg: nativeRefreshConfig{AgentID: "agent-one", RefreshMode: "auto"},
+	}
+	if _, err := admitter.Admit(context.Background(), "q_catalog_key", "resource-a"); !errors.Is(err, qurl.ErrNativeSessionOperationLeaseMargin) {
+		t.Fatalf("resource A first Admit() = %v, want lease margin", err)
+	}
+	if _, err := admitter.Admit(context.Background(), "q_catalog_key", "resource-a"); !errors.Is(err, qurl.ErrNativeSessionOperationLeaseMargin) {
+		t.Fatalf("resource A second Admit() = %v, want lease margin", err)
+	}
+	if refreshes != 1 {
+		t.Fatalf("resource A spent immediate credit refreshed %d times, want 1", refreshes)
+	}
+	if _, err := admitter.Admit(context.Background(), "q_catalog_key", "resource-b"); !errors.Is(err, qurl.ErrNativeSessionOperationLeaseMargin) || !errors.Is(err, errNativeRefreshBackoffPending) {
+		t.Fatalf("resource B first Admit() = %v, want lease margin with persisted backoff", err)
+	}
+	if refreshes != 1 || store.marks != 1 {
+		t.Fatalf("resource B bypassed shared backoff: refreshes=%d marks=%d, want 1/1", refreshes, store.marks)
+	}
+	store.mu.Lock()
+	store.marker.NextAttemptUnixMilli = time.Now().Add(-time.Second).UnixMilli()
+	store.mu.Unlock()
+	if _, err := admitter.Admit(context.Background(), "q_catalog_key", "resource-b"); !errors.Is(err, qurl.ErrNativeSessionOperationLeaseMargin) {
+		t.Fatalf("resource B retry Admit() = %v, want lease margin", err)
+	}
+	if refreshes != 2 || store.marks != 2 {
+		t.Fatalf("resource B immediate credit refreshes=%d marks=%d, want 2/2", refreshes, store.marks)
+	}
+}
+
+func TestNativeAdmitterCollapsesConcurrentImmediateRefreshesByGeneration(t *testing.T) {
+	oldRefresh := refreshNativeRuntime
+	oldTakeKey := takeNativeKey
+	t.Cleanup(func() {
+		refreshNativeRuntime = oldRefresh
+		takeNativeKey = oldTakeKey
+	})
+	takeNativeKey = func(*qurl.AgentRuntimeBinding) []byte { return make([]byte, 32) }
+
+	const resourceCount = 8
+	ready := make(chan struct{}, resourceCount)
+	operations := &fanoutDispatchFailureOperations{
+		ready: ready, err: qurl.ErrNativeSessionOperationLeaseMargin,
+	}
+	refreshStarted := make(chan struct{})
+	releaseRefresh := make(chan struct{})
+	var refreshMu sync.Mutex
+	refreshes := 0
+	refreshNativeRuntime = func(context.Context, qurl.HubBootstrap, qurl.AgentStateStore, ...qurl.AgentRuntimeRefreshOption) (*qurl.Client, *qurl.AgentRuntimeBinding, error) {
+		refreshMu.Lock()
+		refreshes++
+		attempt := refreshes
+		refreshMu.Unlock()
+		if attempt == 1 {
+			close(refreshStarted)
+			<-releaseRefresh
+		}
+		return &qurl.Client{}, &qurl.AgentRuntimeBinding{AgentID: "agent-one"}, nil
+	}
+	store := &memoryNativeStore{attemptBackoff: time.Second}
+	admitter := &NativeAdmitter{
+		binding: &qurl.AgentRuntimeBinding{AgentID: "agent-one"}, privateKey: make([]byte, 32),
+		operations: operations, store: store,
+		refreshCfg: nativeRefreshConfig{AgentID: "agent-one", RefreshMode: "auto"},
+	}
+	errs := make(chan error, resourceCount)
+	for resource := 0; resource < resourceCount; resource++ {
+		resourceID := fmt.Sprintf("resource-%d", resource)
+		go func() {
+			_, err := admitter.Admit(context.Background(), "q_catalog_key", resourceID)
+			errs <- err
+		}()
+	}
+	<-refreshStarted
+	for resource := 0; resource < resourceCount; resource++ {
+		<-ready
+	}
+	close(releaseRefresh)
+	for resource := 0; resource < resourceCount; resource++ {
+		if err := <-errs; !errors.Is(err, qurl.ErrNativeSessionOperationLeaseMargin) {
+			t.Fatalf("concurrent Admit() = %v, want lease margin", err)
+		}
+	}
+	refreshMu.Lock()
+	gotRefreshes := refreshes
+	refreshMu.Unlock()
+	store.mu.Lock()
+	gotMarks := store.marks
+	store.mu.Unlock()
+	admitter.runtimeMu.RLock()
+	generation := admitter.generation
+	admitter.runtimeMu.RUnlock()
+	if gotRefreshes != 1 || gotMarks != 1 || generation != 1 {
+		t.Fatalf("concurrent fan-out refreshes=%d marks=%d generation=%d, want 1/1/1", gotRefreshes, gotMarks, generation)
+	}
+}
+
+func TestNativeAdmitterRefreshesLeaseMarginImmediately(t *testing.T) {
+	oldRefresh := refreshNativeRuntime
+	oldTakeKey := takeNativeKey
+	t.Cleanup(func() {
+		refreshNativeRuntime = oldRefresh
+		takeNativeKey = oldTakeKey
+	})
+	takeNativeKey = func(*qurl.AgentRuntimeBinding) []byte { return make([]byte, 32) }
+	refreshes := 0
+	refreshNativeRuntime = func(context.Context, qurl.HubBootstrap, qurl.AgentStateStore, ...qurl.AgentRuntimeRefreshOption) (*qurl.Client, *qurl.AgentRuntimeBinding, error) {
+		refreshes++
+		return &qurl.Client{}, &qurl.AgentRuntimeBinding{AgentID: "agent-one"}, nil
+	}
+	store := &memoryNativeStore{}
+	admitter := &NativeAdmitter{
+		binding: &qurl.AgentRuntimeBinding{AgentID: "agent-one"}, privateKey: make([]byte, 32),
+		operations: dispatchFailureOperations{err: qurl.ErrNativeSessionOperationLeaseMargin},
+		store:      store, refreshCfg: nativeRefreshConfig{AgentID: "agent-one", RefreshMode: "auto"},
+	}
+	if _, err := admitter.Admit(context.Background(), "q_catalog_key", "public-resource"); !errors.Is(err, qurl.ErrNativeSessionOperationLeaseMargin) {
+		t.Fatalf("Admit() = %v, want retry failure after one refresh", err)
+	}
+	if refreshes != 1 || store.marks != 1 {
+		t.Fatalf("refreshes=%d persisted attempts=%d, want 1/1 on first margin failure", refreshes, store.marks)
+	}
+	store.mu.Lock()
+	immediateReason := store.marker.Reason
+	store.mu.Unlock()
+	if immediateReason != nativeRefreshReasonImmediate {
+		t.Fatalf("immediate refresh reason=%q, want %q", immediateReason, nativeRefreshReasonImmediate)
+	}
+	if err := admitter.MarkServingHealthy(); err != nil {
+		t.Fatal(err)
+	}
+	store.mu.Lock()
+	markerPresent := store.present
+	store.mu.Unlock()
+	if markerPresent {
+		t.Fatal("serving confirmation did not close the persisted refresh episode")
+	}
+	if _, err := admitter.Admit(context.Background(), "q_catalog_key", "public-resource"); !errors.Is(err, qurl.ErrNativeSessionOperationLeaseMargin) {
+		t.Fatalf("second Admit() after episode clear = %v, want margin failure without another immediate refresh", err)
+	}
+	if refreshes != 1 || store.marks != 1 {
+		t.Fatalf("second margin failure refreshes=%d persisted attempts=%d, want bounded 1/1", refreshes, store.marks)
+	}
+}
+
+func TestPrepareRefreshedRuntimeReportsExactMissingMarkerReason(t *testing.T) {
+	store := missingRefreshMarkerStore{memoryNativeStore: &memoryNativeStore{}}
+	_, _, err := prepareRefreshedRuntime(
+		context.Background(), store, nativeRefreshConfig{RefreshMode: "auto"}, nativeRefreshReasonImmediate,
+	)
+	if err == nil || !strings.Contains(err.Error(), nativeRefreshReasonImmediate) || strings.Contains(err.Error(), nativeRefreshReasonSustained) {
+		t.Fatalf("prepareRefreshedRuntime() = %v, want exact immediate reason", err)
+	}
+}
+
+func TestNativeAdmitterDoesNotRearmImmediateRefreshAfterInterleavedFailure(t *testing.T) {
+	oldKnock := knockNativeRuntime
+	oldRefresh := refreshNativeRuntime
+	oldTakeKey := takeNativeKey
+	t.Cleanup(func() {
+		knockNativeRuntime = oldKnock
+		refreshNativeRuntime = oldRefresh
+		takeNativeKey = oldTakeKey
+	})
+	takeNativeKey = func(*qurl.AgentRuntimeBinding) []byte { return make([]byte, 32) }
+	knocks := 0
+	knockNativeRuntime = func(context.Context, *qurl.AgentRuntimeBinding, []byte, string, qurl.NativeKnockOptions, ...qurl.AgentRuntimeUDPOption) (*qurl.NativeKnockResult, error) {
+		knocks++
+		switch knocks {
+		case 1, 2, 4:
+			return nil, qurl.ErrNativeSessionOperationLeaseMargin
+		case 3:
+			return nil, qurl.ErrServerOverloaded
+		default:
+			return nil, errors.New("unexpected knock")
+		}
+	}
+	refreshes := 0
+	refreshNativeRuntime = func(context.Context, qurl.HubBootstrap, qurl.AgentStateStore, ...qurl.AgentRuntimeRefreshOption) (*qurl.Client, *qurl.AgentRuntimeBinding, error) {
+		refreshes++
+		return &qurl.Client{}, &qurl.AgentRuntimeBinding{AgentID: "agent-one"}, nil
+	}
+	store := &memoryNativeStore{}
+	admitter := &NativeAdmitter{
+		binding: &qurl.AgentRuntimeBinding{AgentID: "agent-one"}, privateKey: make([]byte, 32),
+		operations: testNativeSessionOperations{},
+		store:      store, refreshCfg: nativeRefreshConfig{AgentID: "agent-one", RefreshMode: "auto"},
+	}
+	if _, err := admitter.Admit(context.Background(), "q_catalog_key", "public-resource"); !errors.Is(err, qurl.ErrNativeSessionOperationLeaseMargin) {
+		t.Fatalf("first Admit() = %v, want lease-margin retry failure", err)
+	}
+	if _, err := admitter.Admit(context.Background(), "q_catalog_key", "public-resource"); !errors.Is(err, qurl.ErrServerOverloaded) {
+		t.Fatalf("interleaved Admit() = %v, want overload", err)
+	}
+	if _, err := admitter.Admit(context.Background(), "q_catalog_key", "public-resource"); !errors.Is(err, qurl.ErrNativeSessionOperationLeaseMargin) {
+		t.Fatalf("third Admit() = %v, want lease margin", err)
+	}
+	if refreshes != 1 || store.marks != 1 {
+		t.Fatalf("interleaved failures refreshed %d times and marked %d times, want 1/1", refreshes, store.marks)
+	}
+}
+
+func TestNativeAdmitterDoesNotSpendImmediateRefreshAtSustainedThreshold(t *testing.T) {
+	oldKnock := knockNativeRuntime
+	oldRefresh := refreshNativeRuntime
+	oldTakeKey := takeNativeKey
+	t.Cleanup(func() {
+		knockNativeRuntime = oldKnock
+		refreshNativeRuntime = oldRefresh
+		takeNativeKey = oldTakeKey
+	})
+	takeNativeKey = func(*qurl.AgentRuntimeBinding) []byte { return make([]byte, 32) }
+	knocks := 0
+	knockNativeRuntime = func(context.Context, *qurl.AgentRuntimeBinding, []byte, string, qurl.NativeKnockOptions, ...qurl.AgentRuntimeUDPOption) (*qurl.NativeKnockResult, error) {
+		knocks++
+		if knocks <= 4 {
+			return nil, nativeudp.ErrTransport
+		}
+		return nil, qurl.ErrNativeSessionOperationLeaseMargin
+	}
+	refreshes := 0
+	refreshNativeRuntime = func(context.Context, qurl.HubBootstrap, qurl.AgentStateStore, ...qurl.AgentRuntimeRefreshOption) (*qurl.Client, *qurl.AgentRuntimeBinding, error) {
+		refreshes++
+		return &qurl.Client{}, &qurl.AgentRuntimeBinding{AgentID: "agent-one"}, nil
+	}
+	store := &memoryNativeStore{}
+	admitter := &NativeAdmitter{
+		binding: &qurl.AgentRuntimeBinding{AgentID: "agent-one"}, privateKey: make([]byte, 32),
+		operations: testNativeSessionOperations{},
+		store:      store, refreshCfg: nativeRefreshConfig{AgentID: "agent-one", RefreshMode: "auto"},
+	}
+	for attempt := 1; attempt <= 4; attempt++ {
+		if _, err := admitter.Admit(context.Background(), "q_catalog_key", "public-resource"); !errors.Is(err, nativeudp.ErrTransport) {
+			t.Fatalf("transport attempt %d = %v, want transport failure", attempt, err)
+		}
+	}
+	if _, err := admitter.Admit(context.Background(), "q_catalog_key", "public-resource"); !errors.Is(err, qurl.ErrNativeSessionOperationLeaseMargin) {
+		t.Fatalf("threshold Admit() = %v, want lease-margin retry failure", err)
+	}
+	if refreshes != 1 {
+		t.Fatalf("threshold refreshes=%d, want 1", refreshes)
+	}
+	store.mu.Lock()
+	store.marker.NextAttemptUnixMilli = time.Now().Add(-time.Second).UnixMilli()
+	store.mu.Unlock()
+	if _, err := admitter.Admit(context.Background(), "q_catalog_key", "public-resource"); !errors.Is(err, qurl.ErrNativeSessionOperationLeaseMargin) {
+		t.Fatalf("post-threshold Admit() = %v, want lease-margin retry failure", err)
+	}
+	if refreshes != 2 || store.marks != 2 {
+		t.Fatalf("threshold then immediate refreshes=%d marks=%d, want 2/2", refreshes, store.marks)
+	}
+}
+
+func TestNativeAdmitterRestoresImmediateRefreshAfterCallerDeadline(t *testing.T) {
+	oldRefresh := refreshNativeRuntime
+	oldTakeKey := takeNativeKey
+	t.Cleanup(func() {
+		refreshNativeRuntime = oldRefresh
+		takeNativeKey = oldTakeKey
+	})
+	takeNativeKey = func(*qurl.AgentRuntimeBinding) []byte { return make([]byte, 32) }
+	refreshes := 0
+	refreshNativeRuntime = func(ctx context.Context, _ qurl.HubBootstrap, _ qurl.AgentStateStore, _ ...qurl.AgentRuntimeRefreshOption) (*qurl.Client, *qurl.AgentRuntimeBinding, error) {
+		refreshes++
+		if refreshes == 1 {
+			<-ctx.Done()
+			return nil, nil, ctx.Err()
+		}
+		return &qurl.Client{}, &qurl.AgentRuntimeBinding{AgentID: "agent-one"}, nil
+	}
+	store := &memoryNativeStore{attemptBackoff: time.Second}
+	admitter := &NativeAdmitter{
+		binding: &qurl.AgentRuntimeBinding{AgentID: "agent-one"}, privateKey: make([]byte, 32),
+		operations: dispatchFailureOperations{err: qurl.ErrNativeSessionOperationLeaseMargin},
+		store:      store, refreshCfg: nativeRefreshConfig{AgentID: "agent-one", RefreshMode: "auto"},
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	if _, err := admitter.Admit(ctx, "q_catalog_key", "public-resource"); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("deadline Admit() = %v, want deadline", err)
+	}
+	if _, err := admitter.Admit(context.Background(), "q_catalog_key", "public-resource"); !errors.Is(err, qurl.ErrNativeSessionOperationLeaseMargin) || !errors.Is(err, errNativeRefreshBackoffPending) {
+		t.Fatalf("backoff Admit() = %v, want lease margin with persisted backoff", err)
+	}
+	if refreshes != 1 {
+		t.Fatalf("refresh calls during persisted backoff=%d, want 1", refreshes)
+	}
+	store.mu.Lock()
+	store.marker.NextAttemptUnixMilli = time.Now().Add(-time.Second).UnixMilli()
+	store.mu.Unlock()
+	if _, err := admitter.Admit(context.Background(), "q_catalog_key", "public-resource"); !errors.Is(err, qurl.ErrNativeSessionOperationLeaseMargin) {
+		t.Fatalf("retry Admit() = %v, want lease-margin retry failure", err)
+	}
+	if refreshes != 2 {
+		t.Fatalf("refresh calls=%d, want immediate retry after caller deadline", refreshes)
+	}
+}
+
+func TestNativeAdmitterRestoresImmediateRefreshAfterLocalMarkerFailure(t *testing.T) {
+	oldRefresh := refreshNativeRuntime
+	oldTakeKey := takeNativeKey
+	t.Cleanup(func() {
+		refreshNativeRuntime = oldRefresh
+		takeNativeKey = oldTakeKey
+	})
+	takeNativeKey = func(*qurl.AgentRuntimeBinding) []byte { return make([]byte, 32) }
+	refreshes := 0
+	refreshNativeRuntime = func(context.Context, qurl.HubBootstrap, qurl.AgentStateStore, ...qurl.AgentRuntimeRefreshOption) (*qurl.Client, *qurl.AgentRuntimeBinding, error) {
+		refreshes++
+		return &qurl.Client{}, &qurl.AgentRuntimeBinding{AgentID: "agent-one"}, nil
+	}
+	markerErr := errors.New("refresh marker temporarily unavailable")
+	store := &memoryNativeStore{requestErr: markerErr}
+	admitter := &NativeAdmitter{
+		binding: &qurl.AgentRuntimeBinding{AgentID: "agent-one"}, privateKey: make([]byte, 32),
+		operations: dispatchFailureOperations{err: qurl.ErrNativeSessionOperationLeaseMargin},
+		store:      store, refreshCfg: nativeRefreshConfig{AgentID: "agent-one", RefreshMode: "auto"},
+	}
+	if _, err := admitter.Admit(context.Background(), "q_catalog_key", "public-resource"); !errors.Is(err, markerErr) {
+		t.Fatalf("first Admit() = %v, want marker failure", err)
+	}
+	if refreshes != 0 {
+		t.Fatalf("Hub refreshes after local marker failure=%d, want 0", refreshes)
+	}
+	store.mu.Lock()
+	store.requestErr = nil
+	store.mu.Unlock()
+	if _, err := admitter.Admit(context.Background(), "q_catalog_key", "public-resource"); !errors.Is(err, qurl.ErrNativeSessionOperationLeaseMargin) {
+		t.Fatalf("retry Admit() = %v, want lease-margin retry failure", err)
+	}
+	if refreshes != 1 || store.marks != 1 {
+		t.Fatalf("retry refreshes=%d marks=%d, want 1/1", refreshes, store.marks)
+	}
+}
+
+func TestNativeAdmitterRestoresImmediateRefreshAfterHubRejection(t *testing.T) {
+	oldRefresh := refreshNativeRuntime
+	oldTakeKey := takeNativeKey
+	oldWait := waitNativeRefresh
+	t.Cleanup(func() {
+		refreshNativeRuntime = oldRefresh
+		takeNativeKey = oldTakeKey
+		waitNativeRefresh = oldWait
+	})
+	takeNativeKey = func(*qurl.AgentRuntimeBinding) []byte { return make([]byte, 32) }
+	waits := 0
+	waitNativeRefresh = func(_ context.Context, delay time.Duration) error {
+		waits++
+		return fmt.Errorf("live refresh waited %s through persisted backoff", delay)
+	}
+	refreshes := 0
+	refreshNativeRuntime = func(context.Context, qurl.HubBootstrap, qurl.AgentStateStore, ...qurl.AgentRuntimeRefreshOption) (*qurl.Client, *qurl.AgentRuntimeBinding, error) {
+		refreshes++
+		if refreshes == 1 {
+			return nil, nil, qurl.ErrAssignmentQuotaExceeded
+		}
+		return &qurl.Client{}, &qurl.AgentRuntimeBinding{AgentID: "agent-one"}, nil
+	}
+	store := &memoryNativeStore{attemptBackoff: time.Second}
+	admitter := &NativeAdmitter{
+		binding: &qurl.AgentRuntimeBinding{AgentID: "agent-one"}, privateKey: make([]byte, 32),
+		operations: dispatchFailureOperations{err: qurl.ErrNativeSessionOperationLeaseMargin},
+		store:      store, refreshCfg: nativeRefreshConfig{AgentID: "agent-one", RefreshMode: "auto"},
+	}
+	if _, err := admitter.Admit(context.Background(), "q_catalog_key", "public-resource"); !errors.Is(err, qurl.ErrAssignmentQuotaExceeded) {
+		t.Fatalf("first Admit() = %v, want Hub rejection", err)
+	}
+	store.mu.Lock()
+	firstNextAttempt := store.marker.NextAttemptUnixMilli
+	store.mu.Unlock()
+	if _, err := admitter.Admit(context.Background(), "q_catalog_key", "public-resource"); !errors.Is(err, qurl.ErrNativeSessionOperationLeaseMargin) || !errors.Is(err, errNativeRefreshBackoffPending) {
+		t.Fatalf("backoff Admit() = %v, want lease margin with persisted backoff", err)
+	}
+	if refreshes != 1 || store.marks != 1 || waits != 0 {
+		t.Fatalf("during backoff refreshes=%d persisted attempts=%d waits=%d, want 1/1/0", refreshes, store.marks, waits)
+	}
+	store.mu.Lock()
+	store.marker.NextAttemptUnixMilli = time.Now().Add(-time.Second).UnixMilli()
+	store.mu.Unlock()
+	if _, err := admitter.Admit(context.Background(), "q_catalog_key", "public-resource"); !errors.Is(err, qurl.ErrNativeSessionOperationLeaseMargin) {
+		t.Fatalf("ready retry Admit() = %v, want lease-margin retry failure", err)
+	}
+	store.mu.Lock()
+	secondNextAttempt := store.marker.NextAttemptUnixMilli
+	store.mu.Unlock()
+	if refreshes != 2 || store.marks != 2 || waits != 0 || secondNextAttempt <= firstNextAttempt {
+		t.Fatalf("ready retry refreshes=%d marks=%d waits=%d next=%d after %d, want 2/2/0 and growing backoff",
+			refreshes, store.marks, waits, secondNextAttempt, firstNextAttempt)
 	}
 }
 
