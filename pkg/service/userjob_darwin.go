@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/layervai/qurl-connector/pkg/internal/atomicfile"
 )
@@ -18,11 +19,16 @@ import (
 type launchdUserJobManager struct {
 	plistPath      func(string) (string, error)
 	launchctlQuery func(...string) (string, error)
+	sleep          func(time.Duration)
 }
+
+const launchdBootstrapRetryDelay = 250 * time.Millisecond
 
 // NewUserJobManager returns a per-user launchd manager.
 func NewUserJobManager() UserJobManager {
-	return &launchdUserJobManager{plistPath: currentUserJobPlistPath, launchctlQuery: launchctlOutput}
+	return &launchdUserJobManager{
+		plistPath: currentUserJobPlistPath, launchctlQuery: launchctlOutput, sleep: time.Sleep,
+	}
 }
 
 func (m *launchdUserJobManager) Ensure(job UserJob) error {
@@ -83,13 +89,95 @@ func (m *launchdUserJobManager) ensure(job UserJob, forceReplace bool) error {
 			return fmt.Errorf("write launchd job %s: %w", job.Label, err)
 		}
 	}
-	if _, err := m.launchctlQuery("bootstrap", domain, plistPath); err != nil {
+	possiblyLoaded, err := m.bootstrapWithSettleRetry(domain, service, plistPath)
+	if err != nil {
+		// Unload an ambiguous job so a later Ensure cannot mistake it for this
+		// definition. Keep the new plist for login-time autostart when the unload
+		// succeeds. possiblyLoaded is deliberately conservative: it also includes
+		// a new job that bootstrap loaded before returning an error. Unload that
+		// job rather than trust unparsed launchctl arguments. After a confirmed
+		// unload, make one bounded bootstrap cycle in the same Ensure call so a
+		// transient EIO does not require the user to repeat publish. If even the
+		// unload is ambiguous, remove a changed plist fail-closed.
+		if possiblyLoaded {
+			unloadErr := m.unloadAmbiguous(service, plistPath, "ambiguous", definitionChanged)
+			err = errors.Join(err, unloadErr)
+			if unloadErr == nil {
+				retryLoaded, retryErr := m.bootstrapWithSettleRetry(domain, service, plistPath)
+				if retryErr == nil {
+					err = nil
+				} else {
+					err = errors.Join(err, fmt.Errorf("retry bootstrap after ambiguous unload: %w", retryErr))
+					if retryLoaded {
+						err = errors.Join(err, m.unloadAmbiguous(service, plistPath, "retry-ambiguous", definitionChanged))
+					}
+				}
+			}
+		}
+	}
+	if err != nil {
 		return fmt.Errorf("bootstrap launchd job %s: %w", job.Label, err)
 	}
 	if _, err := m.launchctlQuery("kickstart", "-k", service); err != nil {
 		return fmt.Errorf("start launchd job %s: %w", job.Label, err)
 	}
 	return nil
+}
+
+// unloadAmbiguous boots out a job whose loaded definition cannot be proven.
+// If launchd cannot confirm the unload, remove a changed plist so a later
+// Ensure cannot mistake the stale process for the replacement definition.
+func (m *launchdUserJobManager) unloadAmbiguous(service, plistPath, what string, definitionChanged bool) error {
+	_, err := m.launchctlQuery("bootout", service)
+	if err == nil || isLaunchdNotFound(err) {
+		return nil
+	}
+	joined := fmt.Errorf("unload %s launchd job: %w", what, err)
+	if definitionChanged {
+		if removeErr := os.Remove(plistPath); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+			joined = errors.Join(joined, fmt.Errorf("remove unconverged launchd job definition: %w", removeErr))
+		}
+	}
+	return joined
+}
+
+// bootstrapWithSettleRetry retries once only when launchd confirms the service
+// is absent. macOS can briefly return EIO after a successful bootout while it
+// finishes removing the prior job. The read between attempts also tells the
+// caller when a loaded or unreadable service state makes the result ambiguous.
+func (m *launchdUserJobManager) bootstrapWithSettleRetry(domain, service, plistPath string) (bool, error) {
+	_, firstErr := m.launchctlQuery("bootstrap", domain, plistPath)
+	if firstErr == nil {
+		return false, nil
+	}
+	sleep := m.sleep
+	if sleep == nil {
+		sleep = time.Sleep
+	}
+	sleep(launchdBootstrapRetryDelay)
+	if _, statusErr := m.launchctlQuery("print", service); statusErr == nil {
+		return true, firstErr
+	} else if !isLaunchdNotFound(statusErr) {
+		// An unreadable service state is ambiguous, not absent. Tell the caller
+		// to remove a changed plist so a later Ensure cannot confuse an old
+		// loaded job with the replacement definition.
+		return true, errors.Join(firstErr, fmt.Errorf("inspect launchd job after bootstrap failure: %w", statusErr))
+	}
+	if _, retryErr := m.launchctlQuery("bootstrap", domain, plistPath); retryErr != nil {
+		// bootstrap can return an error after launchd has accepted the job. Check
+		// the retry result exactly as we check the first attempt so the caller can
+		// unload an ambiguous replacement instead of reporting false convergence.
+		if _, statusErr := m.launchctlQuery("print", service); statusErr == nil {
+			return true, errors.Join(firstErr, retryErr)
+		} else if !isLaunchdNotFound(statusErr) {
+			return true, errors.Join(
+				firstErr, retryErr,
+				fmt.Errorf("inspect launchd job after bootstrap retry failure: %w", statusErr),
+			)
+		}
+		return false, errors.Join(firstErr, retryErr)
+	}
+	return false, nil
 }
 
 func (m *launchdUserJobManager) Remove(label string) error {
