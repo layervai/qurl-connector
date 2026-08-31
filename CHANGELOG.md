@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.8.10](https://github.com/layervai/qurl-connector/compare/v0.8.9...v0.8.10) (2026-08-31)
+
+
+### Bug Fixes
+
+* **service:** tolerate cold Windows task scheduler ([#30](https://github.com/layervai/qurl-connector/issues/30)) ([17a2464](https://github.com/layervai/qurl-connector/commit/17a24643169e5c18ed5590209c9a8cadd62c1159))
+
 ## [0.8.9](https://github.com/layervai/qurl-connector/compare/v0.8.8...v0.8.9) (2026-08-31)
 
 
