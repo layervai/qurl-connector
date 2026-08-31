@@ -793,9 +793,17 @@ func NewNativeAdmitter(ctx context.Context, runtime *NativeRuntime) (*NativeAdmi
 	// Startup cleanup must not take down healthy sibling shares. It is still
 	// fail-closed for each resource: that resource's lock and journal remain in
 	// place until authenticated recovery succeeds.
-	admitter.recoveryWG.Add(1)
-	go admitter.recoverOrphanedSessionOperations()
+	admitter.startRecoveryWorkers()
 	return admitter, nil
+}
+
+func (a *NativeAdmitter) startRecoveryWorkers() {
+	a.recoveryWG.Add(2)
+	go a.recoverOrphanedSessionOperations()
+	go func() {
+		defer a.recoveryWG.Done()
+		a.recoverQueuedNativeRetirements()
+	}()
 }
 
 func (a *NativeAdmitter) recoverOrphanedSessionOperations() {
@@ -815,7 +823,6 @@ func (a *NativeAdmitter) recoverOrphanedSessionOperations() {
 		}
 		backoff = min(backoff*2, nativeOrphanRecoveryMaxBackoff)
 	}
-	a.recoverQueuedNativeRetirements()
 }
 
 func waitForNativeRetirementRecovery(ctx context.Context, delay time.Duration) bool {

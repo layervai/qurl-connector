@@ -53,7 +53,7 @@ func TestRenderSystemdUserJobCredentialFreeAndEscaped(t *testing.T) {
 	}
 	for _, want := range []string{
 		`ExecStart="`, `$$(`, `%%n`, `quote\"slash\\`,
-		`Restart=on-failure`, `TimeoutStopSec=15s`, `UMask=0077`,
+		`Type=exec`, `Restart=on-failure`, `TimeoutStopSec=15s`, `UMask=0077`,
 		`StandardOutput=append:`, `StandardError=append:`,
 		`NoNewPrivileges=true`, `WantedBy=default.target`,
 	} {
@@ -62,7 +62,7 @@ func TestRenderSystemdUserJobCredentialFreeAndEscaped(t *testing.T) {
 		}
 	}
 	for _, forbidden := range []string{
-		"Environment=", "QURL_API_KEY", "Bearer", "ExecStart=/bin/sh", "PrivateTmp=", "network-online.target",
+		"Type=simple", "Environment=", "QURL_API_KEY", "Bearer", "ExecStart=/bin/sh", "PrivateTmp=", "network-online.target",
 	} {
 		if strings.Contains(got, forbidden) {
 			t.Errorf("credential-free systemd unit contains %q", forbidden)
@@ -261,7 +261,45 @@ func TestLinuxEnsureStartsMatchingEnabledStoppedJob(t *testing.T) {
 	if err := manager.Ensure(job); err != nil {
 		t.Fatal(err)
 	}
-	if want := []string{"show", "start", "show"}; !reflect.DeepEqual(verbs, want) {
+	if want := []string{"show", "reset-failed", "start", "show"}; !reflect.DeepEqual(verbs, want) {
+		t.Fatalf("systemctl verbs = %v, want %v", verbs, want)
+	}
+}
+
+func TestLinuxEnsureStopsWhenFailedStartLimitCannotReset(t *testing.T) {
+	job := linuxTestUserJob(t)
+	unitPath := filepath.Join(t.TempDir(), "systemd", "user", job.Label+".service")
+	if err := os.MkdirAll(filepath.Dir(unitPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	content, err := RenderSystemdUserJob(job)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(unitPath, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	wantErr := errors.New("reset failed")
+	var verbs []string
+	manager := &linuxUserJobManager{
+		unitPath: func(string) (string, error) { return unitPath, nil },
+		run: func(args ...string) (string, error) {
+			verbs = append(verbs, args[0])
+			switch args[0] {
+			case "show":
+				return linuxSystemdState(unitPath, "loaded", "inactive", "dead", "enabled", "no"), nil
+			case "reset-failed":
+				return "", wantErr
+			default:
+				t.Fatalf("unexpected systemctl call %v", args)
+				return "", nil
+			}
+		},
+	}
+	if err := manager.Ensure(job); !errors.Is(err, wantErr) {
+		t.Fatalf("Ensure error = %v, want reset-failed error", err)
+	}
+	if want := []string{"show", "reset-failed"}; !reflect.DeepEqual(verbs, want) {
 		t.Fatalf("systemctl verbs = %v, want %v", verbs, want)
 	}
 }
@@ -289,7 +327,7 @@ func TestLinuxEnsureInstallsAbsentJobWithoutShellFallback(t *testing.T) {
 	if err := manager.Ensure(job); err != nil {
 		t.Fatal(err)
 	}
-	if want := []string{"show", "daemon-reload", "disable", "start", "show"}; !reflect.DeepEqual(verbs, want) {
+	if want := []string{"show", "daemon-reload", "disable", "reset-failed", "start", "show"}; !reflect.DeepEqual(verbs, want) {
 		t.Fatalf("systemctl verbs = %v, want %v", verbs, want)
 	}
 	content, err := os.ReadFile(unitPath)
@@ -333,7 +371,7 @@ func TestLinuxEnsureReloadsMatchingFileWhenSystemdStateIsStale(t *testing.T) {
 	if err := manager.Ensure(job); err != nil {
 		t.Fatal(err)
 	}
-	if want := []string{"show", "stop", "daemon-reload", "enable", "start", "show"}; !reflect.DeepEqual(verbs, want) {
+	if want := []string{"show", "stop", "daemon-reload", "enable", "reset-failed", "start", "show"}; !reflect.DeepEqual(verbs, want) {
 		t.Fatalf("systemctl verbs = %v, want %v", verbs, want)
 	}
 }
@@ -366,7 +404,7 @@ func TestLinuxEnsureRepairsBadSettingDefinition(t *testing.T) {
 	if err := manager.Ensure(job); err != nil {
 		t.Fatal(err)
 	}
-	if want := []string{"show", "daemon-reload", "enable", "start", "show"}; !reflect.DeepEqual(verbs, want) {
+	if want := []string{"show", "daemon-reload", "enable", "reset-failed", "start", "show"}; !reflect.DeepEqual(verbs, want) {
 		t.Fatalf("systemctl verbs = %v, want %v", verbs, want)
 	}
 }
@@ -405,7 +443,7 @@ func TestLinuxEnsureReplacesChangedDefinitionAfterStopping(t *testing.T) {
 	if err := manager.Ensure(job); err != nil {
 		t.Fatal(err)
 	}
-	if want := []string{"show", "stop", "daemon-reload", "enable", "start", "show"}; !reflect.DeepEqual(verbs, want) {
+	if want := []string{"show", "stop", "daemon-reload", "enable", "reset-failed", "start", "show"}; !reflect.DeepEqual(verbs, want) {
 		t.Fatalf("systemctl verbs = %v, want %v", verbs, want)
 	}
 	updated, err := os.ReadFile(unitPath)
@@ -596,6 +634,68 @@ func TestLinuxRemoveCleansBadSettingDefinition(t *testing.T) {
 	}
 	if _, err := os.Lstat(unitPath); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("bad-setting definition remains: %v", err)
+	}
+}
+
+func TestLinuxRemoveCleansOwnerDefinitionWithDriftedMode(t *testing.T) {
+	job := linuxTestUserJob(t)
+	unitPath := filepath.Join(t.TempDir(), "systemd", "user", job.Label+".service")
+	if err := os.MkdirAll(filepath.Dir(unitPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(unitPath, []byte("[Service]\nType=exec\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var verbs []string
+	manager := &linuxUserJobManager{
+		unitPath: func(string) (string, error) { return unitPath, nil },
+		run: func(args ...string) (string, error) {
+			verbs = append(verbs, args[0])
+			if args[0] == "show" {
+				return linuxSystemdState(unitPath, "loaded", "inactive", "dead", "disabled", "no"), nil
+			}
+			return "", nil
+		},
+	}
+	if err := manager.Remove(job.Label); err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"show", "disable", "daemon-reload"}; !reflect.DeepEqual(verbs, want) {
+		t.Fatalf("systemctl verbs = %v, want %v", verbs, want)
+	}
+	if _, err := os.Lstat(unitPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("mode-drifted definition remains: %v", err)
+	}
+}
+
+func TestLinuxRemoveUnmasksManagedDefinitionBeforeCleanup(t *testing.T) {
+	job := linuxTestUserJob(t)
+	unitPath := filepath.Join(t.TempDir(), "systemd", "user", job.Label+".service")
+	if err := os.MkdirAll(filepath.Dir(unitPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(unitPath, []byte("[Service]\nType=exec\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var verbs []string
+	manager := &linuxUserJobManager{
+		unitPath: func(string) (string, error) { return unitPath, nil },
+		run: func(args ...string) (string, error) {
+			verbs = append(verbs, args[0])
+			if args[0] == "show" {
+				return linuxSystemdState(unitPath, "masked", "inactive", "dead", "masked-runtime", "no"), nil
+			}
+			return "", nil
+		},
+	}
+	if err := manager.Remove(job.Label); err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"show", "unmask", "disable", "daemon-reload"}; !reflect.DeepEqual(verbs, want) {
+		t.Fatalf("systemctl verbs = %v, want %v", verbs, want)
+	}
+	if _, err := os.Lstat(unitPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("masked definition remains: %v", err)
 	}
 }
 

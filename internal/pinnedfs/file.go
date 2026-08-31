@@ -15,6 +15,14 @@ func ValidateRegularFile(namespace *Directory, name string, file *os.File, label
 	})
 }
 
+// ValidateOwnerRegularFile proves the same descriptor-entry continuity as
+// ValidateRegularFile while accepting any mode on an euid-owned file. It is
+// for safe cleanup of private state whose mode may have drifted, never for
+// reading or executing that state.
+func ValidateOwnerRegularFile(namespace *Directory, name string, file *os.File, label string) (os.FileInfo, error) {
+	return validateRegularFile(namespace, name, file, label, validateOwnerRegularDescriptor)
+}
+
 // ValidateTrustedReadOnlyFile proves the same descriptor-entry continuity as
 // ValidateRegularFile while accepting a root- or euid-owned file with any
 // read bits and no group/other write bits. It is for immutable customer config
@@ -82,6 +90,16 @@ func validateRegularDescriptor(info os.FileInfo, label string, mode os.FileMode)
 	}
 	if info.Mode().Perm() != mode.Perm() {
 		return fmt.Errorf("%s mode is %04o, want %04o", label, info.Mode().Perm(), mode.Perm())
+	}
+	if err := RequireSingleLinkInfo(info, label); err != nil {
+		return err
+	}
+	return RequireCurrentOwnerInfo(info, label)
+}
+
+func validateOwnerRegularDescriptor(info os.FileInfo, label string) error {
+	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+		return fmt.Errorf("%s must be a non-symlink regular file", label)
 	}
 	if err := RequireSingleLinkInfo(info, label); err != nil {
 		return err

@@ -207,6 +207,19 @@ type blockingQueuedRetirementOperations struct {
 	stopOnce          sync.Once
 }
 
+type signalingRetirementOperations struct {
+	testNativeSessionOperations
+	started chan struct{}
+	once    sync.Once
+}
+
+func (o *signalingRetirementOperations) Retire(_ context.Context, _ *qurl.AgentRuntimeBinding, _ []byte,
+	_, _ string, _ qurl.NativeSessionReceipt, _ []qurl.AgentRuntimeUDPOption,
+) error {
+	o.once.Do(func() { close(o.started) })
+	return nil
+}
+
 func (o *blockingQueuedRetirementOperations) Retire(ctx context.Context, _ *qurl.AgentRuntimeBinding, _ []byte,
 	_, _ string, _ qurl.NativeSessionReceipt, _ []qurl.AgentRuntimeUDPOption,
 ) error {
@@ -2767,8 +2780,7 @@ func TestNativeAdmitterCanceledRetireWakesBoundedResourceRecovery(t *testing.T) 
 		lifecycle:                   lifecycle,
 		cancel:                      cancelLifecycle,
 	}
-	admitter.recoveryWG.Add(1)
-	go admitter.recoverOrphanedSessionOperations()
+	admitter.startRecoveryWorkers()
 	t.Cleanup(func() {
 		if err := admitter.Close(); err != nil {
 			t.Errorf("Close() error = %v", err)
@@ -2825,6 +2837,36 @@ func TestNativeAdmitterCanceledRetireWakesBoundedResourceRecovery(t *testing.T) 
 	}
 }
 
+func TestNativeAdmitterQueuedRetirementStartsWhileOrphanScanFails(t *testing.T) {
+	receipt := testSessionReceipt(1, "run-one", 1)
+	key := admissionKey(receipt)
+	store := &memoryNativeStore{scanRetryableErr: errors.New("scan unavailable")}
+	operations := &signalingRetirementOperations{started: make(chan struct{})}
+	lifecycle, cancelLifecycle := context.WithCancel(context.Background())
+	admitter := &NativeAdmitter{
+		binding: &qurl.AgentRuntimeBinding{AgentID: "agent-one"}, privateKey: make([]byte, 32),
+		operations: operations, store: store,
+		live: map[nativeAdmissionKey]nativeLiveAdmission{
+			key: {resourceID: "resource-one", operationID: "operation-one", receipt: receipt},
+		},
+		pending:                     map[nativeAdmissionKey]bool{key: true},
+		retirementRecoveryWake:      make(chan struct{}, 1),
+		retirementRecoveryResources: make(map[string]struct{}),
+		lifecycle:                   lifecycle,
+		cancel:                      cancelLifecycle,
+	}
+	admitter.startRecoveryWorkers()
+	admitter.queueNativeRetirementRecovery("resource-one")
+	select {
+	case <-operations.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("queued retirement was gated behind the failing orphan scan")
+	}
+	if err := admitter.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestNativeAdmitterCloseCancelsQueuedRetirementRecovery(t *testing.T) {
 	receipt := testSessionReceipt(1, "run-one", 1)
 	key := admissionKey(receipt)
@@ -2845,8 +2887,7 @@ func TestNativeAdmitterCloseCancelsQueuedRetirementRecovery(t *testing.T) {
 		lifecycle:                   lifecycle,
 		cancel:                      cancelLifecycle,
 	}
-	admitter.recoveryWG.Add(1)
-	go admitter.recoverOrphanedSessionOperations()
+	admitter.startRecoveryWorkers()
 	if err := admitter.Retire(context.Background(), Admission{
 		ResourceID: "resource-one", RunID: "run-one", RunAttempt: 1,
 		SessionID: 1, SessionReceipt: receipt,

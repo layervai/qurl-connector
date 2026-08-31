@@ -27,7 +27,7 @@ const systemdUserJobTemplate = `[Unit]
 Description=qURL background daemon - managed by qurl, do not edit
 
 [Service]
-Type=simple
+Type=exec
 ExecStart={{systemdExecutable .BinaryPath}}{{range .Arguments}} {{systemdExec .}}{{end}}
 Restart={{if .KeepAlive}}on-failure{{else}}no{{end}}
 RestartSec=1s
@@ -53,6 +53,7 @@ type linuxUnitState struct {
 	loaded           bool
 	running          bool
 	invalid          bool
+	masked           bool
 	unitFileState    string
 	fragmentPath     string
 	needDaemonReload bool
@@ -277,6 +278,9 @@ func (m *linuxUserJobManager) setRunAtLoad(label string, runAtLoad bool) error {
 }
 
 func (m *linuxUserJobManager) start(label, unitPath string, runAtLoad bool) error {
+	if _, err := m.run("reset-failed", systemdUserUnitName(label)); err != nil {
+		return fmt.Errorf("reset failed-start limit for systemd user job %s: %w", label, err)
+	}
 	if _, err := m.run("start", systemdUserUnitName(label)); err != nil {
 		return fmt.Errorf("start systemd user job %s: %w", label, err)
 	}
@@ -300,20 +304,25 @@ func (m *linuxUserJobManager) Remove(label string) error {
 	if err != nil {
 		return err
 	}
-	if _, _, err := readLinuxUserJobDefinition(unitPath); err != nil {
+	if err := validateRemovableLinuxUserJobDefinition(unitPath); err != nil {
 		return fmt.Errorf("validate systemd user job %s before removal: %w", label, err)
 	}
-	state, err := m.state(label, unitPath)
+	state, err := m.removalState(label, unitPath)
 	if err != nil {
 		return err
 	}
 	unit := systemdUserUnitName(label)
-	if state.loaded {
+	if state.running {
 		if _, err := m.run("stop", unit); err != nil {
 			return fmt.Errorf("stop systemd user job %s: %w", label, err)
 		}
 	}
-	if state.loaded || state.invalid || state.unitFileState != "" {
+	if state.masked {
+		if _, err := m.run("unmask", unit); err != nil {
+			return fmt.Errorf("unmask systemd user job %s before removal: %w", label, err)
+		}
+	}
+	if state.loaded || state.invalid || state.masked || state.unitFileState != "" {
 		if _, err := m.run("disable", unit); err != nil {
 			return fmt.Errorf("disable systemd user job %s: %w", label, err)
 		}
@@ -321,7 +330,7 @@ func (m *linuxUserJobManager) Remove(label string) error {
 	if err := removeLinuxUserJobDefinition(unitPath); err != nil {
 		return fmt.Errorf("remove systemd user job %s: %w", label, err)
 	}
-	if state.loaded || state.invalid || state.unitFileState != "" {
+	if state.loaded || state.invalid || state.masked || state.unitFileState != "" {
 		if _, err := m.run("daemon-reload"); err != nil {
 			return fmt.Errorf("reload systemd user manager after removing %s: %w", label, err)
 		}
@@ -354,6 +363,14 @@ func (m *linuxUserJobManager) Status(label string) (ServiceStatus, error) {
 }
 
 func (m *linuxUserJobManager) state(label, unitPath string) (linuxUnitState, error) {
+	return m.inspectState(label, unitPath, false)
+}
+
+func (m *linuxUserJobManager) removalState(label, unitPath string) (linuxUnitState, error) {
+	return m.inspectState(label, unitPath, true)
+}
+
+func (m *linuxUserJobManager) inspectState(label, unitPath string, allowMasked bool) (linuxUnitState, error) {
 	unit := systemdUserUnitName(label)
 	output, err := m.run(
 		"show", unit, "--no-pager",
@@ -386,14 +403,15 @@ func (m *linuxUserJobManager) state(label, unitPath string) (linuxUnitState, err
 		loaded:           properties["LoadState"] == "loaded",
 		running:          properties["ActiveState"] == "active" && properties["SubState"] == "running",
 		invalid:          properties["LoadState"] == "bad-setting",
+		masked:           properties["LoadState"] == "masked" || strings.HasPrefix(properties["UnitFileState"], "masked"),
 		unitFileState:    properties["UnitFileState"],
 		fragmentPath:     properties["FragmentPath"],
 		needDaemonReload: properties["NeedDaemonReload"] == "yes",
 	}
-	if !state.loaded && !state.invalid && properties["LoadState"] != "not-found" {
+	if !state.loaded && !state.invalid && properties["LoadState"] != "not-found" && !(allowMasked && state.masked) {
 		return linuxUnitState{}, fmt.Errorf("systemd user job %s has unsupported load state %q", label, properties["LoadState"])
 	}
-	if state.running && !state.loaded {
+	if state.running && !state.loaded && !(allowMasked && state.masked) {
 		return linuxUnitState{}, fmt.Errorf("systemd user job %s is running without a loaded definition", label)
 	}
 	if state.loaded && state.fragmentPath == "" {
@@ -470,7 +488,7 @@ func removeLinuxUserJobDefinition(path string) (retErr error) {
 	if err != nil {
 		return err
 	}
-	if _, err := pinnedfs.ValidateRegularFile(dir, name, file, "systemd user job definition", 0o600); err != nil {
+	if _, err := pinnedfs.ValidateOwnerRegularFile(dir, name, file, "systemd user job definition"); err != nil {
 		return errors.Join(err, file.Close())
 	}
 	if err := file.Close(); err != nil {
@@ -480,6 +498,27 @@ func removeLinuxUserJobDefinition(path string) (retErr error) {
 		return err
 	}
 	return dir.Sync()
+}
+
+func validateRemovableLinuxUserJobDefinition(path string) (retErr error) {
+	dir, err := pinnedfs.OpenTrusted(filepath.Dir(path))
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	defer func() { retErr = errors.Join(retErr, dir.Close()) }()
+	name := filepath.Base(path)
+	file, err := dir.OpenFile(name, os.O_RDONLY|unix.O_NOFOLLOW, 0)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	_, validateErr := pinnedfs.ValidateOwnerRegularFile(dir, name, file, "systemd user job definition")
+	return errors.Join(validateErr, file.Close())
 }
 
 func ensureLinuxUserJobLogs(paths ...string) error {
