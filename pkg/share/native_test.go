@@ -970,6 +970,49 @@ func TestNativeRuntimeDeviceAuthorizationRecoveryFailureDoesNotLoopOrReplace(t *
 	}
 }
 
+func TestNativeRuntimeDeviceAuthorizationAssemblyFailureDoesNotLoopOrReplace(t *testing.T) {
+	oldRecover := recoverNativeRuntime
+	t.Cleanup(func() { recoverNativeRuntime = oldRecover })
+	providerCalls := 0
+	recoveryCalls := 0
+	recoverNativeRuntime = func(ctx context.Context, provider qurl.AgentRuntimeRecoveryCredentialProvider, _ qurl.AgentStateStore, _ ...qurl.AgentRuntimeRecoveryOption) (*qurl.Client, *qurl.AgentRuntimeBinding, error) {
+		recoveryCalls++
+		if _, err := provider(ctx); err != nil {
+			return nil, nil, err
+		}
+		return &qurl.Client{}, &qurl.AgentRuntimeBinding{AgentID: "agent-two"}, nil
+	}
+	oldClient := &qurl.Client{}
+	oldBinding := &qurl.AgentRuntimeBinding{AgentID: "agent-one"}
+	store := &memoryNativeStore{}
+	runtime := &NativeRuntime{
+		Client: oldClient, Binding: oldBinding, AgentID: "agent-one", OpenKind: NativeOpenWarm,
+		store: store, refreshCfg: nativeRefreshConfig{AgentID: "agent-one"},
+	}
+	provider := func(context.Context) (string, error) {
+		providerCalls++
+		return "lv_test_validatedaccountcredentialabcdefghijklmnopqrstuvwxyz", nil
+	}
+	err := runtime.RecoverCredentialAfterDeviceAuthorizationFailure(
+		context.Background(), http.StatusUnauthorized, "api_key_invalid", provider,
+	)
+	if err == nil || !strings.Contains(err.Error(), "conflicts with persisted identity") {
+		t.Fatalf("assembly error = %v, want identity conflict", err)
+	}
+	if runtime.Client != oldClient || runtime.Binding != oldBinding || runtime.OpenKind != NativeOpenWarm {
+		t.Fatal("failed assembly replaced the warm runtime")
+	}
+	err = runtime.RecoverCredentialAfterDeviceAuthorizationFailure(
+		context.Background(), http.StatusUnauthorized, "api_key_invalid", provider,
+	)
+	if !errors.Is(err, errNativeDeviceAuthorizationRecoveryNotAllowed) {
+		t.Fatalf("second repair error = %v, want one-shot rejection", err)
+	}
+	if providerCalls != 1 || recoveryCalls != 1 || store.handoffCalls != 1 {
+		t.Fatalf("failed assembly looped: provider/recovery/handoff=%d/%d/%d", providerCalls, recoveryCalls, store.handoffCalls)
+	}
+}
+
 func TestOpenNativeRuntimeResumesPersistedCredentialRecovery(t *testing.T) {
 	oldStore := newNativeStateStore
 	oldConnect := connectNativeRuntime
@@ -2829,6 +2872,31 @@ func TestNativeAdmitterCloseCancelsQueuedRetirementRecovery(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("Close did not finish after queued retirement stopped")
+	}
+}
+
+func TestNativeAdmitterRetirementBatchRequeuesFailureBeforeRetireOne(t *testing.T) {
+	lifecycle, cancelLifecycle := context.WithCancel(context.Background())
+	defer cancelLifecycle()
+	admitter := &NativeAdmitter{
+		// An incomplete runtime makes recovery fail before retireOne can requeue.
+		retirementRecoveryWake:      make(chan struct{}, 1),
+		retirementRecoveryResources: map[string]struct{}{"resource-one": {}},
+		lifecycle:                   lifecycle,
+	}
+	if retry := admitter.recoverQueuedNativeRetirementBatch(); !retry {
+		t.Fatal("retirement batch did not report a retryable pre-retire failure")
+	}
+	admitter.stateMu.Lock()
+	_, queued := admitter.retirementRecoveryResources["resource-one"]
+	admitter.stateMu.Unlock()
+	if !queued {
+		t.Fatal("retirement batch dropped a resource after a pre-retire failure")
+	}
+	select {
+	case <-admitter.retirementRecoveryWake:
+	default:
+		t.Fatal("retirement batch did not wake the worker after requeueing")
 	}
 }
 

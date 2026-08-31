@@ -872,18 +872,9 @@ func (a *NativeAdmitter) recoverQueuedNativeRetirements() {
 			return
 		case <-a.retirementRecoveryWake:
 		}
-		retry := false
-		for _, resourceID := range a.takeNativeRetirementRecoveryResources() {
-			if err := a.recoverPendingNativeRetirements(a.lifecycle, resourceID); err != nil {
-				if a.lifecycle.Err() != nil {
-					return
-				}
-				// retireOne requeues the same resource before returning. Keep
-				// one capped delay between attempts so a silent issuing cell
-				// cannot create a local retry loop.
-				retry = true
-				slog.WarnContext(a.lifecycle, "durable native session retirement failed; retrying", "err", err)
-			}
+		retry := a.recoverQueuedNativeRetirementBatch()
+		if a.lifecycle.Err() != nil {
+			return
 		}
 		if !retry {
 			backoff = nativeOrphanRecoveryInitialBackoff
@@ -894,6 +885,23 @@ func (a *NativeAdmitter) recoverQueuedNativeRetirements() {
 		}
 		backoff = min(backoff*2, nativeOrphanRecoveryMaxBackoff)
 	}
+}
+
+func (a *NativeAdmitter) recoverQueuedNativeRetirementBatch() bool {
+	retry := false
+	for _, resourceID := range a.takeNativeRetirementRecoveryResources() {
+		if err := a.recoverPendingNativeRetirements(a.lifecycle, resourceID); err != nil {
+			if a.lifecycle.Err() != nil {
+				return false
+			}
+			// Re-arm here as well as in retireOne. This keeps the worker live
+			// when validation fails before retireOne receives the resource.
+			a.queueNativeRetirementRecovery(resourceID)
+			retry = true
+			slog.WarnContext(a.lifecycle, "durable native session retirement failed; retrying", "err", err)
+		}
+	}
+	return retry
 }
 
 func (a *NativeAdmitter) recoverPendingNativeRetirements(ctx context.Context, resourceID string) error {

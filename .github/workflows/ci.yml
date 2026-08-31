@@ -53,15 +53,20 @@ jobs:
         run: |
           set -euo pipefail
           user_id="$(id -u)"
+          user_name="$(id -un)"
           export XDG_RUNTIME_DIR="/run/user/${user_id}"
           export DBUS_SESSION_BUS_ADDRESS="unix:path=${XDG_RUNTIME_DIR}/bus"
           cleanup() {
             systemctl --user disable --now ai.layerv.qurl.integration.service 2>/dev/null || true
-            sudo loginctl disable-linger "$USER" 2>/dev/null || true
+            sudo loginctl disable-linger "$user_name" 2>/dev/null || true
           }
           trap cleanup EXIT
-          sudo loginctl enable-linger "$USER"
+          sudo loginctl enable-linger "$user_name"
           sudo systemctl start "user@${user_id}.service"
+          for _ in $(seq 1 50); do
+            [[ -S "${XDG_RUNTIME_DIR}/bus" ]] && break
+            sleep 0.2
+          done
           [[ -S "${XDG_RUNTIME_DIR}/bus" ]] || {
             echo "systemd user bus is unavailable" >&2
             exit 1

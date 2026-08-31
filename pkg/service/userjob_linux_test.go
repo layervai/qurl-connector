@@ -33,10 +33,10 @@ func linuxTestUserJob(t *testing.T) UserJob {
 	}
 }
 
-func linuxSystemdState(unitPath, load, active, sub, reload string) string {
+func linuxSystemdState(unitPath, load, active, sub, unitFileState, reload string) string {
 	return fmt.Sprintf(
-		"LoadState=%s\nActiveState=%s\nSubState=%s\nFragmentPath=%s\nNeedDaemonReload=%s\n",
-		load, active, sub, unitPath, reload,
+		"LoadState=%s\nActiveState=%s\nSubState=%s\nUnitFileState=%s\nFragmentPath=%s\nNeedDaemonReload=%s\n",
+		load, active, sub, unitFileState, unitPath, reload,
 	)
 }
 
@@ -55,13 +55,15 @@ func TestRenderSystemdUserJobCredentialFreeAndEscaped(t *testing.T) {
 		`ExecStart="`, `$$(`, `%%n`, `quote\"slash\\`,
 		`Restart=on-failure`, `TimeoutStopSec=15s`, `UMask=0077`,
 		`StandardOutput=append:`, `StandardError=append:`,
-		`NoNewPrivileges=true`, `PrivateTmp=true`, `WantedBy=default.target`,
+		`NoNewPrivileges=true`, `WantedBy=default.target`,
 	} {
 		if !strings.Contains(got, want) {
 			t.Errorf("systemd unit missing %q:\n%s", want, got)
 		}
 	}
-	for _, forbidden := range []string{"Environment=", "QURL_API_KEY", "Bearer", "ExecStart=/bin/sh"} {
+	for _, forbidden := range []string{
+		"Environment=", "QURL_API_KEY", "Bearer", "ExecStart=/bin/sh", "PrivateTmp=", "network-online.target",
+	} {
 		if strings.Contains(got, forbidden) {
 			t.Errorf("credential-free systemd unit contains %q", forbidden)
 		}
@@ -139,7 +141,7 @@ func TestLinuxEnsureLeavesExactRunningJobUntouched(t *testing.T) {
 		unitPath: func(string) (string, error) { return unitPath, nil },
 		run: func(args ...string) (string, error) {
 			calls = append(calls, append([]string(nil), args...))
-			return linuxSystemdState(unitPath, "loaded", "active", "running", "no"), nil
+			return linuxSystemdState(unitPath, "loaded", "active", "running", "enabled", "no"), nil
 		},
 	}
 	if err := manager.Ensure(job); err != nil {
@@ -147,6 +149,120 @@ func TestLinuxEnsureLeavesExactRunningJobUntouched(t *testing.T) {
 	}
 	if len(calls) != 1 || calls[0][0] != "show" {
 		t.Fatalf("systemctl calls = %#v, want one non-disruptive show", calls)
+	}
+}
+
+func TestLinuxEnsureRepairsDisabledExactRunningJob(t *testing.T) {
+	job := linuxTestUserJob(t)
+	unitPath := filepath.Join(t.TempDir(), "systemd", "user", job.Label+".service")
+	if err := os.MkdirAll(filepath.Dir(unitPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	content, err := RenderSystemdUserJob(job)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(unitPath, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var verbs []string
+	showCalls := 0
+	manager := &linuxUserJobManager{
+		unitPath: func(string) (string, error) { return unitPath, nil },
+		run: func(args ...string) (string, error) {
+			verbs = append(verbs, args[0])
+			if args[0] == "show" {
+				showCalls++
+				unitFileState := "disabled"
+				if showCalls > 1 {
+					unitFileState = "enabled"
+				}
+				return linuxSystemdState(unitPath, "loaded", "active", "running", unitFileState, "no"), nil
+			}
+			return "", nil
+		},
+	}
+	if err := manager.Ensure(job); err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"show", "enable", "show"}; !reflect.DeepEqual(verbs, want) {
+		t.Fatalf("systemctl verbs = %v, want %v", verbs, want)
+	}
+}
+
+func TestLinuxEnsureDisablesUnexpectedRunAtLoadWithoutRestart(t *testing.T) {
+	job := linuxTestUserJob(t)
+	job.RunAtLoad = false
+	unitPath := filepath.Join(t.TempDir(), "systemd", "user", job.Label+".service")
+	if err := os.MkdirAll(filepath.Dir(unitPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	content, err := RenderSystemdUserJob(job)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(unitPath, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var verbs []string
+	showCalls := 0
+	manager := &linuxUserJobManager{
+		unitPath: func(string) (string, error) { return unitPath, nil },
+		run: func(args ...string) (string, error) {
+			verbs = append(verbs, args[0])
+			if args[0] == "show" {
+				showCalls++
+				unitFileState := "enabled"
+				if showCalls > 1 {
+					unitFileState = "disabled"
+				}
+				return linuxSystemdState(unitPath, "loaded", "active", "running", unitFileState, "no"), nil
+			}
+			return "", nil
+		},
+	}
+	if err := manager.Ensure(job); err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"show", "disable", "show"}; !reflect.DeepEqual(verbs, want) {
+		t.Fatalf("systemctl verbs = %v, want %v", verbs, want)
+	}
+}
+
+func TestLinuxEnsureStartsMatchingEnabledStoppedJob(t *testing.T) {
+	job := linuxTestUserJob(t)
+	unitPath := filepath.Join(t.TempDir(), "systemd", "user", job.Label+".service")
+	if err := os.MkdirAll(filepath.Dir(unitPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	content, err := RenderSystemdUserJob(job)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(unitPath, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var verbs []string
+	showCalls := 0
+	manager := &linuxUserJobManager{
+		unitPath: func(string) (string, error) { return unitPath, nil },
+		run: func(args ...string) (string, error) {
+			verbs = append(verbs, args[0])
+			if args[0] == "show" {
+				showCalls++
+				if showCalls == 1 {
+					return linuxSystemdState(unitPath, "loaded", "inactive", "dead", "enabled", "no"), nil
+				}
+				return linuxSystemdState(unitPath, "loaded", "active", "running", "enabled", "no"), nil
+			}
+			return "", nil
+		},
+	}
+	if err := manager.Ensure(job); err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"show", "start", "show"}; !reflect.DeepEqual(verbs, want) {
+		t.Fatalf("systemctl verbs = %v, want %v", verbs, want)
 	}
 }
 
@@ -163,9 +279,9 @@ func TestLinuxEnsureInstallsAbsentJobWithoutShellFallback(t *testing.T) {
 			if args[0] == "show" {
 				showCalls++
 				if showCalls == 1 {
-					return linuxSystemdState("", "not-found", "inactive", "dead", "no"), nil
+					return linuxSystemdState("", "not-found", "inactive", "dead", "", "no"), nil
 				}
-				return linuxSystemdState(unitPath, "loaded", "active", "running", "no"), nil
+				return linuxSystemdState(unitPath, "loaded", "active", "running", "disabled", "no"), nil
 			}
 			return "", nil
 		},
@@ -207,9 +323,9 @@ func TestLinuxEnsureReloadsMatchingFileWhenSystemdStateIsStale(t *testing.T) {
 			if args[0] == "show" {
 				showCalls++
 				if showCalls == 1 {
-					return linuxSystemdState(unitPath, "loaded", "active", "running", "yes"), nil
+					return linuxSystemdState(unitPath, "loaded", "active", "running", "enabled", "yes"), nil
 				}
-				return linuxSystemdState(unitPath, "loaded", "active", "running", "no"), nil
+				return linuxSystemdState(unitPath, "loaded", "active", "running", "enabled", "no"), nil
 			}
 			return "", nil
 		},
@@ -240,9 +356,9 @@ func TestLinuxEnsureRepairsBadSettingDefinition(t *testing.T) {
 			if args[0] == "show" {
 				showCalls++
 				if showCalls == 1 {
-					return linuxSystemdState(unitPath, "bad-setting", "inactive", "dead", "no"), nil
+					return linuxSystemdState(unitPath, "bad-setting", "inactive", "dead", "disabled", "no"), nil
 				}
-				return linuxSystemdState(unitPath, "loaded", "active", "running", "no"), nil
+				return linuxSystemdState(unitPath, "loaded", "active", "running", "enabled", "no"), nil
 			}
 			return "", nil
 		},
@@ -279,9 +395,9 @@ func TestLinuxEnsureReplacesChangedDefinitionAfterStopping(t *testing.T) {
 			if args[0] == "show" {
 				showCalls++
 				if showCalls == 1 {
-					return linuxSystemdState(unitPath, "loaded", "active", "running", "no"), nil
+					return linuxSystemdState(unitPath, "loaded", "active", "running", "enabled", "no"), nil
 				}
-				return linuxSystemdState(unitPath, "loaded", "active", "running", "no"), nil
+				return linuxSystemdState(unitPath, "loaded", "active", "running", "enabled", "no"), nil
 			}
 			return "", nil
 		},
@@ -321,7 +437,7 @@ func TestLinuxEnsurePreservesOldDefinitionWhenStopFails(t *testing.T) {
 		unitPath: func(string) (string, error) { return unitPath, nil },
 		run: func(args ...string) (string, error) {
 			if args[0] == "show" {
-				return linuxSystemdState(unitPath, "loaded", "active", "running", "no"), nil
+				return linuxSystemdState(unitPath, "loaded", "active", "running", "enabled", "no"), nil
 			}
 			if args[0] == "stop" {
 				return "", stopErr
@@ -361,7 +477,7 @@ func TestLinuxStatusAndRemoveAreExactAndIdempotent(t *testing.T) {
 		run: func(args ...string) (string, error) {
 			verbs = append(verbs, args[0])
 			if args[0] == "show" {
-				return linuxSystemdState(unitPath, "loaded", "active", "running", "no"), nil
+				return linuxSystemdState(unitPath, "loaded", "active", "running", "enabled", "no"), nil
 			}
 			return "", nil
 		},
@@ -387,7 +503,7 @@ func TestLinuxStatusRejectsLoadedUnitFromUnexpectedPath(t *testing.T) {
 	manager := &linuxUserJobManager{
 		unitPath: func(string) (string, error) { return unitPath, nil },
 		run: func(args ...string) (string, error) {
-			return linuxSystemdState("/etc/systemd/user/"+job.Label+".service", "loaded", "active", "running", "no"), nil
+			return linuxSystemdState("/etc/systemd/user/"+job.Label+".service", "loaded", "active", "running", "enabled", "no"), nil
 		},
 	}
 	status, err := manager.Status(job.Label)
@@ -396,6 +512,31 @@ func TestLinuxStatusRejectsLoadedUnitFromUnexpectedPath(t *testing.T) {
 	}
 	if status.Installed || status.Running {
 		t.Fatalf("Status reported an untrusted job as installed or running: %#v", status)
+	}
+}
+
+func TestLinuxStateRejectsMalformedManagerProperties(t *testing.T) {
+	unitPath := filepath.Join(t.TempDir(), "systemd", "user", "ai.layerv.qurl.daemon.service")
+	valid := linuxSystemdState(unitPath, "loaded", "active", "running", "enabled", "no")
+	tests := []struct {
+		name   string
+		output string
+		want   string
+	}{
+		{name: "duplicate", output: valid + "LoadState=loaded\n", want: "duplicate"},
+		{name: "missing", output: strings.Replace(valid, "UnitFileState=enabled\n", "", 1), want: "omitted UnitFileState"},
+		{name: "invalid reload", output: strings.Replace(valid, "NeedDaemonReload=no", "NeedDaemonReload=maybe", 1), want: "invalid daemon-reload"},
+		{name: "unsupported load", output: strings.Replace(valid, "LoadState=loaded", "LoadState=masked", 1), want: "unsupported load state"},
+		{name: "running not loaded", output: strings.Replace(valid, "LoadState=loaded", "LoadState=not-found", 1), want: "running without a loaded definition"},
+		{name: "loaded no fragment", output: strings.Replace(valid, "FragmentPath="+unitPath, "FragmentPath=", 1), want: "no fragment path"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			manager := &linuxUserJobManager{run: func(...string) (string, error) { return test.output, nil }}
+			if _, err := manager.state("ai.layerv.qurl.daemon", unitPath); err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("state error = %v, want %q", err, test.want)
+			}
+		})
 	}
 }
 
@@ -442,7 +583,7 @@ func TestLinuxRemoveCleansBadSettingDefinition(t *testing.T) {
 		run: func(args ...string) (string, error) {
 			verbs = append(verbs, args[0])
 			if args[0] == "show" {
-				return linuxSystemdState(unitPath, "bad-setting", "inactive", "dead", "no"), nil
+				return linuxSystemdState(unitPath, "bad-setting", "inactive", "dead", "disabled", "no"), nil
 			}
 			return "", nil
 		},
@@ -455,6 +596,28 @@ func TestLinuxRemoveCleansBadSettingDefinition(t *testing.T) {
 	}
 	if _, err := os.Lstat(unitPath); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("bad-setting definition remains: %v", err)
+	}
+}
+
+func TestLinuxRemoveDisablesDanglingEnablement(t *testing.T) {
+	job := linuxTestUserJob(t)
+	unitPath := filepath.Join(t.TempDir(), "systemd", "user", job.Label+".service")
+	var verbs []string
+	manager := &linuxUserJobManager{
+		unitPath: func(string) (string, error) { return unitPath, nil },
+		run: func(args ...string) (string, error) {
+			verbs = append(verbs, args[0])
+			if args[0] == "show" {
+				return linuxSystemdState("", "not-found", "inactive", "dead", "enabled", "no"), nil
+			}
+			return "", nil
+		},
+	}
+	if err := manager.Remove(job.Label); err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"show", "disable", "daemon-reload"}; !reflect.DeepEqual(verbs, want) {
+		t.Fatalf("systemctl verbs = %v, want %v", verbs, want)
 	}
 }
 
@@ -532,6 +695,14 @@ func TestLinuxUserJobManagerIntegration(t *testing.T) {
 	if err := manager.Ensure(job); err != nil {
 		t.Fatal(err)
 	}
+	requireSystemdUserJobEnabled(t, job.Label)
+	if _, err := systemctlUserOutput("disable", systemdUserUnitName(job.Label)); err != nil {
+		t.Fatalf("disable integration job before repair: %v", err)
+	}
+	if err := manager.Ensure(job); err != nil {
+		t.Fatalf("repair disabled integration job: %v", err)
+	}
+	requireSystemdUserJobEnabled(t, job.Label)
 	waitForLinuxUserJobMarker(t, job.Arguments[0])
 	status, err := manager.Status(job.Label)
 	if err != nil || !status.Installed || !status.Running {
@@ -550,6 +721,17 @@ func TestLinuxUserJobManagerIntegration(t *testing.T) {
 	status, err = manager.Status(job.Label)
 	if err != nil || status.Installed || status.Running {
 		t.Fatalf("removed integration status = %#v, %v", status, err)
+	}
+}
+
+func requireSystemdUserJobEnabled(t *testing.T, label string) {
+	t.Helper()
+	output, err := systemctlUserOutput("is-enabled", systemdUserUnitName(label))
+	if err != nil {
+		t.Fatalf("inspect systemd user job enablement: %v", err)
+	}
+	if state := strings.TrimSpace(output); state != "enabled" {
+		t.Fatalf("systemd user job enablement = %q, want enabled", state)
 	}
 }
 

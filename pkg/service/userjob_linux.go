@@ -25,8 +25,6 @@ const maxLinuxUserJobDefinitionBytes = 64 << 10
 
 const systemdUserJobTemplate = `[Unit]
 Description=qURL background daemon - managed by qurl, do not edit
-After=network-online.target
-Wants=network-online.target
 
 [Service]
 Type=simple
@@ -40,7 +38,6 @@ StandardInput=null
 StandardOutput=append:{{.StandardOut}}
 StandardError=append:{{.StandardErr}}
 NoNewPrivileges=true
-PrivateTmp=true
 RestrictSUIDSGID=true
 
 [Install]
@@ -56,8 +53,16 @@ type linuxUnitState struct {
 	loaded           bool
 	running          bool
 	invalid          bool
+	unitFileState    string
 	fragmentPath     string
 	needDaemonReload bool
+}
+
+func (s linuxUnitState) runAtLoadMatches(runAtLoad bool) bool {
+	if runAtLoad {
+		return s.unitFileState == "enabled"
+	}
+	return s.unitFileState == "disabled"
 }
 
 // NewUserJobManager returns a per-user systemd manager. Linux hosts without a
@@ -219,11 +224,20 @@ func (m *linuxUserJobManager) ensure(job UserJob, forceReplace bool) error {
 	}
 	definitionChanged := !installed || !bytes.Equal(existing, []byte(content))
 	loadedDefinitionMatches := state.loaded && !state.needDaemonReload && filepath.Clean(state.fragmentPath) == filepath.Clean(unitPath)
-	if !forceReplace && !definitionChanged && loadedDefinitionMatches {
+	if !forceReplace && !definitionChanged && loadedDefinitionMatches && state.runAtLoadMatches(job.RunAtLoad) {
 		if state.running {
 			return nil
 		}
-		return m.start(job.Label, unitPath)
+		return m.start(job.Label, unitPath, job.RunAtLoad)
+	}
+	if !forceReplace && !definitionChanged && loadedDefinitionMatches {
+		if err := m.setRunAtLoad(job.Label, job.RunAtLoad); err != nil {
+			return err
+		}
+		if state.running {
+			return m.validateRunning(job.Label, unitPath, job.RunAtLoad)
+		}
+		return m.start(job.Label, unitPath, job.RunAtLoad)
 	}
 
 	// Stop the loaded process before changing its definition. If stop fails,
@@ -245,26 +259,37 @@ func (m *linuxUserJobManager) ensure(job UserJob, forceReplace bool) error {
 	if _, err := m.run("daemon-reload"); err != nil {
 		return fmt.Errorf("reload systemd user manager after writing %s: %w", job.Label, err)
 	}
-	unit := systemdUserUnitName(job.Label)
-	if job.RunAtLoad {
-		if _, err := m.run("enable", unit); err != nil {
-			return fmt.Errorf("enable systemd user job %s: %w", job.Label, err)
-		}
-	} else if _, err := m.run("disable", unit); err != nil {
-		return fmt.Errorf("disable systemd user job %s: %w", job.Label, err)
+	if err := m.setRunAtLoad(job.Label, job.RunAtLoad); err != nil {
+		return err
 	}
-	return m.start(job.Label, unitPath)
+	return m.start(job.Label, unitPath, job.RunAtLoad)
 }
 
-func (m *linuxUserJobManager) start(label, unitPath string) error {
+func (m *linuxUserJobManager) setRunAtLoad(label string, runAtLoad bool) error {
+	verb := "disable"
+	if runAtLoad {
+		verb = "enable"
+	}
+	if _, err := m.run(verb, systemdUserUnitName(label)); err != nil {
+		return fmt.Errorf("%s systemd user job %s: %w", verb, label, err)
+	}
+	return nil
+}
+
+func (m *linuxUserJobManager) start(label, unitPath string, runAtLoad bool) error {
 	if _, err := m.run("start", systemdUserUnitName(label)); err != nil {
 		return fmt.Errorf("start systemd user job %s: %w", label, err)
 	}
+	return m.validateRunning(label, unitPath, runAtLoad)
+}
+
+func (m *linuxUserJobManager) validateRunning(label, unitPath string, runAtLoad bool) error {
 	state, err := m.state(label, unitPath)
 	if err != nil {
 		return err
 	}
-	if !state.loaded || !state.running || state.needDaemonReload || filepath.Clean(state.fragmentPath) != filepath.Clean(unitPath) {
+	if !state.loaded || !state.running || !state.runAtLoadMatches(runAtLoad) || state.needDaemonReload ||
+		filepath.Clean(state.fragmentPath) != filepath.Clean(unitPath) {
 		return fmt.Errorf("systemd user job %s did not reach the exact running definition", label)
 	}
 	return nil
@@ -288,7 +313,7 @@ func (m *linuxUserJobManager) Remove(label string) error {
 			return fmt.Errorf("stop systemd user job %s: %w", label, err)
 		}
 	}
-	if state.loaded || state.invalid {
+	if state.loaded || state.invalid || state.unitFileState != "" {
 		if _, err := m.run("disable", unit); err != nil {
 			return fmt.Errorf("disable systemd user job %s: %w", label, err)
 		}
@@ -296,7 +321,7 @@ func (m *linuxUserJobManager) Remove(label string) error {
 	if err := removeLinuxUserJobDefinition(unitPath); err != nil {
 		return fmt.Errorf("remove systemd user job %s: %w", label, err)
 	}
-	if state.loaded || state.invalid {
+	if state.loaded || state.invalid || state.unitFileState != "" {
 		if _, err := m.run("daemon-reload"); err != nil {
 			return fmt.Errorf("reload systemd user manager after removing %s: %w", label, err)
 		}
@@ -333,12 +358,12 @@ func (m *linuxUserJobManager) state(label, unitPath string) (linuxUnitState, err
 	output, err := m.run(
 		"show", unit, "--no-pager",
 		"--property=LoadState", "--property=ActiveState", "--property=SubState",
-		"--property=FragmentPath", "--property=NeedDaemonReload",
+		"--property=UnitFileState", "--property=FragmentPath", "--property=NeedDaemonReload",
 	)
 	if err != nil {
 		return linuxUnitState{}, fmt.Errorf("inspect systemd user job %s: %w", label, err)
 	}
-	properties := make(map[string]string, 5)
+	properties := make(map[string]string, 6)
 	for _, line := range strings.Split(strings.TrimSpace(output), "\n") {
 		key, value, found := strings.Cut(line, "=")
 		if !found || key == "" {
@@ -349,7 +374,7 @@ func (m *linuxUserJobManager) state(label, unitPath string) (linuxUnitState, err
 		}
 		properties[key] = value
 	}
-	for _, key := range []string{"LoadState", "ActiveState", "SubState", "FragmentPath", "NeedDaemonReload"} {
+	for _, key := range []string{"LoadState", "ActiveState", "SubState", "UnitFileState", "FragmentPath", "NeedDaemonReload"} {
 		if _, present := properties[key]; !present {
 			return linuxUnitState{}, fmt.Errorf("systemd user job %s state omitted %s", label, key)
 		}
@@ -361,6 +386,7 @@ func (m *linuxUserJobManager) state(label, unitPath string) (linuxUnitState, err
 		loaded:           properties["LoadState"] == "loaded",
 		running:          properties["ActiveState"] == "active" && properties["SubState"] == "running",
 		invalid:          properties["LoadState"] == "bad-setting",
+		unitFileState:    properties["UnitFileState"],
 		fragmentPath:     properties["FragmentPath"],
 		needDaemonReload: properties["NeedDaemonReload"] == "yes",
 	}
