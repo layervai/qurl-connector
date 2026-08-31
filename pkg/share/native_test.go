@@ -752,6 +752,117 @@ func TestOpenNativeRuntimeRecoversAuthenticatedRejectedIdentity(t *testing.T) {
 	}
 }
 
+func TestOpenNativeRuntimeResumesPersistedCredentialRecovery(t *testing.T) {
+	oldStore := newNativeStateStore
+	oldConnect := connectNativeRuntime
+	oldRefresh := refreshNativeRuntime
+	oldRecover := recoverNativeRuntime
+	oldWait := waitNativeRefresh
+	t.Cleanup(func() {
+		newNativeStateStore = oldStore
+		connectNativeRuntime = oldConnect
+		refreshNativeRuntime = oldRefresh
+		recoverNativeRuntime = oldRecover
+		waitNativeRefresh = oldWait
+	})
+	pending := &qurl.NativeCredentialRecoveryRequiredError{
+		AgentID: "agent-one", Cause: qurl.ErrCredentialRecoveryRequired,
+	}
+	tests := []struct {
+		name          string
+		store         *memoryNativeStore
+		wantWarmCalls int
+		wantRefresh   int
+	}{
+		{
+			name: "pending refresh episode",
+			store: &memoryNativeStore{present: true, marker: agentstate.RefreshMarker{
+				Version: 2, Reason: "placement recovery",
+			}},
+			wantRefresh: 1,
+		},
+		{
+			name:          "pending warm open",
+			store:         &memoryNativeStore{},
+			wantWarmCalls: 1,
+		},
+		{
+			name: "pending successful handoff warm open",
+			store: &memoryNativeStore{present: true, marker: agentstate.RefreshMarker{
+				Version: 3, AttemptCount: 1, StartedAtUnix: 1,
+				LastAttemptUnixMilli: 1, NextAttemptUnixMilli: 2, RefreshSucceededUnixMilli: 1,
+			}},
+			wantWarmCalls: 1,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			newNativeStateStore = func(string, string) (nativeStateStore, error) { return test.store, nil }
+			waitNativeRefresh = func(context.Context, time.Duration) error { return nil }
+			warmCalls := 0
+			connectNativeRuntime = func(context.Context, qurl.AgentStateStore, ...qurl.AgentRuntimeRegistrationOption) (*qurl.Client, *qurl.AgentRuntimeBinding, error) {
+				warmCalls++
+				return nil, nil, pending
+			}
+			refreshCalls := 0
+			refreshNativeRuntime = func(context.Context, qurl.HubBootstrap, qurl.AgentStateStore, ...qurl.AgentRuntimeRefreshOption) (*qurl.Client, *qurl.AgentRuntimeBinding, error) {
+				refreshCalls++
+				return nil, nil, pending
+			}
+			providerCalls := 0
+			recoveryCalls := 0
+			recoverNativeRuntime = func(_ context.Context, credential string, _ qurl.AgentStateStore, _ ...qurl.AgentRuntimeRecoveryOption) (*qurl.Client, *qurl.AgentRuntimeBinding, error) {
+				recoveryCalls++
+				if credential != "lv_test_recoverycredentialabcdefghijklmnopqrstuvwxyz0123456789" {
+					t.Fatalf("recovery credential = %q", credential)
+				}
+				return &qurl.Client{}, &qurl.AgentRuntimeBinding{AgentID: "agent-one"}, nil
+			}
+			runtime, err := OpenNativeRuntime(context.Background(), NativeRuntimeConfig{
+				StateDir: "/private/state", AgentID: "agent-one",
+				RecoveryCredentialProvider: func(context.Context) (string, error) {
+					providerCalls++
+					return "lv_test_recoverycredentialabcdefghijklmnopqrstuvwxyz0123456789", nil
+				},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if runtime.OpenKind != NativeOpenRecovery || runtime.AgentID != "agent-one" {
+				t.Fatalf("resumed runtime = kind %q agent %q", runtime.OpenKind, runtime.AgentID)
+			}
+			if warmCalls != test.wantWarmCalls || refreshCalls != test.wantRefresh || providerCalls != 1 || recoveryCalls != 1 {
+				t.Fatalf("resume calls warm/refresh/provider/recovery=%d/%d/%d/%d, want %d/%d/1/1",
+					warmCalls, refreshCalls, providerCalls, recoveryCalls, test.wantWarmCalls, test.wantRefresh)
+			}
+			if err := runtime.Close(); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestResumableNativeCredentialRecoveryRejectsUnsafeLocalStates(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"authenticated identity rejection", qurl.ErrAssignmentIdentityRejected, true},
+		{"valid pending episode", &qurl.NativeCredentialRecoveryRequiredError{Cause: qurl.ErrCredentialRecoveryRequired}, true},
+		{"missing credential", &qurl.NativeCredentialRecoveryRequiredError{Cause: qurl.ErrDeviceCredentialMissing}, false},
+		{"malformed pending state", errors.Join(qurl.ErrCredentialRecoveryRequired, qurl.ErrInvalidAgentState), false},
+		{"unrelated error", qurl.ErrInvalidAssignmentConfig, false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := resumableNativeCredentialRecovery(test.err); got != test.want {
+				t.Fatalf("resumableNativeCredentialRecovery(%v) = %t, want %t", test.err, got, test.want)
+			}
+		})
+	}
+}
+
 func TestOpenNativeRuntimeDoesNotRecoverWithoutExplicitAuthority(t *testing.T) {
 	oldStore := newNativeStateStore
 	oldRefresh := refreshNativeRuntime

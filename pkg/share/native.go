@@ -153,6 +153,9 @@ func OpenNativeRuntime(ctx context.Context, cfg NativeRuntimeConfig) (_ *NativeR
 		if openErr == nil {
 			return runtime, nil
 		}
+		if resumableNativeCredentialRecovery(openErr) {
+			return recoverNativeCredential(ctx, cfg, store, openErr, mode)
+		}
 		// Offline open and Hub refresh share the same local transient-error
 		// sentinels. Reuse the closed refresh classifier so new or corrupt local
 		// state still fails closed instead of widening unattended retries. Offline
@@ -168,7 +171,7 @@ func OpenNativeRuntime(ctx context.Context, cfg NativeRuntimeConfig) (_ *NativeR
 		if refreshErr == nil {
 			return runtime, nil
 		}
-		return recoverRejectedNativeIdentity(ctx, cfg, store, refreshErr, mode)
+		return recoverNativeCredential(ctx, cfg, store, refreshErr, mode)
 	}
 
 	runtime, openErr := warmOpenNativeRuntime(ctx, cfg, store, mode)
@@ -187,7 +190,10 @@ func OpenNativeRuntime(ctx context.Context, cfg NativeRuntimeConfig) (_ *NativeR
 		if refreshErr == nil {
 			return runtime, nil
 		}
-		return recoverRejectedNativeIdentity(ctx, cfg, store, refreshErr, mode)
+		return recoverNativeCredential(ctx, cfg, store, refreshErr, mode)
+	}
+	if resumableNativeCredentialRecovery(openErr) {
+		return recoverNativeCredential(ctx, cfg, store, openErr, mode)
 	}
 	if !errors.Is(openErr, qurl.ErrAgentStateNotFound) {
 		return nil, openErr
@@ -242,21 +248,35 @@ func warmOpenNativeRuntime(ctx context.Context, cfg NativeRuntimeConfig, store n
 	return assembleNativeRuntime(client, binding, store, refreshConfig(cfg, mode), NativeOpenWarm)
 }
 
-func recoverRejectedNativeIdentity(ctx context.Context, cfg NativeRuntimeConfig, store nativeStateStore, refreshErr error, mode string) (*NativeRuntime, error) {
-	if !errors.Is(refreshErr, qurl.ErrAssignmentIdentityRejected) || cfg.RecoveryCredentialProvider == nil {
-		return nil, refreshErr
+func resumableNativeCredentialRecovery(err error) bool {
+	if errors.Is(err, qurl.ErrAssignmentIdentityRejected) {
+		return true
+	}
+	// A valid pending episode is the only local recovery-required state that
+	// may consume account authority automatically. Missing credentials and
+	// malformed state also unwrap ErrCredentialRecoveryRequired, but qurl-go
+	// marks those with ErrDeviceCredentialMissing or ErrInvalidAgentState. They
+	// need deliberate operator action and must not spend a recovery credential.
+	return errors.Is(err, qurl.ErrCredentialRecoveryRequired) &&
+		!errors.Is(err, qurl.ErrDeviceCredentialMissing) &&
+		!errors.Is(err, qurl.ErrInvalidAgentState)
+}
+
+func recoverNativeCredential(ctx context.Context, cfg NativeRuntimeConfig, store nativeStateStore, triggerErr error, mode string) (*NativeRuntime, error) {
+	if !resumableNativeCredentialRecovery(triggerErr) || cfg.RecoveryCredentialProvider == nil {
+		return nil, triggerErr
 	}
 	credential, err := cfg.RecoveryCredentialProvider(ctx)
 	if err != nil {
-		return nil, errors.Join(refreshErr, fmt.Errorf("resolve native credential recovery authority: %w", err))
+		return nil, errors.Join(triggerErr, fmt.Errorf("resolve native credential recovery authority: %w", err))
 	}
 	credential = strings.TrimSpace(credential)
 	if credential == "" {
-		return nil, errors.Join(refreshErr, errors.New("native credential recovery authority is empty"))
+		return nil, errors.Join(triggerErr, errors.New("native credential recovery authority is empty"))
 	}
 	state, err := store.Handoff()
 	if err != nil {
-		return nil, errors.Join(refreshErr, err)
+		return nil, errors.Join(triggerErr, err)
 	}
 	options := make([]qurl.AgentRuntimeRecoveryOption, 0, len(cfg.UDPOptions)+3)
 	options = append(options, qurl.WithAgentRuntimeRecoveryHub(cfg.Hub))
