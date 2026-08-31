@@ -607,7 +607,7 @@ func TestLinuxStateRejectsMalformedManagerProperties(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			manager := &linuxUserJobManager{run: func(...string) (string, error) { return test.output, nil }}
-			if _, err := manager.state("ai.layerv.qurl.daemon", unitPath); err == nil || !strings.Contains(err.Error(), test.want) {
+			if _, err := manager.state("ai.layerv.qurl.daemon"); err == nil || !strings.Contains(err.Error(), test.want) {
 				t.Fatalf("state error = %v, want %q", err, test.want)
 			}
 		})
@@ -701,6 +701,61 @@ func TestLinuxRemoveCleansOwnerDefinitionWithDriftedMode(t *testing.T) {
 	}
 	if _, err := os.Lstat(unitPath); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("mode-drifted definition remains: %v", err)
+	}
+}
+
+func TestLinuxRemoveStopsLoadedNonRunningUnitBeforeCleanup(t *testing.T) {
+	job := linuxTestUserJob(t)
+	unitPath := filepath.Join(t.TempDir(), "systemd", "user", job.Label+".service")
+	if err := os.MkdirAll(filepath.Dir(unitPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	content, err := RenderSystemdUserJob(job)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(unitPath, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var verbs []string
+	manager := &linuxUserJobManager{
+		unitPath: func(string) (string, error) { return unitPath, nil },
+		run: func(args ...string) (string, error) {
+			verbs = append(verbs, args[0])
+			if args[0] == "show" {
+				return linuxSystemdState(unitPath, "loaded", "activating", "auto-restart", "enabled", "no"), nil
+			}
+			return "", nil
+		},
+	}
+	if err := manager.Remove(job.Label); err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"show", "stop", "disable", "daemon-reload"}; !reflect.DeepEqual(verbs, want) {
+		t.Fatalf("systemctl verbs = %v, want %v", verbs, want)
+	}
+	if _, err := os.Lstat(unitPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("activating unit definition remains: %v", err)
+	}
+}
+
+func TestSystemctlUserOutputKeepsCommandChannelsSeparate(t *testing.T) {
+	dir := t.TempDir()
+	systemctl := filepath.Join(dir, "systemctl")
+	if err := os.WriteFile(systemctl, []byte("#!/bin/sh\nif [ \"$2\" = fail ]; then\n  printf 'partial output\\n'\n  printf 'manager failure\\n' >&2\n  exit 1\nfi\nprintf 'manager warning\\n' >&2\nprintf 'LoadState=loaded\\n'\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	output, err := systemctlUserOutput("show", "test.service")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if output != "LoadState=loaded\n" {
+		t.Fatalf("systemctl stdout = %q, want state only", output)
+	}
+	_, err = systemctlUserOutput("fail")
+	if err == nil || !strings.Contains(err.Error(), "partial output") || !strings.Contains(err.Error(), "manager failure") {
+		t.Fatalf("systemctl failure = %v, want stdout and stderr diagnostics", err)
 	}
 }
 

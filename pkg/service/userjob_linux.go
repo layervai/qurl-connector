@@ -52,6 +52,7 @@ type linuxUserJobManager struct {
 type linuxUnitState struct {
 	loaded           bool
 	running          bool
+	activeState      string
 	invalid          bool
 	masked           bool
 	unitFileState    string
@@ -219,7 +220,7 @@ func (m *linuxUserJobManager) ensure(job UserJob, forceReplace bool) error {
 	if err != nil {
 		return fmt.Errorf("read systemd user job %s: %w", job.Label, err)
 	}
-	state, err := m.state(job.Label, unitPath)
+	state, err := m.state(job.Label)
 	if err != nil {
 		return err
 	}
@@ -288,7 +289,7 @@ func (m *linuxUserJobManager) start(label, unitPath string, runAtLoad bool) erro
 }
 
 func (m *linuxUserJobManager) validateRunning(label, unitPath string, runAtLoad bool) error {
-	state, err := m.state(label, unitPath)
+	state, err := m.state(label)
 	if err != nil {
 		return err
 	}
@@ -307,12 +308,15 @@ func (m *linuxUserJobManager) Remove(label string) error {
 	if err := validateRemovableLinuxUserJobDefinition(unitPath); err != nil {
 		return fmt.Errorf("validate systemd user job %s before removal: %w", label, err)
 	}
-	state, err := m.removalState(label, unitPath)
+	state, err := m.removalState(label)
 	if err != nil {
 		return err
 	}
 	unit := systemdUserUnitName(label)
-	if state.running {
+	// A unit can be activating, auto-restarting, or deactivating without
+	// reporting SubState=running. Fail closed for every nonterminal ActiveState
+	// before deleting its definition.
+	if state.activeState != "inactive" && state.activeState != "failed" {
 		if _, err := m.run("stop", unit); err != nil {
 			return fmt.Errorf("stop systemd user job %s: %w", label, err)
 		}
@@ -350,7 +354,7 @@ func (m *linuxUserJobManager) Status(label string) (ServiceStatus, error) {
 	if err != nil {
 		return ServiceStatus{}, fmt.Errorf("inspect systemd user job %s: %w", label, err)
 	}
-	state, err := m.state(label, unitPath)
+	state, err := m.state(label)
 	if err != nil {
 		return ServiceStatus{Installed: installed}, err
 	}
@@ -365,15 +369,15 @@ func (m *linuxUserJobManager) Status(label string) (ServiceStatus, error) {
 	return ServiceStatus{Installed: installed, Running: state.running}, nil
 }
 
-func (m *linuxUserJobManager) state(label, unitPath string) (linuxUnitState, error) {
-	return m.inspectState(label, unitPath, false)
+func (m *linuxUserJobManager) state(label string) (linuxUnitState, error) {
+	return m.inspectState(label, false)
 }
 
-func (m *linuxUserJobManager) removalState(label, unitPath string) (linuxUnitState, error) {
-	return m.inspectState(label, unitPath, true)
+func (m *linuxUserJobManager) removalState(label string) (linuxUnitState, error) {
+	return m.inspectState(label, true)
 }
 
-func (m *linuxUserJobManager) inspectState(label, unitPath string, allowMasked bool) (linuxUnitState, error) {
+func (m *linuxUserJobManager) inspectState(label string, allowMasked bool) (linuxUnitState, error) {
 	unit := systemdUserUnitName(label)
 	output, err := m.run(
 		"show", unit, "--no-pager",
@@ -384,6 +388,8 @@ func (m *linuxUserJobManager) inspectState(label, unitPath string, allowMasked b
 		return linuxUnitState{}, fmt.Errorf("inspect systemd user job %s: %w", label, err)
 	}
 	properties := make(map[string]string, 6)
+	// An explicit --property list makes systemctl show empty values. Keep all
+	// six fields mandatory so truncated or mixed diagnostic output fails closed.
 	for _, line := range strings.Split(strings.TrimSpace(output), "\n") {
 		key, value, found := strings.Cut(line, "=")
 		if !found || key == "" {
@@ -405,6 +411,7 @@ func (m *linuxUserJobManager) inspectState(label, unitPath string, allowMasked b
 	state := linuxUnitState{
 		loaded:           properties["LoadState"] == "loaded",
 		running:          properties["ActiveState"] == "active" && properties["SubState"] == "running",
+		activeState:      properties["ActiveState"],
 		invalid:          properties["LoadState"] == "bad-setting",
 		masked:           properties["LoadState"] == "masked" || strings.HasPrefix(properties["UnitFileState"], "masked"),
 		unitFileState:    properties["UnitFileState"],
@@ -670,11 +677,21 @@ func systemctlUserOutput(args ...string) (string, error) {
 	cmdArgs := append([]string{"--user"}, args...)
 	cmd := exec.Command("systemctl", cmdArgs...)
 	cmd.Env = append(os.Environ(), "LC_ALL=C", "SYSTEMD_COLORS=0", "SYSTEMD_PAGER=")
-	output, err := cmd.CombinedOutput()
+	output, err := cmd.Output()
 	if err == nil {
 		return string(output), nil
 	}
+	errorOutput := strings.TrimSpace(string(output))
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) && len(exitErr.Stderr) > 0 {
+		stderr := strings.TrimSpace(string(exitErr.Stderr))
+		if errorOutput == "" {
+			errorOutput = stderr
+		} else if stderr != "" {
+			errorOutput += "\n" + stderr
+		}
+	}
 	return "", &systemctlUserError{
-		args: append([]string(nil), args...), output: strings.TrimSpace(string(output)), err: err,
+		args: append([]string(nil), args...), output: errorOutput, err: err,
 	}
 }
