@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -166,7 +167,7 @@ func TestWindowsUserJobEnsureCreateReuseReplaceAndRemove(t *testing.T) {
 		currentSID: currentWindowsUserSID,
 		powerShell: func() (string, error) { return "powershell.exe", nil },
 	}
-	manager.run = func(name string, args ...string) (string, error) {
+	manager.runWithin = func(_ time.Duration, name string, args ...string) (string, error) {
 		calls = append(calls, windowsJobCall{name: name, args: append([]string(nil), args...)})
 		joined := strings.Join(args, " ")
 		switch {
@@ -353,7 +354,7 @@ func TestWindowsUserJobEnsureCreateReuseReplaceAndRemove(t *testing.T) {
 func TestWindowsUserJobStatusDoesNotHideSchedulerErrors(t *testing.T) {
 	want := errors.New("scheduled task query failed")
 	manager := &windowsUserJobManager{
-		run:        func(string, ...string) (string, error) { return "", want },
+		runWithin:  func(time.Duration, string, ...string) (string, error) { return "", want },
 		currentSID: func() (string, error) { return "S-1-5-21-1000", nil },
 		powerShell: func() (string, error) { return "powershell.exe", nil },
 	}
@@ -378,7 +379,7 @@ func TestWindowsUserJobDoesNotRestartWhenRegisteredIdentityIsIndeterminate(t *te
 		powerShell:    func() (string, error) { return "powershell.exe", nil },
 		taskScheduler: func() (string, error) { return "schtasks.exe", nil },
 	}
-	manager.run = func(name string, args ...string) (string, error) {
+	manager.runWithin = func(_ time.Duration, name string, args ...string) (string, error) {
 		command := strings.Join(args, " ")
 		switch {
 		case strings.HasSuffix(strings.ToLower(name), "powershell.exe") && strings.Contains(command, "$task.State"):
@@ -398,7 +399,7 @@ func TestWindowsUserJobDoesNotRestartWhenRegisteredIdentityIsIndeterminate(t *te
 
 func TestWindowsUserJobStatusDoesNotTreatEmptySchedulerOutputAsAbsent(t *testing.T) {
 	manager := &windowsUserJobManager{
-		run: func(_ string, args ...string) (string, error) {
+		runWithin: func(_ time.Duration, _ string, args ...string) (string, error) {
 			command := strings.Join(args, " ")
 			for _, want := range []string{"Get-Command Get-ScheduledTask", "-ErrorAction Stop", "CmdletizationQuery_NotFound,Get-ScheduledTask", "ObjectNotFound", "throw"} {
 				if !strings.Contains(command, want) {
@@ -422,7 +423,7 @@ func TestWindowsUserJobRemoveFailurePreservesDisabledState(t *testing.T) {
 	deleteErr := errors.New("injected delete failure")
 	var enabled bool
 	manager := &windowsUserJobManager{
-		run: func(_ string, args ...string) (string, error) {
+		runWithin: func(_ time.Duration, _ string, args ...string) (string, error) {
 			command := strings.Join(args, " ")
 			switch {
 			case strings.Contains(command, "$task.State"):
@@ -453,7 +454,7 @@ func TestWindowsUserJobRemoveFailurePreservesDisabledState(t *testing.T) {
 func TestWindowsUserJobStopWaitUsesOneBoundedProviderProcess(t *testing.T) {
 	var calls int
 	manager := &windowsUserJobManager{
-		run: func(_ string, args ...string) (string, error) {
+		runWithin: func(_ time.Duration, _ string, args ...string) (string, error) {
 			calls++
 			command := strings.Join(args, " ")
 			for _, want := range []string{"Get-ScheduledTask", "AddSeconds(6)", "Start-Sleep -Milliseconds 250", "CmdletizationQuery_NotFound,Get-ScheduledTask"} {
@@ -577,7 +578,7 @@ func TestWindowsUserJobMissingParentHasActionableError(t *testing.T) {
 }
 
 func TestWindowsUserJobCommandOutputKeepsStdoutAndStderrSeparate(t *testing.T) {
-	output, err := windowsJobCommandOutput("cmd.exe", "/d", "/s", "/c",
+	output, err := windowsJobCommandOutputWithin(windowsTaskSchedulerCommandTimeout, "cmd.exe", "/d", "/s", "/c",
 		`(echo scheduler-stdout)&(echo scheduler-stderr 1>&2)&exit /b 7`)
 	if err == nil {
 		t.Fatal("failing Windows command returned no error")
@@ -587,6 +588,41 @@ func TestWindowsUserJobCommandOutputKeepsStdoutAndStderrSeparate(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "scheduler-stderr") || strings.Contains(err.Error(), "scheduler-stdout") {
 		t.Fatalf("failing Windows command error mixed stdout and stderr: %v", err)
+	}
+}
+
+func TestWindowsUserJobSelectsCommandTimeouts(t *testing.T) {
+	type call struct {
+		timeout    time.Duration
+		executable string
+	}
+	var calls []call
+	manager := &windowsUserJobManager{
+		runWithin: func(timeout time.Duration, executable string, _ ...string) (string, error) {
+			calls = append(calls, call{timeout: timeout, executable: executable})
+			return "", nil
+		},
+		powerShell:    func() (string, error) { return "powershell.exe", nil },
+		taskScheduler: func() (string, error) { return "schtasks.exe", nil },
+	}
+	if _, err := manager.runPowerShell("Get-ScheduledTask"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.runTaskScheduler("/Query"); err != nil {
+		t.Fatal(err)
+	}
+	want := []call{
+		{timeout: windowsPowerShellCommandTimeout, executable: "powershell.exe"},
+		{timeout: windowsTaskSchedulerCommandTimeout, executable: "schtasks.exe"},
+	}
+	if !slices.Equal(calls, want) {
+		t.Fatalf("Windows command timeouts = %#v, want %#v", calls, want)
+	}
+	if windowsPowerShellCommandTimeout < 30*time.Second || windowsPowerShellCommandTimeout > 2*time.Minute ||
+		windowsTaskSchedulerCommandTimeout < 5*time.Second || windowsTaskSchedulerCommandTimeout > 30*time.Second ||
+		windowsPowerShellCommandTimeout <= windowsTaskSchedulerCommandTimeout {
+		t.Fatalf("Windows command timeout constants = (%s, %s), want a longer bounded provider timeout",
+			windowsPowerShellCommandTimeout, windowsTaskSchedulerCommandTimeout)
 	}
 }
 
@@ -824,7 +860,8 @@ func TestWindowsUserJobIntegration(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			registered, err := windowsJobCommandOutput(scheduler, "/Query", "/TN", windowsScopedTaskName(label, sid), "/XML")
+			registered, err := windowsJobCommandOutputWithin(windowsTaskSchedulerCommandTimeout,
+				scheduler, "/Query", "/TN", windowsScopedTaskName(label, sid), "/XML")
 			if err != nil {
 				t.Fatal(err)
 			}
