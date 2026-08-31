@@ -209,56 +209,16 @@ func openTransactionLock(ctx context.Context, namespace *pinnedfs.Directory, nam
 }
 
 func validateTransactionFile(namespace *pinnedfs.Directory, name string, file *os.File, label string, mode os.FileMode) error {
-	opened, err := file.Stat()
-	if err != nil {
-		return fmt.Errorf("stat opened %s: %w", label, err)
-	}
-	if err := validateTransactionDescriptor(opened, label, mode); err != nil {
+	if _, err := pinnedfs.ValidateRegularFile(namespace, name, file, label, mode); err != nil {
 		return err
 	}
-	entry, err := namespace.Lstat(name)
-	if err != nil {
-		return fmt.Errorf("inspect %s entry: %w", label, err)
-	}
-	if entry.Mode()&os.ModeSymlink != 0 || !entry.Mode().IsRegular() {
-		return fmt.Errorf("%s entry must be a non-symlink regular file", label)
-	}
-	if !os.SameFile(opened, entry) {
-		return fmt.Errorf("%s descriptor no longer matches its namespace entry", label)
-	}
 	beforeTransactionFileFinalValidation(label)
-	latest, err := file.Stat()
-	if err != nil {
-		return fmt.Errorf("final stat opened %s: %w", label, err)
-	}
-	if err := validateTransactionDescriptor(latest, label, mode); err != nil {
+	if _, err := pinnedfs.ValidateRegularFile(namespace, name, file, label, mode); err != nil {
 		return err
 	}
 	beforeTransactionFileFinalEntryValidation(label)
-	latestEntry, err := namespace.Lstat(name)
-	if err != nil {
-		return fmt.Errorf("final inspect %s entry: %w", label, err)
-	}
-	if err := validateTransactionDescriptor(latestEntry, label+" final entry", mode); err != nil {
-		return err
-	}
-	if !os.SameFile(opened, latest) || !os.SameFile(latest, latestEntry) {
-		return fmt.Errorf("%s descriptor changed or no longer matches its final namespace entry", label)
-	}
-	return nil
-}
-
-func validateTransactionDescriptor(info os.FileInfo, label string, mode os.FileMode) error {
-	if !info.Mode().IsRegular() {
-		return fmt.Errorf("%s must be a regular file", label)
-	}
-	if info.Mode().Perm() != mode.Perm() {
-		return fmt.Errorf("%s mode is %04o, want %04o", label, info.Mode().Perm(), mode.Perm())
-	}
-	if err := pinnedfs.RequireSingleLinkInfo(info, label); err != nil {
-		return err
-	}
-	return pinnedfs.RequireCurrentOwnerInfo(info, label)
+	_, err := pinnedfs.ValidateRegularFile(namespace, name, file, label+" final entry", mode)
+	return err
 }
 
 func (tx *FileTransaction) validateNamespace() error {

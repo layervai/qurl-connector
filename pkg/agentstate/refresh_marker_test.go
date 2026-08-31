@@ -9,6 +9,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/layervai/qurl-connector/internal/pinnedfs"
 )
 
 // markerPathFor resolves the marker file inside dir without going through the
@@ -18,7 +20,11 @@ func markerPathFor(dir string) string { return filepath.Join(dir, RefreshMarkerF
 func refreshMarkerTestDir(t *testing.T) string {
 	t.Helper()
 	dir := filepath.Join(realSDKTempDir(t), "state")
-	if err := os.Mkdir(dir, dirMode); err != nil {
+	namespace, err := pinnedfs.EnsurePrivate(dir, dirMode)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := namespace.Close(); err != nil {
 		t.Fatal(err)
 	}
 	return dir
@@ -61,8 +67,8 @@ func TestRegistrationRefreshMarker_RequestSetsFreshSchedule(t *testing.T) {
 	if err != nil {
 		t.Fatalf("stat marker: %v", err)
 	}
-	if got := info.Mode().Perm(); got != pubMode {
-		t.Fatalf("marker mode = %v, want %v", got, pubMode)
+	if !pinnedfs.PrivateModeMatches(info, pubMode) {
+		t.Fatalf("marker mode = %v, want private mode", info.Mode().Perm())
 	}
 }
 

@@ -449,8 +449,8 @@ func TestNewSDKStoreFileProviderUsesSingleSDKEnvelope(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SDK state directory: %v", err)
 	}
-	if got := dirInfo.Mode().Perm(); got != 0o700 {
-		t.Fatalf("SDK state directory mode = %#o, want 0700", got)
+	if !pinnedfs.PrivateModeMatches(dirInfo, 0o700) {
+		t.Fatalf("SDK state directory mode = %#o, want private mode", dirInfo.Mode().Perm())
 	}
 	stateInfo, err := os.Lstat(filepath.Join(dir, AgentStateFile))
 	if err != nil {
@@ -459,8 +459,8 @@ func TestNewSDKStoreFileProviderUsesSingleSDKEnvelope(t *testing.T) {
 	if !stateInfo.Mode().IsRegular() {
 		t.Fatalf("SDK state file mode = %v, want regular file", stateInfo.Mode())
 	}
-	if got := stateInfo.Mode().Perm(); got != 0o600 {
-		t.Fatalf("SDK state file mode = %#o, want 0600", got)
+	if !pinnedfs.PrivateModeMatches(stateInfo, 0o600) {
+		t.Fatalf("SDK state file mode = %#o, want private mode", stateInfo.Mode().Perm())
 	}
 	for _, legacy := range []string{AgentIDFile, PrivateKeyFile, PublicKeyFile, SealedPrivateKeyFile} {
 		if _, err := os.Stat(filepath.Join(dir, legacy)); !errors.Is(err, os.ErrNotExist) {
@@ -470,6 +470,9 @@ func TestNewSDKStoreFileProviderUsesSingleSDKEnvelope(t *testing.T) {
 }
 
 func TestSDKStoreFailsClosedWhenStateNamespaceIsReplaced(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows prevents replacement while the retained directory handle is open")
+	}
 	parent := realSDKTempDir(t)
 	dir := filepath.Join(parent, "state")
 	t.Setenv(EnvKeyProvider, KeyProviderFile)
@@ -584,6 +587,9 @@ func TestSDKStoreLoadRegistrationRefreshMarkerPropagatesCorruptMarker(t *testing
 }
 
 func TestSDKStoreRefreshMarkerNeverFollowsReplacementNamespace(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows prevents replacement while the retained directory handle is open")
+	}
 	parent := realSDKTempDir(t)
 	dir := filepath.Join(parent, "state")
 	t.Setenv(EnvKeyProvider, KeyProviderFile)
@@ -668,6 +674,9 @@ func TestSDKStoreCloseWaitsForInFlightSealedSaveAndRejectsLaterHandoff(t *testin
 }
 
 func TestSDKStoreCloseDetectsNamespaceReplacementWhileSDKCloseBlocks(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows prevents replacement while the retained directory handle is open")
+	}
 	parent := realSDKTempDir(t)
 	dir := filepath.Join(parent, "state")
 	namespace, err := pinnedfs.EnsurePrivate(dir, 0o700)

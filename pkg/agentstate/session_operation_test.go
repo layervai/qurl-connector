@@ -15,6 +15,8 @@ import (
 	"testing"
 
 	qurl "github.com/layervai/qurl-go/qurl"
+
+	"github.com/layervai/qurl-connector/internal/pinnedfs"
 )
 
 const testOperationProtectedResourceID = "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEcOtuxu2qhc3gt1E7BiEU0CLqEDlXDwzZq0JnESgMAwERX6y_XXF5Cn5SKITWIZQmUhCZ0pHHlVn7SmFUTAnTGQ"
@@ -104,7 +106,7 @@ func TestSDKStoreSessionOperationLifecycleIsCrashSafe(t *testing.T) {
 		t.Fatal(err)
 	}
 	info, err := os.Stat(filepath.Join(dir, name))
-	if err != nil || info.Mode().Perm() != sessionOperationFileMode {
+	if err != nil || !pinnedfs.PrivateModeMatches(info, sessionOperationFileMode) {
 		t.Fatalf("operation file = %v, %v", info, err)
 	}
 	if err := store.Close(); err != nil {

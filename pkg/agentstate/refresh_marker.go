@@ -453,7 +453,7 @@ func writeRefreshMarker(namespace *pinnedfs.Directory, m RefreshMarker) (retErr 
 		if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
 			return fmt.Errorf("registration refresh marker %s must be a non-symlink regular file", path)
 		}
-		if info.Mode().Perm() != pubMode {
+		if !pinnedfs.PrivateModeMatches(info, pubMode) {
 			return fmt.Errorf("registration refresh marker %s has mode %04o, want %04o", path, info.Mode().Perm(), pubMode)
 		}
 	} else if !pinnedfs.IsNotExist(err) {

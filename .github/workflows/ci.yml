@@ -127,14 +127,14 @@ jobs:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
-      - name: Run Windows user-job tests
+      - name: Run Windows native-state and user-job tests
         shell: bash
         env:
           QURL_WINDOWS_USER_JOB_INTEGRATION: "1"
         run: |
           go build ./...
-          go vet ./pkg/service
-          CGO_ENABLED=0 go test -count=1 ./pkg/service
+          go vet ./pkg/agentstate ./pkg/config ./pkg/share ./pkg/service ./internal/pinnedfs
+          CGO_ENABLED=0 go test -count=1 ./pkg/agentstate ./pkg/config ./pkg/share ./pkg/service ./internal/pinnedfs
 
   # The race detector requires cgo, so this lane builds with CGO_ENABLED=1 —
   # the only place in CI that does. `make test` keeps proving the CGO_ENABLED=0
