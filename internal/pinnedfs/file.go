@@ -5,6 +5,7 @@ import (
 	"os"
 )
 
+var beforeRegularFileFinalDescriptorValidation = func(*Directory, string, *os.File) {}
 var beforeRegularFileFinalEntryValidation = func(*Directory, string, *os.File) {}
 
 // ValidateRegularFile proves that file is an owner-owned, single-link regular
@@ -67,6 +68,7 @@ func validateRegularFile(
 	if !os.SameFile(opened, entry) {
 		return nil, fmt.Errorf("%s descriptor no longer matches its namespace entry", label)
 	}
+	beforeRegularFileFinalDescriptorValidation(namespace, name, file)
 	latest, err := file.Stat()
 	if err != nil {
 		return nil, fmt.Errorf("final stat opened %s: %w", label, err)

@@ -28,7 +28,7 @@ var configTransactionToken = func() chan struct{} {
 }()
 
 var beforeConfigTempCommitValidation = func(*FileTransaction, string) {}
-var beforeTransactionFileFinalValidation = func(string) {}
+var beforeTransactionFileValidation = func(string) {}
 var afterConfigTransactionRead = func(*FileTransaction) {}
 var closeConfigTransactionFile = func(file *os.File) error { return file.Close() }
 var releaseConfigTransactionCandidate = releaseTransactionLock
@@ -208,7 +208,7 @@ func openTransactionLock(ctx context.Context, namespace *pinnedfs.Directory, nam
 }
 
 func validateTransactionFile(namespace *pinnedfs.Directory, name string, file *os.File, label string, mode os.FileMode) error {
-	beforeTransactionFileFinalValidation(label)
+	beforeTransactionFileValidation(label)
 	_, err := pinnedfs.ValidateRegularFile(namespace, name, file, label, mode)
 	return wrapConfigFileValidationError(label, err)
 }

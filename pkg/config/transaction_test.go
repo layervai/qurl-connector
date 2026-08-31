@@ -97,10 +97,10 @@ func TestConfigTransactionLockAcquireJoinsPostValidationReleaseFailure(t *testin
 		t.Fatal(err)
 	}
 	releaseErr := errors.New("injected config lock candidate release failure")
-	originalHook := beforeTransactionFileFinalValidation
+	originalHook := beforeTransactionFileValidation
 	originalRelease := releaseConfigTransactionCandidate
 	validationCount := 0
-	beforeTransactionFileFinalValidation = func(label string) {
+	beforeTransactionFileValidation = func(label string) {
 		if label != "config transaction lock" {
 			return
 		}
@@ -115,7 +115,7 @@ func TestConfigTransactionLockAcquireJoinsPostValidationReleaseFailure(t *testin
 		return errors.Join(releaseTransactionLock(file), releaseErr)
 	}
 	t.Cleanup(func() {
-		beforeTransactionFileFinalValidation = originalHook
+		beforeTransactionFileValidation = originalHook
 		releaseConfigTransactionCandidate = originalRelease
 	})
 
@@ -317,18 +317,18 @@ func TestCreateTempJoinsRejectedTempCleanupFailures(t *testing.T) {
 	closeErr := errors.New("injected rejected-temp close failure")
 	removeErr := errors.New("injected rejected-temp remove failure")
 	syncErr := errors.New("injected rejected-temp sync failure")
-	originalFinalHook := beforeTransactionFileFinalValidation
+	originalValidationHook := beforeTransactionFileValidation
 	originalClose := closeConfigTransactionFile
 	originalRemove := removeConfigTransactionTemp
 	originalSync := syncConfigTransactionNamespace
 	t.Cleanup(func() {
-		beforeTransactionFileFinalValidation = originalFinalHook
+		beforeTransactionFileValidation = originalValidationHook
 		closeConfigTransactionFile = originalClose
 		removeConfigTransactionTemp = originalRemove
 		syncConfigTransactionNamespace = originalSync
 	})
 	mutated := false
-	beforeTransactionFileFinalValidation = func(label string) {
+	beforeTransactionFileValidation = func(label string) {
 		if label != "temporary config file" || mutated {
 			return
 		}
@@ -365,7 +365,7 @@ func TestCreateTempJoinsRejectedTempCleanupFailures(t *testing.T) {
 	}
 }
 
-func TestValidateTransactionFileUsesFinalStableSnapshot(t *testing.T) {
+func TestValidateTransactionFileRejectsMutationBeforeValidation(t *testing.T) {
 	tests := []struct {
 		name   string
 		mutate func(*testing.T, string)
@@ -405,10 +405,10 @@ func TestValidateTransactionFileUsesFinalStableSnapshot(t *testing.T) {
 			}
 			defer tx.Close()
 
-			originalHook := beforeTransactionFileFinalValidation
-			t.Cleanup(func() { beforeTransactionFileFinalValidation = originalHook })
+			originalHook := beforeTransactionFileValidation
+			t.Cleanup(func() { beforeTransactionFileValidation = originalHook })
 			mutated := false
-			beforeTransactionFileFinalValidation = func(label string) {
+			beforeTransactionFileValidation = func(label string) {
 				if label == "existing config file" && !mutated {
 					mutated = true
 					tt.mutate(t, path)

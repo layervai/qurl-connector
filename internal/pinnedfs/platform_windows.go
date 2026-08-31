@@ -627,7 +627,7 @@ func openPinnedFile(root *os.Root, name string, flag int, perm os.FileMode) (*os
 	if flag&os.O_EXCL != 0 {
 		disposition = windows.FILE_CREATE
 	}
-	handle, _, err := ntOpenWindowsObject(parent, name, access, disposition, windows.FILE_NON_DIRECTORY_FILE, secureSD)
+	handle, created, err := ntOpenWindowsObject(parent, name, access, disposition, windows.FILE_NON_DIRECTORY_FILE, secureSD)
 	if err != nil {
 		return nil, &os.PathError{Op: "openat", Path: name, Err: err}
 	}
@@ -635,6 +635,14 @@ func openPinnedFile(root *os.Root, name string, flag int, perm os.FileMode) (*os
 	if file == nil {
 		_ = windows.CloseHandle(handle)
 		return nil, errors.New("wrap Windows pinned-state file handle")
+	}
+	if !created {
+		if err := validateSecureWindowsACL(handle, filepath.Join(root.Name(), name)); err != nil {
+			return nil, errors.Join(
+				fmt.Errorf("validate existing Windows pinned-state file: %w", err),
+				file.Close(),
+			)
+		}
 	}
 	if flag&os.O_TRUNC != 0 {
 		if err := windows.SetEndOfFile(handle); err != nil {

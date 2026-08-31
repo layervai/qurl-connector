@@ -192,13 +192,16 @@ func TestWindowsCreateOpenDoesNotAdoptPrecreatedForeignDACL(t *testing.T) {
 		t.Fatal(err)
 	}
 	setWindowsTestWorldACL(t, filepath.Join(path, name), windows.GENERIC_READ)
-	file, err := namespace.OpenFile(name, os.O_WRONLY|os.O_CREATE, 0o600)
-	if err != nil {
-		t.Fatal(err)
+	file, err := namespace.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	if file != nil {
+		_ = file.Close()
+		t.Fatal("create-open returned a file with a foreign DACL")
 	}
-	defer file.Close()
-	if _, err := ValidateRegularFile(namespace, name, file, "precreated Windows state", 0o600); err == nil {
-		t.Fatal("create-open adopted a precreated file with a foreign DACL")
+	if err == nil {
+		t.Fatal("create-open accepted a precreated file with a foreign DACL")
+	}
+	if raw, readErr := os.ReadFile(filepath.Join(path, name)); readErr != nil || string(raw) != "foreign" {
+		t.Fatalf("rejected precreated file = %q, %v; want unchanged content", raw, readErr)
 	}
 }
 
