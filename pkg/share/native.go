@@ -561,27 +561,29 @@ type NativeAdmitter struct {
 	// runtimeMu prevents refresh or close from replacing the binding and key
 	// while a native exchange uses them. Ordinary operations take a read lock,
 	// so unrelated resources can recover and retire concurrently.
-	runtimeMu             sync.RWMutex
-	refreshMu             sync.Mutex
-	knockMu               sync.Mutex
-	stateMu               sync.Mutex
-	resources             keyedResourceLocks
-	recoveryWG            sync.WaitGroup
-	recoveryPermanentOnce sync.Once
+	runtimeMu              sync.RWMutex
+	refreshMu              sync.Mutex
+	knockMu                sync.Mutex
+	stateMu                sync.Mutex
+	resources              keyedResourceLocks
+	recoveryWG             sync.WaitGroup
+	recoveryPermanentOnce  sync.Once
+	retirementRecoveryWake chan struct{}
 
-	binding           *qurl.AgentRuntimeBinding
-	privateKey        []byte
-	udpOpts           []qurl.AgentRuntimeUDPOption
-	store             nativeStateStore
-	refreshCfg        nativeRefreshConfig
-	operations        nativeSessionOperationController
-	placementFailures map[string]nativePlacementFailureState
-	generation        uint64
-	closed            bool
-	live              map[nativeAdmissionKey]nativeLiveAdmission
-	pending           map[nativeAdmissionKey]bool
-	lifecycle         context.Context
-	cancel            context.CancelFunc
+	binding                     *qurl.AgentRuntimeBinding
+	privateKey                  []byte
+	udpOpts                     []qurl.AgentRuntimeUDPOption
+	store                       nativeStateStore
+	refreshCfg                  nativeRefreshConfig
+	operations                  nativeSessionOperationController
+	placementFailures           map[string]nativePlacementFailureState
+	generation                  uint64
+	closed                      bool
+	live                        map[nativeAdmissionKey]nativeLiveAdmission
+	pending                     map[nativeAdmissionKey]bool
+	retirementRecoveryResources map[string]struct{}
+	lifecycle                   context.Context
+	cancel                      context.CancelFunc
 }
 
 type nativePlacementFailureState struct {
@@ -676,10 +678,12 @@ func NewNativeAdmitter(ctx context.Context, runtime *NativeRuntime) (*NativeAdmi
 		binding: runtime.Binding, privateKey: key, store: runtime.store,
 		udpOpts:    append([]qurl.AgentRuntimeUDPOption(nil), runtime.UDPOptions...),
 		refreshCfg: runtime.refreshCfg, operations: operations,
-		live:      make(map[nativeAdmissionKey]nativeLiveAdmission),
-		pending:   make(map[nativeAdmissionKey]bool),
-		lifecycle: lifecycle,
-		cancel:    cancel,
+		live:                        make(map[nativeAdmissionKey]nativeLiveAdmission),
+		pending:                     make(map[nativeAdmissionKey]bool),
+		retirementRecoveryWake:      make(chan struct{}, 1),
+		retirementRecoveryResources: make(map[string]struct{}),
+		lifecycle:                   lifecycle,
+		cancel:                      cancel,
 	}
 	runtime.Binding = nil
 	runtime.store = nil
@@ -700,21 +704,108 @@ func (a *NativeAdmitter) recoverOrphanedSessionOperations() {
 	backoff := nativeOrphanRecoveryInitialBackoff
 	for {
 		err := a.recoverAllPending(a.lifecycle)
-		if err == nil || a.lifecycle.Err() != nil {
+		if err == nil {
+			break
+		}
+		if a.lifecycle.Err() != nil {
 			return
 		}
 		slog.WarnContext(a.lifecycle, "durable native session cleanup failed; retrying", "err", err)
-		timer := time.NewTimer(backoff)
-		select {
-		case <-a.lifecycle.Done():
-			if !timer.Stop() {
-				<-timer.C
-			}
+		if !waitForNativeRetirementRecovery(a.lifecycle, backoff) {
 			return
-		case <-timer.C:
 		}
 		backoff = min(backoff*2, nativeOrphanRecoveryMaxBackoff)
 	}
+	a.recoverQueuedNativeRetirements()
+}
+
+func waitForNativeRetirementRecovery(ctx context.Context, delay time.Duration) bool {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
+}
+
+// queueNativeRetirementRecovery coalesces failures by protected resource. The
+// single background worker gives every retry its existing bounded cleanup
+// budget without creating one goroutine for every local share.
+func (a *NativeAdmitter) queueNativeRetirementRecovery(resourceID string) {
+	if a == nil || resourceID == "" || a.lifecycle == nil || a.retirementRecoveryWake == nil ||
+		a.lifecycle.Err() != nil {
+		return
+	}
+	a.stateMu.Lock()
+	if a.retirementRecoveryResources == nil {
+		a.retirementRecoveryResources = make(map[string]struct{})
+	}
+	_, queued := a.retirementRecoveryResources[resourceID]
+	a.retirementRecoveryResources[resourceID] = struct{}{}
+	a.stateMu.Unlock()
+	if queued {
+		return
+	}
+	select {
+	case a.retirementRecoveryWake <- struct{}{}:
+	default:
+	}
+}
+
+func (a *NativeAdmitter) takeNativeRetirementRecoveryResources() []string {
+	a.stateMu.Lock()
+	defer a.stateMu.Unlock()
+	resources := make([]string, 0, len(a.retirementRecoveryResources))
+	for resourceID := range a.retirementRecoveryResources {
+		resources = append(resources, resourceID)
+	}
+	clear(a.retirementRecoveryResources)
+	return resources
+}
+
+func (a *NativeAdmitter) recoverQueuedNativeRetirements() {
+	backoff := nativeOrphanRecoveryInitialBackoff
+	for {
+		select {
+		case <-a.lifecycle.Done():
+			return
+		case <-a.retirementRecoveryWake:
+		}
+		retry := false
+		for _, resourceID := range a.takeNativeRetirementRecoveryResources() {
+			if err := a.recoverPendingNativeRetirements(a.lifecycle, resourceID); err != nil {
+				if a.lifecycle.Err() != nil {
+					return
+				}
+				// retireOne requeues the same resource before returning. Keep
+				// one capped delay between attempts so a silent issuing cell
+				// cannot create a local retry loop.
+				retry = true
+				slog.WarnContext(a.lifecycle, "durable native session retirement failed; retrying", "err", err)
+			}
+		}
+		if !retry {
+			backoff = nativeOrphanRecoveryInitialBackoff
+			continue
+		}
+		if !waitForNativeRetirementRecovery(a.lifecycle, backoff) {
+			return
+		}
+		backoff = min(backoff*2, nativeOrphanRecoveryMaxBackoff)
+	}
+}
+
+func (a *NativeAdmitter) recoverPendingNativeRetirements(ctx context.Context, resourceID string) error {
+	unlockResource := a.resources.lock(resourceID)
+	defer unlockResource()
+	a.runtimeMu.RLock()
+	defer a.runtimeMu.RUnlock()
+	if a.closed || a.binding == nil || len(a.privateKey) != 32 || a.operations == nil {
+		return errors.New("recover native retirement: native admitter is closed")
+	}
+	return a.retirePendingForResource(ctx, resourceID)
 }
 
 func (a *NativeAdmitter) recoverAllPending(ctx context.Context) error {
@@ -1322,6 +1413,7 @@ func (a *NativeAdmitter) retireOne(ctx context.Context, key nativeAdmissionKey, 
 		return errors.New("native admitter has no durable session-operation authority")
 	}
 	if err := a.operations.Retire(ctx, a.binding, a.privateKey, live.resourceID, live.operationID, live.receipt, a.udpOpts); err != nil {
+		a.queueNativeRetirementRecovery(live.resourceID)
 		return err
 	}
 	a.stateMu.Lock()
@@ -1449,6 +1541,7 @@ func (a *NativeAdmitter) Close() error {
 	a.stateMu.Lock()
 	a.live = nil
 	a.pending = nil
+	a.retirementRecoveryResources = nil
 	a.placementFailures = nil
 	a.stateMu.Unlock()
 	a.runtimeMu.Unlock()

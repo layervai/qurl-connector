@@ -196,6 +196,35 @@ type retirementFailureOperations struct {
 	err error
 }
 
+type blockingQueuedRetirementOperations struct {
+	testNativeSessionOperations
+	mu                sync.Mutex
+	calls             int
+	backgroundStarted chan struct{}
+	backgroundStopped chan struct{}
+	startOnce         sync.Once
+	stopOnce          sync.Once
+}
+
+func (o *blockingQueuedRetirementOperations) Retire(ctx context.Context, _ *qurl.AgentRuntimeBinding, _ []byte,
+	_, _ string, _ qurl.NativeSessionReceipt, _ []qurl.AgentRuntimeUDPOption,
+) error {
+	o.mu.Lock()
+	o.calls++
+	call := o.calls
+	o.mu.Unlock()
+	if call == 1 {
+		return nativeudp.ErrNoReply
+	}
+	if call == 2 {
+		o.startOnce.Do(func() { close(o.backgroundStarted) })
+		<-ctx.Done()
+		o.stopOnce.Do(func() { close(o.backgroundStopped) })
+		return ctx.Err()
+	}
+	return nil
+}
+
 type dispatchFailureOperations struct {
 	testNativeSessionOperations
 	err error
@@ -2449,6 +2478,166 @@ func TestNewNativeAdmitterCallerCancellationStopsOrphanRecovery(t *testing.T) {
 	}
 	if err := admitter.Close(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestNativeAdmitterCanceledRetireWakesBoundedResourceRecovery(t *testing.T) {
+	oldRecover := recoverNativeSessionOperation
+	oldWait := waitNativeSessionRecovery
+	t.Cleanup(func() {
+		recoverNativeSessionOperation = oldRecover
+		waitNativeSessionRecovery = oldWait
+	})
+	store := &memoryNativeStore{}
+	mapped, receipt := seedMappedDurableRecord(t, store)
+	operations, err := newDurableNativeSessionOperations(store, testNativeSessionAuthority())
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstStarted := make(chan struct{})
+	recovered := make(chan struct{})
+	var recoverOnce sync.Once
+	var callsMu sync.Mutex
+	calls := 0
+	waitNativeSessionRecovery = func(ctx context.Context, _ time.Duration) error { return ctx.Err() }
+	recoverNativeSessionOperation = func(ctx context.Context, _ *qurl.AgentRuntimeBinding, _ []byte,
+		_ qurl.NativeSessionOperation, _ qurl.NHPUDPEndpoint, _ ...qurl.AgentRuntimeUDPOption,
+	) (*qurl.NativeSessionOperationRecovery, error) {
+		callsMu.Lock()
+		calls++
+		call := calls
+		callsMu.Unlock()
+		switch call {
+		case 1:
+			close(firstStarted)
+			<-ctx.Done()
+			return nil, ctx.Err()
+		case 2:
+			return nil, nativeudp.ErrNoReply
+		default:
+			recoverOnce.Do(func() { close(recovered) })
+			return &qurl.NativeSessionOperationRecovery{Complete: true}, nil
+		}
+	}
+	key := admissionKey(receipt)
+	lifecycle, cancelLifecycle := context.WithCancel(context.Background())
+	admitter := &NativeAdmitter{
+		binding: &qurl.AgentRuntimeBinding{AgentID: "agent-one"}, privateKey: make([]byte, 32),
+		operations: operations, store: store,
+		live: map[nativeAdmissionKey]nativeLiveAdmission{
+			key: {resourceID: mapped.Operation.ProtectedResourceID, operationID: mapped.Operation.OperationID, receipt: receipt},
+		},
+		pending:                     make(map[nativeAdmissionKey]bool),
+		retirementRecoveryWake:      make(chan struct{}, 1),
+		retirementRecoveryResources: make(map[string]struct{}),
+		lifecycle:                   lifecycle,
+		cancel:                      cancelLifecycle,
+	}
+	admitter.recoveryWG.Add(1)
+	go admitter.recoverOrphanedSessionOperations()
+	t.Cleanup(func() {
+		if err := admitter.Close(); err != nil {
+			t.Errorf("Close() error = %v", err)
+		}
+	})
+
+	retireCtx, cancelRetire := context.WithCancel(context.Background())
+	retired := make(chan error, 1)
+	go func() {
+		retired <- admitter.Retire(retireCtx, Admission{
+			ResourceID: mapped.Operation.ProtectedResourceID, RunID: receipt.RunID, RunAttempt: receipt.RunAttempt,
+			SessionID: receipt.SessionID, SessionReceipt: receipt,
+		})
+	}()
+	select {
+	case <-firstStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("initial retirement did not start")
+	}
+	cancelRetire()
+	if err := <-retired; !errors.Is(err, context.Canceled) {
+		t.Fatalf("Retire() = %v, want caller cancellation", err)
+	}
+	select {
+	case <-recovered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("queued resource retirement did not recover")
+	}
+	var live, pending, queued, recordCount int
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		admitter.stateMu.Lock()
+		live, pending, queued = len(admitter.live), len(admitter.pending), len(admitter.retirementRecoveryResources)
+		admitter.stateMu.Unlock()
+		records, loadErr := store.LoadSessionOperations(context.Background(), mapped.Operation.ProtectedResourceID)
+		if loadErr != nil {
+			t.Fatal(loadErr)
+		}
+		recordCount = len(records)
+		if live == 0 && pending == 0 && queued == 0 && recordCount == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	callsMu.Lock()
+	recoveryCalls := calls
+	callsMu.Unlock()
+	if recoveryCalls != 3 || live != 0 || pending != 0 || queued != 0 || recordCount != 0 {
+		t.Fatalf("recovery calls=%d live=%d pending=%d queued=%d records=%d, want 3/0/0/0/0",
+			recoveryCalls, live, pending, queued, recordCount)
+	}
+}
+
+func TestNativeAdmitterCloseCancelsQueuedRetirementRecovery(t *testing.T) {
+	receipt := testSessionReceipt(1, "run-one", 1)
+	key := admissionKey(receipt)
+	operations := &blockingQueuedRetirementOperations{
+		backgroundStarted: make(chan struct{}),
+		backgroundStopped: make(chan struct{}),
+	}
+	lifecycle, cancelLifecycle := context.WithCancel(context.Background())
+	admitter := &NativeAdmitter{
+		binding: &qurl.AgentRuntimeBinding{AgentID: "agent-one"}, privateKey: make([]byte, 32),
+		operations: operations, store: &memoryNativeStore{},
+		live: map[nativeAdmissionKey]nativeLiveAdmission{
+			key: {resourceID: "resource-one", operationID: "operation-one", receipt: receipt},
+		},
+		pending:                     make(map[nativeAdmissionKey]bool),
+		retirementRecoveryWake:      make(chan struct{}, 1),
+		retirementRecoveryResources: make(map[string]struct{}),
+		lifecycle:                   lifecycle,
+		cancel:                      cancelLifecycle,
+	}
+	admitter.recoveryWG.Add(1)
+	go admitter.recoverOrphanedSessionOperations()
+	if err := admitter.Retire(context.Background(), Admission{
+		ResourceID: "resource-one", RunID: "run-one", RunAttempt: 1,
+		SessionID: 1, SessionReceipt: receipt,
+	}); !errors.Is(err, nativeudp.ErrNoReply) {
+		t.Fatalf("Retire() = %v, want no-reply failure", err)
+	}
+	select {
+	case <-operations.backgroundStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("queued retirement recovery did not start")
+	}
+	closed := make(chan error, 1)
+	go func() { closed <- admitter.Close() }()
+	select {
+	case <-operations.backgroundStopped:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Close did not cancel queued retirement recovery")
+	}
+	select {
+	case err := <-closed:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Close did not finish after queued retirement stopped")
 	}
 }
 
