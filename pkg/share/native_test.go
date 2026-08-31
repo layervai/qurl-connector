@@ -37,10 +37,21 @@ type memoryNativeStore struct {
 	operations       map[string][]agentstate.SessionOperationRecord
 	scanPermanentErr error
 	scanRetryableErr error
+	handoffErr       error
+	handoffErrAt     int
+	handoffCalls     int
 }
 
-func (*memoryNativeStore) Handoff() (qurl.AgentStateStore, error) { return nil, nil }
-func (*memoryNativeStore) ValidateContinuity() error              { return nil }
+func (s *memoryNativeStore) Handoff() (qurl.AgentStateStore, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.handoffCalls++
+	if s.handoffErr != nil && (s.handoffErrAt == 0 || s.handoffCalls >= s.handoffErrAt) {
+		return nil, s.handoffErr
+	}
+	return nil, nil
+}
+func (*memoryNativeStore) ValidateContinuity() error { return nil }
 func (s *memoryNativeStore) LoadRegistrationRefreshMarker() (agentstate.RefreshMarker, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -954,6 +965,12 @@ func TestMayConsumeNativeRecoveryAuthorityRejectsUnsafeLocalStates(t *testing.T)
 		{"bare recovery sentinel", qurl.ErrCredentialRecoveryRequired, false},
 		{"missing credential", &qurl.NativeCredentialRecoveryRequiredError{Cause: qurl.ErrDeviceCredentialMissing}, false},
 		{"malformed pending state", &qurl.NativeCredentialRecoveryRequiredError{Cause: qurl.ErrInvalidAgentState}, false},
+		{"wrapped pending sentinel", &qurl.NativeCredentialRecoveryRequiredError{Cause: fmt.Errorf("unexpected wrapper: %w", qurl.ErrCredentialRecoveryRequired)}, false},
+		{"expired pending episode", &qurl.NativeCredentialRecoveryRequiredError{Cause: errors.Join(qurl.ErrCredentialRecoveryRequired, qurl.ErrCredentialRecoveryExpired)}, false},
+		{"revoke-required pending episode", &qurl.NativeCredentialRecoveryRequiredError{Cause: errors.Join(qurl.ErrCredentialRecoveryRequired, qurl.ErrCredentialRecoveryRevokeRequired)}, false},
+		{"conflicting pending episode", &qurl.NativeCredentialRecoveryRequiredError{Cause: errors.Join(qurl.ErrCredentialRecoveryRequired, qurl.ErrCredentialRecoveryCandidateConflict)}, false},
+		{"identity-rejected pending episode", &qurl.NativeCredentialRecoveryRequiredError{Cause: errors.Join(qurl.ErrCredentialRecoveryRequired, qurl.ErrCredentialRecoveryIdentityRejected)}, false},
+		{"credential-rejected pending episode", &qurl.NativeCredentialRecoveryRequiredError{Cause: errors.Join(qurl.ErrCredentialRecoveryRequired, qurl.ErrRecoveryCredentialRejected)}, false},
 		{"unrelated error", qurl.ErrInvalidAssignmentConfig, false},
 	}
 	for _, test := range tests {
@@ -1081,7 +1098,7 @@ func TestOpenNativeRuntimeDoesNotSpendRecoveryAuthorityOnOtherFailures(t *testin
 	}
 }
 
-func TestOpenNativeRuntimeRecoveryProviderFailurePreservesIdentityRejection(t *testing.T) {
+func TestOpenNativeRuntimeRecoveryProviderFailureStaysRetryable(t *testing.T) {
 	oldStore := newNativeStateStore
 	oldRefresh := refreshNativeRuntime
 	oldWait := waitNativeRefresh
@@ -1101,8 +1118,32 @@ func TestOpenNativeRuntimeRecoveryProviderFailurePreservesIdentityRejection(t *t
 		StateDir:                   "/private/state",
 		RecoveryCredentialProvider: func(context.Context) (string, error) { return "", want },
 	})
-	if !errors.Is(err, qurl.ErrAssignmentIdentityRejected) || !errors.Is(err, want) {
-		t.Fatalf("OpenNativeRuntime() = %v, want identity rejection joined with provider failure", err)
+	if errors.Is(err, qurl.ErrAssignmentIdentityRejected) || !errors.Is(err, want) || IsPermanentNativeOpenError(err) {
+		t.Fatalf("OpenNativeRuntime() = %v, want retryable provider failure without terminal trigger", err)
+	}
+}
+
+func TestOpenNativeRuntimeRecoveryStateHandoffFailureStaysRetryable(t *testing.T) {
+	oldStore := newNativeStateStore
+	oldConnect := connectNativeRuntime
+	t.Cleanup(func() {
+		newNativeStateStore = oldStore
+		connectNativeRuntime = oldConnect
+	})
+	want := errors.New("temporary state handoff failure")
+	store := &memoryNativeStore{handoffErr: want, handoffErrAt: 2}
+	newNativeStateStore = func(string, string) (nativeStateStore, error) { return store, nil }
+	connectNativeRuntime = func(context.Context, qurl.AgentStateStore, ...qurl.AgentRuntimeRegistrationOption) (*qurl.Client, *qurl.AgentRuntimeBinding, error) {
+		return nil, nil, &qurl.NativeCredentialRecoveryRequiredError{Cause: qurl.ErrCredentialRecoveryRequired}
+	}
+	_, err := OpenNativeRuntime(context.Background(), NativeRuntimeConfig{
+		StateDir: "/private/state",
+		RecoveryCredentialProvider: func(context.Context) (string, error) {
+			return "lv_test_recoverycredentialabcdefghijklmnopqrstuvwxyz0123456789", nil
+		},
+	})
+	if errors.Is(err, qurl.ErrCredentialRecoveryRequired) || !errors.Is(err, want) || IsPermanentNativeOpenError(err) {
+		t.Fatalf("OpenNativeRuntime() = %v, want retryable state handoff failure without terminal trigger", err)
 	}
 }
 

@@ -253,16 +253,12 @@ func mayConsumeNativeRecoveryAuthority(err error) bool {
 	if errors.Is(err, qurl.ErrAssignmentIdentityRejected) {
 		return true
 	}
-	// A valid pending episode is the only local recovery-required state that
-	// may consume account authority automatically. Missing credentials and
-	// malformed state also unwrap ErrCredentialRecoveryRequired, but qurl-go
-	// marks those with ErrDeviceCredentialMissing or ErrInvalidAgentState. They
-	// need deliberate operator action and must not spend a recovery credential.
+	// qurl-go's exact pending-episode sentinel is the only local state that may
+	// consume account authority automatically. Wrapped or joined causes fail
+	// closed so new, malformed, and terminal upstream states cannot spend it.
 	var pending *qurl.NativeCredentialRecoveryRequiredError
 	return errors.As(err, &pending) && pending != nil &&
-		errors.Is(pending.Cause, qurl.ErrCredentialRecoveryRequired) &&
-		!errors.Is(pending.Cause, qurl.ErrDeviceCredentialMissing) &&
-		!errors.Is(pending.Cause, qurl.ErrInvalidAgentState)
+		pending.Cause == qurl.ErrCredentialRecoveryRequired //nolint:errorlint // Exact sentinel is the allowlist boundary.
 }
 
 func recoverNativeCredential(ctx context.Context, cfg NativeRuntimeConfig, store nativeStateStore, triggerErr error, mode string) (*NativeRuntime, error) {
@@ -271,15 +267,15 @@ func recoverNativeCredential(ctx context.Context, cfg NativeRuntimeConfig, store
 	}
 	credential, err := cfg.RecoveryCredentialProvider(ctx)
 	if err != nil {
-		return nil, errors.Join(triggerErr, fmt.Errorf("resolve native credential recovery authority: %w", err))
+		return nil, fmt.Errorf("resolve native credential recovery authority: %w", err)
 	}
 	credential = strings.TrimSpace(credential)
 	if credential == "" {
-		return nil, errors.Join(triggerErr, errors.New("native credential recovery authority is empty"))
+		return nil, fmt.Errorf("%w: native credential recovery authority is empty", qurl.ErrCredentialRecoveryRequired)
 	}
 	state, err := store.Handoff()
 	if err != nil {
-		return nil, errors.Join(triggerErr, err)
+		return nil, fmt.Errorf("open native state for credential recovery: %w", err)
 	}
 	options := make([]qurl.AgentRuntimeRecoveryOption, 0, len(cfg.UDPOptions)+3)
 	options = append(options, qurl.WithAgentRuntimeRecoveryHub(cfg.Hub))
