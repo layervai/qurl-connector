@@ -17,8 +17,9 @@ func ValidateRegularFile(namespace *Directory, name string, file *os.File, label
 
 // ValidateOwnerRegularFile proves the same descriptor-entry continuity as
 // ValidateRegularFile while accepting any mode on an euid-owned file. It is
-// for safe cleanup of private state whose mode may have drifted, never for
-// reading or executing that state.
+// for safe cleanup or mode repair of private state whose mode may have
+// drifted. Callers must restore and revalidate the required mode before they
+// read or execute that state.
 func ValidateOwnerRegularFile(namespace *Directory, name string, file *os.File, label string) (os.FileInfo, error) {
 	return validateRegularFile(namespace, name, file, label, validateOwnerRegularDescriptor)
 }

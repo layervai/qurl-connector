@@ -1397,6 +1397,47 @@ func TestOpenNativeRuntimeRecoveryProviderFailureStaysRetryable(t *testing.T) {
 	}
 }
 
+func TestOpenNativeRuntimeRecoveryProviderRejectsEmptyAuthorityBeforeRecoveryIO(t *testing.T) {
+	oldStore := newNativeStateStore
+	oldRefresh := refreshNativeRuntime
+	oldRecover := recoverNativeRuntime
+	oldWait := waitNativeRefresh
+	t.Cleanup(func() {
+		newNativeStateStore = oldStore
+		refreshNativeRuntime = oldRefresh
+		recoverNativeRuntime = oldRecover
+		waitNativeRefresh = oldWait
+	})
+	store := &memoryNativeStore{present: true, marker: agentstate.RefreshMarker{Version: 2, Reason: "placement recovery"}}
+	newNativeStateStore = func(string, string) (nativeStateStore, error) { return store, nil }
+	waitNativeRefresh = func(context.Context, time.Duration) error { return nil }
+	refreshNativeRuntime = func(context.Context, qurl.HubBootstrap, qurl.AgentStateStore, ...qurl.AgentRuntimeRefreshOption) (*qurl.Client, *qurl.AgentRuntimeBinding, error) {
+		return nil, nil, qurl.ErrAssignmentIdentityRejected
+	}
+	providerCalls := 0
+	recoveryIO := 0
+	recoverNativeRuntime = func(ctx context.Context, provider qurl.AgentRuntimeRecoveryCredentialProvider, _ qurl.AgentStateStore, _ ...qurl.AgentRuntimeRecoveryOption) (*qurl.Client, *qurl.AgentRuntimeBinding, error) {
+		if _, err := provider(ctx); err != nil {
+			return nil, nil, err
+		}
+		recoveryIO++
+		return nil, nil, errors.New("unexpected recovery I/O")
+	}
+	_, err := OpenNativeRuntime(context.Background(), NativeRuntimeConfig{
+		StateDir: "/private/state",
+		RecoveryCredentialProvider: func(context.Context) (string, error) {
+			providerCalls++
+			return " \t\n", nil
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), "recovery authority is empty") {
+		t.Fatalf("OpenNativeRuntime() = %v, want empty recovery authority error", err)
+	}
+	if providerCalls != 1 || recoveryIO != 0 {
+		t.Fatalf("empty recovery authority calls provider/I/O=%d/%d, want 1/0", providerCalls, recoveryIO)
+	}
+}
+
 func TestOpenNativeRuntimeRecoveryStateHandoffFailureStaysRetryable(t *testing.T) {
 	oldStore := newNativeStateStore
 	oldConnect := connectNativeRuntime

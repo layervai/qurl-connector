@@ -152,6 +152,42 @@ func TestLinuxEnsureLeavesExactRunningJobUntouched(t *testing.T) {
 	}
 }
 
+func TestLinuxEnsureRepairsOwnerDefinitionWithDriftedMode(t *testing.T) {
+	job := linuxTestUserJob(t)
+	unitPath := filepath.Join(t.TempDir(), "systemd", "user", job.Label+".service")
+	if err := os.MkdirAll(filepath.Dir(unitPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	content, err := RenderSystemdUserJob(job)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(unitPath, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var calls [][]string
+	manager := &linuxUserJobManager{
+		unitPath: func(string) (string, error) { return unitPath, nil },
+		run: func(args ...string) (string, error) {
+			calls = append(calls, append([]string(nil), args...))
+			return linuxSystemdState(unitPath, "loaded", "active", "running", "enabled", "no"), nil
+		},
+	}
+	if err := manager.Ensure(job); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(unitPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Fatalf("repaired unit mode = %04o, want 0600", info.Mode().Perm())
+	}
+	if len(calls) != 1 || calls[0][0] != "show" {
+		t.Fatalf("systemctl calls = %#v, want one non-disruptive show", calls)
+	}
+}
+
 func TestLinuxEnsureRepairsDisabledExactRunningJob(t *testing.T) {
 	job := linuxTestUserJob(t)
 	unitPath := filepath.Join(t.TempDir(), "systemd", "user", job.Label+".service")
@@ -743,6 +779,26 @@ func TestLinuxUserJobRejectsUnsafeExecutableAndLogNamespace(t *testing.T) {
 	}
 	if err := ensureLinuxUserJobLogs(job.StandardOut); err == nil {
 		t.Fatal("symlinked log path was accepted")
+	}
+}
+
+func TestLinuxUserJobRepairsOwnerLogWithDriftedMode(t *testing.T) {
+	job := linuxTestUserJob(t)
+	if err := os.MkdirAll(filepath.Dir(job.StandardOut), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(job.StandardOut, []byte("existing\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := ensureLinuxUserJobLogs(job.StandardOut); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(job.StandardOut)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Fatalf("repaired log mode = %04o, want 0600", info.Mode().Perm())
 	}
 }
 

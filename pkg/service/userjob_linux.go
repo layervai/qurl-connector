@@ -215,7 +215,7 @@ func (m *linuxUserJobManager) ensure(job UserJob, forceReplace bool) error {
 	if err := ensureTrustedSystemdUnitDirectory(filepath.Dir(unitPath)); err != nil {
 		return err
 	}
-	existing, installed, err := readLinuxUserJobDefinition(unitPath)
+	existing, installed, err := readLinuxUserJobDefinition(unitPath, true)
 	if err != nil {
 		return fmt.Errorf("read systemd user job %s: %w", job.Label, err)
 	}
@@ -346,7 +346,7 @@ func (m *linuxUserJobManager) Status(label string) (ServiceStatus, error) {
 	if err != nil {
 		return ServiceStatus{}, err
 	}
-	_, installed, err := readLinuxUserJobDefinition(unitPath)
+	_, installed, err := readLinuxUserJobDefinition(unitPath, false)
 	if err != nil {
 		return ServiceStatus{}, fmt.Errorf("inspect systemd user job %s: %w", label, err)
 	}
@@ -444,7 +444,7 @@ func syncTrustedSystemdUnitDirectory(path string) error {
 	return errors.Join(dir.Sync(), dir.Close())
 }
 
-func readLinuxUserJobDefinition(path string) ([]byte, bool, error) {
+func readLinuxUserJobDefinition(path string, repairMode bool) ([]byte, bool, error) {
 	dir, err := pinnedfs.OpenTrusted(filepath.Dir(path))
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, false, nil
@@ -461,7 +461,7 @@ func readLinuxUserJobDefinition(path string) ([]byte, bool, error) {
 		return nil, false, err
 	}
 	defer func() { _ = file.Close() }()
-	if _, err := pinnedfs.ValidateRegularFile(dir, filepath.Base(path), file, "systemd user job definition", 0o600); err != nil {
+	if err := validateLinuxUserJobFileMode(dir, filepath.Base(path), file, "systemd user job definition", 0o600, repairMode); err != nil {
 		return nil, false, err
 	}
 	content, err := io.ReadAll(io.LimitReader(file, maxLinuxUserJobDefinitionBytes+1))
@@ -472,6 +472,29 @@ func readLinuxUserJobDefinition(path string) ([]byte, bool, error) {
 		return nil, false, errors.New("systemd user job definition is too large")
 	}
 	return content, true, nil
+}
+
+func validateLinuxUserJobFileMode(dir *pinnedfs.Directory, name string, file *os.File, label string,
+	mode os.FileMode, repair bool,
+) error {
+	if !repair {
+		_, err := pinnedfs.ValidateRegularFile(dir, name, file, label, mode)
+		return err
+	}
+	info, err := pinnedfs.ValidateOwnerRegularFile(dir, name, file, label)
+	if err != nil {
+		return err
+	}
+	if info.Mode().Perm() != mode.Perm() {
+		if err := file.Chmod(mode.Perm()); err != nil {
+			return fmt.Errorf("repair %s mode: %w", label, err)
+		}
+		if err := file.Sync(); err != nil {
+			return fmt.Errorf("make repaired %s mode durable: %w", label, err)
+		}
+	}
+	_, err = pinnedfs.ValidateRegularFile(dir, name, file, label, mode)
+	return err
 }
 
 func removeLinuxUserJobDefinition(path string) (retErr error) {
@@ -585,7 +608,7 @@ func ensureLinuxUserJobLogs(paths ...string) error {
 			_ = dir.Close()
 			return fmt.Errorf("create Linux user job log %s: %w", path, openErr)
 		}
-		_, validateErr := pinnedfs.ValidateRegularFile(dir, filepath.Base(path), file, "Linux user job log", 0o600)
+		validateErr := validateLinuxUserJobFileMode(dir, filepath.Base(path), file, "Linux user job log", 0o600, true)
 		closeErr := errors.Join(file.Close(), dir.Close())
 		if err := errors.Join(validateErr, closeErr); err != nil {
 			return fmt.Errorf("validate Linux user job log %s: %w", path, err)

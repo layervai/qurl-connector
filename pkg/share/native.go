@@ -300,13 +300,27 @@ func recoverNativeCredential(ctx context.Context, cfg NativeRuntimeConfig, store
 		return nil, fmt.Errorf("open native state for credential recovery: %w", err)
 	}
 	options := nativeCredentialRecoveryOptions(cfg.Hub, cfg.AgentID, cfg.ClientBaseURL, cfg.UDPOptions)
-	client, binding, err := recoverNativeRuntime(ctx, qurl.AgentRuntimeRecoveryCredentialProvider(cfg.RecoveryCredentialProvider), state, options...)
+	client, binding, err := recoverNativeRuntime(ctx, validatedNativeRecoveryCredentialProvider(cfg.RecoveryCredentialProvider), state, options...)
 	if err != nil {
 		// Do not join triggerErr here. A valid pending episode remains durable,
 		// while a Hub outage or rate limit must stay retryable for the daemon.
 		return nil, fmt.Errorf("recover native credential: %w", err)
 	}
 	return assembleRefreshedNativeRuntime(ctx, client, binding, store, refreshConfig(cfg, mode), NativeOpenRecovery)
+}
+
+func validatedNativeRecoveryCredentialProvider(provider func(context.Context) (string, error)) qurl.AgentRuntimeRecoveryCredentialProvider {
+	return func(ctx context.Context) (string, error) {
+		credential, err := provider(ctx)
+		if err != nil {
+			return "", err
+		}
+		credential = strings.TrimSpace(credential)
+		if credential == "" {
+			return "", errors.New("native credential recovery authority is empty")
+		}
+		return credential, nil
+	}
 }
 
 func nativeCredentialRecoveryOptions(hub qurl.HubBootstrap, agentID, clientBaseURL string, udpOptions []qurl.AgentRuntimeUDPOption) []qurl.AgentRuntimeRecoveryOption {
@@ -610,7 +624,7 @@ func (r *NativeRuntime) RecoverCredentialAfterDeviceAuthorizationFailure(
 		return fmt.Errorf("open native state for device authorization recovery: %w", err)
 	}
 	options := nativeCredentialRecoveryOptions(r.refreshCfg.Hub, r.AgentID, r.refreshCfg.ClientBaseURL, r.refreshCfg.UDPOptions)
-	client, binding, err := recoverNativeRuntime(ctx, qurl.AgentRuntimeRecoveryCredentialProvider(provider), state, options...)
+	client, binding, err := recoverNativeRuntime(ctx, validatedNativeRecoveryCredentialProvider(provider), state, options...)
 	if err != nil {
 		return fmt.Errorf("recover native credential after device authorization rejection: %w", err)
 	}
