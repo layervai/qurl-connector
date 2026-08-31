@@ -438,11 +438,11 @@ func clearRegistrationRefreshMarker(namespace *pinnedfs.Directory) error {
 	return namespace.ValidateCurrent()
 }
 
-// writeRefreshMarker atomically persists m under dir. Mode 0644 (non-secret
-// breadcrumb) via the same atomicfile.Write (<name>.tmp + fsync + rename)
-// the native state writes use, so a crash mid-write leaves either the prior
-// marker or the new one — never a torn file the warm-restart read would
-// reject.
+// writeRefreshMarker atomically persists m under dir. Unix uses mode 0644 for
+// this non-secret breadcrumb. Windows keeps the same file owner-only because
+// ACLs, not Unix mode bits, define its state-file safety. The write uses the
+// same <name>.tmp + fsync + rename sequence as native state, so a crash leaves
+// either the prior marker or the new one, never a torn file.
 func writeRefreshMarker(namespace *pinnedfs.Directory, m RefreshMarker) (retErr error) {
 	data, err := json.Marshal(m)
 	if err != nil {
@@ -453,7 +453,7 @@ func writeRefreshMarker(namespace *pinnedfs.Directory, m RefreshMarker) (retErr 
 		if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
 			return fmt.Errorf("registration refresh marker %s must be a non-symlink regular file", path)
 		}
-		if info.Mode().Perm() != pubMode {
+		if !pinnedfs.PrivateModeMatches(info, pubMode) {
 			return fmt.Errorf("registration refresh marker %s has mode %04o, want %04o", path, info.Mode().Perm(), pubMode)
 		}
 	} else if !pinnedfs.IsNotExist(err) {

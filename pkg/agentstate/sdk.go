@@ -441,6 +441,11 @@ func NewSDKStore(dir, configuredAgentID string) (_ *SDKStore, retErr error) {
 	if err != nil {
 		return nil, err
 	}
+	// The pinned qurl-go dependency writes both plaintext and sealed envelopes
+	// through its protected-ACL Windows pinned-state implementation.
+	// Connector-owned refresh markers, session journals, locks, and identity-
+	// cache files use internal/pinnedfs. No production identity or session-state
+	// writer uses plain pathname creation inside this protected directory.
 	if providerName == KeyProviderFile {
 		store, err := qurl.OpenFileAgentState(filepath.Join(dir, AgentStateFile))
 		if err != nil {

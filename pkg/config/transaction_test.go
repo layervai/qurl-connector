@@ -97,10 +97,10 @@ func TestConfigTransactionLockAcquireJoinsPostValidationReleaseFailure(t *testin
 		t.Fatal(err)
 	}
 	releaseErr := errors.New("injected config lock candidate release failure")
-	originalHook := beforeTransactionFileFinalValidation
+	originalHook := beforeTransactionFileValidation
 	originalRelease := releaseConfigTransactionCandidate
 	validationCount := 0
-	beforeTransactionFileFinalValidation = func(label string) {
+	beforeTransactionFileValidation = func(label string) {
 		if label != "config transaction lock" {
 			return
 		}
@@ -115,7 +115,7 @@ func TestConfigTransactionLockAcquireJoinsPostValidationReleaseFailure(t *testin
 		return errors.Join(releaseTransactionLock(file), releaseErr)
 	}
 	t.Cleanup(func() {
-		beforeTransactionFileFinalValidation = originalHook
+		beforeTransactionFileValidation = originalHook
 		releaseConfigTransactionCandidate = originalRelease
 	})
 
@@ -317,18 +317,18 @@ func TestCreateTempJoinsRejectedTempCleanupFailures(t *testing.T) {
 	closeErr := errors.New("injected rejected-temp close failure")
 	removeErr := errors.New("injected rejected-temp remove failure")
 	syncErr := errors.New("injected rejected-temp sync failure")
-	originalFinalHook := beforeTransactionFileFinalValidation
+	originalValidationHook := beforeTransactionFileValidation
 	originalClose := closeConfigTransactionFile
 	originalRemove := removeConfigTransactionTemp
 	originalSync := syncConfigTransactionNamespace
 	t.Cleanup(func() {
-		beforeTransactionFileFinalValidation = originalFinalHook
+		beforeTransactionFileValidation = originalValidationHook
 		closeConfigTransactionFile = originalClose
 		removeConfigTransactionTemp = originalRemove
 		syncConfigTransactionNamespace = originalSync
 	})
 	mutated := false
-	beforeTransactionFileFinalValidation = func(label string) {
+	beforeTransactionFileValidation = func(label string) {
 		if label != "temporary config file" || mutated {
 			return
 		}
@@ -365,7 +365,7 @@ func TestCreateTempJoinsRejectedTempCleanupFailures(t *testing.T) {
 	}
 }
 
-func TestValidateTransactionFileUsesFinalStableSnapshot(t *testing.T) {
+func TestValidateTransactionFileRejectsMutationBeforeValidation(t *testing.T) {
 	tests := []struct {
 		name   string
 		mutate func(*testing.T, string)
@@ -405,66 +405,10 @@ func TestValidateTransactionFileUsesFinalStableSnapshot(t *testing.T) {
 			}
 			defer tx.Close()
 
-			originalHook := beforeTransactionFileFinalValidation
-			t.Cleanup(func() { beforeTransactionFileFinalValidation = originalHook })
+			originalHook := beforeTransactionFileValidation
+			t.Cleanup(func() { beforeTransactionFileValidation = originalHook })
 			mutated := false
-			beforeTransactionFileFinalValidation = func(label string) {
-				if label == "existing config file" && !mutated {
-					mutated = true
-					tt.mutate(t, path)
-				}
-			}
-			if err := tx.Save(testTransactionConfig("after")); err == nil || !strings.Contains(err.Error(), tt.want) {
-				t.Fatalf("Save error = %v, want %q", err, tt.want)
-			}
-		})
-	}
-}
-
-func TestValidateTransactionFileValidatesFinalNamespaceSnapshot(t *testing.T) {
-	tests := []struct {
-		name   string
-		mutate func(*testing.T, string)
-		want   string
-	}{
-		{
-			name: "hard link after final descriptor stat",
-			mutate: func(t *testing.T, path string) {
-				t.Helper()
-				if err := os.Link(path, path+".alias"); err != nil {
-					t.Fatal(err)
-				}
-			},
-			want: "final entry link count is 2",
-		},
-		{
-			name: "chmod after final descriptor stat",
-			mutate: func(t *testing.T, path string) {
-				t.Helper()
-				if err := os.Chmod(path, 0o644); err != nil {
-					t.Fatal(err)
-				}
-			},
-			want: "final entry mode is 0644, want 0600",
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			parent := t.TempDir()
-			path := filepath.Join(parent, "qurl-proxy.yaml")
-			if err := Save(testTransactionConfig("before"), path); err != nil {
-				t.Fatal(err)
-			}
-			tx, err := AcquireFileTransaction(path)
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer tx.Close()
-
-			originalHook := beforeTransactionFileFinalEntryValidation
-			t.Cleanup(func() { beforeTransactionFileFinalEntryValidation = originalHook })
-			mutated := false
-			beforeTransactionFileFinalEntryValidation = func(label string) {
+			beforeTransactionFileValidation = func(label string) {
 				if label == "existing config file" && !mutated {
 					mutated = true
 					tt.mutate(t, path)

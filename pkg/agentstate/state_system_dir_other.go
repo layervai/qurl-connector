@@ -1,11 +1,8 @@
-//go:build !darwin && !linux
+//go:build !darwin && !linux && !windows
 
 package agentstate
 
-// systemStateDirCreatable assumes the system default is usable on platforms
-// without a writability probe. The Connector's pinned-filesystem layer only
-// supports darwin and linux (pinnedfs.requireSupportedPlatform), so this branch
-// is effectively unreachable at runtime; it exists only to keep the package
-// buildable everywhere and preserves the pre-fallback behavior (always the
-// system default) on such platforms.
+// systemStateDirCreatable assumes the system default is usable on unsupported
+// platforms without a writability probe. This keeps those packages buildable;
+// the pinned-filesystem layer still rejects their state operations.
 func systemStateDirCreatable() bool { return true }

@@ -564,7 +564,7 @@ func writeSessionOperationJournal(namespace *pinnedfs.Directory, name string, jo
 		return fmt.Errorf("native session operation exceeds %d bytes", sessionOperationFileMaxBytes)
 	}
 	if info, err := namespace.Lstat(name); err == nil {
-		if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() || info.Mode().Perm() != sessionOperationFileMode {
+		if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() || !pinnedfs.PrivateModeMatches(info, sessionOperationFileMode) {
 			return fmt.Errorf("native session operation %s has an unsafe file shape", filepath.Join(namespace.Path(), name))
 		}
 	} else if !pinnedfs.IsNotExist(err) {

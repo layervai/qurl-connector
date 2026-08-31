@@ -25,11 +25,7 @@ var ErrUnsupported = errors.New("pinned filesystem transactions are unsupported 
 var ErrNamespaceNotOwned = errors.New("pinned transaction namespace is not owned by the effective user")
 
 var syncPinnedParent = func(parent *os.Root, edgePath string) error {
-	dir, err := parent.Open(".")
-	if err != nil {
-		return fmt.Errorf("open parent for %s durability sync: %w", edgePath, err)
-	}
-	return errors.Join(dir.Sync(), dir.Close())
+	return syncPinnedDirectory(parent, edgePath)
 }
 
 var chmodPinnedChild = func(parent *os.Root, name string, mode os.FileMode) error {
@@ -46,6 +42,7 @@ type pathEdge struct {
 	child     *os.Root
 	childInfo os.FileInfo
 	path      string
+	created   bool
 }
 
 // Directory retains every directory handle from anchor to path. anchor is the
@@ -99,8 +96,9 @@ func OpenPrivate(path string, mode os.FileMode) (*Directory, error) {
 }
 
 // Ensure creates missing path components one at a time and fsyncs each
-// component's parent. Existing edges are fsynced too, so a retry after an
-// uncertain earlier fsync re-establishes durability before returning.
+// component's parent. Platform retry rules also fsync existing edges that may
+// have survived an uncertain earlier fsync, so visibility is not mistaken for
+// durability.
 func Ensure(path string, mode os.FileMode) (*Directory, error) {
 	return walk(path, true, mode.Perm(), nil, false, false, false)
 }
@@ -154,11 +152,11 @@ func walk(path string, create bool, mode os.FileMode, exactMode *os.FileMode, re
 		return nil, fmt.Errorf("resolve directory path: %w", err)
 	}
 	abs = filepath.Clean(abs)
-	if filepath.VolumeName(abs) != "" || !filepath.IsAbs(abs) {
-		return nil, fmt.Errorf("directory path %s is not an absolute Unix path", abs)
+	if err := validateAbsoluteDirectoryPath(abs); err != nil {
+		return nil, err
 	}
 
-	dir, err := walkFrom(string(filepath.Separator), abs, create, mode, exactMode, requireOwner, requireTrust, allowSticky)
+	dir, err := walkFrom(directoryWalkAnchor(abs), abs, create, mode, exactMode, requireOwner, requireTrust, allowSticky)
 	if err == nil {
 		return dir, nil
 	}
@@ -174,7 +172,7 @@ func walk(path string, create bool, mode os.FileMode, exactMode *os.FileMode, re
 	// part of the path is still validated edge by edge. This never weakens the
 	// unconfined case: when the walk from / succeeds, it is used.
 	var confined *confinedAncestorError
-	if !errors.As(err, &confined) {
+	if !supportsConfinedRecovery() || !errors.As(err, &confined) {
 		return nil, err
 	}
 	// One fallback, not a loop: this recovers a single contiguous unreachable
@@ -287,7 +285,7 @@ func walkFrom(anchor, abs string, create bool, mode os.FileMode, exactMode *os.F
 		if statErr != nil {
 			return nil, fmt.Errorf("stat pinned walk anchor %s: %w", anchor, statErr)
 		}
-		if err := validateTrustedDirectory(anchorInfo, anchor, allowSticky); err != nil {
+		if err := validateTrustedDirectoryRoot(anchorRoot, anchorInfo, anchor, allowSticky); err != nil {
 			return nil, err
 		}
 	}
@@ -316,14 +314,21 @@ func walkFrom(anchor, abs string, create bool, mode os.FileMode, exactMode *os.F
 			return nil, err
 		}
 		if requireTrust {
-			if err := validateTrustedDirectory(edge.childInfo, edge.path, allowSticky); err != nil {
+			if err := validateTrustedDirectoryRoot(edge.child, edge.childInfo, edge.path, allowSticky); err != nil {
 				return nil, err
 			}
 		}
-		if create {
-			// Always sync in create mode, including when this edge already
-			// existed. If a previous attempt created the edge but its parent
-			// fsync failed, retry must not mistake visibility for durability.
+		shouldSync := edge.created
+		if create && !shouldSync {
+			shouldSync, err = shouldRetryDirectoryEdgeSync(edge.child, edge.path)
+			if err != nil {
+				return nil, err
+			}
+		}
+		if create && shouldSync {
+			// Unix retries every existing edge. Windows retries only edges with
+			// the protected ACL installed by createPinnedDirectory, so ordinary
+			// volume and profile ancestors never need write access.
 			if err := syncPinnedParent(edge.parent, edge.path); err != nil {
 				return nil, fmt.Errorf("sync parent for directory edge %s: %w", edge.path, err)
 			}
@@ -342,26 +347,16 @@ func walkFrom(anchor, abs string, create bool, mode os.FileMode, exactMode *os.F
 
 func openPathEdge(parent *os.Root, name, path string, create bool, mode os.FileMode) (pathEdge, error) {
 	for range maxEdgeOpenAttempts {
+		created := false
 		before, err := parent.Lstat(name)
 		if errors.Is(err, os.ErrNotExist) && create {
-			if err := parent.Mkdir(name, mode.Perm()); err != nil {
+			if err := createPinnedDirectory(parent, name, path, mode.Perm()); err != nil {
 				if errors.Is(err, os.ErrExist) {
 					continue
 				}
 				return pathEdge{}, fmt.Errorf("create directory component %s: %w", path, err)
 			}
-			// mkdir honors the process umask. Force the requested mode through
-			// the retained parent before opening the new edge so a restrictive
-			// umask cannot make the directory itself unopenable.
-			if err := chmodPinnedChild(parent, name, mode.Perm()); err != nil {
-				removeErr := removePinnedChild(parent, name)
-				syncErr := syncPinnedParent(parent, path)
-				return pathEdge{}, errors.Join(
-					fmt.Errorf("set directory component %s permissions: %w", path, err),
-					wrapDirectoryCleanupError(path, "remove after permission failure", removeErr),
-					wrapDirectoryCleanupError(path, "sync parent after permission-failure cleanup", syncErr),
-				)
-			}
+			created = true
 			before, err = parent.Lstat(name)
 		}
 		if err != nil {
@@ -396,7 +391,7 @@ func openPathEdge(parent *os.Root, name, path string, create bool, mode os.FileM
 			_ = child.Close()
 			continue
 		}
-		return pathEdge{parent: parent, name: name, child: child, childInfo: opened, path: path}, nil
+		return pathEdge{parent: parent, name: name, child: child, childInfo: opened, path: path, created: created}, nil
 	}
 	return pathEdge{}, fmt.Errorf("directory component %s changed during %d open attempts", path, maxEdgeOpenAttempts)
 }
@@ -438,7 +433,7 @@ func (d *Directory) validateEdges() error {
 			return fmt.Errorf("directory component %s was replaced while pinned", edge.path)
 		}
 		if d.requireTrust {
-			if err := validateTrustedDirectory(opened, edge.path, d.allowSticky); err != nil {
+			if err := validateTrustedDirectoryRoot(edge.child, opened, edge.path, d.allowSticky); err != nil {
 				return err
 			}
 		}
@@ -454,20 +449,7 @@ func (d *Directory) validateFinalAttributes() error {
 	if err != nil {
 		return fmt.Errorf("stat pinned directory %s: %w", d.path, err)
 	}
-	if d.exactMode != nil && info.Mode().Perm() != d.exactMode.Perm() {
-		return fmt.Errorf("directory %s has mode %04o, want %04o", d.path, info.Mode().Perm(), d.exactMode.Perm())
-	}
-	if d.requireOwner {
-		if err := validateCurrentOwner(info, d.path); err != nil {
-			return err
-		}
-	}
-	if d.requireTrust {
-		if err := validateTrustedReadOnlyInfo(info, d.path); err != nil {
-			return err
-		}
-	}
-	return nil
+	return validateFinalDirectory(d.root, info, d.path, d.exactMode, d.requireOwner, d.requireTrust)
 }
 
 // ValidateCurrent revalidates every retained path edge and the final
@@ -486,16 +468,7 @@ func (d *Directory) RequireOwnedNamespace() error {
 	if err != nil {
 		return fmt.Errorf("stat transaction namespace %s: %w", d.path, err)
 	}
-	if err := validateCurrentOwner(info, d.path); err != nil {
-		if trustedErr := validateTrustedReadOnlyInfo(info, d.path); trustedErr == nil {
-			return fmt.Errorf("%w: %w", ErrNamespaceNotOwned, err)
-		}
-		return err
-	}
-	if info.Mode().Perm()&0o022 != 0 {
-		return fmt.Errorf("transaction namespace %s has mode %04o, want no group/other write", d.path, info.Mode().Perm())
-	}
-	return nil
+	return validateOwnedDirectory(d.root, info, d.path)
 }
 
 // Path is the absolute public path pinned by this Directory.
@@ -511,7 +484,7 @@ func (d *Directory) OpenFile(name string, flag int, perm os.FileMode) (*os.File,
 	if err := d.ValidateCurrent(); err != nil {
 		return nil, err
 	}
-	return d.root.OpenFile(name, flag, perm)
+	return openPinnedFile(d.root, name, flag, perm)
 }
 
 // Lstat reports on name without following its final symlink.
@@ -586,11 +559,7 @@ func (d *Directory) Sync() error {
 	if err := d.ValidateCurrent(); err != nil {
 		return err
 	}
-	dir, err := d.root.Open(".")
-	if err != nil {
-		return fmt.Errorf("open pinned directory for sync: %w", err)
-	}
-	return errors.Join(dir.Sync(), dir.Close())
+	return syncPinnedDirectory(d.root, d.path)
 }
 
 // Close releases every retained directory handle.

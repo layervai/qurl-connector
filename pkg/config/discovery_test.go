@@ -64,7 +64,7 @@ func TestDiscover_CWD(t *testing.T) {
 func TestDiscover_UserConfigDir(t *testing.T) {
 	// Use a temp dir as a fake home.
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	setTestUserHome(t, home)
 
 	configDir := filepath.Join(home, UserConfigDir)
 	if err := os.MkdirAll(configDir, 0o755); err != nil {
@@ -94,7 +94,7 @@ func TestDiscover_NothingFound(t *testing.T) {
 	// Point CWD and HOME to empty dirs so nothing is found.
 	emptyDir := t.TempDir()
 	emptyHome := t.TempDir()
-	t.Setenv("HOME", emptyHome)
+	setTestUserHome(t, emptyHome)
 
 	orig, _ := os.Getwd()
 	t.Cleanup(func() { _ = os.Chdir(orig) })
@@ -104,4 +104,12 @@ func TestDiscover_NothingFound(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error when no config is found")
 	}
+}
+
+func setTestUserHome(t *testing.T, home string) {
+	t.Helper()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	t.Setenv("HOMEDRIVE", "")
+	t.Setenv("HOMEPATH", "")
 }

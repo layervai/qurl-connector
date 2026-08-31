@@ -125,6 +125,71 @@ func realSDKTempDir(t *testing.T) string {
 	return dir
 }
 
+func secureSDKTestDir(t *testing.T, dir string) string {
+	t.Helper()
+	namespace, err := pinnedfs.EnsurePrivate(dir, dirMode)
+	if err != nil {
+		t.Fatalf("create secure SDK test directory: %v", err)
+	}
+	if err := namespace.Close(); err != nil {
+		t.Fatalf("close secure SDK test directory: %v", err)
+	}
+	return dir
+}
+
+func secureSDKStateDir(t *testing.T) string {
+	t.Helper()
+	return secureSDKTestDir(t, filepath.Join(realSDKTempDir(t), "state"))
+}
+
+func writePinnedSDKTestFile(t *testing.T, dir, name string, raw []byte, mode os.FileMode) {
+	t.Helper()
+	namespace, err := pinnedfs.OpenPrivate(dir, dirMode)
+	if err != nil {
+		t.Fatalf("open secure SDK test directory: %v", err)
+	}
+	namespaceOpen := true
+	defer func() {
+		if namespaceOpen {
+			_ = namespace.Close()
+		}
+	}()
+
+	file, err := namespace.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_EXCL|pinnedfs.SafeOpenFlags(), mode)
+	if err != nil {
+		t.Fatalf("create secure SDK test file %s: %v", name, err)
+	}
+	open := true
+	defer func() {
+		if open {
+			_ = file.Close()
+		}
+	}()
+	if err := file.Chmod(mode); err != nil {
+		t.Fatalf("set secure SDK test file mode %s: %v", name, err)
+	}
+	if _, err := file.Write(raw); err != nil {
+		t.Fatalf("write secure SDK test file %s: %v", name, err)
+	}
+	if err := file.Sync(); err != nil {
+		t.Fatalf("sync secure SDK test file %s: %v", name, err)
+	}
+	if _, err := pinnedfs.ValidateRegularFile(namespace, name, file, "SDK test state", mode); err != nil {
+		t.Fatalf("validate secure SDK test file %s: %v", name, err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatalf("close secure SDK test file %s: %v", name, err)
+	}
+	open = false
+	if err := namespace.Sync(); err != nil {
+		t.Fatalf("sync secure SDK test directory: %v", err)
+	}
+	if err := namespace.Close(); err != nil {
+		t.Fatalf("close secure SDK test directory: %v", err)
+	}
+	namespaceOpen = false
+}
+
 func openSDKStoreForTest(t *testing.T, dir, configuredAgentID string) (*SDKStore, qurl.AgentStateStore) {
 	t.Helper()
 	owner, err := NewSDKStore(dir, configuredAgentID)
@@ -194,9 +259,6 @@ func snapshotSDKStateFilesystem(t *testing.T, dir string) sdkStateFilesystemSnap
 }
 
 func TestOpenSDKStateReaderReadsWithoutFilesystemMutation(t *testing.T) {
-	if runtime.GOOS != "linux" && runtime.GOOS != "darwin" {
-		t.Skip("read-only pinned SDK state readers are supported on Linux and Darwin")
-	}
 	tests := []struct {
 		name     string
 		provider string
@@ -272,9 +334,6 @@ func TestOpenSDKStateReaderReadsWithoutFilesystemMutation(t *testing.T) {
 }
 
 func TestOpenSDKStateReaderMissingDirectoryDoesNotCreateIt(t *testing.T) {
-	if runtime.GOOS != "linux" && runtime.GOOS != "darwin" {
-		t.Skip("read-only pinned SDK state readers are supported on Linux and Darwin")
-	}
 	dir := filepath.Join(realSDKTempDir(t), "missing")
 	if reader, err := OpenSDKStateReader(dir, ""); reader != nil || err == nil {
 		t.Fatalf("OpenSDKStateReader = (%T, %v), want missing-directory error", reader, err)
@@ -449,8 +508,8 @@ func TestNewSDKStoreFileProviderUsesSingleSDKEnvelope(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SDK state directory: %v", err)
 	}
-	if got := dirInfo.Mode().Perm(); got != 0o700 {
-		t.Fatalf("SDK state directory mode = %#o, want 0700", got)
+	if !pinnedfs.PrivateModeMatches(dirInfo, 0o700) {
+		t.Fatalf("SDK state directory mode = %#o, want private mode", dirInfo.Mode().Perm())
 	}
 	stateInfo, err := os.Lstat(filepath.Join(dir, AgentStateFile))
 	if err != nil {
@@ -459,8 +518,8 @@ func TestNewSDKStoreFileProviderUsesSingleSDKEnvelope(t *testing.T) {
 	if !stateInfo.Mode().IsRegular() {
 		t.Fatalf("SDK state file mode = %v, want regular file", stateInfo.Mode())
 	}
-	if got := stateInfo.Mode().Perm(); got != 0o600 {
-		t.Fatalf("SDK state file mode = %#o, want 0600", got)
+	if !pinnedfs.PrivateModeMatches(stateInfo, 0o600) {
+		t.Fatalf("SDK state file mode = %#o, want private mode", stateInfo.Mode().Perm())
 	}
 	for _, legacy := range []string{AgentIDFile, PrivateKeyFile, PublicKeyFile, SealedPrivateKeyFile} {
 		if _, err := os.Stat(filepath.Join(dir, legacy)); !errors.Is(err, os.ErrNotExist) {
@@ -560,12 +619,7 @@ func TestSDKStoreLoadRegistrationRefreshMarkerPropagatesCorruptMarker(t *testing
 	owner, _ := openSDKStoreForTest(t, dir, "")
 
 	markerPath := filepath.Join(dir, RefreshMarkerFile)
-	if err := os.WriteFile(markerPath, []byte("{corrupt"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Chmod(markerPath, 0o644); err != nil {
-		t.Fatal(err)
-	}
+	writePinnedSDKTestFile(t, dir, RefreshMarkerFile, []byte("{corrupt"), pubMode)
 	marker, present, err := owner.LoadRegistrationRefreshMarker()
 	if !errors.Is(err, ErrInvalidRefreshMarker) || present || marker != (RefreshMarker{}) {
 		t.Fatalf("corrupt-marker load = (%#v, %v, %v), want ErrInvalidRefreshMarker", marker, present, err)
@@ -855,14 +909,9 @@ func TestNewSDKStoreEnforcesSingleEnvelopeProviderBinding(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			dir := realSDKTempDir(t)
-			if err := os.Chmod(dir, 0o700); err != nil {
-				t.Fatal(err)
-			}
+			dir := secureSDKStateDir(t)
 			for _, name := range tt.files {
-				if err := os.WriteFile(filepath.Join(dir, name), []byte("{}"), 0o600); err != nil {
-					t.Fatal(err)
-				}
+				writePinnedSDKTestFile(t, dir, name, []byte("{}"), 0o600)
 			}
 			t.Setenv(EnvKeyProvider, tt.provider)
 			t.Setenv(EnvAWSKMSKeyID, "arn:aws:kms:us-east-1:111122223333:key/test")

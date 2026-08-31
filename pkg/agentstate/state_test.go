@@ -3,6 +3,7 @@ package agentstate
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 
 	"github.com/layervai/qurl-connector/internal/pinnedfs"
@@ -76,6 +77,7 @@ func TestResolveDirFallsBackToXDGWhenSystemDefaultUnusable(t *testing.T) {
 	// resolution falls to ~/.local/state.
 	home := filepath.Join(t.TempDir(), "home")
 	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
 	t.Setenv("XDG_STATE_HOME", "relative/not/absolute")
 	wantHome := filepath.Join(home, ".local", "state", xdgStateSubdir)
 	if got := ResolveDir(""); got != wantHome {
@@ -96,12 +98,25 @@ func TestEnsureDirModeCreatesAndTightensTo0700(t *testing.T) {
 		if err := EnsureDirMode(dir); err != nil {
 			t.Fatalf("EnsureDirMode(fresh) = %v", err)
 		}
+		if runtime.GOOS == "windows" {
+			namespace, err := pinnedfs.OpenPrivate(dir, 0o700)
+			if err != nil {
+				t.Fatalf("fresh Windows state directory is not protected: %v", err)
+			}
+			if err := namespace.Close(); err != nil {
+				t.Fatal(err)
+			}
+			return
+		}
 		if got := statMode(t, dir); got != 0o700 {
 			t.Fatalf("fresh dir mode = %04o, want 0700", got)
 		}
 	})
 
 	t.Run("tightens a pre-existing 0755 directory", func(t *testing.T) {
+		if runtime.GOOS == "windows" {
+			t.Skip("the greenfield Windows ACL contract does not adopt an existing directory")
+		}
 		dir := filepath.Join(base, "loose")
 		if err := os.Mkdir(dir, 0o755); err != nil {
 			t.Fatal(err)

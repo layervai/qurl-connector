@@ -15,6 +15,8 @@ import (
 	"testing"
 
 	qurl "github.com/layervai/qurl-go/qurl"
+
+	"github.com/layervai/qurl-connector/internal/pinnedfs"
 )
 
 const testOperationProtectedResourceID = "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEcOtuxu2qhc3gt1E7BiEU0CLqEDlXDwzZq0JnESgMAwERX6y_XXF5Cn5SKITWIZQmUhCZ0pHHlVn7SmFUTAnTGQ"
@@ -104,7 +106,7 @@ func TestSDKStoreSessionOperationLifecycleIsCrashSafe(t *testing.T) {
 		t.Fatal(err)
 	}
 	info, err := os.Stat(filepath.Join(dir, name))
-	if err != nil || info.Mode().Perm() != sessionOperationFileMode {
+	if err != nil || !pinnedfs.PrivateModeMatches(info, sessionOperationFileMode) {
 		t.Fatalf("operation file = %v, %v", info, err)
 	}
 	if err := store.Close(); err != nil {
@@ -168,9 +170,7 @@ func TestSDKStoreEnumeratesJournalsAndRemovesCrashTemporaries(t *testing.T) {
 		t.Fatal(err)
 	}
 	temporaryName := "." + name + ".tmp-" + strings.Repeat("a", 16)
-	if err := os.WriteFile(filepath.Join(dir, temporaryName), []byte("partial"), sessionOperationFileMode); err != nil {
-		t.Fatal(err)
-	}
+	writePinnedSDKTestFile(t, dir, temporaryName, []byte("partial"), sessionOperationFileMode)
 	scan := store.ScanSessionOperationResources(context.Background())
 	if scan.PermanentError != nil || scan.RetryableError != nil || len(scan.ResourceIDs) != 1 ||
 		scan.ResourceIDs[0] != record.Operation.ProtectedResourceID {
@@ -205,13 +205,9 @@ func TestSDKStoreRejectsJournalWhoseHashedFilenameDoesNotMatchResource(t *testin
 		t.Fatal(err)
 	}
 	spoofedPath := filepath.Join(dir, spoofedName)
-	if err := os.WriteFile(spoofedPath, raw, sessionOperationFileMode); err != nil {
-		t.Fatal(err)
-	}
+	writePinnedSDKTestFile(t, dir, spoofedName, raw, sessionOperationFileMode)
 	temporaryName := "." + name + ".tmp-" + strings.Repeat("b", 16)
-	if err := os.WriteFile(filepath.Join(dir, temporaryName), []byte("partial"), sessionOperationFileMode); err != nil {
-		t.Fatal(err)
-	}
+	writePinnedSDKTestFile(t, dir, temporaryName, []byte("partial"), sessionOperationFileMode)
 	scan := store.ScanSessionOperationResources(context.Background())
 	if len(scan.ResourceIDs) != 1 || scan.ResourceIDs[0] != record.Operation.ProtectedResourceID ||
 		!errors.Is(scan.PermanentError, ErrSessionOperationJournalCorrupt) || scan.RetryableError != nil {
@@ -379,9 +375,7 @@ func TestSDKStoreSessionOperationRetainsCorruptJournal(t *testing.T) {
 	}
 	path := filepath.Join(dir, name)
 	const corrupt = `{"schema":2,"protected_resource_id":"incomplete"}`
-	if err := os.WriteFile(path, []byte(corrupt), sessionOperationFileMode); err != nil {
-		t.Fatal(err)
-	}
+	writePinnedSDKTestFile(t, dir, name, []byte(corrupt), sessionOperationFileMode)
 	if records, err := store.LoadSessionOperations(context.Background(), record.Operation.ProtectedResourceID); records != nil || !errors.Is(err, ErrSessionOperationJournalCorrupt) {
 		t.Fatalf("corrupt journal load = (%+v, %v), want retained corruption", records, err)
 	}
