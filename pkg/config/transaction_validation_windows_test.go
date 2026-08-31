@@ -21,6 +21,19 @@ func TestWindowsConfigValidationErrorExplainsGreenfieldProtectedACL(t *testing.T
 	}
 }
 
+func TestWindowsConfigNamespaceValidationErrorExplainsGreenfieldRecovery(t *testing.T) {
+	wantErr := errors.New("config directory is not owned by the current Windows user")
+	err := wrapConfigNamespaceValidationError(wantErr)
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("wrapped namespace error = %v, want original cause", err)
+	}
+	for _, want := range []string{"directory owned by the current user with a trusted ACL", "stop Connector", "move the existing config directory aside", "qurl-connector add", "do not copy the old directory back"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("wrapped namespace error = %q, want guidance %q", err, want)
+		}
+	}
+}
+
 func TestWindowsNonConfigValidationErrorIsUnchanged(t *testing.T) {
 	wantErr := errors.New("lock validation failed")
 	if got := wrapConfigFileValidationError("config transaction lock", wantErr); !errors.Is(got, wantErr) || got.Error() != wantErr.Error() {

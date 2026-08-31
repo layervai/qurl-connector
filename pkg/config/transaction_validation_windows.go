@@ -4,6 +4,13 @@ package config
 
 import "fmt"
 
+func wrapConfigNamespaceValidationError(err error) error {
+	if err == nil {
+		return nil
+	}
+	return fmt.Errorf("%w; on Windows, Connector can write configuration only in a directory owned by the current user with a trusted ACL: stop Connector, move the existing config directory aside, run `qurl-connector add` to create protected configuration, and then re-enter its routes; do not copy the old directory back", err)
+}
+
 func wrapConfigFileValidationError(label string, err error) error {
 	if err == nil {
 		return nil

@@ -105,7 +105,7 @@ func AcquireFileTransactionContext(ctx context.Context, path string) (*FileTrans
 	}
 	if err := namespace.RequireOwnedNamespace(); err != nil {
 		return nil, errors.Join(
-			fmt.Errorf("validate config transaction namespace: %w", err),
+			fmt.Errorf("validate config transaction namespace: %w", wrapConfigNamespaceValidationError(err)),
 			namespace.Close(),
 		)
 	}
