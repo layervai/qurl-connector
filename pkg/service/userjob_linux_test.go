@@ -1097,7 +1097,7 @@ func TestLinuxUserJobManagerIntegration(t *testing.T) {
 	}
 	// systemctl mask does not overwrite a regular unit in its highest-priority
 	// user directory. Construct the exact durable mask it would otherwise use,
-	// then make the real manager load and report that state.
+	// then remove it while the real manager still has the prior unit cached.
 	if err := os.Remove(unitPath); err != nil {
 		t.Fatalf("remove integration definition before persistent mask: %v", err)
 	}
@@ -1107,15 +1107,12 @@ func TestLinuxUserJobManagerIntegration(t *testing.T) {
 	if err := syncTrustedSystemdUnitDirectory(filepath.Dir(unitPath)); err != nil {
 		t.Fatalf("make persistent integration mask durable: %v", err)
 	}
-	if _, err := systemctlUserOutput("daemon-reload"); err != nil {
-		t.Fatalf("load persistent integration mask: %v", err)
-	}
 	if target, err := os.Readlink(unitPath); err != nil || target != "/dev/null" {
 		t.Fatalf("persistent integration mask = %q, %v; want /dev/null symlink", target, err)
 	}
 	loadState, err := systemctlUserOutput("show", systemdUserUnitName(job.Label), "--property=LoadState")
-	if err != nil || strings.TrimSpace(loadState) != "LoadState=masked" {
-		t.Fatalf("persistent integration manager state = %q, %v; want LoadState=masked", loadState, err)
+	if err != nil || strings.TrimSpace(loadState) == "LoadState=masked" {
+		t.Fatalf("stale integration manager state = %q, %v; want the prior cached definition", loadState, err)
 	}
 	if err := manager.Remove(job.Label); err != nil {
 		t.Fatal(err)
