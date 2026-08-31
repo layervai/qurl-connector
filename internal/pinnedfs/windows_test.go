@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -180,6 +181,37 @@ func TestWindowsPrivateFileRejectsForeignDACL(t *testing.T) {
 	}
 }
 
+func TestWindowsRegularFileRejectsDACLMutationBeforeFinalDescriptorSnapshot(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "qurl", "connector")
+	namespace, err := EnsurePrivate(path, 0o700)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer namespace.Close()
+	writeWindowsPinnedTestFile(t, namespace, ".state.tmp", "state.json", []byte("state"))
+
+	file, err := namespace.OpenFile("state.json", os.O_RDONLY|SafeOpenFlags(), 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+
+	original := beforeRegularFileFinalDescriptorValidation
+	mutated := false
+	beforeRegularFileFinalDescriptorValidation = func(*Directory, string, *os.File) {
+		if mutated {
+			return
+		}
+		mutated = true
+		setWindowsTestWorldACL(t, filepath.Join(path, "state.json"), windows.GENERIC_READ)
+	}
+	t.Cleanup(func() { beforeRegularFileFinalDescriptorValidation = original })
+
+	if _, err := ValidateRegularFile(namespace, "state.json", file, "mutated Windows state", 0o600); err == nil || !strings.Contains(err.Error(), "grants access to another Windows principal") {
+		t.Fatalf("ValidateRegularFile error = %v, want final descriptor ACL rejection", err)
+	}
+}
+
 func TestWindowsCreateOpenDoesNotAdoptPrecreatedForeignDACL(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "qurl", "connector")
 	namespace, err := EnsurePrivate(path, 0o700)
@@ -263,6 +295,10 @@ func TestNormalizeWindowsOpenErrorPreservesErrorsIs(t *testing.T) {
 	missing := &os.PathError{Op: "openat", Path: "state", Err: normalizeWindowsOpenError(windows.ERROR_FILE_NOT_FOUND)}
 	if !errors.Is(missing, os.ErrNotExist) {
 		t.Fatalf("not-found wrapper = %v, want errors.Is(os.ErrNotExist)", missing)
+	}
+	denied := &os.PathError{Op: "openat", Path: "state", Err: normalizeWindowsOpenError(windows.STATUS_ACCESS_DENIED)}
+	if !errors.Is(denied, os.ErrPermission) {
+		t.Fatalf("access-denied wrapper = %v, want errors.Is(os.ErrPermission)", denied)
 	}
 }
 

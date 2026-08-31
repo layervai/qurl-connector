@@ -209,6 +209,10 @@ func normalizeWindowsOpenError(err error) error {
 	case errors.Is(err, windows.STATUS_OBJECT_NAME_NOT_FOUND), errors.Is(err, windows.STATUS_OBJECT_PATH_NOT_FOUND), errors.Is(err, windows.ERROR_FILE_NOT_FOUND), errors.Is(err, windows.ERROR_PATH_NOT_FOUND):
 		return windows.ERROR_FILE_NOT_FOUND
 	default:
+		var status windows.NTStatus
+		if errors.As(err, &status) {
+			return status.Errno()
+		}
 		return err
 	}
 }
