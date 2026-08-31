@@ -188,6 +188,41 @@ func TestLinuxEnsureRepairsOwnerDefinitionWithDriftedMode(t *testing.T) {
 	}
 }
 
+func TestLinuxStatusRepairsOwnerDefinitionWithDriftedMode(t *testing.T) {
+	job := linuxTestUserJob(t)
+	unitPath := filepath.Join(t.TempDir(), "systemd", "user", job.Label+".service")
+	if err := os.MkdirAll(filepath.Dir(unitPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	content, err := RenderSystemdUserJob(job)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(unitPath, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	manager := &linuxUserJobManager{
+		unitPath: func(string) (string, error) { return unitPath, nil },
+		run: func(args ...string) (string, error) {
+			if args[0] != "show" {
+				t.Fatalf("unexpected systemctl call %v", args)
+			}
+			return linuxSystemdState(unitPath, "loaded", "active", "running", "enabled", "no"), nil
+		},
+	}
+	status, err := manager.Status(job.Label)
+	if err != nil || !status.Installed || !status.Running {
+		t.Fatalf("Status = %#v, %v", status, err)
+	}
+	info, err := os.Stat(unitPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Fatalf("repaired unit mode = %04o, want 0600", info.Mode().Perm())
+	}
+}
+
 func TestLinuxEnsureRepairsDisabledExactRunningJob(t *testing.T) {
 	job := linuxTestUserJob(t)
 	unitPath := filepath.Join(t.TempDir(), "systemd", "user", job.Label+".service")
@@ -745,17 +780,43 @@ func TestSystemctlUserOutputKeepsCommandChannelsSeparate(t *testing.T) {
 	if err := os.WriteFile(systemctl, []byte("#!/bin/sh\nif [ \"$2\" = fail ]; then\n  printf 'partial output\\n'\n  printf 'manager failure\\n' >&2\n  exit 1\nfi\nprintf 'manager warning\\n' >&2\nprintf 'LoadState=loaded\\n'\n"), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
-	output, err := systemctlUserOutput("show", "test.service")
+	hostileDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(hostileDir, "systemctl"), []byte("#!/bin/sh\nprintf 'LoadState=hostile\\n'\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", hostileDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	output, err := systemctlUserOutputAt(systemctl, "show", "test.service")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if output != "LoadState=loaded\n" {
 		t.Fatalf("systemctl stdout = %q, want state only", output)
 	}
-	_, err = systemctlUserOutput("fail")
+	_, err = systemctlUserOutputAt(systemctl, "fail")
 	if err == nil || !strings.Contains(err.Error(), "partial output") || !strings.Contains(err.Error(), "manager failure") {
 		t.Fatalf("systemctl failure = %v, want stdout and stderr diagnostics", err)
+	}
+}
+
+func TestResolveTrustedSystemctlRejectsPathAndUnsafeCandidates(t *testing.T) {
+	dir := t.TempDir()
+	trusted := filepath.Join(dir, "trusted-systemctl")
+	if err := os.WriteFile(trusted, []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	got, err := resolveTrustedSystemctl([]string{"relative-systemctl", filepath.Join(dir, "missing"), trusted})
+	if err != nil || got != trusted {
+		t.Fatalf("resolveTrustedSystemctl = %q, %v; want %q", got, err, trusted)
+	}
+	unsafe := filepath.Join(dir, "unsafe-systemctl")
+	if err := os.WriteFile(unsafe, []byte("#!/bin/sh\nexit 0\n"), 0o777); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(unsafe, 0o777); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := resolveTrustedSystemctl([]string{unsafe}); err == nil || !strings.Contains(err.Error(), "unsafe writable mode") {
+		t.Fatalf("unsafe systemctl error = %v", err)
 	}
 }
 

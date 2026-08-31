@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -719,6 +720,66 @@ const (
 	nativeOrphanRecoveryMaxBackoff     = 30 * time.Second
 )
 
+type nativeRetirementRecoveryAttempt struct {
+	notBefore time.Time
+	backoff   time.Duration
+}
+
+type nativeRetirementRecoverySchedule map[string]nativeRetirementRecoveryAttempt
+
+func (s nativeRetirementRecoverySchedule) queue(resourceID string, now time.Time) {
+	if resourceID == "" {
+		return
+	}
+	if _, exists := s[resourceID]; exists {
+		return
+	}
+	s[resourceID] = nativeRetirementRecoveryAttempt{
+		notBefore: now,
+		backoff:   nativeOrphanRecoveryInitialBackoff,
+	}
+}
+
+func (s nativeRetirementRecoverySchedule) retry(resourceID string, now time.Time) {
+	attempt, exists := s[resourceID]
+	if !exists {
+		attempt.backoff = nativeOrphanRecoveryInitialBackoff
+	}
+	if attempt.backoff <= 0 {
+		attempt.backoff = nativeOrphanRecoveryInitialBackoff
+	}
+	attempt.notBefore = now.Add(attempt.backoff)
+	attempt.backoff = min(attempt.backoff*2, nativeOrphanRecoveryMaxBackoff)
+	s[resourceID] = attempt
+}
+
+func (s nativeRetirementRecoverySchedule) due(now time.Time) []string {
+	resources := make([]string, 0, len(s))
+	for resourceID, attempt := range s {
+		if !attempt.notBefore.After(now) {
+			resources = append(resources, resourceID)
+		}
+	}
+	sort.Strings(resources)
+	return resources
+}
+
+func (s nativeRetirementRecoverySchedule) nextDelay(now time.Time) (time.Duration, bool) {
+	var earliest time.Time
+	for _, attempt := range s {
+		if earliest.IsZero() || attempt.notBefore.Before(earliest) {
+			earliest = attempt.notBefore
+		}
+	}
+	if earliest.IsZero() {
+		return 0, false
+	}
+	if !earliest.After(now) {
+		return 0, true
+	}
+	return earliest.Sub(now), true
+}
+
 type keyedResourceLocks struct {
 	mu    sync.Mutex
 	locks map[string]*keyedResourceLock
@@ -823,8 +884,9 @@ func (a *NativeAdmitter) startRecoveryWorkers() {
 func (a *NativeAdmitter) recoverOrphanedSessionOperations() {
 	defer a.recoveryWG.Done()
 	backoff := nativeOrphanRecoveryInitialBackoff
+	permanentResources := make(map[string]struct{})
 	for {
-		err := a.recoverAllPending(a.lifecycle)
+		err := a.recoverAllPendingExcludingPermanent(a.lifecycle, permanentResources)
 		if err == nil {
 			break
 		}
@@ -886,57 +948,131 @@ func (a *NativeAdmitter) takeNativeRetirementRecoveryResources() []string {
 }
 
 func (a *NativeAdmitter) recoverQueuedNativeRetirements() {
-	backoff := nativeOrphanRecoveryInitialBackoff
+	schedule := make(nativeRetirementRecoverySchedule)
 	for {
-		select {
-		case <-a.lifecycle.Done():
-			return
-		case <-a.retirementRecoveryWake:
+		now := time.Now()
+		for _, resourceID := range a.takeNativeRetirementRecoveryResources() {
+			schedule.queue(resourceID, now)
 		}
-		retry := a.recoverQueuedNativeRetirementBatch()
+		for _, resourceID := range schedule.due(now) {
+			permanent, err := a.recoverPendingNativeRetirements(a.lifecycle, resourceID)
+			if a.lifecycle.Err() != nil {
+				return
+			}
+			switch {
+			case err == nil:
+				delete(schedule, resourceID)
+			case permanent:
+				delete(schedule, resourceID)
+				slog.ErrorContext(a.lifecycle, "durable native session retirement requires operator attention",
+					"resource_id", resourceID, "err", err)
+			default:
+				schedule.retry(resourceID, time.Now())
+				slog.WarnContext(a.lifecycle, "durable native session retirement failed; retrying",
+					"resource_id", resourceID, "err", err)
+			}
+		}
 		if a.lifecycle.Err() != nil {
 			return
 		}
-		if !retry {
-			backoff = nativeOrphanRecoveryInitialBackoff
+		delay, scheduled := schedule.nextDelay(time.Now())
+		if !scheduled {
+			select {
+			case <-a.lifecycle.Done():
+				return
+			case <-a.retirementRecoveryWake:
+			}
 			continue
 		}
-		if !waitForNativeRetirementRecovery(a.lifecycle, backoff) {
-			return
-		}
-		backoff = min(backoff*2, nativeOrphanRecoveryMaxBackoff)
-	}
-}
-
-func (a *NativeAdmitter) recoverQueuedNativeRetirementBatch() bool {
-	retry := false
-	for _, resourceID := range a.takeNativeRetirementRecoveryResources() {
-		if err := a.recoverPendingNativeRetirements(a.lifecycle, resourceID); err != nil {
-			if a.lifecycle.Err() != nil {
-				return false
+		timer := time.NewTimer(delay)
+		select {
+		case <-a.lifecycle.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
 			}
-			// Re-arm here as well as in retireOne. This keeps the worker live
-			// when validation fails before retireOne receives the resource.
-			a.queueNativeRetirementRecovery(resourceID)
-			retry = true
-			slog.WarnContext(a.lifecycle, "durable native session retirement failed; retrying", "err", err)
+			return
+		case <-a.retirementRecoveryWake:
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+		case <-timer.C:
 		}
 	}
-	return retry
 }
 
-func (a *NativeAdmitter) recoverPendingNativeRetirements(ctx context.Context, resourceID string) error {
+func (a *NativeAdmitter) dropNativeRetirementRecovery(resourceID string) {
+	a.stateMu.Lock()
+	delete(a.retirementRecoveryResources, resourceID)
+	a.stateMu.Unlock()
+}
+
+func (a *NativeAdmitter) recoverPendingNativeRetirements(ctx context.Context, resourceID string) (bool, error) {
 	unlockResource := a.resources.lock(resourceID)
 	defer unlockResource()
 	a.runtimeMu.RLock()
 	defer a.runtimeMu.RUnlock()
 	if a.closed || a.binding == nil || len(a.privateKey) != 32 || a.operations == nil {
-		return errors.New("recover native retirement: native admitter is closed")
+		return false, errors.New("recover native retirement: native admitter is closed")
 	}
-	return a.retirePendingForResource(ctx, resourceID)
+	err := a.retirePendingForResource(ctx, resourceID)
+	permanent := isPermanentNativeRetirementError(err)
+	if permanent {
+		// retireOne queues every failure before returning. Remove that stale wake
+		// while the resource lock still excludes a new foreground retirement.
+		a.dropNativeRetirementRecovery(resourceID)
+	}
+	return permanent, err
+}
+
+func isPermanentNativeRetirementError(err error) bool {
+	if err == nil {
+		return false
+	}
+	type multiUnwrapper interface{ Unwrap() []error }
+	if joined, ok := err.(multiUnwrapper); ok {
+		causes := joined.Unwrap()
+		if len(causes) == 0 {
+			return false
+		}
+		for _, cause := range causes {
+			if !isPermanentNativeRetirementError(cause) {
+				return false
+			}
+		}
+		return true
+	}
+	if cause := errors.Unwrap(err); cause != nil {
+		return isPermanentNativeRetirementError(cause)
+	}
+	var deny *qurl.ServerDenyError
+	if errors.As(err, &deny) {
+		return true
+	}
+	for _, sentinel := range []error{
+		qurl.ErrInvalidNativeSessionOperation,
+		agentstate.ErrSessionOperationConflict,
+		agentstate.ErrSessionOperationJournalCorrupt,
+	} {
+		if errors.Is(err, sentinel) {
+			return true
+		}
+	}
+	return false
 }
 
 func (a *NativeAdmitter) recoverAllPending(ctx context.Context) error {
+	return a.recoverAllPendingExcludingPermanent(ctx, nil)
+}
+
+func (a *NativeAdmitter) recoverAllPendingExcludingPermanent(ctx context.Context,
+	permanentResources map[string]struct{},
+) error {
 	if ctx == nil {
 		return errors.New("recover native session operations: context is nil")
 	}
@@ -961,6 +1097,9 @@ func (a *NativeAdmitter) recoverAllPending(ctx context.Context) error {
 		recoveryErr = fmt.Errorf("enumerate native session operations: %w", scan.RetryableError)
 	}
 	for _, resourceID := range scan.ResourceIDs {
+		if _, permanent := permanentResources[resourceID]; permanent {
+			continue
+		}
 		if err := ctx.Err(); err != nil {
 			return errors.Join(recoveryErr, err)
 		}
@@ -976,6 +1115,14 @@ func (a *NativeAdmitter) recoverAllPending(ctx context.Context) error {
 		)
 		a.runtimeMu.RUnlock()
 		unlockResource()
+		if isPermanentNativeRetirementError(err) {
+			if permanentResources != nil {
+				permanentResources[resourceID] = struct{}{}
+			}
+			slog.ErrorContext(ctx, "durable native session retirement requires operator attention",
+				"resource_id", resourceID, "err", err)
+			continue
+		}
 		if err != nil {
 			recoveryErr = errors.Join(recoveryErr, err)
 		}

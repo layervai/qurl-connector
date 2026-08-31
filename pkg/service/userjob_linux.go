@@ -23,6 +23,11 @@ import (
 
 const maxLinuxUserJobDefinitionBytes = 64 << 10
 
+const (
+	primarySystemctlPath  = "/usr/bin/systemctl"
+	fallbackSystemctlPath = "/bin/systemctl"
+)
+
 const systemdUserJobTemplate = `[Unit]
 Description=qURL background daemon - managed by qurl, do not edit
 
@@ -350,7 +355,10 @@ func (m *linuxUserJobManager) Status(label string) (ServiceStatus, error) {
 	if err != nil {
 		return ServiceStatus{}, err
 	}
-	_, installed, err := readLinuxUserJobDefinition(unitPath, false)
+	// Status applies the same safe owner-only mode repair as Ensure. A definition
+	// that only drifted from 0600 to a more permissive owner-controlled mode is
+	// still the same managed job; repair it before asking the manager for state.
+	_, installed, err := readLinuxUserJobDefinition(unitPath, true)
 	if err != nil {
 		return ServiceStatus{}, fmt.Errorf("inspect systemd user job %s: %w", label, err)
 	}
@@ -674,8 +682,35 @@ func (e *systemctlUserError) Error() string {
 func (e *systemctlUserError) Unwrap() error { return e.err }
 
 func systemctlUserOutput(args ...string) (string, error) {
+	systemctl, err := resolveTrustedSystemctl([]string{primarySystemctlPath, fallbackSystemctlPath})
+	if err != nil {
+		return "", err
+	}
+	return systemctlUserOutputAt(systemctl, args...)
+}
+
+func resolveTrustedSystemctl(candidates []string) (string, error) {
+	var candidateErr error
+	for _, candidate := range candidates {
+		if !filepath.IsAbs(candidate) {
+			candidateErr = errors.Join(candidateErr, fmt.Errorf("systemctl candidate %q is not absolute", candidate))
+			continue
+		}
+		if err := validateLinuxUserJobExecutable(candidate); err != nil {
+			candidateErr = errors.Join(candidateErr, fmt.Errorf("validate systemctl candidate %s: %w", candidate, err))
+			continue
+		}
+		return candidate, nil
+	}
+	if candidateErr == nil {
+		candidateErr = errors.New("no systemctl candidates configured")
+	}
+	return "", fmt.Errorf("resolve trusted systemctl control plane: %w", candidateErr)
+}
+
+func systemctlUserOutputAt(systemctl string, args ...string) (string, error) {
 	cmdArgs := append([]string{"--user"}, args...)
-	cmd := exec.Command("systemctl", cmdArgs...)
+	cmd := exec.Command(systemctl, cmdArgs...)
 	cmd.Env = append(os.Environ(), "LC_ALL=C", "SYSTEMD_COLORS=0", "SYSTEMD_PAGER=")
 	output, err := cmd.Output()
 	if err == nil {

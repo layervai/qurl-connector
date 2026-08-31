@@ -2993,28 +2993,96 @@ func TestNativeAdmitterCloseCancelsQueuedRetirementRecovery(t *testing.T) {
 	}
 }
 
-func TestNativeAdmitterRetirementBatchRequeuesFailureBeforeRetireOne(t *testing.T) {
+func TestNativeRetirementRecoveryScheduleDoesNotDelayNewSibling(t *testing.T) {
+	now := time.Unix(1_800_000_000, 0)
+	schedule := make(nativeRetirementRecoverySchedule)
+	schedule.queue("resource-stuck", now)
+	for range 10 {
+		schedule.retry("resource-stuck", now)
+		now = schedule["resource-stuck"].notBefore
+	}
+	if schedule["resource-stuck"].backoff != nativeOrphanRecoveryMaxBackoff {
+		t.Fatalf("stuck resource backoff = %s, want %s",
+			schedule["resource-stuck"].backoff, nativeOrphanRecoveryMaxBackoff)
+	}
+	// Leave the stuck resource waiting at its maximum delay, then add a sibling.
+	schedule.retry("resource-stuck", now)
+	schedule.queue("resource-new", now)
+	if got, want := schedule.due(now), []string{"resource-new"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("due resources = %v, want %v", got, want)
+	}
+	if delay, scheduled := schedule.nextDelay(now); !scheduled || delay != 0 {
+		t.Fatalf("new sibling delay = %s, scheduled=%t; want immediate", delay, scheduled)
+	}
+}
+
+func TestPermanentNativeRetirementErrorIsConservative(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{name: "authenticated deny", err: &qurl.ServerDenyError{ErrCode: "52004"}, want: true},
+		{name: "invalid durable operation", err: fmt.Errorf("recover: %w", qurl.ErrInvalidNativeSessionOperation), want: true},
+		{name: "malformed authenticated reply", err: qurl.ErrMalformedReply, want: false},
+		{name: "journal conflict", err: agentstate.ErrSessionOperationConflict, want: true},
+		{name: "journal corruption", err: agentstate.ErrSessionOperationJournalCorrupt, want: true},
+		{name: "no reply", err: nativeudp.ErrNoReply, want: false},
+		{name: "local cancellation", err: context.Canceled, want: false},
+		{
+			name: "mixed permanent and transient",
+			err:  errors.Join(&qurl.ServerDenyError{ErrCode: "52004"}, nativeudp.ErrNoReply),
+			want: false,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := isPermanentNativeRetirementError(test.err); got != test.want {
+				t.Fatalf("isPermanentNativeRetirementError(%v) = %t, want %t", test.err, got, test.want)
+			}
+		})
+	}
+}
+
+func TestNativeAdmitterPermanentRetirementFailureDoesNotRequeue(t *testing.T) {
+	receipt := testSessionReceipt(1, "run-one", 1)
+	key := admissionKey(receipt)
 	lifecycle, cancelLifecycle := context.WithCancel(context.Background())
 	defer cancelLifecycle()
+	deny := &qurl.ServerDenyError{ErrCode: "52004"}
 	admitter := &NativeAdmitter{
-		// An incomplete runtime makes recovery fail before retireOne can requeue.
+		binding:    &qurl.AgentRuntimeBinding{AgentID: "agent-one"},
+		privateKey: make([]byte, 32),
+		operations: retirementFailureOperations{err: deny},
+		live: map[nativeAdmissionKey]nativeLiveAdmission{
+			key: {resourceID: "resource-one", operationID: "operation-one", receipt: receipt},
+		},
+		pending:                     map[nativeAdmissionKey]bool{key: true},
 		retirementRecoveryWake:      make(chan struct{}, 1),
-		retirementRecoveryResources: map[string]struct{}{"resource-one": {}},
+		retirementRecoveryResources: make(map[string]struct{}),
 		lifecycle:                   lifecycle,
 	}
-	if retry := admitter.recoverQueuedNativeRetirementBatch(); !retry {
-		t.Fatal("retirement batch did not report a retryable pre-retire failure")
+	permanent, err := admitter.recoverPendingNativeRetirements(lifecycle, "resource-one")
+	if !permanent || !errors.Is(err, deny) {
+		t.Fatalf("recovery permanent=%t error=%v, want authenticated deny", permanent, err)
 	}
 	admitter.stateMu.Lock()
 	_, queued := admitter.retirementRecoveryResources["resource-one"]
 	admitter.stateMu.Unlock()
-	if !queued {
-		t.Fatal("retirement batch dropped a resource after a pre-retire failure")
+	if queued {
+		t.Fatal("permanent retirement failure was requeued")
 	}
-	select {
-	case <-admitter.retirementRecoveryWake:
-	default:
-		t.Fatal("retirement batch did not wake the worker after requeueing")
+	if len(admitter.live) != 1 || len(admitter.pending) != 1 {
+		t.Fatalf("permanent retirement released fail-closed state: live=%d pending=%d",
+			len(admitter.live), len(admitter.pending))
+	}
+}
+
+func TestNativeAdmitterPreRetireFailureStaysRetryable(t *testing.T) {
+	admitter := &NativeAdmitter{}
+	permanent, err := admitter.recoverPendingNativeRetirements(context.Background(), "resource-one")
+	if err == nil || permanent {
+		t.Fatalf("pre-retire recovery permanent=%t error=%v, want retryable incomplete-runtime error", permanent, err)
 	}
 }
 

@@ -338,6 +338,94 @@ func TestNativeAdmitterOrphanRecoveryIsolatesSiblingResources(t *testing.T) {
 	}
 }
 
+func TestNativeAdmitterOrphanRecoveryStopsRetryingPermanentRetirement(t *testing.T) {
+	oldRecover := recoverNativeSessionOperation
+	t.Cleanup(func() { recoverNativeSessionOperation = oldRecover })
+	store := &memoryNativeStore{}
+	record := testPreparedDurableRecord(t)
+	record.Status = agentstate.SessionOperationDispatching
+	store.operations = map[string][]agentstate.SessionOperationRecord{
+		record.Operation.ProtectedResourceID: {record},
+	}
+	calls := 0
+	recoverNativeSessionOperation = func(context.Context, *qurl.AgentRuntimeBinding, []byte,
+		qurl.NativeSessionOperation, qurl.NHPUDPEndpoint, ...qurl.AgentRuntimeUDPOption,
+	) (*qurl.NativeSessionOperationRecovery, error) {
+		calls++
+		return nil, &qurl.ServerDenyError{ErrCode: "52004"}
+	}
+	controller, err := newDurableNativeSessionOperations(store, testNativeSessionAuthority())
+	if err != nil {
+		t.Fatal(err)
+	}
+	admitter := &NativeAdmitter{
+		binding: &qurl.AgentRuntimeBinding{AgentID: "agent-one"}, privateKey: make([]byte, 32),
+		store: store, operations: controller,
+	}
+	if err := admitter.recoverAllPending(context.Background()); err != nil {
+		t.Fatalf("recoverAllPending() = %v, want terminal failure reported without retry", err)
+	}
+	if calls != 1 {
+		t.Fatalf("permanent retirement calls = %d, want 1", calls)
+	}
+	if len(store.operations[record.Operation.ProtectedResourceID]) != 1 {
+		t.Fatalf("permanent retirement discarded fail-closed journal: %+v", store.operations)
+	}
+}
+
+func TestNativeAdmitterOrphanRecoveryDoesNotRepeatPermanentSibling(t *testing.T) {
+	oldRecover := recoverNativeSessionOperation
+	t.Cleanup(func() { recoverNativeSessionOperation = oldRecover })
+	store := &memoryNativeStore{}
+	permanent := testPreparedDurableRecord(t)
+	permanent.Status = agentstate.SessionOperationDispatching
+	transientOperation := testDurableOperationForProtectedResource("MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE2vPoafaVb5Lue-bfcCuoL-_CnVBKf8YvV94G8ozebA6RHEQUPsnguSt1yx2mTzDSogBmb9WYEVBDgX7vc2NKTg")
+	transient, err := agentstate.NewSessionOperationRecord(transientOperation, testDurableRecoveryEndpoint())
+	if err != nil {
+		t.Fatal(err)
+	}
+	transient.Status = agentstate.SessionOperationDispatching
+	store.operations = map[string][]agentstate.SessionOperationRecord{
+		permanent.Operation.ProtectedResourceID: {permanent},
+		transient.Operation.ProtectedResourceID: {transient},
+	}
+	calls := make(map[string]int)
+	transientErr := errors.New("issuing cell unavailable")
+	recoverNativeSessionOperation = func(_ context.Context, _ *qurl.AgentRuntimeBinding, _ []byte,
+		operation qurl.NativeSessionOperation, _ qurl.NHPUDPEndpoint, _ ...qurl.AgentRuntimeUDPOption,
+	) (*qurl.NativeSessionOperationRecovery, error) {
+		calls[operation.ProtectedResourceID]++
+		if operation.ProtectedResourceID == permanent.Operation.ProtectedResourceID {
+			return nil, &qurl.ServerDenyError{ErrCode: "52004"}
+		}
+		return nil, transientErr
+	}
+	controller, err := newDurableNativeSessionOperations(store, testNativeSessionAuthority())
+	if err != nil {
+		t.Fatal(err)
+	}
+	admitter := &NativeAdmitter{
+		binding: &qurl.AgentRuntimeBinding{AgentID: "agent-one"}, privateKey: make([]byte, 32),
+		store: store, operations: controller,
+	}
+	permanentResources := make(map[string]struct{})
+	for range 2 {
+		if err := admitter.recoverAllPendingExcludingPermanent(context.Background(), permanentResources); !errors.Is(err, transientErr) {
+			t.Fatalf("recoverAllPendingExcludingPermanent() = %v, want transient sibling error", err)
+		}
+	}
+	if calls[permanent.Operation.ProtectedResourceID] != 1 || calls[transient.Operation.ProtectedResourceID] != 2 {
+		t.Fatalf("recovery calls = %+v, want permanent=1 transient=2", calls)
+	}
+	if _, marked := permanentResources[permanent.Operation.ProtectedResourceID]; !marked {
+		t.Fatalf("permanent resource was not retained in the worker exclusion set: %+v", permanentResources)
+	}
+	if len(store.operations[permanent.Operation.ProtectedResourceID]) != 1 ||
+		len(store.operations[transient.Operation.ProtectedResourceID]) != 1 {
+		t.Fatalf("orphan recovery discarded fail-closed journals: %+v", store.operations)
+	}
+}
+
 func TestNativeAdmitterOrphanRecoveryContinuesPastCorruptSiblingJournal(t *testing.T) {
 	store := &memoryNativeStore{scanPermanentErr: agentstate.ErrSessionOperationJournalCorrupt}
 	operation := testPreparedDurableRecord(t)
