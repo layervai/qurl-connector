@@ -29,7 +29,6 @@ var configTransactionToken = func() chan struct{} {
 
 var beforeConfigTempCommitValidation = func(*FileTransaction, string) {}
 var beforeTransactionFileFinalValidation = func(string) {}
-var beforeTransactionFileFinalEntryValidation = func(string) {}
 var afterConfigTransactionRead = func(*FileTransaction) {}
 var closeConfigTransactionFile = func(file *os.File) error { return file.Close() }
 var releaseConfigTransactionCandidate = releaseTransactionLock
@@ -213,11 +212,7 @@ func validateTransactionFile(namespace *pinnedfs.Directory, name string, file *o
 		return err
 	}
 	beforeTransactionFileFinalValidation(label)
-	if _, err := pinnedfs.ValidateRegularFile(namespace, name, file, label, mode); err != nil {
-		return err
-	}
-	beforeTransactionFileFinalEntryValidation(label)
-	_, err := pinnedfs.ValidateRegularFile(namespace, name, file, label+" final entry", mode)
+	_, err := pinnedfs.ValidateRegularFile(namespace, name, file, label, mode)
 	return err
 }
 

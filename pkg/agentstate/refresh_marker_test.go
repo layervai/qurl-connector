@@ -19,15 +19,7 @@ func markerPathFor(dir string) string { return filepath.Join(dir, RefreshMarkerF
 
 func refreshMarkerTestDir(t *testing.T) string {
 	t.Helper()
-	dir := filepath.Join(realSDKTempDir(t), "state")
-	namespace, err := pinnedfs.EnsurePrivate(dir, dirMode)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := namespace.Close(); err != nil {
-		t.Fatal(err)
-	}
-	return dir
+	return secureSDKStateDir(t)
 }
 
 func TestRegistrationRefreshMarker_AbsentIsNotPresent(t *testing.T) {
@@ -250,9 +242,7 @@ func TestRegistrationRefreshMarker_ClearThenRequestStartsNewEpisode(t *testing.T
 
 func TestRegistrationRefreshMarker_CorruptJSONIsError(t *testing.T) {
 	dir := refreshMarkerTestDir(t)
-	if err := os.WriteFile(markerPathFor(dir), []byte("{not json"), pubMode); err != nil {
-		t.Fatalf("seed corrupt marker: %v", err)
-	}
+	writePinnedSDKTestFile(t, dir, RefreshMarkerFile, []byte("{not json"), pubMode)
 	_, present, err := LoadRegistrationRefreshMarker(dir)
 	if !errors.Is(err, ErrInvalidRefreshMarker) {
 		t.Fatal("LoadRegistrationRefreshMarker on corrupt JSON returned nil error; want a decode error so the caller can log it")
@@ -285,9 +275,7 @@ func TestRegistrationRefreshMarker_StrictSchemaRejectsAmbiguity(t *testing.T) {
 	for name, raw := range tests {
 		t.Run(name, func(t *testing.T) {
 			dir := refreshMarkerTestDir(t)
-			if err := os.WriteFile(markerPathFor(dir), []byte(raw), pubMode); err != nil {
-				t.Fatal(err)
-			}
+			writePinnedSDKTestFile(t, dir, RefreshMarkerFile, []byte(raw), pubMode)
 			if marker, present, err := LoadRegistrationRefreshMarker(dir); !errors.Is(err, ErrInvalidRefreshMarker) || present || marker != (RefreshMarker{}) {
 				t.Fatalf("LoadRegistrationRefreshMarker = (%#v, %v, %v), want zero, absent, invalid", marker, present, err)
 			}
@@ -298,9 +286,7 @@ func TestRegistrationRefreshMarker_StrictSchemaRejectsAmbiguity(t *testing.T) {
 func TestRegistrationRefreshMarker_LoadsLegacyV2ForInPlaceRecovery(t *testing.T) {
 	dir := refreshMarkerTestDir(t)
 	raw := `{"version":2,"reason":"existing episode","attempt_count":1,"started_at_unix":1,"last_attempt_unix_milli":1000,"next_attempt_unix_milli":2000}`
-	if err := os.WriteFile(markerPathFor(dir), []byte(raw), pubMode); err != nil {
-		t.Fatal(err)
-	}
+	writePinnedSDKTestFile(t, dir, RefreshMarkerFile, []byte(raw), pubMode)
 	marker, present, err := LoadRegistrationRefreshMarker(dir)
 	if err != nil || !present {
 		t.Fatalf("legacy marker = (%#v, %t, %v)", marker, present, err)
@@ -320,9 +306,7 @@ func TestRegistrationRefreshMarker_LoadsLegacyV2ForInPlaceRecovery(t *testing.T)
 func TestRegistrationRefreshMarker_SuccessUpgradesLegacyV2InPlace(t *testing.T) {
 	dir := refreshMarkerTestDir(t)
 	raw := `{"version":2,"reason":"existing episode","attempt_count":1,"started_at_unix":1,"last_attempt_unix_milli":1000,"next_attempt_unix_milli":2000}`
-	if err := os.WriteFile(markerPathFor(dir), []byte(raw), pubMode); err != nil {
-		t.Fatal(err)
-	}
+	writePinnedSDKTestFile(t, dir, RefreshMarkerFile, []byte(raw), pubMode)
 	if err := MarkRegistrationRefreshSucceeded(dir); err != nil {
 		t.Fatal(err)
 	}
@@ -336,9 +320,7 @@ func TestRegistrationRefreshMarker_SuccessUpgradesLegacyV2InPlace(t *testing.T) 
 func TestRegistrationRefreshMarker_NormalizesLegacyV3ZeroRetryDeadline(t *testing.T) {
 	dir := refreshMarkerTestDir(t)
 	raw := `{"version":3,"reason":"existing handoff","attempt_count":2,"started_at_unix":1,"last_attempt_unix_milli":1000,"next_attempt_unix_milli":0,"refresh_succeeded_unix_milli":1001}`
-	if err := os.WriteFile(markerPathFor(dir), []byte(raw), pubMode); err != nil {
-		t.Fatal(err)
-	}
+	writePinnedSDKTestFile(t, dir, RefreshMarkerFile, []byte(raw), pubMode)
 	marker, present, err := LoadRegistrationRefreshMarker(dir)
 	want := 1001 + refreshRetryBase(2).Milliseconds()
 	if err != nil || !present || marker.NextAttemptUnixMilli != want {
@@ -380,9 +362,7 @@ func TestRegistrationRefreshMarker_RequestRejectsUnboundedReason(t *testing.T) {
 
 func TestRegistrationRefreshMarker_EmptyFileIsError(t *testing.T) {
 	dir := refreshMarkerTestDir(t)
-	if err := os.WriteFile(markerPathFor(dir), []byte("   \n"), pubMode); err != nil {
-		t.Fatalf("seed empty marker: %v", err)
-	}
+	writePinnedSDKTestFile(t, dir, RefreshMarkerFile, []byte("   \n"), pubMode)
 	if _, present, err := LoadRegistrationRefreshMarker(dir); !errors.Is(err, ErrInvalidRefreshMarker) || present {
 		t.Fatalf("empty marker: present=%v err=%v, want present=false and a non-nil error", present, err)
 	}
@@ -392,9 +372,7 @@ func TestRegistrationRefreshMarker_OversizeIsError(t *testing.T) {
 	dir := refreshMarkerTestDir(t)
 	big := append([]byte(`{"reason":"`), []byte(strings.Repeat("a", refreshMarkerFileMaxBytes+1))...)
 	big = append(big, []byte(`"}`)...)
-	if err := os.WriteFile(markerPathFor(dir), big, pubMode); err != nil {
-		t.Fatalf("seed oversize marker: %v", err)
-	}
+	writePinnedSDKTestFile(t, dir, RefreshMarkerFile, big, pubMode)
 	if _, present, err := LoadRegistrationRefreshMarker(dir); !errors.Is(err, ErrInvalidRefreshMarker) || present {
 		t.Fatalf("oversize marker: present=%v err=%v, want present=false and a non-nil error", present, err)
 	}
@@ -405,9 +383,7 @@ func TestRegistrationRefreshMarker_OversizeIsError(t *testing.T) {
 func TestRegistrationRefreshMarker_RequestLeavesExistingCorruptUntouched(t *testing.T) {
 	dir := refreshMarkerTestDir(t)
 	const corrupt = "{bad"
-	if err := os.WriteFile(markerPathFor(dir), []byte(corrupt), pubMode); err != nil {
-		t.Fatalf("seed corrupt: %v", err)
-	}
+	writePinnedSDKTestFile(t, dir, RefreshMarkerFile, []byte(corrupt), pubMode)
 	if err := RequestRegistrationRefresh(dir, "should-not-overwrite"); err != nil {
 		t.Fatalf("RequestRegistrationRefresh over corrupt marker: %v", err)
 	}

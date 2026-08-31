@@ -1322,10 +1322,7 @@ func TestMayConsumeNativeRecoveryAuthorityAcceptsRealPendingState(t *testing.T) 
 			HubServerPublicKeyB64: base64.StdEncoding.EncodeToString(serverKey.PublicKey().Bytes()),
 		},
 	}
-	stateDir := t.TempDir()
-	if err := os.Chmod(stateDir, 0o700); err != nil {
-		t.Fatal(err)
-	}
+	stateDir := secureNativeStateDirForTest(t)
 	store, err := qurl.OpenFileAgentState(filepath.Join(stateDir, "agent.json"))
 	if err != nil {
 		t.Fatal(err)

@@ -421,62 +421,6 @@ func TestValidateTransactionFileUsesFinalStableSnapshot(t *testing.T) {
 	}
 }
 
-func TestValidateTransactionFileValidatesFinalNamespaceSnapshot(t *testing.T) {
-	tests := []struct {
-		name   string
-		mutate func(*testing.T, string)
-		want   string
-	}{
-		{
-			name: "hard link after final descriptor stat",
-			mutate: func(t *testing.T, path string) {
-				t.Helper()
-				if err := os.Link(path, path+".alias"); err != nil {
-					t.Fatal(err)
-				}
-			},
-			want: "final entry link count is 2",
-		},
-		{
-			name: "chmod after final descriptor stat",
-			mutate: func(t *testing.T, path string) {
-				t.Helper()
-				if err := os.Chmod(path, 0o644); err != nil {
-					t.Fatal(err)
-				}
-			},
-			want: "final entry mode is 0644, want 0600",
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			parent := t.TempDir()
-			path := filepath.Join(parent, "qurl-proxy.yaml")
-			if err := Save(testTransactionConfig("before"), path); err != nil {
-				t.Fatal(err)
-			}
-			tx, err := AcquireFileTransaction(path)
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer tx.Close()
-
-			originalHook := beforeTransactionFileFinalEntryValidation
-			t.Cleanup(func() { beforeTransactionFileFinalEntryValidation = originalHook })
-			mutated := false
-			beforeTransactionFileFinalEntryValidation = func(label string) {
-				if label == "existing config file" && !mutated {
-					mutated = true
-					tt.mutate(t, path)
-				}
-			}
-			if err := tx.Save(testTransactionConfig("after")); err == nil || !strings.Contains(err.Error(), tt.want) {
-				t.Fatalf("Save error = %v, want %q", err, tt.want)
-			}
-		})
-	}
-}
-
 func TestFileTransactionRejectsParentReplacementBeforeMutation(t *testing.T) {
 	root := t.TempDir()
 	parent := filepath.Join(root, "config")

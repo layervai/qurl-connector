@@ -5,10 +5,10 @@ package pinnedfs
 import (
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
@@ -35,6 +35,55 @@ type windowsFileIdentity struct {
 	volume uint32
 	index  uint64
 }
+
+type windowsSecurityMaterial struct {
+	current    *windows.SID
+	admin      *windows.SID
+	system     *windows.SID
+	installer  *windows.SID
+	descriptor *windows.SECURITY_DESCRIPTOR
+}
+
+var loadWindowsSecurityMaterial = sync.OnceValues(func() (*windowsSecurityMaterial, error) {
+	token, err := windows.OpenCurrentProcessToken()
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = token.Close() }()
+	user, err := token.GetTokenUser()
+	if err != nil {
+		return nil, fmt.Errorf("read current Windows user SID: %w", err)
+	}
+	if user == nil || user.User.Sid == nil {
+		return nil, errors.New("current Windows token has no user SID")
+	}
+	current, err := windows.StringToSid(user.User.Sid.String())
+	if err != nil {
+		return nil, fmt.Errorf("copy current Windows user SID: %w", err)
+	}
+	sidText := current.String()
+	descriptor, err := windows.SecurityDescriptorFromString(fmt.Sprintf(
+		"O:%sG:%sD:P(A;;FA;;;%s)(A;;FA;;;SY)(A;;FA;;;BA)", sidText, sidText, sidText))
+	if err != nil {
+		return nil, fmt.Errorf("build protected Windows state ACL: %w", err)
+	}
+	admin, err := windows.CreateWellKnownSid(windows.WinBuiltinAdministratorsSid)
+	if err != nil {
+		return nil, fmt.Errorf("build Windows Administrators SID: %w", err)
+	}
+	system, err := windows.CreateWellKnownSid(windows.WinLocalSystemSid)
+	if err != nil {
+		return nil, fmt.Errorf("build Windows SYSTEM SID: %w", err)
+	}
+	installer, err := windows.StringToSid(windowsTrustedInstallerSID)
+	if err != nil {
+		return nil, fmt.Errorf("build Windows TrustedInstaller SID: %w", err)
+	}
+	return &windowsSecurityMaterial{
+		current: current, admin: admin, system: system,
+		installer: installer, descriptor: descriptor,
+	}, nil
+})
 
 func requireSupportedPlatform() error { return nil }
 
@@ -77,26 +126,11 @@ func windowsNTPath(path string) (string, error) {
 }
 
 func currentWindowsSecurity() (*windows.SID, *windows.SECURITY_DESCRIPTOR, error) {
-	token, err := windows.OpenCurrentProcessToken()
+	security, err := loadWindowsSecurityMaterial()
 	if err != nil {
 		return nil, nil, err
 	}
-	defer func() { _ = token.Close() }()
-	user, err := token.GetTokenUser()
-	if err != nil || user == nil || user.User.Sid == nil {
-		return nil, nil, fmt.Errorf("read current Windows user SID: %w", err)
-	}
-	sid, err := windows.StringToSid(user.User.Sid.String())
-	if err != nil {
-		return nil, nil, fmt.Errorf("copy current Windows user SID: %w", err)
-	}
-	sidText := sid.String()
-	sd, err := windows.SecurityDescriptorFromString(fmt.Sprintf(
-		"O:%sG:%sD:P(A;;FA;;;%s)(A;;FA;;;SY)(A;;FA;;;BA)", sidText, sidText, sidText))
-	if err != nil {
-		return nil, nil, fmt.Errorf("build protected Windows state ACL: %w", err)
-	}
-	return sid, sd, nil
+	return security.current, security.descriptor, nil
 }
 
 func ntOpenWindowsObject(root windows.Handle, name string, access uint32, disposition uint32, options uint32, sd *windows.SECURITY_DESCRIPTOR) (windows.Handle, bool, error) {
@@ -233,21 +267,12 @@ func syncPinnedDirectory(root *os.Root, label string) error {
 	return errors.Join(windows.FlushFileBuffers(handle), windows.CloseHandle(handle))
 }
 
-func windowsTrustedSIDs(current *windows.SID) (admin, system, installer *windows.SID, err error) {
-	admin, err = windows.CreateWellKnownSid(windows.WinBuiltinAdministratorsSid)
+func windowsTrustedSIDs() (admin, system, installer *windows.SID, err error) {
+	security, err := loadWindowsSecurityMaterial()
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	system, err = windows.CreateWellKnownSid(windows.WinLocalSystemSid)
-	if err != nil {
-		return nil, nil, nil, err
-	}
-	installer, err = windows.StringToSid(windowsTrustedInstallerSID)
-	if err != nil {
-		return nil, nil, nil, err
-	}
-	_ = current
-	return admin, system, installer, nil
+	return security.admin, security.system, security.installer, nil
 }
 
 func windowsHandleSecurity(handle windows.Handle, label string) (*windows.SECURITY_DESCRIPTOR, *windows.SID, error) {
@@ -280,7 +305,7 @@ func validateSecureWindowsACL(handle windows.Handle, label string) error {
 	if err != nil || dacl == nil {
 		return fmt.Errorf("%s has no restrictive DACL", label)
 	}
-	admin, system, _, err := windowsTrustedSIDs(current)
+	admin, system, _, err := windowsTrustedSIDs()
 	if err != nil {
 		return fmt.Errorf("build trusted Windows SIDs for %s: %w", label, err)
 	}
@@ -317,7 +342,7 @@ func validateTrustedWindowsACL(handle windows.Handle, label string, requireCurre
 	if err != nil {
 		return err
 	}
-	admin, system, installer, err := windowsTrustedSIDs(current)
+	admin, system, installer, err := windowsTrustedSIDs()
 	if err != nil {
 		return fmt.Errorf("build trusted Windows SIDs for %s: %w", label, err)
 	}
@@ -412,6 +437,9 @@ func openPinnedFile(root *os.Root, name string, flag int, perm os.FileMode) (*os
 	if flag&os.O_CREATE == 0 {
 		return root.OpenFile(name, flag, perm)
 	}
+	if flag&os.O_APPEND != 0 {
+		return nil, errors.New("create Windows pinned-state file with O_APPEND is unsupported")
+	}
 	_, secureSD, err := currentWindowsSecurity()
 	if err != nil {
 		return nil, err
@@ -447,11 +475,6 @@ func openPinnedFile(root *os.Root, name string, flag int, perm os.FileMode) (*os
 	}
 	if flag&os.O_TRUNC != 0 {
 		if err := windows.SetEndOfFile(handle); err != nil {
-			return nil, errors.Join(err, file.Close())
-		}
-	}
-	if flag&os.O_APPEND != 0 {
-		if _, err := file.Seek(0, io.SeekEnd); err != nil {
 			return nil, errors.Join(err, file.Close())
 		}
 	}

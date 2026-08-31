@@ -125,6 +125,89 @@ func TestWindowsPrivateFileRejectsForeignDACL(t *testing.T) {
 	}
 }
 
+func TestWindowsCreateOpenDoesNotAdoptPrecreatedForeignDACL(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "qurl", "connector")
+	namespace, err := EnsurePrivate(path, 0o700)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer namespace.Close()
+	name := "precreated.json"
+	if err := os.WriteFile(filepath.Join(path, name), []byte("foreign"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	setWindowsTestWorldACL(t, filepath.Join(path, name), windows.GENERIC_READ)
+	file, err := namespace.OpenFile(name, os.O_WRONLY|os.O_CREATE, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	if _, err := ValidateRegularFile(namespace, name, file, "precreated Windows state", 0o600); err == nil {
+		t.Fatal("create-open adopted a precreated file with a foreign DACL")
+	}
+}
+
+func TestWindowsCreateOpenRejectsAppendFlag(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "qurl", "connector")
+	namespace, err := EnsurePrivate(path, 0o700)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer namespace.Close()
+	if file, err := namespace.OpenFile("append.log", os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o600); file != nil || err == nil {
+		t.Fatalf("create with O_APPEND = (%v, %v), want explicit rejection", file, err)
+	}
+}
+
+func TestWindowsCreateOpenTruncatesExistingSecureFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "qurl", "connector")
+	namespace, err := EnsurePrivate(path, 0o700)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer namespace.Close()
+	writeWindowsPinnedTestFile(t, namespace, ".state.tmp", "state.json", []byte("long content"))
+	file, err := namespace.OpenFile("state.json", os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := file.Write([]byte("new")); err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if raw, err := os.ReadFile(filepath.Join(path, "state.json")); err != nil || string(raw) != "new" {
+		t.Fatalf("truncated state = %q, %v", raw, err)
+	}
+}
+
+func TestWindowsPathHelpersRejectDeviceNamespacesAndBuildUNC(t *testing.T) {
+	for _, path := range []string{`\\?\C:\qurl\state`, `\\.\C:\qurl\state`} {
+		if err := validateAbsoluteDirectoryPath(path); err == nil {
+			t.Fatalf("device namespace %q was accepted", path)
+		}
+	}
+	got, err := windowsNTPath(`\\server\share\qurl\state`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := `\??\UNC\server\share\qurl\state`; got != want {
+		t.Fatalf("UNC NT path = %q, want %q", got, want)
+	}
+}
+
+func TestNormalizeWindowsOpenErrorPreservesErrorsIs(t *testing.T) {
+	exists := &os.PathError{Op: "openat", Path: "state", Err: normalizeWindowsOpenError(windows.ERROR_ALREADY_EXISTS)}
+	if !errors.Is(exists, os.ErrExist) {
+		t.Fatalf("already-exists wrapper = %v, want errors.Is(os.ErrExist)", exists)
+	}
+	missing := &os.PathError{Op: "openat", Path: "state", Err: normalizeWindowsOpenError(windows.ERROR_FILE_NOT_FOUND)}
+	if !errors.Is(missing, os.ErrNotExist) {
+		t.Fatalf("not-found wrapper = %v, want errors.Is(os.ErrNotExist)", missing)
+	}
+}
+
 func TestWindowsPrivateDirectoryRejectsForeignDACL(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "qurl", "connector")
 	namespace, err := EnsurePrivate(path, 0o700)

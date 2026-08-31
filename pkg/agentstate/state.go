@@ -7,7 +7,10 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
+
+	"github.com/layervai/qurl-connector/internal/pinnedfs"
 )
 
 const (
@@ -105,8 +108,9 @@ func xdgStateDir() string {
 	return filepath.Join(home, ".local", "state", xdgStateSubdir)
 }
 
-// EnsureDirMode makes dir exist as an owner-only 0700 directory before the
-// pinned-filesystem layer validates it.
+// EnsureDirMode makes dir exist as an owner-only state directory before the
+// pinned-filesystem layer validates it. Unix uses mode 0700. Windows creates a
+// protected owner/SYSTEM/Administrators ACL atomically for each missing edge.
 //
 // pinnedfs.EnsurePrivate (and qurl-go's OpenFileAgentState) require the state
 // directory to be exactly 0700 and fail closed otherwise ("has mode 0755, want
@@ -115,16 +119,24 @@ func xdgStateDir() string {
 // directory a user created by hand, or a packaged install left at 0755, would
 // make the very first run die on a mode check it never had a chance to satisfy.
 //
-// EnsureDirMode closes that gap by satisfying the 0700 requirement up front,
-// without weakening it: os.MkdirAll honors the umask on the components it
-// creates and leaves an existing directory's mode untouched, so an explicit
-// Chmod pins the final directory to exactly 0700. pinnedfs still performs its
-// full no-follow and ownership validation afterward, so this cannot turn a
-// symlink or foreign-owned path into an accepted namespace.
+// On Unix, EnsureDirMode closes that gap by creating and chmodding the final
+// directory before pinned validation. Windows is a greenfield contract and
+// does not adopt an existing directory with inherited or foreign ACLs; it uses
+// pinnedfs.EnsurePrivate for protected creation and exact ACL validation.
 func EnsureDirMode(dir string) error {
 	dir = strings.TrimSpace(dir)
 	if dir == "" {
 		return errors.New("state directory path is empty")
+	}
+	if runtime.GOOS == "windows" {
+		namespace, err := pinnedfs.EnsurePrivate(dir, dirMode)
+		if err != nil {
+			return fmt.Errorf("create protected Windows state directory %s: %w", dir, err)
+		}
+		if err := namespace.Close(); err != nil {
+			return fmt.Errorf("close protected Windows state directory %s: %w", dir, err)
+		}
+		return nil
 	}
 	if err := os.MkdirAll(dir, dirMode); err != nil {
 		return fmt.Errorf("create state directory %s: %w", dir, err)
