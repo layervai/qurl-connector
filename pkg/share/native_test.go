@@ -2,9 +2,13 @@ package share
 
 import (
 	"context"
+	"crypto/ecdh"
+	"crypto/rand"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"reflect"
 	"sort"
 	"strings"
@@ -842,7 +846,72 @@ func TestOpenNativeRuntimeResumesPersistedCredentialRecovery(t *testing.T) {
 	}
 }
 
-func TestResumableNativeCredentialRecoveryRejectsUnsafeLocalStates(t *testing.T) {
+func TestOpenNativeRuntimeDoesNotResumePendingRecoveryWithoutAuthority(t *testing.T) {
+	oldStore := newNativeStateStore
+	oldConnect := connectNativeRuntime
+	oldRefresh := refreshNativeRuntime
+	oldRecover := recoverNativeRuntime
+	oldWait := waitNativeRefresh
+	t.Cleanup(func() {
+		newNativeStateStore = oldStore
+		connectNativeRuntime = oldConnect
+		refreshNativeRuntime = oldRefresh
+		recoverNativeRuntime = oldRecover
+		waitNativeRefresh = oldWait
+	})
+	pending := &qurl.NativeCredentialRecoveryRequiredError{
+		AgentID: "agent-one", Cause: qurl.ErrCredentialRecoveryRequired,
+	}
+	tests := []struct {
+		name        string
+		store       *memoryNativeStore
+		wantWarm    int
+		wantRefresh int
+	}{
+		{name: "ordinary warm open", store: &memoryNativeStore{}, wantWarm: 1},
+		{
+			name: "successful marker warm open",
+			store: &memoryNativeStore{present: true, marker: agentstate.RefreshMarker{
+				Version: 3, RefreshSucceededUnixMilli: 1,
+			}},
+			wantWarm: 1,
+		},
+		{
+			name: "pending refresh marker",
+			store: &memoryNativeStore{present: true, marker: agentstate.RefreshMarker{
+				Version: 2, Reason: "placement recovery",
+			}},
+			wantRefresh: 1,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			newNativeStateStore = func(string, string) (nativeStateStore, error) { return test.store, nil }
+			waitNativeRefresh = func(context.Context, time.Duration) error { return nil }
+			warmCalls := 0
+			connectNativeRuntime = func(context.Context, qurl.AgentStateStore, ...qurl.AgentRuntimeRegistrationOption) (*qurl.Client, *qurl.AgentRuntimeBinding, error) {
+				warmCalls++
+				return nil, nil, pending
+			}
+			refreshCalls := 0
+			refreshNativeRuntime = func(context.Context, qurl.HubBootstrap, qurl.AgentStateStore, ...qurl.AgentRuntimeRefreshOption) (*qurl.Client, *qurl.AgentRuntimeBinding, error) {
+				refreshCalls++
+				return nil, nil, pending
+			}
+			recoverNativeRuntime = func(context.Context, string, qurl.AgentStateStore, ...qurl.AgentRuntimeRecoveryOption) (*qurl.Client, *qurl.AgentRuntimeBinding, error) {
+				t.Fatal("recovery ran without explicit account authority")
+				return nil, nil, nil
+			}
+			_, err := OpenNativeRuntime(context.Background(), NativeRuntimeConfig{StateDir: "/private/state"})
+			if !errors.Is(err, qurl.ErrCredentialRecoveryRequired) || warmCalls != test.wantWarm || refreshCalls != test.wantRefresh {
+				t.Fatalf("open error=%v warm/refresh=%d/%d, want pending recovery and %d/%d",
+					err, warmCalls, refreshCalls, test.wantWarm, test.wantRefresh)
+			}
+		})
+	}
+}
+
+func TestMayConsumeNativeRecoveryAuthorityRejectsUnsafeLocalStates(t *testing.T) {
 	tests := []struct {
 		name string
 		err  error
@@ -857,10 +926,65 @@ func TestResumableNativeCredentialRecoveryRejectsUnsafeLocalStates(t *testing.T)
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			if got := resumableNativeCredentialRecovery(test.err); got != test.want {
-				t.Fatalf("resumableNativeCredentialRecovery(%v) = %t, want %t", test.err, got, test.want)
+			if got := mayConsumeNativeRecoveryAuthority(test.err); got != test.want {
+				t.Fatalf("mayConsumeNativeRecoveryAuthority(%v) = %t, want %t", test.err, got, test.want)
 			}
 		})
+	}
+}
+
+func TestMayConsumeNativeRecoveryAuthorityAcceptsRealPendingState(t *testing.T) {
+	deviceKey, err := ecdh.X25519().GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	serverKey, err := ecdh.X25519().GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC().Truncate(time.Second)
+	publicKey := base64.StdEncoding.EncodeToString(deviceKey.PublicKey().Bytes())
+	state := &qurl.AgentState{
+		AgentID:        "agent-one",
+		PrivateKeyB64:  base64.StdEncoding.EncodeToString(deviceKey.Bytes()),
+		PublicKeyB64:   publicKey,
+		RegisteredAt:   &now,
+		SchemaVersion:  7,
+		DeviceAPIKey:   "lv_live_" + base64.RawURLEncoding.EncodeToString(make([]byte, 32)),
+		DeviceAPIKeyID: "key_DeviceKey123",
+		Assignment: &qurl.AgentAssignment{
+			CellID: "cell0", AssignmentGeneration: 1, EndpointRevision: 1,
+			LeaseExpiresAt: now.Add(time.Hour),
+			Endpoint: qurl.NHPUDPEndpoint{
+				Host: "cell0.nhp.layerv.xyz", Port: 443,
+				ServerPublicKeyB64: base64.StdEncoding.EncodeToString(serverKey.PublicKey().Bytes()),
+			},
+		},
+		PendingCredentialRecoveryIssue: &qurl.PendingAgentCredentialRecoveryIssue{
+			RequestNonce:                     base64.RawURLEncoding.EncodeToString(make([]byte, 32)),
+			ReplayNotAfter:                   now.Add(time.Hour),
+			RecoveryCredentialFingerprintB64: base64.RawURLEncoding.EncodeToString(make([]byte, 32)),
+			AgentID:                          "agent-one", AgentPublicKeyB64: publicKey,
+			HubHost: "hub.nhp.layerv.xyz", HubPort: 443,
+			HubServerPublicKeyB64: base64.StdEncoding.EncodeToString(serverKey.PublicKey().Bytes()),
+		},
+	}
+	stateDir := t.TempDir()
+	if err := os.Chmod(stateDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	store, err := qurl.OpenFileAgentState(filepath.Join(stateDir, "agent.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	if err := store.SaveAgentState(context.Background(), state); err != nil {
+		t.Fatal(err)
+	}
+	_, _, openErr := qurl.ConnectAgentRuntime(context.Background(), store, qurl.WithAgentRuntimeOfflineOpen())
+	var pending *qurl.NativeCredentialRecoveryRequiredError
+	if !errors.As(openErr, &pending) || !mayConsumeNativeRecoveryAuthority(openErr) {
+		t.Fatalf("real pending state error = %v, want typed resumable recovery", openErr)
 	}
 }
 
@@ -952,11 +1076,21 @@ func TestOpenNativeRuntimeRecoveryProviderFailurePreservesIdentityRejection(t *t
 
 func TestNativeOpenPermanentClassification(t *testing.T) {
 	for name, err := range map[string]error{
-		"bad enrollment token": qurl.ErrAssignmentKeyRejected,
-		"consumed token":       qurl.ErrAssignmentBootstrapConsumed,
-		"registration policy":  qurl.ErrRegistrationDisabled,
-		"corrupt state":        qurl.ErrInvalidAgentState,
-		"authenticated deny":   &qurl.ServerDenyError{ErrCode: "52999"},
+		"bad enrollment token":               qurl.ErrAssignmentKeyRejected,
+		"consumed token":                     qurl.ErrAssignmentBootstrapConsumed,
+		"registration policy":                qurl.ErrRegistrationDisabled,
+		"corrupt state":                      qurl.ErrInvalidAgentState,
+		"authenticated deny":                 &qurl.ServerDenyError{ErrCode: "52999"},
+		"pending recovery without authority": qurl.ErrCredentialRecoveryRequired,
+		"missing device credential":          qurl.ErrDeviceCredentialMissing,
+		"recovery credential rejected":       qurl.ErrRecoveryCredentialRejected,
+		"recovery identity rejected":         qurl.ErrCredentialRecoveryIdentityRejected,
+		"recovery revoke required":           qurl.ErrCredentialRecoveryRevokeRequired,
+		"recovery request rejected":          qurl.ErrCredentialRecoveryRequestRejected,
+		"recovery assignment required":       qurl.ErrCredentialRecoveryAssignmentRequired,
+		"recovery candidate conflict":        qurl.ErrCredentialRecoveryCandidateConflict,
+		"recovery response invalid":          qurl.ErrCredentialRecoveryInvalidResponse,
+		"recovery expired":                   qurl.ErrCredentialRecoveryExpired,
 	} {
 		t.Run(name, func(t *testing.T) {
 			if !IsPermanentNativeOpenError(err) {
@@ -965,12 +1099,19 @@ func TestNativeOpenPermanentClassification(t *testing.T) {
 		})
 	}
 	for name, err := range map[string]error{
-		"assignment rate limit":  qurl.ErrAssignmentRateLimited,
-		"registration rate":      qurl.ErrRegistrationRateLimited,
-		"assignment unavailable": qurl.ErrAssignmentUnavailable,
-		"endpoint no reply":      qurl.ErrEndpointNoReply,
-		"server overload":        qurl.ErrServerOverloaded,
-		"transport":              errors.New("temporary network failure"),
+		"assignment rate limit":           qurl.ErrAssignmentRateLimited,
+		"registration rate":               qurl.ErrRegistrationRateLimited,
+		"assignment unavailable":          qurl.ErrAssignmentUnavailable,
+		"endpoint no reply":               qurl.ErrEndpointNoReply,
+		"server overload":                 qurl.ErrServerOverloaded,
+		"recovery unavailable":            qurl.ErrCredentialRecoveryUnavailable,
+		"recovery rate limited":           qurl.ErrCredentialRecoveryRateLimited,
+		"replacement unavailable":         qurl.ErrCredentialReplacementUnavailable,
+		"recovery retry required":         qurl.ErrCredentialRecoveryRetryRequired,
+		"recovery grant renewal required": qurl.ErrCredentialRecoveryGrantRejected,
+		"recovery candidate persistence":  qurl.ErrCredentialRecoveryCandidatePersistence,
+		"recovered assignment refresh":    qurl.ErrCredentialRecoveredAssignmentRefreshRequired,
+		"transport":                       errors.New("temporary network failure"),
 	} {
 		t.Run(name, func(t *testing.T) {
 			if IsPermanentNativeOpenError(err) {

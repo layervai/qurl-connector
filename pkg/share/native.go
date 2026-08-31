@@ -25,10 +25,11 @@ type NativeRuntimeConfig struct {
 	ClientBaseURL                string
 	EnrollmentCredential         string
 	EnrollmentCredentialProvider qurl.AgentEnrollmentCredentialProvider
-	// RecoveryCredentialProvider is invoked only after the pinned Hub
-	// authenticates the persisted agent and rejects its device credential.
-	// It must return a live qurl:agent account credential. The provider and its
-	// result are never retained after OpenNativeRuntime returns.
+	// RecoveryCredentialProvider is invoked after the pinned Hub authenticates
+	// the persisted agent and rejects its device credential, or when the same
+	// state contains a valid pending credential-recovery episode. It must return
+	// a live qurl:agent account credential. The provider and its result are never
+	// retained after OpenNativeRuntime returns.
 	RecoveryCredentialProvider func(context.Context) (string, error)
 	RefreshMode                string
 	UDPOptions                 []qurl.AgentRuntimeUDPOption
@@ -153,7 +154,7 @@ func OpenNativeRuntime(ctx context.Context, cfg NativeRuntimeConfig) (_ *NativeR
 		if openErr == nil {
 			return runtime, nil
 		}
-		if resumableNativeCredentialRecovery(openErr) {
+		if mayConsumeNativeRecoveryAuthority(openErr) {
 			return recoverNativeCredential(ctx, cfg, store, openErr, mode)
 		}
 		// Offline open and Hub refresh share the same local transient-error
@@ -192,7 +193,7 @@ func OpenNativeRuntime(ctx context.Context, cfg NativeRuntimeConfig) (_ *NativeR
 		}
 		return recoverNativeCredential(ctx, cfg, store, refreshErr, mode)
 	}
-	if resumableNativeCredentialRecovery(openErr) {
+	if mayConsumeNativeRecoveryAuthority(openErr) {
 		return recoverNativeCredential(ctx, cfg, store, openErr, mode)
 	}
 	if !errors.Is(openErr, qurl.ErrAgentStateNotFound) {
@@ -248,7 +249,7 @@ func warmOpenNativeRuntime(ctx context.Context, cfg NativeRuntimeConfig, store n
 	return assembleNativeRuntime(client, binding, store, refreshConfig(cfg, mode), NativeOpenWarm)
 }
 
-func resumableNativeCredentialRecovery(err error) bool {
+func mayConsumeNativeRecoveryAuthority(err error) bool {
 	if errors.Is(err, qurl.ErrAssignmentIdentityRejected) {
 		return true
 	}
@@ -265,7 +266,7 @@ func resumableNativeCredentialRecovery(err error) bool {
 }
 
 func recoverNativeCredential(ctx context.Context, cfg NativeRuntimeConfig, store nativeStateStore, triggerErr error, mode string) (*NativeRuntime, error) {
-	if !resumableNativeCredentialRecovery(triggerErr) || cfg.RecoveryCredentialProvider == nil {
+	if !mayConsumeNativeRecoveryAuthority(triggerErr) || cfg.RecoveryCredentialProvider == nil {
 		return nil, triggerErr
 	}
 	credential, err := cfg.RecoveryCredentialProvider(ctx)
@@ -442,6 +443,16 @@ func IsPermanentNativeOpenError(err error) bool {
 		qurl.ErrCompletionIdentityRejected,
 		qurl.ErrCompletionCredentialConflict,
 		qurl.ErrCompletionRequestRejected,
+		qurl.ErrCredentialRecoveryRequired,
+		qurl.ErrDeviceCredentialMissing,
+		qurl.ErrRecoveryCredentialRejected,
+		qurl.ErrCredentialRecoveryIdentityRejected,
+		qurl.ErrCredentialRecoveryRevokeRequired,
+		qurl.ErrCredentialRecoveryRequestRejected,
+		qurl.ErrCredentialRecoveryAssignmentRequired,
+		qurl.ErrCredentialRecoveryCandidateConflict,
+		qurl.ErrCredentialRecoveryInvalidResponse,
+		qurl.ErrCredentialRecoveryExpired,
 	} {
 		if errors.Is(err, sentinel) {
 			return true
