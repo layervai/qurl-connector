@@ -20,10 +20,12 @@ func ValidateRegularFile(namespace *Directory, name string, file *os.File, label
 
 // ValidateOwnerRegularFile proves the same descriptor-entry continuity as
 // ValidateRegularFile while accepting any mode on an euid-owned Unix file. On
-// Windows, modes do not express ACL safety, so this keeps the strict owner-only
-// ACL requirement. It is for safe cleanup or Unix mode repair of private state.
-// Callers must restore and revalidate the required mode before they read or
-// execute that state.
+// Windows, modes do not express ACL safety, so there is no relaxed repair
+// variant: this keeps the strict protected owner-only ACL requirement. A
+// Windows file whose ACL drifted remains rejected and requires operator action
+// outside the running Connector. This function is for safe cleanup or Unix
+// mode repair of private state. Callers must restore and revalidate the
+// required mode before they read or execute that state.
 func ValidateOwnerRegularFile(namespace *Directory, name string, file *os.File, label string) (os.FileInfo, error) {
 	return validateRegularFile(namespace, name, file, label, func(current *os.File, info os.FileInfo, currentLabel string) error {
 		return validatePrivateRegularFile(current, info, currentLabel, info.Mode().Perm(), false)

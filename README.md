@@ -21,6 +21,15 @@ The user manager must support `Type=exec`, append log output, and
 `RestrictSUIDSGID`. qURL reports these requirements if the installed systemd
 cannot load the managed service definition.
 
+On Windows, native state is under `%LOCALAPPDATA%\qurl-connector`. The first
+run creates the directory and its security-sensitive files with protected ACLs
+for the current user, SYSTEM, and Administrators. This is a greenfield contract:
+the Connector does not adopt a state directory or file with inherited or
+foreign ACLs. If ACL validation fails, stop the Connector, move that state
+directory aside, and start again so it can create protected state and enroll a
+new identity. Connector and pinned qurl-go writers use the same protected-file
+contract for all production identity and session state.
+
 `cmd/frpc` is retained for development and diagnostics. It is not a supported
 customer distribution, Homebrew formula, release binary, or container image.
 

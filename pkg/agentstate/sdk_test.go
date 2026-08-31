@@ -529,9 +529,6 @@ func TestNewSDKStoreFileProviderUsesSingleSDKEnvelope(t *testing.T) {
 }
 
 func TestSDKStoreFailsClosedWhenStateNamespaceIsReplaced(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("Windows prevents replacement while the retained directory handle is open")
-	}
 	parent := realSDKTempDir(t)
 	dir := filepath.Join(parent, "state")
 	t.Setenv(EnvKeyProvider, KeyProviderFile)
@@ -544,6 +541,20 @@ func TestSDKStoreFailsClosedWhenStateNamespaceIsReplaced(t *testing.T) {
 	}
 
 	displaced := filepath.Join(parent, "state-displaced")
+	if runtime.GOOS == "windows" {
+		if err := os.Rename(dir, displaced); err == nil {
+			_ = owner.Close()
+			t.Fatal("Windows replaced a pinned state namespace; the fail-closed replacement path must be tested")
+		}
+		if err := owner.ValidateContinuity(); err != nil {
+			_ = owner.Close()
+			t.Fatalf("ValidateContinuity after rejected Windows replacement: %v", err)
+		}
+		if err := owner.Close(); err != nil {
+			t.Fatalf("Close after rejected Windows replacement: %v", err)
+		}
+		return
+	}
 	if err := os.Rename(dir, displaced); err != nil {
 		t.Fatal(err)
 	}
@@ -641,9 +652,6 @@ func TestSDKStoreLoadRegistrationRefreshMarkerPropagatesCorruptMarker(t *testing
 }
 
 func TestSDKStoreRefreshMarkerNeverFollowsReplacementNamespace(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("Windows prevents replacement while the retained directory handle is open")
-	}
 	parent := realSDKTempDir(t)
 	dir := filepath.Join(parent, "state")
 	t.Setenv(EnvKeyProvider, KeyProviderFile)
@@ -656,6 +664,20 @@ func TestSDKStoreRefreshMarkerNeverFollowsReplacementNamespace(t *testing.T) {
 	}
 
 	displaced := filepath.Join(parent, "state-displaced")
+	if runtime.GOOS == "windows" {
+		if err := os.Rename(dir, displaced); err == nil {
+			_ = owner.Close()
+			t.Fatal("Windows replaced a pinned refresh-marker namespace; the fail-closed replacement path must be tested")
+		}
+		if err := owner.ValidateContinuity(); err != nil {
+			_ = owner.Close()
+			t.Fatalf("ValidateContinuity after rejected Windows refresh-marker replacement: %v", err)
+		}
+		if err := owner.Close(); err != nil {
+			t.Fatalf("Close after rejected Windows refresh-marker replacement: %v", err)
+		}
+		return
+	}
 	if err := os.Rename(dir, displaced); err != nil {
 		t.Fatal(err)
 	}
@@ -728,9 +750,6 @@ func TestSDKStoreCloseWaitsForInFlightSealedSaveAndRejectsLaterHandoff(t *testin
 }
 
 func TestSDKStoreCloseDetectsNamespaceReplacementWhileSDKCloseBlocks(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("Windows prevents replacement while the retained directory handle is open")
-	}
 	parent := realSDKTempDir(t)
 	dir := filepath.Join(parent, "state")
 	namespace, err := pinnedfs.EnsurePrivate(dir, 0o700)
@@ -751,6 +770,21 @@ func TestSDKStoreCloseDetectsNamespaceReplacementWhileSDKCloseBlocks(t *testing.
 	<-store.entered
 
 	displaced := filepath.Join(parent, "state-displaced")
+	if runtime.GOOS == "windows" {
+		renameErr := os.Rename(dir, displaced)
+		close(store.release)
+		closeErr := <-closeDone
+		if renameErr == nil {
+			t.Fatal("Windows replaced a pinned state namespace during close; the fail-closed replacement path must be tested")
+		}
+		if closeErr != nil {
+			t.Fatalf("Close after rejected Windows replacement: %v", closeErr)
+		}
+		if err := owner.Close(); err != nil {
+			t.Fatalf("second Close after rejected Windows replacement: %v", err)
+		}
+		return
+	}
 	if err := os.Rename(dir, displaced); err != nil {
 		t.Fatal(err)
 	}
