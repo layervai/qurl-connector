@@ -362,6 +362,42 @@ type prepareFenceOperations struct {
 	prepareOnce    sync.Once
 }
 
+type durableRetirementFenceOperations struct {
+	controller *durableNativeSessionOperations
+}
+
+func (o *durableRetirementFenceOperations) RecoverPending(ctx context.Context, binding *qurl.AgentRuntimeBinding,
+	privateKey []byte, resourceID string, preserve map[string]struct{}, udpOptions []qurl.AgentRuntimeUDPOption,
+) error {
+	return o.controller.RecoverPending(ctx, binding, privateKey, resourceID, preserve, udpOptions)
+}
+
+func (o *durableRetirementFenceOperations) RecoverOperation(ctx context.Context, binding *qurl.AgentRuntimeBinding,
+	privateKey []byte, resourceID, operationID string, udpOptions []qurl.AgentRuntimeUDPOption,
+) error {
+	return o.controller.RecoverOperation(ctx, binding, privateKey, resourceID, operationID, udpOptions)
+}
+
+func (*durableRetirementFenceOperations) PrepareDispatch(_ context.Context, _ *qurl.AgentRuntimeBinding, _ []byte,
+	knockResourceID, protectedResourceID, runID string, runAttempt uint64,
+) (*qurl.NativeSessionOperation, error) {
+	return &qurl.NativeSessionOperation{
+		OperationID: strings.Repeat("9", 64), ResourceID: knockResourceID,
+		ProtectedResourceID: protectedResourceID, RunID: runID, RunAttempt: runAttempt,
+	}, nil
+}
+
+func (*durableRetirementFenceOperations) RecordMapped(context.Context, string, qurl.NativeSessionOperation, qurl.NativeSessionReceipt) error {
+	return nil
+}
+
+func (o *durableRetirementFenceOperations) Retire(ctx context.Context, binding *qurl.AgentRuntimeBinding,
+	privateKey []byte, resourceID, operationID string, receipt qurl.NativeSessionReceipt,
+	udpOptions []qurl.AgentRuntimeUDPOption,
+) error {
+	return o.controller.Retire(ctx, binding, privateKey, resourceID, operationID, receipt, udpOptions)
+}
+
 func (o *prepareFenceOperations) RecoverPending(_ context.Context, _ *qurl.AgentRuntimeBinding, _ []byte,
 	resourceID string, _ map[string]struct{}, _ []qurl.AgentRuntimeUDPOption,
 ) error {
@@ -3299,5 +3335,150 @@ func TestNativeAdmitterRetriesFailedRetirementBeforeSameResourceReplacement(t *t
 	}
 	if retireCalls != 2 {
 		t.Fatalf("same-resource admission retirement calls=%d, want 2", retireCalls)
+	}
+}
+
+func TestNativeAdmitterFencesServingReplacementUntilDurableRetirementTerminal(t *testing.T) {
+	oldRecover := recoverNativeSessionOperation
+	oldWait := waitNativeSessionRecovery
+	oldKnock := knockNativeRuntime
+	t.Cleanup(func() {
+		recoverNativeSessionOperation = oldRecover
+		waitNativeSessionRecovery = oldWait
+		knockNativeRuntime = oldKnock
+	})
+
+	store := &memoryNativeStore{}
+	mapped, receipt := seedMappedDurableRecord(t, store)
+	controller, err := newDurableNativeSessionOperations(store, testNativeSessionAuthority())
+	if err != nil {
+		t.Fatal(err)
+	}
+	controller.clock = func() time.Time { return time.UnixMilli(1_800_000_011_000).UTC() }
+
+	// qurl-go maps authenticated 52029 replies to Complete=false and 52030 to
+	// Complete=true. Keep the exact wire-code sequence visible at this seam so
+	// the Connector fence cannot regress to treating a pending poll as terminal.
+	codes := []string{"52029", "52029", "52029", "52030"}
+	terminalPoll := make(chan struct{})
+	allowTerminal := make(chan struct{})
+	violation := make(chan error, 1)
+	recoveryCalls := 0
+	waits := 0
+	oldAuthorityLive := true
+	recoverNativeSessionOperation = func(_ context.Context, _ *qurl.AgentRuntimeBinding, _ []byte,
+		operation qurl.NativeSessionOperation, _ qurl.NHPUDPEndpoint, _ ...qurl.AgentRuntimeUDPOption,
+	) (*qurl.NativeSessionOperationRecovery, error) {
+		if operation.OperationID != mapped.Operation.OperationID {
+			err := fmt.Errorf("recovered operation = %q, want original %q", operation.OperationID, mapped.Operation.OperationID)
+			violation <- err
+			return nil, err
+		}
+		if recoveryCalls >= len(codes) {
+			err := errors.New("durable retirement polled after terminal 52030")
+			violation <- err
+			return nil, err
+		}
+		code := codes[recoveryCalls]
+		recoveryCalls++
+		if code == "52029" {
+			return &qurl.NativeSessionOperationRecovery{Complete: false}, nil
+		}
+		close(terminalPoll)
+		<-allowTerminal
+		oldAuthorityLive = false
+		return &qurl.NativeSessionOperationRecovery{Complete: true}, nil
+	}
+	waitNativeSessionRecovery = func(context.Context, time.Duration) error {
+		waits++
+		return nil
+	}
+	knockNativeRuntime = func(_ context.Context, _ *qurl.AgentRuntimeBinding, _ []byte, _ string,
+		opts qurl.NativeKnockOptions, _ ...qurl.AgentRuntimeUDPOption,
+	) (*qurl.NativeKnockResult, error) {
+		if oldAuthorityLive {
+			err := errors.New("replacement admission overlapped nonterminal durable retirement")
+			violation <- err
+			return nil, err
+		}
+		replacement := testSessionReceipt(92, opts.RunID, opts.RunAttempt)
+		replacement.CellID = "cell-02"
+		return &qurl.NativeKnockResult{
+			ACToken: "token", ResourceHost: "127.0.0.1:7000", SessionID: replacement.SessionID,
+			OpenTime: 3600, SessionReceipt: replacement,
+		}, nil
+	}
+
+	key := admissionKey(receipt)
+	operations := &durableRetirementFenceOperations{controller: controller}
+	admitter := &NativeAdmitter{
+		binding: &qurl.AgentRuntimeBinding{AgentID: mapped.Operation.AgentID}, privateKey: make([]byte, 32),
+		operations: operations, store: store,
+		live: map[nativeAdmissionKey]nativeLiveAdmission{
+			key: {resourceID: testProtectedResourceID, operationID: mapped.Operation.OperationID, receipt: receipt},
+		},
+		pending: map[nativeAdmissionKey]bool{key: true},
+	}
+	factory := &overlapFactory{}
+	serving := make(chan Admission, 1)
+	runner, err := NewResourceRunner(ResourceConfig{
+		KnockResourceID: "resource-b", ResourceID: testProtectedResourceID,
+		Admitter: admitter, Sessions: factory, OnServing: func(admission Admission) { serving <- admission },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	runDone := make(chan error, 1)
+	go func() { runDone <- runner.Run(ctx) }()
+
+	select {
+	case <-terminalPoll:
+	case err := <-violation:
+		t.Fatal(err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("durable retirement did not reach terminal 52030 poll")
+	}
+	factory.mu.Lock()
+	startedBeforeTerminal := factory.next
+	factory.mu.Unlock()
+	if recoveryCalls != 4 || waits != 3 || startedBeforeTerminal != 0 || !oldAuthorityLive {
+		t.Fatalf("pre-terminal recovery calls/waits/starts/live=%d/%d/%d/%t, want 4/3/0/true",
+			recoveryCalls, waits, startedBeforeTerminal, oldAuthorityLive)
+	}
+	select {
+	case admission := <-serving:
+		t.Fatalf("replacement served before terminal retirement: %v", admission)
+	case err := <-runDone:
+		t.Fatalf("runner exited before terminal retirement: %v", err)
+	default:
+	}
+
+	close(allowTerminal)
+	select {
+	case admission := <-serving:
+		if admission.SessionID != 92 || oldAuthorityLive {
+			t.Fatalf("replacement serving admission/live = %v/%t", admission, oldAuthorityLive)
+		}
+	case err := <-runDone:
+		t.Fatalf("runner exited instead of serving replacement: %v", err)
+	case err := <-violation:
+		t.Fatal(err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("replacement did not serve after terminal 52030")
+	}
+
+	cancel()
+	if err := <-runDone; !errors.Is(err, context.Canceled) {
+		t.Fatalf("runner shutdown = %v, want context cancellation", err)
+	}
+	factory.mu.Lock()
+	servingCount, gap := factory.serving, factory.gap
+	factory.mu.Unlock()
+	if servingCount != 0 || gap || recoveryCalls != len(codes) {
+		t.Fatalf("final serving/gap/recovery=%d/%t/%d, want 0/false/%d", servingCount, gap, recoveryCalls, len(codes))
+	}
+	if records, loadErr := store.LoadSessionOperations(context.Background(), testProtectedResourceID); loadErr != nil || len(records) != 0 {
+		t.Fatalf("terminal durable retirement records=%+v err=%v", records, loadErr)
 	}
 }
