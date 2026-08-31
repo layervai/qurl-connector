@@ -282,8 +282,9 @@ func mayConsumeNativeRecoveryAuthority(err error) bool {
 	if errors.Is(err, qurl.ErrAssignmentIdentityRejected) {
 		return true
 	}
-	// qurl-go's exact pending-episode sentinel is the only local state that may
-	// consume account authority automatically. Wrapped or joined causes fail
+	// The outer typed pending error may be wrapped; only its Cause must be the
+	// exact unwrapped qurl-go pending-episode sentinel. Joined top-level unsafe
+	// causes are rejected above, while wrapped or joined pending causes fail
 	// closed so new, malformed, and terminal upstream states cannot spend it.
 	var pending *qurl.NativeCredentialRecoveryRequiredError
 	return errors.As(err, &pending) && pending != nil &&
