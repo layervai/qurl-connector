@@ -321,6 +321,9 @@ func (m *linuxUserJobManager) Remove(label string) error {
 		if _, err := m.run("unmask", unit); err != nil {
 			return fmt.Errorf("unmask systemd user job %s before removal: %w", label, err)
 		}
+		if err := syncTrustedSystemdUnitDirectory(filepath.Dir(unitPath)); err != nil {
+			return fmt.Errorf("make unmasked systemd user job %s durable: %w", label, err)
+		}
 	}
 	if state.loaded || state.invalid || state.masked || state.unitFileState != "" {
 		if _, err := m.run("disable", unit); err != nil {
@@ -510,15 +513,53 @@ func validateRemovableLinuxUserJobDefinition(path string) (retErr error) {
 	}
 	defer func() { retErr = errors.Join(retErr, dir.Close()) }()
 	name := filepath.Base(path)
-	file, err := dir.OpenFile(name, os.O_RDONLY|unix.O_NOFOLLOW, 0)
+	entry, err := dir.Lstat(name)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
 	}
 	if err != nil {
 		return err
 	}
+	if entry.Mode()&os.ModeSymlink != 0 {
+		return validateSystemdMaskSymlink(dir, name, entry)
+	}
+	file, err := dir.OpenFile(name, os.O_RDONLY|unix.O_NOFOLLOW, 0)
+	if err != nil {
+		return err
+	}
 	_, validateErr := pinnedfs.ValidateOwnerRegularFile(dir, name, file, "systemd user job definition")
 	return errors.Join(validateErr, file.Close())
+}
+
+func validateSystemdMaskSymlink(dir *pinnedfs.Directory, name string, entry os.FileInfo) error {
+	const maskTarget = "/dev/null"
+	if err := pinnedfs.RequireCurrentOwnerInfo(entry, "systemd user job mask"); err != nil {
+		return err
+	}
+	if err := pinnedfs.RequireSingleLinkInfo(entry, "systemd user job mask"); err != nil {
+		return err
+	}
+	target, err := dir.Readlink(name)
+	if err != nil {
+		return err
+	}
+	if target != maskTarget {
+		return fmt.Errorf("systemd user job definition symlink targets %q, want exact systemd mask %q", target, maskTarget)
+	}
+	latest, err := dir.Lstat(name)
+	if err != nil {
+		return err
+	}
+	if latest.Mode()&os.ModeSymlink == 0 || !os.SameFile(entry, latest) {
+		return errors.New("systemd user job mask changed during validation")
+	}
+	if err := pinnedfs.RequireCurrentOwnerInfo(latest, "systemd user job mask"); err != nil {
+		return err
+	}
+	if err := pinnedfs.RequireSingleLinkInfo(latest, "systemd user job mask"); err != nil {
+		return err
+	}
+	return dir.ValidateCurrent()
 }
 
 func ensureLinuxUserJobLogs(paths ...string) error {

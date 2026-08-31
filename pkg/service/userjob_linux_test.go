@@ -674,7 +674,7 @@ func TestLinuxRemoveUnmasksManagedDefinitionBeforeCleanup(t *testing.T) {
 	if err := os.MkdirAll(filepath.Dir(unitPath), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(unitPath, []byte("[Service]\nType=exec\n"), 0o600); err != nil {
+	if err := os.Symlink("/dev/null", unitPath); err != nil {
 		t.Fatal(err)
 	}
 	var verbs []string
@@ -683,7 +683,10 @@ func TestLinuxRemoveUnmasksManagedDefinitionBeforeCleanup(t *testing.T) {
 		run: func(args ...string) (string, error) {
 			verbs = append(verbs, args[0])
 			if args[0] == "show" {
-				return linuxSystemdState(unitPath, "masked", "inactive", "dead", "masked-runtime", "no"), nil
+				return linuxSystemdState(unitPath, "masked", "inactive", "dead", "masked", "no"), nil
+			}
+			if args[0] == "unmask" {
+				return "", os.Remove(unitPath)
 			}
 			return "", nil
 		},
@@ -815,6 +818,19 @@ func TestLinuxUserJobManagerIntegration(t *testing.T) {
 		t.Fatal(err)
 	}
 	waitForLinuxUserJobMarker(t, job.Arguments[0])
+	unitPath, err := SystemdUserJobPath(configDir, job.Label)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := systemctlUserOutput("stop", systemdUserUnitName(job.Label)); err != nil {
+		t.Fatalf("stop integration job before persistent mask: %v", err)
+	}
+	if _, err := systemctlUserOutput("mask", "--force", systemdUserUnitName(job.Label)); err != nil {
+		t.Fatalf("persistently mask integration job: %v", err)
+	}
+	if target, err := os.Readlink(unitPath); err != nil || target != "/dev/null" {
+		t.Fatalf("persistent integration mask = %q, %v; want /dev/null symlink", target, err)
+	}
 	if err := manager.Remove(job.Label); err != nil {
 		t.Fatal(err)
 	}
