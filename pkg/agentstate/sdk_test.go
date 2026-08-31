@@ -541,20 +541,6 @@ func TestSDKStoreFailsClosedWhenStateNamespaceIsReplaced(t *testing.T) {
 	}
 
 	displaced := filepath.Join(parent, "state-displaced")
-	if runtime.GOOS == "windows" {
-		if err := os.Rename(dir, displaced); err == nil {
-			_ = owner.Close()
-			t.Fatal("Windows replaced a pinned state namespace; the fail-closed replacement path must be tested")
-		}
-		if err := owner.ValidateContinuity(); err != nil {
-			_ = owner.Close()
-			t.Fatalf("ValidateContinuity after rejected Windows replacement: %v", err)
-		}
-		if err := owner.Close(); err != nil {
-			t.Fatalf("Close after rejected Windows replacement: %v", err)
-		}
-		return
-	}
 	if err := os.Rename(dir, displaced); err != nil {
 		t.Fatal(err)
 	}
@@ -664,20 +650,6 @@ func TestSDKStoreRefreshMarkerNeverFollowsReplacementNamespace(t *testing.T) {
 	}
 
 	displaced := filepath.Join(parent, "state-displaced")
-	if runtime.GOOS == "windows" {
-		if err := os.Rename(dir, displaced); err == nil {
-			_ = owner.Close()
-			t.Fatal("Windows replaced a pinned refresh-marker namespace; the fail-closed replacement path must be tested")
-		}
-		if err := owner.ValidateContinuity(); err != nil {
-			_ = owner.Close()
-			t.Fatalf("ValidateContinuity after rejected Windows refresh-marker replacement: %v", err)
-		}
-		if err := owner.Close(); err != nil {
-			t.Fatalf("Close after rejected Windows refresh-marker replacement: %v", err)
-		}
-		return
-	}
 	if err := os.Rename(dir, displaced); err != nil {
 		t.Fatal(err)
 	}
@@ -770,21 +742,6 @@ func TestSDKStoreCloseDetectsNamespaceReplacementWhileSDKCloseBlocks(t *testing.
 	<-store.entered
 
 	displaced := filepath.Join(parent, "state-displaced")
-	if runtime.GOOS == "windows" {
-		renameErr := os.Rename(dir, displaced)
-		close(store.release)
-		closeErr := <-closeDone
-		if renameErr == nil {
-			t.Fatal("Windows replaced a pinned state namespace during close; the fail-closed replacement path must be tested")
-		}
-		if closeErr != nil {
-			t.Fatalf("Close after rejected Windows replacement: %v", closeErr)
-		}
-		if err := owner.Close(); err != nil {
-			t.Fatalf("second Close after rejected Windows replacement: %v", err)
-		}
-		return
-	}
 	if err := os.Rename(dir, displaced); err != nil {
 		t.Fatal(err)
 	}
