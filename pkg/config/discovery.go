@@ -56,7 +56,7 @@ func Discover(configFlag string) (string, error) {
 	}
 
 	// 4. User config directory.
-	if home, err := userConfigHomeDir(); err == nil {
+	if home, err := os.UserHomeDir(); err == nil {
 		p := filepath.Join(home, UserConfigDir, yamlConfigName)
 		if fileExists(p) {
 			return p, nil
@@ -64,17 +64,6 @@ func Discover(configFlag string) (string, error) {
 	}
 
 	return "", errors.New("no configuration file found; create qurl-proxy.yaml or pass --config")
-}
-
-// userConfigHomeDir preserves the documented HOME-relative discovery contract
-// on every platform. os.UserHomeDir ignores HOME on Windows and resolves
-// USERPROFILE instead, which makes an explicit isolated HOME ineffective for
-// managed processes and tests.
-func userConfigHomeDir() (string, error) {
-	if home := os.Getenv("HOME"); home != "" {
-		return home, nil
-	}
-	return os.UserHomeDir()
 }
 
 // fileExists returns true if the path exists and is a regular file.

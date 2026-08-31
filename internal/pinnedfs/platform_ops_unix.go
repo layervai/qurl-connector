@@ -20,7 +20,7 @@ func directoryWalkAnchor(string) string { return string(filepath.Separator) }
 
 func supportsConfinedRecovery() bool { return true }
 
-func syncExistingDirectoryEdges() bool { return true }
+func shouldRetryDirectoryEdgeSync(*os.Root, string) (bool, error) { return true, nil }
 
 func createPinnedDirectory(parent *os.Root, name, path string, mode os.FileMode) error {
 	if err := parent.Mkdir(name, mode.Perm()); err != nil {

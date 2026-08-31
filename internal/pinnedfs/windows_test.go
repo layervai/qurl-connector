@@ -240,12 +240,12 @@ func TestWindowsPrivateDirectoryRejectsAncestorDeleteControl(t *testing.T) {
 	}
 }
 
-func TestWindowsEnsurePrivateDoesNotSyncUnchangedAncestors(t *testing.T) {
+func TestWindowsEnsurePrivateRetriesOnlyProtectedExistingEdges(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "qurl", "connector")
 	original := syncPinnedParent
-	var calls int
-	syncPinnedParent = func(*os.Root, string) error {
-		calls++
+	var calls []string
+	syncPinnedParent = func(_ *os.Root, edgePath string) error {
+		calls = append(calls, edgePath)
 		return nil
 	}
 	t.Cleanup(func() { syncPinnedParent = original })
@@ -256,10 +256,10 @@ func TestWindowsEnsurePrivateDoesNotSyncUnchangedAncestors(t *testing.T) {
 	if err := first.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if calls != 2 {
-		t.Fatalf("syncs for two created components = %d, want 2", calls)
+	if len(calls) != 2 {
+		t.Fatalf("syncs for two created components = %v, want 2", calls)
 	}
-	calls = 0
+	calls = nil
 	second, err := EnsurePrivate(path, 0o700)
 	if err != nil {
 		t.Fatal(err)
@@ -267,8 +267,110 @@ func TestWindowsEnsurePrivateDoesNotSyncUnchangedAncestors(t *testing.T) {
 	if err := second.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if calls != 0 {
-		t.Fatalf("syncs for unchanged ancestors = %d, want 0", calls)
+	if len(calls) != 2 || calls[0] != filepath.Dir(path) || calls[1] != path {
+		t.Fatalf("retry syncs for protected existing edges = %v, want [%s %s]", calls, filepath.Dir(path), path)
+	}
+}
+
+func TestWindowsEnsurePrivateFailsWhenProtectedEdgeRetrySyncFails(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "qurl", "connector")
+	first, err := EnsurePrivate(path, 0o700)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	wantErr := errors.New("injected existing-edge sync failure")
+	original := syncPinnedParent
+	syncPinnedParent = func(_ *os.Root, edgePath string) error {
+		if edgePath == path {
+			return wantErr
+		}
+		return nil
+	}
+	t.Cleanup(func() { syncPinnedParent = original })
+	if namespace, err := EnsurePrivate(path, 0o700); namespace != nil || !errors.Is(err, wantErr) {
+		if namespace != nil {
+			_ = namespace.Close()
+		}
+		t.Fatalf("EnsurePrivate retry = (%v, %v), want fail-closed sync error", namespace, err)
+	}
+}
+
+func TestWindowsCreatedACLClassifierRequiresExactCreationSubjects(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "qurl", "connector")
+	namespace, err := EnsurePrivate(path, 0o700)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := namespace.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if !windowsTestMatchesCreatedACL(t, path) {
+		t.Fatal("fresh protected directory did not match its creation ACL")
+	}
+
+	for _, tc := range []struct {
+		name          string
+		includeAdmin  bool
+		includeSystem bool
+	}{
+		{name: "missing Administrators", includeSystem: true},
+		{name: "missing SYSTEM", includeAdmin: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			setWindowsTestPrivateACL(t, path, tc.includeAdmin, tc.includeSystem)
+			if windowsTestMatchesCreatedACL(t, path) {
+				t.Fatal("non-exact protected ACL matched the creation policy")
+			}
+		})
+	}
+}
+
+func windowsTestMatchesCreatedACL(t *testing.T, path string) bool {
+	t.Helper()
+	handle, err := openWindowsDirectoryAbsolute(path, windows.FILE_GENERIC_READ|windows.READ_CONTROL|windows.SYNCHRONIZE)
+	if err != nil {
+		t.Fatal(err)
+	}
+	match, matchErr := matchesCreatedWindowsACL(handle, path)
+	if err := errors.Join(matchErr, windows.CloseHandle(handle)); err != nil {
+		t.Fatal(err)
+	}
+	return match
+}
+
+func setWindowsTestPrivateACL(t *testing.T, path string, includeAdmin, includeSystem bool) {
+	t.Helper()
+	current, _, err := currentWindowsSecurity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	entries := []windows.EXPLICIT_ACCESS{windowsTestAccess(current, windows.GENERIC_ALL)}
+	if includeAdmin {
+		admin, err := windows.CreateWellKnownSid(windows.WinBuiltinAdministratorsSid)
+		if err != nil {
+			t.Fatal(err)
+		}
+		entries = append(entries, windowsTestAccess(admin, windows.GENERIC_ALL))
+	}
+	if includeSystem {
+		system, err := windows.CreateWellKnownSid(windows.WinLocalSystemSid)
+		if err != nil {
+			t.Fatal(err)
+		}
+		entries = append(entries, windowsTestAccess(system, windows.GENERIC_ALL))
+	}
+	acl, err := windows.ACLFromEntries(entries, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := windows.SetNamedSecurityInfo(path, windows.SE_FILE_OBJECT,
+		windows.DACL_SECURITY_INFORMATION|windows.PROTECTED_DACL_SECURITY_INFORMATION,
+		nil, nil, acl, nil); err != nil {
+		t.Fatal(err)
 	}
 }
 

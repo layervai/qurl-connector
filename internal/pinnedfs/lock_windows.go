@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"runtime"
 	"time"
 
 	"golang.org/x/sys/windows"
@@ -29,6 +30,7 @@ func acquireAdvisoryLock(ctx context.Context, file *os.File, shared bool) error 
 			return err
 		}
 		err := windows.LockFileEx(windows.Handle(file.Fd()), flags, 0, 1, 0, &overlapped)
+		runtime.KeepAlive(file)
 		if err == nil {
 			return nil
 		}

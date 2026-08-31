@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"unsafe"
@@ -104,7 +105,36 @@ func directoryWalkAnchor(path string) string {
 
 func supportsConfinedRecovery() bool { return false }
 
-func syncExistingDirectoryEdges() bool { return false }
+// shouldRetryDirectoryEdgeSync identifies a directory edge created with this
+// package's exact protected ACL. Such an edge can be visible after an earlier
+// uncertain parent flush, so a retry must flush it again. Ordinary volume,
+// profile, and LocalAppData ancestors retain their inherited ACLs and are not
+// reopened with write access.
+func shouldRetryDirectoryEdgeSync(root *os.Root, label string) (bool, error) {
+	file, err := root.Open(".")
+	if err != nil {
+		return false, fmt.Errorf("open existing directory edge %s for durability classification: %w", label, err)
+	}
+	handle := windows.Handle(file.Fd())
+	if _, err := validateWindowsDirectoryHandle(handle, label); err != nil {
+		runtime.KeepAlive(file)
+		return false, errors.Join(err, file.Close())
+	}
+	match, classifyErr := matchesCreatedWindowsACL(handle, label)
+	runtime.KeepAlive(file)
+	closeErr := file.Close()
+	if classifyErr != nil || closeErr != nil {
+		var wrappedClassifyErr error
+		if classifyErr != nil {
+			wrappedClassifyErr = fmt.Errorf("classify existing directory edge %s for durability retry: %w", label, classifyErr)
+		}
+		return false, errors.Join(
+			wrappedClassifyErr,
+			closeErr,
+		)
+	}
+	return match, nil
+}
 
 func windowsRelativeName(name string) error {
 	if name == "" || name == "." || name == ".." || strings.ContainsAny(name, `\/:`) {
@@ -282,10 +312,114 @@ func windowsHandleSecurity(handle windows.Handle, label string) (*windows.SECURI
 	}
 	sd, err := windows.GetSecurityInfo(handle, windows.SE_FILE_OBJECT,
 		windows.OWNER_SECURITY_INFORMATION|windows.DACL_SECURITY_INFORMATION)
-	if err != nil || sd == nil {
+	if err != nil {
 		return nil, nil, fmt.Errorf("read %s ACL: %w", label, err)
 	}
+	if sd == nil {
+		return nil, nil, fmt.Errorf("read %s ACL: empty security descriptor", label)
+	}
 	return sd, current, nil
+}
+
+func windowsHandleCreatedSecurity(handle windows.Handle, label string) (*windows.SECURITY_DESCRIPTOR, *windows.SID, error) {
+	current, _, err := currentWindowsSecurity()
+	if err != nil {
+		return nil, nil, fmt.Errorf("resolve current Windows identity for %s: %w", label, err)
+	}
+	sd, err := windows.GetSecurityInfo(handle, windows.SE_FILE_OBJECT,
+		windows.OWNER_SECURITY_INFORMATION|windows.GROUP_SECURITY_INFORMATION|windows.DACL_SECURITY_INFORMATION)
+	if err != nil {
+		return nil, nil, fmt.Errorf("read %s creation ACL: %w", label, err)
+	}
+	if sd == nil {
+		return nil, nil, fmt.Errorf("read %s creation ACL: empty security descriptor", label)
+	}
+	return sd, current, nil
+}
+
+// matchesCreatedWindowsACL reports whether handle has the exact access policy
+// installed by createPinnedDirectory. A successfully inspected but different
+// ACL is an ordinary ancestor and returns false. Inspection and descriptor
+// parsing failures remain hard errors so a retry cannot silently lose its
+// durability guarantee.
+func matchesCreatedWindowsACL(handle windows.Handle, label string) (bool, error) {
+	sd, current, err := windowsHandleCreatedSecurity(handle, label)
+	if err != nil {
+		return false, err
+	}
+	owner, _, err := sd.Owner()
+	if err != nil {
+		return false, fmt.Errorf("read %s ACL owner: %w", label, err)
+	}
+	if owner == nil || !owner.Equals(current) {
+		return false, nil
+	}
+	group, _, err := sd.Group()
+	if err != nil {
+		return false, fmt.Errorf("read %s ACL group: %w", label, err)
+	}
+	if group == nil || !group.Equals(current) {
+		return false, nil
+	}
+	control, _, err := sd.Control()
+	if err != nil {
+		return false, fmt.Errorf("read %s ACL control: %w", label, err)
+	}
+	if control&windows.SE_DACL_PROTECTED == 0 {
+		return false, nil
+	}
+	dacl, _, err := sd.DACL()
+	if err != nil {
+		return false, fmt.Errorf("read %s DACL: %w", label, err)
+	}
+	if dacl == nil {
+		return false, nil
+	}
+	admin, system, _, err := windowsTrustedSIDs()
+	if err != nil {
+		return false, fmt.Errorf("build trusted Windows SIDs for %s: %w", label, err)
+	}
+	header := (*windowsACLHeader)(unsafe.Pointer(dacl))
+	if header.ACECount != 3 {
+		return false, nil
+	}
+	var userSeen, adminSeen, systemSeen bool
+	for index := uint32(0); index < uint32(header.ACECount); index++ {
+		var ace *windows.ACCESS_ALLOWED_ACE
+		if err := windows.GetAce(dacl, index, &ace); err != nil {
+			return false, fmt.Errorf("inspect %s DACL entry %d: %w", label, index, err)
+		}
+		if ace == nil {
+			return false, fmt.Errorf("inspect %s DACL entry %d: empty entry", label, index)
+		}
+		if ace.Header.AceType != windows.ACCESS_ALLOWED_ACE_TYPE || ace.Header.AceFlags != 0 || ace.Mask != windowsFileAllAccess {
+			return false, nil
+		}
+		sid := (*windows.SID)(unsafe.Pointer(&ace.SidStart))
+		if sid == nil || !sid.IsValid() {
+			return false, fmt.Errorf("inspect %s DACL entry %d: invalid SID", label, index)
+		}
+		switch {
+		case sid.Equals(current):
+			if userSeen {
+				return false, nil
+			}
+			userSeen = true
+		case sid.Equals(admin):
+			if adminSeen {
+				return false, nil
+			}
+			adminSeen = true
+		case sid.Equals(system):
+			if systemSeen {
+				return false, nil
+			}
+			systemSeen = true
+		default:
+			return false, nil
+		}
+	}
+	return userSeen && adminSeen && systemSeen, nil
 }
 
 func validateSecureWindowsACL(handle windows.Handle, label string) error {
@@ -294,15 +428,24 @@ func validateSecureWindowsACL(handle windows.Handle, label string) error {
 		return err
 	}
 	owner, _, err := sd.Owner()
-	if err != nil || owner == nil || !owner.Equals(current) {
+	if err != nil {
+		return fmt.Errorf("read %s ACL owner: %w", label, err)
+	}
+	if owner == nil || !owner.Equals(current) {
 		return fmt.Errorf("%s is not owned by the current Windows user", label)
 	}
 	control, _, err := sd.Control()
-	if err != nil || control&windows.SE_DACL_PROTECTED == 0 {
+	if err != nil {
+		return fmt.Errorf("read %s ACL control: %w", label, err)
+	}
+	if control&windows.SE_DACL_PROTECTED == 0 {
 		return fmt.Errorf("%s ACL must be protected from inheritance", label)
 	}
 	dacl, _, err := sd.DACL()
-	if err != nil || dacl == nil {
+	if err != nil {
+		return fmt.Errorf("read %s DACL: %w", label, err)
+	}
+	if dacl == nil {
 		return fmt.Errorf("%s has no restrictive DACL", label)
 	}
 	admin, system, _, err := windowsTrustedSIDs()
@@ -313,8 +456,11 @@ func validateSecureWindowsACL(handle windows.Handle, label string) error {
 	var userMask windows.ACCESS_MASK
 	for index := uint32(0); index < uint32(header.ACECount); index++ {
 		var ace *windows.ACCESS_ALLOWED_ACE
-		if err := windows.GetAce(dacl, index, &ace); err != nil || ace == nil {
+		if err := windows.GetAce(dacl, index, &ace); err != nil {
 			return fmt.Errorf("inspect %s DACL entry %d: %w", label, index, err)
+		}
+		if ace == nil {
+			return fmt.Errorf("%s has an empty DACL entry %d", label, index)
 		}
 		if ace.Header.AceType != windows.ACCESS_ALLOWED_ACE_TYPE || ace.Header.AceFlags != 0 {
 			return fmt.Errorf("%s has an unsupported, inherited, or deny ACE", label)
@@ -350,14 +496,28 @@ func validateTrustedWindowsACL(handle windows.Handle, label string, requireCurre
 		return sid != nil && (sid.Equals(current) || sid.Equals(admin) || sid.Equals(system) || sid.Equals(installer))
 	}
 	owner, _, err := sd.Owner()
-	if err != nil || owner == nil || (!trusted(owner) && !requireCurrentOwner) || (requireCurrentOwner && !owner.Equals(current)) {
-		if requireCurrentOwner && owner != nil && trusted(owner) {
+	if err != nil {
+		return fmt.Errorf("read %s ACL owner: %w", label, err)
+	}
+	if owner == nil {
+		return fmt.Errorf("%s has no Windows owner", label)
+	}
+	if requireCurrentOwner {
+		if owner.Equals(current) {
+			// Continue with the namespace-mutation checks below.
+		} else if trusted(owner) {
 			return fmt.Errorf("%w: %s is not owned by the current Windows user", ErrNamespaceNotOwned, label)
+		} else {
+			return fmt.Errorf("%s is not owned by a trusted Windows principal", label)
 		}
+	} else if !trusted(owner) {
 		return fmt.Errorf("%s is not owned by a trusted Windows principal", label)
 	}
 	dacl, _, err := sd.DACL()
-	if err != nil || dacl == nil {
+	if err != nil {
+		return fmt.Errorf("read %s DACL: %w", label, err)
+	}
+	if dacl == nil {
 		return fmt.Errorf("%s has no Windows DACL", label)
 	}
 	// An ancestor may permit creation of unrelated names. Existing components

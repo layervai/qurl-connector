@@ -29,3 +29,10 @@ func validateTrustedReadOnlyFile(_ *os.File, info os.FileInfo, label string) err
 	}
 	return validateTrustedReadOnlyInfo(info, label)
 }
+
+func validateRegularEntry(info os.FileInfo, label string, validate func(*os.File, os.FileInfo, string) error) error {
+	if err := validateRegularEntryShape(info, label); err != nil {
+		return err
+	}
+	return validate(nil, info, label)
+}

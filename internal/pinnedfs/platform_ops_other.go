@@ -6,10 +6,10 @@ import (
 	"os"
 )
 
-func validateAbsoluteDirectoryPath(string) error { return ErrUnsupported }
-func directoryWalkAnchor(string) string          { return "" }
-func supportsConfinedRecovery() bool             { return false }
-func syncExistingDirectoryEdges() bool           { return false }
+func validateAbsoluteDirectoryPath(string) error                  { return ErrUnsupported }
+func directoryWalkAnchor(string) string                           { return "" }
+func supportsConfinedRecovery() bool                              { return false }
+func shouldRetryDirectoryEdgeSync(*os.Root, string) (bool, error) { return false, nil }
 func createPinnedDirectory(*os.Root, string, string, os.FileMode) error {
 	return ErrUnsupported
 }

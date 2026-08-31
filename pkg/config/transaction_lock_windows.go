@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"runtime"
 	"time"
 
 	"golang.org/x/sys/windows"
@@ -29,6 +30,7 @@ func acquireTransactionLock(ctx context.Context, file *os.File) error {
 			windows.LOCKFILE_EXCLUSIVE_LOCK|windows.LOCKFILE_FAIL_IMMEDIATELY,
 			0, 1, 0, &overlapped,
 		)
+		runtime.KeepAlive(file)
 		if err == nil {
 			return nil
 		}

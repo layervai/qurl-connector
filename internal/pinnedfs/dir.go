@@ -96,8 +96,9 @@ func OpenPrivate(path string, mode os.FileMode) (*Directory, error) {
 }
 
 // Ensure creates missing path components one at a time and fsyncs each
-// component's parent. Existing edges are fsynced too, so a retry after an
-// uncertain earlier fsync re-establishes durability before returning.
+// component's parent. Platform retry rules also fsync existing edges that may
+// have survived an uncertain earlier fsync, so visibility is not mistaken for
+// durability.
 func Ensure(path string, mode os.FileMode) (*Directory, error) {
 	return walk(path, true, mode.Perm(), nil, false, false, false)
 }
@@ -317,12 +318,17 @@ func walkFrom(anchor, abs string, create bool, mode os.FileMode, exactMode *os.F
 				return nil, err
 			}
 		}
-		if create && (edge.created || syncExistingDirectoryEdges()) {
-			// Unix retries sync an existing edge so visibility after an uncertain
-			// earlier fsync is not mistaken for durability. Windows syncs only a
-			// parent this call mutated; reopening every existing ancestor for a
-			// directory flush would incorrectly require write access to volume and
-			// profile roots.
+		shouldSync := edge.created
+		if create && !shouldSync {
+			shouldSync, err = shouldRetryDirectoryEdgeSync(edge.child, edge.path)
+			if err != nil {
+				return nil, err
+			}
+		}
+		if create && shouldSync {
+			// Unix retries every existing edge. Windows retries only edges with
+			// the protected ACL installed by createPinnedDirectory, so ordinary
+			// volume and profile ancestors never need write access.
 			if err := syncPinnedParent(edge.parent, edge.path); err != nil {
 				return nil, fmt.Errorf("sync parent for directory edge %s: %w", edge.path, err)
 			}

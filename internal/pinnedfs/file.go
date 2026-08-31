@@ -59,7 +59,7 @@ func validateRegularFile(
 	if err != nil {
 		return nil, fmt.Errorf("inspect %s entry: %w", label, err)
 	}
-	if err := validateRegularEntryShape(entry, label+" entry"); err != nil {
+	if err := validateRegularEntry(entry, label+" entry", validate); err != nil {
 		return nil, err
 	}
 	if !os.SameFile(opened, entry) {
@@ -76,7 +76,7 @@ func validateRegularFile(
 	if err != nil {
 		return nil, fmt.Errorf("final inspect %s entry: %w", label, err)
 	}
-	if err := validateRegularEntryShape(latestEntry, label+" final entry"); err != nil {
+	if err := validateRegularEntry(latestEntry, label+" final entry", validate); err != nil {
 		return nil, err
 	}
 	if !os.SameFile(latest, latestEntry) {

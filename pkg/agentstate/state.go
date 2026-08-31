@@ -34,9 +34,10 @@ const (
 	pubMode os.FileMode = 0o644
 )
 
-// stateDirUsableAtSystemDefault reports whether this process can create or write
-// the root-owned system default. It is a package var so tests can pin either
-// branch; the production value is the platform writability probe
+// stateDirUsableAtSystemDefault reports whether this process can use the
+// platform default. On Unix this is the root-owned system path; on Windows it
+// is the current user's LocalAppData path. It is a package var so tests can pin
+// either branch; the production value is the platform usability probe
 // (systemStateDirCreatable, defined per-GOOS).
 var stateDirUsableAtSystemDefault = systemStateDirCreatable
 
@@ -45,21 +46,22 @@ var stateDirUsableAtSystemDefault = systemStateDirCreatable
 //
 //  1. explicit override argument (e.g. a future --state-dir flag)
 //  2. QURL_CONNECTOR_STATE_DIR
-//  3. the system default DefaultStateDir when this process can actually create
-//     or write it — true for root / service installs AND for a non-root
+//  3. the platform default DefaultStateDir when this process can use it. On
+//     Unix this is true for root / service installs AND for a non-root
 //     container whose writable state volume is mounted at the system default
 //     (the hardened distroless image runs as UID 65532 on a read-only rootfs
-//     with /var/lib/layerv/agent provided as a writable --volume)
+//     with /var/lib/layerv/agent provided as a writable --volume). On Windows
+//     this is the current user's absolute LocalAppData path.
 //  4. an XDG user path ($XDG_STATE_HOME/qurl-connector, else
 //     ~/.local/state/qurl-connector) only when the system default is not
 //     usable — the common non-root developer on a normal filesystem where
 //     /var/lib is root-owned.
 //
-// The decision is writability-driven, not uid-driven: a non-root process with a
-// writable system default (the container) must not be pushed onto a read-only
-// XDG path, and a non-root developer without one must not be pushed onto a
-// root-owned /var path. An operator can always name a path explicitly through
-// QURL_CONNECTOR_STATE_DIR to bypass the probe.
+// The Unix decision is writability-driven, not uid-driven: a non-root process
+// with a writable system default (the container) must not be pushed onto a
+// read-only XDG path, and a non-root developer without one must not be pushed
+// onto a root-owned /var path. An operator can always name a path explicitly
+// through QURL_CONNECTOR_STATE_DIR to bypass the platform probe.
 func ResolveDir(override string) string {
 	if dir := absCleanDir(override); dir != "" {
 		return dir
@@ -73,9 +75,9 @@ func ResolveDir(override string) string {
 	if xdg := xdgStateDir(); xdg != "" {
 		return xdg
 	}
-	// No XDG base and no home directory: keep the system default rather than an
-	// unrooted relative path. The run then fails with a clear permission error
-	// naming the path instead of silently writing under the cwd.
+	// No user-state base and no home directory: keep the platform default rather
+	// than an unrooted relative path. The run then fails with a clear error that
+	// names the path instead of silently writing under the cwd.
 	return DefaultStateDir
 }
 
@@ -131,7 +133,7 @@ func EnsureDirMode(dir string) error {
 	if runtime.GOOS == "windows" {
 		namespace, err := pinnedfs.EnsurePrivate(dir, dirMode)
 		if err != nil {
-			return fmt.Errorf("create protected Windows state directory %s: %w", dir, err)
+			return fmt.Errorf("create protected Windows state directory %s: %w; if the directory already exists, stop Connector, move it aside, and retry so Connector can create the protected directory", dir, err)
 		}
 		if err := namespace.Close(); err != nil {
 			return fmt.Errorf("close protected Windows state directory %s: %w", dir, err)

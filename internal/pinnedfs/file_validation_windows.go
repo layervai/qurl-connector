@@ -5,13 +5,15 @@ package pinnedfs
 import (
 	"fmt"
 	"os"
+	"runtime"
 
 	"golang.org/x/sys/windows"
 )
 
 func validatePrivateRegularFile(file *os.File, _ os.FileInfo, label string, _ os.FileMode, _ bool) error {
-	identity, info, err := windowsHandleIdentity(windows.Handle(file.Fd()))
-	_ = identity
+	defer func() { runtime.KeepAlive(file) }()
+	handle := windows.Handle(file.Fd())
+	_, info, err := windowsHandleIdentity(handle)
 	if err != nil {
 		return fmt.Errorf("stat %s: %w", label, err)
 	}
@@ -21,11 +23,13 @@ func validatePrivateRegularFile(file *os.File, _ os.FileInfo, label string, _ os
 	if info.NumberOfLinks != 1 {
 		return fmt.Errorf("%s link count is %d, want 1", label, info.NumberOfLinks)
 	}
-	return validateSecureWindowsACL(windows.Handle(file.Fd()), label)
+	return validateSecureWindowsACL(handle, label)
 }
 
 func validateTrustedReadOnlyFile(file *os.File, _ os.FileInfo, label string) error {
-	_, info, err := windowsHandleIdentity(windows.Handle(file.Fd()))
+	defer func() { runtime.KeepAlive(file) }()
+	handle := windows.Handle(file.Fd())
+	_, info, err := windowsHandleIdentity(handle)
 	if err != nil {
 		return fmt.Errorf("stat %s: %w", label, err)
 	}
@@ -35,5 +39,11 @@ func validateTrustedReadOnlyFile(file *os.File, _ os.FileInfo, label string) err
 	if info.NumberOfLinks != 1 {
 		return fmt.Errorf("%s link count is %d, want 1", label, info.NumberOfLinks)
 	}
-	return validateTrustedWindowsACL(windows.Handle(file.Fd()), label, false)
+	return validateTrustedWindowsACL(handle, label, false)
+}
+
+// Windows security attributes are read from the retained handle above. The
+// namespace entry contributes only shape and identity continuity checks.
+func validateRegularEntry(info os.FileInfo, label string, _ func(*os.File, os.FileInfo, string) error) error {
+	return validateRegularEntryShape(info, label)
 }

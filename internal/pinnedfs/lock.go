@@ -15,8 +15,9 @@ var chmodFileLockCandidate = func(file *os.File, mode os.FileMode) error { retur
 var releaseFileLockCandidate = releaseAdvisoryLock
 var beforeFileLockPostAcquireValidation = func(*Directory, string, *os.File) {}
 
-// FileLock owns one advisory lock whose descriptor is continuously bound to a
-// retained namespace entry.
+// FileLock owns one lock whose descriptor is continuously bound to a retained
+// namespace entry. The lock is advisory on Unix and a mandatory byte-range
+// lock on Windows.
 type FileLock struct {
 	namespace *Directory
 	name      string
