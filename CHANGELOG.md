@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.8.9](https://github.com/layervai/qurl-connector/compare/v0.8.8...v0.8.9) (2026-08-31)
+
+
+### Bug Fixes
+
+* **agent:** support secure native state on Windows ([#28](https://github.com/layervai/qurl-connector/issues/28)) ([c74e539](https://github.com/layervai/qurl-connector/commit/c74e539fa49037048051dad5a8363daf2c0a8fcc))
+
 ## [0.8.8](https://github.com/layervai/qurl-connector/compare/v0.8.7...v0.8.8) (2026-08-31)
 
 
