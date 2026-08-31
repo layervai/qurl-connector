@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.8.8](https://github.com/layervai/qurl-connector/compare/v0.8.7...v0.8.8) (2026-08-31)
+
+
+### Features
+
+* support native recovery and Linux user daemon ([#26](https://github.com/layervai/qurl-connector/issues/26)) ([7af80c9](https://github.com/layervai/qurl-connector/commit/7af80c9e8b1275636a4363dd342232a7ec01b07f))
+
 ## [0.8.7](https://github.com/layervai/qurl-connector/compare/v0.8.6...v0.8.7) (2026-08-30)
 
 
