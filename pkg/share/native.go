@@ -1047,11 +1047,9 @@ func isPermanentNativeRetirementError(err error) bool {
 		}
 		return true
 	}
-	if cause := errors.Unwrap(err); cause != nil {
-		return isPermanentNativeRetirementError(cause)
-	}
-	var deny *qurl.ServerDenyError
-	if errors.As(err, &deny) {
+	// Match only this layer. errors.As would cross a mixed error tree and could
+	// incorrectly make a permanent sibling hide a retryable sibling.
+	if _, ok := err.(*qurl.ServerDenyError); ok { //nolint:errorlint
 		return true
 	}
 	for _, sentinel := range []error{
@@ -1059,9 +1057,14 @@ func isPermanentNativeRetirementError(err error) bool {
 		agentstate.ErrSessionOperationConflict,
 		agentstate.ErrSessionOperationJournalCorrupt,
 	} {
-		if errors.Is(err, sentinel) {
+		// Match only this layer for the same all-causes rule above. A wrapper is
+		// handled one layer at a time below.
+		if err == sentinel { //nolint:errorlint
 			return true
 		}
+	}
+	if cause := errors.Unwrap(err); cause != nil {
+		return isPermanentNativeRetirementError(cause)
 	}
 	return false
 }

@@ -30,6 +30,7 @@ const (
 
 const systemdUserJobTemplate = `[Unit]
 Description=qURL background daemon - managed by qurl, do not edit
+StartLimitIntervalSec=0
 
 [Service]
 Type=exec
@@ -128,8 +129,11 @@ func systemdExecutableWord(value string) (string, error) {
 }
 
 func systemdOutputPath(path string) (string, error) {
+	if strings.TrimSpace(path) != path {
+		return "", errors.New("systemd output path has leading or trailing whitespace")
+	}
 	for _, r := range path {
-		if unicode.IsLetter(r) || unicode.IsDigit(r) || strings.ContainsRune("/._-+@:", r) {
+		if unicode.IsLetter(r) || unicode.IsDigit(r) || r == ' ' || strings.ContainsRune("/._-+@:", r) {
 			continue
 		}
 		return "", fmt.Errorf("systemd output path contains unsupported character %#U", r)

@@ -53,7 +53,7 @@ func TestRenderSystemdUserJobCredentialFreeAndEscaped(t *testing.T) {
 	}
 	for _, want := range []string{
 		`ExecStart="`, `$$(`, `%%n`, `quote\"slash\\`,
-		`Type=exec`, `Restart=on-failure`, `TimeoutStopSec=15s`, `UMask=0077`,
+		`StartLimitIntervalSec=0`, `Type=exec`, `Restart=on-failure`, `TimeoutStopSec=15s`, `UMask=0077`,
 		`StandardOutput=append:`, `StandardError=append:`,
 		`NoNewPrivileges=true`, `WantedBy=default.target`,
 	} {
@@ -79,13 +79,16 @@ func TestRenderSystemdUserJobRejectsUnsupportedPathCharacters(t *testing.T) {
 		}
 	}
 	job = linuxTestUserJob(t)
-	job.StandardOut = filepath.Join(filepath.Dir(job.StandardOut), "stdout-%n.log")
-	if _, err := RenderSystemdUserJob(job); err == nil || !strings.Contains(err.Error(), "unsupported character") {
-		t.Fatalf("RenderSystemdUserJob(output path) error = %v", err)
-	}
 	job.StandardOut = filepath.Join(filepath.Dir(job.StandardOut), "stdout log")
-	if _, err := RenderSystemdUserJob(job); err == nil || !strings.Contains(err.Error(), "unsupported character") {
-		t.Fatalf("RenderSystemdUserJob(output whitespace) error = %v", err)
+	if got, err := RenderSystemdUserJob(job); err != nil || !strings.Contains(got, "StandardOutput=append:"+job.StandardOut+"\n") {
+		t.Fatalf("RenderSystemdUserJob(output space) = %q, %v", got, err)
+	}
+	base := filepath.Join(filepath.Dir(job.StandardOut), "stdout")
+	for _, suffix := range []string{"-%n.log", "-$HOME.log", `-"quote.log`, `-back\slash.log`, "-tab\t.log", "-return\r.log", "-line\n[Service].log", "-trailing.log "} {
+		job.StandardOut = base + suffix
+		if _, err := RenderSystemdUserJob(job); err == nil {
+			t.Fatalf("RenderSystemdUserJob(output path %q) succeeded", job.StandardOut)
+		}
 	}
 }
 
@@ -952,12 +955,48 @@ func TestLinuxUserJobManagerIntegration(t *testing.T) {
 	if err := os.Mkdir(specialDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
+	manager := NewUserJobManager()
+	restartHelper := filepath.Join(specialDir, `restart helper`)
+	if err := os.WriteFile(restartHelper, []byte("#!/bin/sh\ncount=0\nif [ -f \"$1\" ]; then IFS= read -r count < \"$1\"; fi\ncount=$((count + 1))\nprintf '%s\\n' \"$count\" > \"$1\"\nif [ \"$count\" -eq 1 ]; then\n  printf ready > \"$3\"\n  while [ ! -f \"$2\" ]; do sleep 0.05; done\n  exit 1\nfi\nif [ \"$count\" -lt 6 ]; then exit 1; fi\nprintf ready > \"$4\"\ntrap 'exit 0' TERM INT\nwhile :; do sleep 1; done\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	restartCount := filepath.Join(specialDir, "restart-count")
+	restartTrigger := filepath.Join(specialDir, "restart-trigger")
+	restartInitial := filepath.Join(specialDir, "restart-initial-ready")
+	restartMarker := filepath.Join(specialDir, "restart-ready")
+	restartJob := UserJob{
+		Label: "ai.layerv.qurl.integration", BinaryPath: restartHelper,
+		Arguments:   []string{restartCount, restartTrigger, restartInitial, restartMarker},
+		StandardOut: filepath.Join(specialDir, "restart stdout.log"),
+		StandardErr: filepath.Join(specialDir, "restart stderr.log"),
+		RunAtLoad:   true, KeepAlive: true,
+	}
+	defer func() { _ = manager.Remove(restartJob.Label) }()
+	if err := manager.Ensure(restartJob); err != nil {
+		t.Fatal(err)
+	}
+	waitForLinuxUserJobMarker(t, restartInitial)
+	if err := os.WriteFile(restartTrigger, []byte("restart\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	waitForLinuxUserJobMarker(t, restartMarker)
+	count, err := os.ReadFile(restartCount)
+	if err != nil || strings.TrimSpace(string(count)) != "6" {
+		t.Fatalf("restart attempts = %q, %v; want 6", count, err)
+	}
+	status, err := manager.Status(restartJob.Label)
+	if err != nil || !status.Installed || !status.Running {
+		t.Fatalf("restart recovery status = %#v, %v", status, err)
+	}
+	if err := manager.Remove(restartJob.Label); err != nil {
+		t.Fatal(err)
+	}
 	helper := filepath.Join(specialDir, `daemon helper`)
 	if err := os.WriteFile(helper, []byte("#!/bin/sh\nprintf ready > \"$1\"\nprintf 'stdout-ready\\n'\nprintf 'stderr-ready\\n' >&2\ntrap 'exit 0' TERM INT\nwhile :; do sleep 1; done\n"), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	stdout := filepath.Join(dir, `logs`, `stdout.log`)
-	stderr := filepath.Join(dir, `logs`, `stderr.log`)
+	stdout := filepath.Join(specialDir, `logs`, `stdout log`)
+	stderr := filepath.Join(specialDir, `logs`, `stderr log`)
 	job := UserJob{
 		Label: "ai.layerv.qurl.integration", BinaryPath: helper,
 		Arguments:   []string{filepath.Join(specialDir, `started one %n $HOME "quoted"`)},
@@ -965,7 +1004,6 @@ func TestLinuxUserJobManagerIntegration(t *testing.T) {
 		StandardErr: stderr,
 		RunAtLoad:   true, KeepAlive: true,
 	}
-	manager := NewUserJobManager()
 	defer func() { _ = manager.Remove(job.Label) }()
 	if err := manager.Ensure(job); err != nil {
 		t.Fatal(err)
@@ -979,7 +1017,7 @@ func TestLinuxUserJobManagerIntegration(t *testing.T) {
 	}
 	requireSystemdUserJobEnabled(t, job.Label)
 	waitForLinuxUserJobMarker(t, job.Arguments[0])
-	status, err := manager.Status(job.Label)
+	status, err = manager.Status(job.Label)
 	if err != nil || !status.Installed || !status.Running {
 		t.Fatalf("running integration status = %#v, %v", status, err)
 	}

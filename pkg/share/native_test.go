@@ -3034,6 +3034,12 @@ func TestPermanentNativeRetirementErrorIsConservative(t *testing.T) {
 			err:  errors.Join(&qurl.ServerDenyError{ErrCode: "52004"}, nativeudp.ErrNoReply),
 			want: false,
 		},
+		{
+			name: "wrapped mixed permanent and transient",
+			err: fmt.Errorf("recover retirement: %w",
+				errors.Join(&qurl.ServerDenyError{ErrCode: "52004"}, nativeudp.ErrNoReply)),
+			want: false,
+		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
