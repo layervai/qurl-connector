@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"os"
 	"strings"
 	"sync"
@@ -63,6 +64,9 @@ type NativeRuntime struct {
 
 	store      nativeStateStore
 	refreshCfg nativeRefreshConfig
+
+	credentialRecoveryMu                 sync.Mutex
+	deviceAuthorizationRecoveryAttempted bool
 }
 
 type NativeOpenKind string
@@ -96,7 +100,7 @@ var (
 	}
 	connectNativeRuntime = qurl.ConnectAgentRuntime
 	refreshNativeRuntime = qurl.RefreshAgentRuntime
-	recoverNativeRuntime = qurl.RecoverAgentRuntime
+	recoverNativeRuntime = qurl.RecoverAgentRuntimeWithCredentialProvider
 	waitNativeRefresh    = sleepWithContext
 	knockNativeRuntime   = qurl.KnockRegisteredAgent
 	retireNativeSession  = qurl.RetireRegisteredAgentSession
@@ -104,6 +108,12 @@ var (
 )
 
 var errNativeRefreshBackoffPending = errors.New("native assignment refresh backoff is pending")
+
+// errNativeDeviceAuthorizationRecoveryNotAllowed reports that a caller tried
+// to spend account recovery authority outside the one narrow explicit-login
+// repair. The repair is available only after a warm runtime receives the exact
+// registered-device invalid-api-key response, and only once per runtime.
+var errNativeDeviceAuthorizationRecoveryNotAllowed = errors.New("native device authorization recovery is not allowed")
 
 const (
 	nativeRefreshReasonImmediate = "stale or expired native assignment placement"
@@ -250,6 +260,25 @@ func warmOpenNativeRuntime(ctx context.Context, cfg NativeRuntimeConfig, store n
 }
 
 func mayConsumeNativeRecoveryAuthority(err error) bool {
+	for _, unsafe := range []error{
+		qurl.ErrInvalidAgentState,
+		qurl.ErrAgentStateContinuity,
+		qurl.ErrAgentSetupLock,
+		qurl.ErrDeviceCredentialMissing,
+		qurl.ErrRecoveryCredentialRejected,
+		qurl.ErrCredentialRecoveryIdentityRejected,
+		qurl.ErrCredentialRecoveryRevokeRequired,
+		qurl.ErrCredentialRecoveryRequestRejected,
+		qurl.ErrCredentialRecoveryAssignmentRequired,
+		qurl.ErrCredentialRecoveryCandidateConflict,
+		qurl.ErrCredentialRecoveryInvalidResponse,
+		qurl.ErrCredentialRecoveryExpired,
+		qurl.ErrCredentialRecoveredAssignmentRefreshRequired,
+	} {
+		if errors.Is(err, unsafe) {
+			return false
+		}
+	}
 	if errors.Is(err, qurl.ErrAssignmentIdentityRejected) {
 		return true
 	}
@@ -265,37 +294,33 @@ func recoverNativeCredential(ctx context.Context, cfg NativeRuntimeConfig, store
 	if !mayConsumeNativeRecoveryAuthority(triggerErr) || cfg.RecoveryCredentialProvider == nil {
 		return nil, triggerErr
 	}
-	credential, err := cfg.RecoveryCredentialProvider(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("resolve native credential recovery authority: %w", err)
-	}
-	credential = strings.TrimSpace(credential)
-	if credential == "" {
-		return nil, fmt.Errorf("%w: native credential recovery authority is empty", qurl.ErrCredentialRecoveryRequired)
-	}
 	state, err := store.Handoff()
 	if err != nil {
 		return nil, fmt.Errorf("open native state for credential recovery: %w", err)
 	}
-	options := make([]qurl.AgentRuntimeRecoveryOption, 0, len(cfg.UDPOptions)+3)
-	options = append(options, qurl.WithAgentRuntimeRecoveryHub(cfg.Hub))
-	if expected := strings.TrimSpace(cfg.AgentID); expected != "" {
-		options = append(options, qurl.WithExpectedAgentRuntimeRecoveryAgentID(expected))
-	}
-	if cfg.ClientBaseURL != "" {
-		options = append(options, qurl.WithAgentClientBaseURL(cfg.ClientBaseURL))
-	}
-	for _, option := range cfg.UDPOptions {
-		options = append(options, option)
-	}
-	client, binding, err := recoverNativeRuntime(ctx, credential, state, options...)
-	credential = ""
+	options := nativeCredentialRecoveryOptions(cfg.Hub, cfg.AgentID, cfg.ClientBaseURL, cfg.UDPOptions)
+	client, binding, err := recoverNativeRuntime(ctx, qurl.AgentRuntimeRecoveryCredentialProvider(cfg.RecoveryCredentialProvider), state, options...)
 	if err != nil {
 		// Do not join triggerErr here. A valid pending episode remains durable,
 		// while a Hub outage or rate limit must stay retryable for the daemon.
-		return nil, fmt.Errorf("recover rejected native identity: %w", err)
+		return nil, fmt.Errorf("recover native credential: %w", err)
 	}
 	return assembleRefreshedNativeRuntime(ctx, client, binding, store, refreshConfig(cfg, mode), NativeOpenRecovery)
+}
+
+func nativeCredentialRecoveryOptions(hub qurl.HubBootstrap, agentID, clientBaseURL string, udpOptions []qurl.AgentRuntimeUDPOption) []qurl.AgentRuntimeRecoveryOption {
+	options := make([]qurl.AgentRuntimeRecoveryOption, 0, len(udpOptions)+3)
+	options = append(options, qurl.WithAgentRuntimeRecoveryHub(hub))
+	if expected := strings.TrimSpace(agentID); expected != "" {
+		options = append(options, qurl.WithExpectedAgentRuntimeRecoveryAgentID(expected))
+	}
+	if clientBaseURL != "" {
+		options = append(options, qurl.WithAgentClientBaseURL(clientBaseURL))
+	}
+	for _, option := range udpOptions {
+		options = append(options, option)
+	}
+	return options
 }
 
 func refreshConfig(cfg NativeRuntimeConfig, mode string) nativeRefreshConfig {
@@ -420,6 +445,8 @@ func IsPermanentNativeOpenError(err error) bool {
 		qurl.ErrInvalidBootstrapConfig,
 		qurl.ErrInvalidAgentState,
 		qurl.ErrInsecureAgentStatePermissions,
+		qurl.ErrAgentStateContinuity,
+		qurl.ErrAgentSetupLock,
 		qurl.ErrInvalidRegisterConfig,
 		qurl.ErrRegistrationInvalidInput,
 		qurl.ErrRegistrationDisabled,
@@ -536,6 +563,77 @@ func (r *NativeRuntime) MarkRegistrationRefreshAttempted() error {
 
 func (r *NativeRuntime) ClearRegistrationRefreshMarker() error {
 	return r.MarkServingHealthy()
+}
+
+// RecoverCredentialAfterDeviceAuthorizationFailure performs the one recovery
+// attempt allowed after explicit login has already validated an account key,
+// a credential-free warm open succeeded, and the first registered-device REST
+// request returned HTTP 401 with problem code api_key_invalid. provider must
+// return that same validated account key.
+//
+// The method rejects every other status, problem code, open kind, and repeated
+// call before reading provider or touching durable state. It never retries the
+// recovery operation. The caller must have exclusive ownership of r and may
+// retry its registered-device request once only after this method succeeds.
+func (r *NativeRuntime) RecoverCredentialAfterDeviceAuthorizationFailure(
+	ctx context.Context,
+	statusCode int,
+	problemCode string,
+	provider func(context.Context) (string, error),
+) error {
+	if ctx == nil {
+		return fmt.Errorf("%w: context is nil", errNativeDeviceAuthorizationRecoveryNotAllowed)
+	}
+	if r == nil || r.store == nil {
+		return fmt.Errorf("%w: native runtime is closed", errNativeDeviceAuthorizationRecoveryNotAllowed)
+	}
+	if r.OpenKind != NativeOpenWarm || statusCode != http.StatusUnauthorized || problemCode != "api_key_invalid" {
+		return errNativeDeviceAuthorizationRecoveryNotAllowed
+	}
+	if provider == nil {
+		return fmt.Errorf("%w: validated account credential provider is nil", errNativeDeviceAuthorizationRecoveryNotAllowed)
+	}
+
+	r.credentialRecoveryMu.Lock()
+	defer r.credentialRecoveryMu.Unlock()
+	if r.deviceAuthorizationRecoveryAttempted {
+		return fmt.Errorf("%w: recovery was already attempted", errNativeDeviceAuthorizationRecoveryNotAllowed)
+	}
+	// Consume the in-process authority before any fallible work. A failed call
+	// must be resumed by a new explicit login, which reopens durable recovery
+	// state through qurl-go instead of looping on the same REST rejection.
+	r.deviceAuthorizationRecoveryAttempted = true
+
+	state, err := r.store.Handoff()
+	if err != nil {
+		return fmt.Errorf("open native state for device authorization recovery: %w", err)
+	}
+	options := nativeCredentialRecoveryOptions(r.refreshCfg.Hub, r.AgentID, r.refreshCfg.ClientBaseURL, r.refreshCfg.UDPOptions)
+	client, binding, err := recoverNativeRuntime(ctx, qurl.AgentRuntimeRecoveryCredentialProvider(provider), state, options...)
+	if err != nil {
+		return fmt.Errorf("recover native credential after device authorization rejection: %w", err)
+	}
+	replacement, err := assembleRefreshedNativeRuntime(ctx, client, binding, r.store, r.refreshCfg, NativeOpenRecovery)
+	if err != nil {
+		return err
+	}
+
+	oldBinding := r.Binding
+	r.Client = replacement.Client
+	r.Binding = replacement.Binding
+	r.AgentID = replacement.AgentID
+	r.Hub = replacement.Hub
+	r.UDPOptions = replacement.UDPOptions
+	r.OpenKind = replacement.OpenKind
+	r.SessionOperations = replacement.SessionOperations
+	r.refreshCfg = replacement.refreshCfg
+	// r continues to own the store. The short-lived replacement is only an
+	// assembly guard and must not become a second logical owner.
+	replacement.store = nil
+	if oldBinding != nil && oldBinding != r.Binding {
+		oldBinding.Destroy()
+	}
+	return nil
 }
 
 func (r *NativeRuntime) Close() error {
