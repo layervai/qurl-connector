@@ -53,7 +53,8 @@ func TestRenderSystemdUserJobCredentialFreeAndEscaped(t *testing.T) {
 	}
 	for _, want := range []string{
 		`ExecStart="`, `$$(`, `%%n`, `quote\"slash\\`,
-		`StartLimitIntervalSec=0`, `Type=exec`, `Restart=on-failure`, `TimeoutStopSec=15s`, `UMask=0077`,
+		`StartLimitIntervalSec=0`, `Type=exec`, `Restart=on-failure`, `RestartSec=10s`,
+		`TimeoutStopSec=15s`, `UMask=0077`,
 		`StandardOutput=append:`, `StandardError=append:`,
 		`NoNewPrivileges=true`, `WantedBy=default.target`,
 	} {
@@ -152,6 +153,31 @@ func TestLinuxEnsureLeavesExactRunningJobUntouched(t *testing.T) {
 	}
 	if len(calls) != 1 || calls[0][0] != "show" {
 		t.Fatalf("systemctl calls = %#v, want one non-disruptive show", calls)
+	}
+}
+
+func TestLinuxEnsureAndStatusRejectMaskedDefinitionClearly(t *testing.T) {
+	job := linuxTestUserJob(t)
+	unitPath := filepath.Join(t.TempDir(), "systemd", "user", job.Label+".service")
+	if err := os.MkdirAll(filepath.Dir(unitPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("/dev/null", unitPath); err != nil {
+		t.Fatal(err)
+	}
+	manager := &linuxUserJobManager{
+		unitPath: func(string) (string, error) { return unitPath, nil },
+		run: func(args ...string) (string, error) {
+			t.Fatalf("masked definition reached systemctl: %v", args)
+			return "", nil
+		},
+	}
+	if err := manager.Ensure(job); err == nil || !strings.Contains(err.Error(), "is masked; remove the systemd mask") {
+		t.Fatalf("Ensure masked error = %v", err)
+	}
+	status, err := manager.Status(job.Label)
+	if err == nil || !strings.Contains(err.Error(), "is masked; remove the systemd mask") || !status.Installed {
+		t.Fatalf("Status masked = %#v, %v", status, err)
 	}
 }
 
@@ -638,7 +664,7 @@ func TestLinuxStateRejectsMalformedManagerProperties(t *testing.T) {
 		{name: "duplicate", output: valid + "LoadState=loaded\n", want: "duplicate"},
 		{name: "missing", output: strings.Replace(valid, "UnitFileState=enabled\n", "", 1), want: "omitted UnitFileState"},
 		{name: "invalid reload", output: strings.Replace(valid, "NeedDaemonReload=no", "NeedDaemonReload=maybe", 1), want: "invalid daemon-reload"},
-		{name: "unsupported load", output: strings.Replace(valid, "LoadState=loaded", "LoadState=masked", 1), want: "unsupported load state"},
+		{name: "masked load", output: strings.Replace(valid, "LoadState=loaded", "LoadState=masked", 1), want: "is masked; remove the systemd mask"},
 		{name: "running not loaded", output: strings.Replace(valid, "LoadState=loaded", "LoadState=not-found", 1), want: "running without a loaded definition"},
 		{name: "loaded no fragment", output: strings.Replace(valid, "FragmentPath="+unitPath, "FragmentPath=", 1), want: "no fragment path"},
 	}
@@ -979,7 +1005,7 @@ func TestLinuxUserJobManagerIntegration(t *testing.T) {
 	if err := os.WriteFile(restartTrigger, []byte("restart\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	waitForLinuxUserJobMarker(t, restartMarker)
+	waitForLinuxUserJobMarkerWithin(t, restartMarker, 70*time.Second)
 	count, err := os.ReadFile(restartCount)
 	if err != nil || strings.TrimSpace(string(count)) != "6" {
 		t.Fatalf("restart attempts = %q, %v; want 6", count, err)
@@ -1091,7 +1117,12 @@ func waitForLinuxUserJobLog(t *testing.T, path, want string) {
 
 func waitForLinuxUserJobMarker(t *testing.T, path string) {
 	t.Helper()
-	deadline := time.Now().Add(10 * time.Second)
+	waitForLinuxUserJobMarkerWithin(t, path, 10*time.Second)
+}
+
+func waitForLinuxUserJobMarkerWithin(t *testing.T, path string, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		if content, err := os.ReadFile(path); err == nil && string(content) == "ready" {
 			return

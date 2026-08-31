@@ -36,7 +36,7 @@ StartLimitIntervalSec=0
 Type=exec
 ExecStart={{systemdExecutable .BinaryPath}}{{range .Arguments}} {{systemdExec .}}{{end}}
 Restart={{if .KeepAlive}}on-failure{{else}}no{{end}}
-RestartSec=1s
+RestartSec=10s
 TimeoutStopSec={{.ExitTimeout}}s
 KillMode=control-group
 UMask={{printf "%04o" .Umask}}
@@ -216,6 +216,13 @@ func (m *linuxUserJobManager) ensure(job UserJob, forceReplace bool) error {
 	if err != nil {
 		return err
 	}
+	masked, err := isMaskedLinuxUserJobDefinition(unitPath)
+	if err != nil {
+		return fmt.Errorf("inspect systemd user job %s definition: %w", job.Label, err)
+	}
+	if masked {
+		return fmt.Errorf("systemd user job %s is masked; remove the systemd mask before retrying", job.Label)
+	}
 	if err := validateLinuxUserJobExecutable(job.BinaryPath); err != nil {
 		return fmt.Errorf("validate Linux user job executable %s: %w", job.BinaryPath, err)
 	}
@@ -359,6 +366,15 @@ func (m *linuxUserJobManager) Status(label string) (ServiceStatus, error) {
 	if err != nil {
 		return ServiceStatus{}, err
 	}
+	masked, err := isMaskedLinuxUserJobDefinition(unitPath)
+	if err != nil {
+		return ServiceStatus{}, fmt.Errorf("inspect systemd user job %s definition: %w", label, err)
+	}
+	if masked {
+		return ServiceStatus{Installed: true}, fmt.Errorf(
+			"systemd user job %s is masked; remove the systemd mask before retrying", label,
+		)
+	}
 	// Status applies the same safe owner-only mode repair as Ensure. A definition
 	// that only drifted from 0600 to a more permissive owner-controlled mode is
 	// still the same managed job; repair it before asking the manager for state.
@@ -430,6 +446,11 @@ func (m *linuxUserJobManager) inspectState(label string, allowMasked bool) (linu
 		fragmentPath:     properties["FragmentPath"],
 		needDaemonReload: properties["NeedDaemonReload"] == "yes",
 	}
+	if state.masked && !allowMasked {
+		return linuxUnitState{}, fmt.Errorf(
+			"systemd user job %s is masked; remove the systemd mask before retrying", label,
+		)
+	}
 	if !state.loaded && !state.invalid && properties["LoadState"] != "not-found" && !(allowMasked && state.masked) {
 		return linuxUnitState{}, fmt.Errorf("systemd user job %s has unsupported load state %q", label, properties["LoadState"])
 	}
@@ -461,6 +482,32 @@ func syncTrustedSystemdUnitDirectory(path string) error {
 		return err
 	}
 	return errors.Join(dir.Sync(), dir.Close())
+}
+
+func isMaskedLinuxUserJobDefinition(path string) (masked bool, retErr error) {
+	dir, err := pinnedfs.OpenTrusted(filepath.Dir(path))
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	defer func() { retErr = errors.Join(retErr, dir.Close()) }()
+	name := filepath.Base(path)
+	entry, err := dir.Lstat(name)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if entry.Mode()&os.ModeSymlink == 0 {
+		return false, nil
+	}
+	if err := validateSystemdMaskSymlink(dir, name, entry); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func readLinuxUserJobDefinition(path string, repairMode bool) ([]byte, bool, error) {
