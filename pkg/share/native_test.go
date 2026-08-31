@@ -818,7 +818,7 @@ func TestOpenNativeRuntimeResumesPersistedCredentialRecovery(t *testing.T) {
 			recoverNativeRuntime = func(_ context.Context, credential string, _ qurl.AgentStateStore, _ ...qurl.AgentRuntimeRecoveryOption) (*qurl.Client, *qurl.AgentRuntimeBinding, error) {
 				recoveryCalls++
 				if credential != "lv_test_recoverycredentialabcdefghijklmnopqrstuvwxyz0123456789" {
-					t.Fatalf("recovery credential = %q", credential)
+					return nil, nil, fmt.Errorf("recovery credential = %q", credential)
 				}
 				return &qurl.Client{}, &qurl.AgentRuntimeBinding{AgentID: "agent-one"}, nil
 			}
@@ -898,16 +898,48 @@ func TestOpenNativeRuntimeDoesNotResumePendingRecoveryWithoutAuthority(t *testin
 				refreshCalls++
 				return nil, nil, pending
 			}
+			recoveryCalls := 0
 			recoverNativeRuntime = func(context.Context, string, qurl.AgentStateStore, ...qurl.AgentRuntimeRecoveryOption) (*qurl.Client, *qurl.AgentRuntimeBinding, error) {
-				t.Fatal("recovery ran without explicit account authority")
-				return nil, nil, nil
+				recoveryCalls++
+				return nil, nil, errors.New("recovery ran without explicit account authority")
 			}
 			_, err := OpenNativeRuntime(context.Background(), NativeRuntimeConfig{StateDir: "/private/state"})
-			if !errors.Is(err, qurl.ErrCredentialRecoveryRequired) || warmCalls != test.wantWarm || refreshCalls != test.wantRefresh {
-				t.Fatalf("open error=%v warm/refresh=%d/%d, want pending recovery and %d/%d",
-					err, warmCalls, refreshCalls, test.wantWarm, test.wantRefresh)
+			if !errors.Is(err, qurl.ErrCredentialRecoveryRequired) || warmCalls != test.wantWarm || refreshCalls != test.wantRefresh || recoveryCalls != 0 {
+				t.Fatalf("open error=%v warm/refresh/recovery=%d/%d/%d, want pending recovery and %d/%d/0",
+					err, warmCalls, refreshCalls, recoveryCalls, test.wantWarm, test.wantRefresh)
 			}
 		})
+	}
+}
+
+func TestOpenNativeRuntimeKeepsRecoveryFailureRetryable(t *testing.T) {
+	oldStore := newNativeStateStore
+	oldConnect := connectNativeRuntime
+	oldRecover := recoverNativeRuntime
+	t.Cleanup(func() {
+		newNativeStateStore = oldStore
+		connectNativeRuntime = oldConnect
+		recoverNativeRuntime = oldRecover
+	})
+	pending := &qurl.NativeCredentialRecoveryRequiredError{
+		AgentID: "agent-one", Cause: qurl.ErrCredentialRecoveryRequired,
+	}
+	wantRecoveryErr := qurl.ErrCredentialRecoveryUnavailable
+	newNativeStateStore = func(string, string) (nativeStateStore, error) { return &memoryNativeStore{}, nil }
+	connectNativeRuntime = func(context.Context, qurl.AgentStateStore, ...qurl.AgentRuntimeRegistrationOption) (*qurl.Client, *qurl.AgentRuntimeBinding, error) {
+		return nil, nil, pending
+	}
+	recoverNativeRuntime = func(context.Context, string, qurl.AgentStateStore, ...qurl.AgentRuntimeRecoveryOption) (*qurl.Client, *qurl.AgentRuntimeBinding, error) {
+		return nil, nil, wantRecoveryErr
+	}
+	_, err := OpenNativeRuntime(context.Background(), NativeRuntimeConfig{
+		StateDir: "/private/state",
+		RecoveryCredentialProvider: func(context.Context) (string, error) {
+			return "lv_test_recoverycredentialabcdefghijklmnopqrstuvwxyz0123456789", nil
+		},
+	})
+	if errors.Is(err, qurl.ErrCredentialRecoveryRequired) || !errors.Is(err, wantRecoveryErr) || IsPermanentNativeOpenError(err) {
+		t.Fatalf("open error=%v, want retryable recovery failure without terminal pending trigger", err)
 	}
 }
 

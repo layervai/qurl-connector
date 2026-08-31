@@ -295,6 +295,8 @@ func recoverNativeCredential(ctx context.Context, cfg NativeRuntimeConfig, store
 	client, binding, err := recoverNativeRuntime(ctx, credential, state, options...)
 	credential = ""
 	if err != nil {
+		// Do not join triggerErr here. A valid pending episode remains durable,
+		// while a Hub outage or rate limit must stay retryable for the daemon.
 		return nil, fmt.Errorf("recover rejected native identity: %w", err)
 	}
 	return assembleRefreshedNativeRuntime(ctx, client, binding, store, refreshConfig(cfg, mode), NativeOpenRecovery)
