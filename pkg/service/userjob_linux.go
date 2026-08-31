@@ -312,6 +312,12 @@ func (m *linuxUserJobManager) validateRunning(label, unitPath string, runAtLoad 
 	if err != nil {
 		return err
 	}
+	if state.invalid {
+		return fmt.Errorf(
+			"systemd user job %s has invalid settings; the user manager must support Type=exec, append log output, and RestrictSUIDSGID",
+			label,
+		)
+	}
 	if !state.loaded || !state.running || !state.runAtLoadMatches(runAtLoad) || state.needDaemonReload ||
 		filepath.Clean(state.fragmentPath) != filepath.Clean(unitPath) {
 		return fmt.Errorf("systemd user job %s did not reach the exact running definition", label)
@@ -756,24 +762,31 @@ func defaultSystemctlCandidates() []string {
 }
 
 func resolveTrustedSystemctl(candidates []string) (string, error) {
+	return resolveTrustedSystemctlWithAlias(candidates, nixosSystemctlPath, nixosAliasRoot, nixosStoreRoot)
+}
+
+func resolveTrustedSystemctlWithAlias(candidates []string, aliasCandidate, aliasRoot, storeRoot string) (string, error) {
 	var candidateErr error
 	for _, candidate := range candidates {
 		if !filepath.IsAbs(candidate) {
 			candidateErr = errors.Join(candidateErr, fmt.Errorf("systemctl candidate %q is not absolute", candidate))
 			continue
 		}
-		if err := validateLinuxUserJobExecutable(candidate); err == nil {
-			return candidate, nil
-		} else if candidate != nixosSystemctlPath {
+		// Never execute the mutable NixOS generation alias directly. Resolve it
+		// while /run is pinned, then execute only the validated store path.
+		if candidate == aliasCandidate {
+			resolved, err := resolveTrustedSystemctlAlias(candidate, aliasRoot, storeRoot)
+			if err != nil {
+				candidateErr = errors.Join(candidateErr, fmt.Errorf("validate systemctl candidate %s: %w", candidate, err))
+				continue
+			}
+			return resolved, nil
+		}
+		if err := validateLinuxUserJobExecutable(candidate); err != nil {
 			candidateErr = errors.Join(candidateErr, fmt.Errorf("validate systemctl candidate %s: %w", candidate, err))
 			continue
 		}
-		resolved, err := resolveTrustedSystemctlAlias(candidate, nixosAliasRoot, nixosStoreRoot)
-		if err != nil {
-			candidateErr = errors.Join(candidateErr, fmt.Errorf("validate systemctl candidate %s: %w", candidate, err))
-			continue
-		}
-		return resolved, nil
+		return candidate, nil
 	}
 	if candidateErr == nil {
 		candidateErr = errors.New("no systemctl candidates configured")

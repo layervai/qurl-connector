@@ -17,6 +17,9 @@ launchd; Windows uses Task Scheduler. Each manager restarts failure exits, and
 the next login or foreground `qurl` command repairs a clean daemon exit. Linux
 fails clearly when the host has no real systemd user manager instead of
 pretending that it installed a persistent background process.
+The user manager must support `Type=exec`, append log output, and
+`RestrictSUIDSGID`. qURL reports these requirements if the installed systemd
+cannot load the managed service definition.
 
 `cmd/frpc` is retained for development and diagnostics. It is not a supported
 customer distribution, Homebrew formula, release binary, or container image.

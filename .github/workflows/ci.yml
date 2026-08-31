@@ -57,9 +57,12 @@ jobs:
           user_name="$(id -un)"
           export XDG_RUNTIME_DIR="/run/user/${user_id}"
           export DBUS_SESSION_BUS_ADDRESS="unix:path=${XDG_RUNTIME_DIR}/bus"
+          test_name="TestLinuxUserJobManagerIntegration"
+          test_output="$(mktemp)"
           cleanup() {
             systemctl --user disable --now ai.layerv.qurl.integration.service 2>/dev/null || true
             sudo loginctl disable-linger "$user_name" 2>/dev/null || true
+            rm -f -- "$test_output"
           }
           trap cleanup EXIT
           sudo loginctl enable-linger "$user_name"
@@ -73,8 +76,18 @@ jobs:
             exit 1
           }
           systemctl --user show-environment >/dev/null
+          test_list="$(go test -list "^${test_name}$" ./pkg/service)"
+          listed="$(printf '%s\n' "$test_list" | sed -n "/^${test_name}$/p")"
+          [[ "$listed" == "$test_name" ]] || {
+            echo "required integration test was not enumerated: ${test_name}" >&2
+            exit 1
+          }
           QURL_LINUX_USER_JOB_INTEGRATION=1 \
-            go test -count=1 -run '^TestLinuxUserJobManagerIntegration$' ./pkg/service
+            go test -v -count=1 -run "^${test_name}$" ./pkg/service | tee "$test_output"
+          grep -qF -- "--- PASS: ${test_name} " "$test_output" || {
+            echo "required integration test did not report PASS: ${test_name}" >&2
+            exit 1
+          }
       # cmd/frpc is a developer command, not a released customer artifact. It
       # must stay fail-closed unless the operator supplies an explicit custom
       # Hub trust configuration.

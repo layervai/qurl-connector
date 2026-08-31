@@ -509,6 +509,24 @@ func TestLinuxEnsureRepairsBadSettingDefinition(t *testing.T) {
 	}
 }
 
+func TestLinuxEnsureExplainsUnsupportedSystemdDirectives(t *testing.T) {
+	job := linuxTestUserJob(t)
+	unitPath := filepath.Join(t.TempDir(), "systemd", "user", job.Label+".service")
+	manager := &linuxUserJobManager{
+		unitPath: func(string) (string, error) { return unitPath, nil },
+		run: func(args ...string) (string, error) {
+			if args[0] == "show" {
+				return linuxSystemdState(unitPath, "bad-setting", "inactive", "dead", "disabled", "no"), nil
+			}
+			return "", nil
+		},
+	}
+	err := manager.Ensure(job)
+	if err == nil || !strings.Contains(err.Error(), "must support Type=exec, append log output, and RestrictSUIDSGID") {
+		t.Fatalf("Ensure error = %v, want required systemd feature guidance", err)
+	}
+}
+
 func TestLinuxEnsureReplacesChangedDefinitionAfterStopping(t *testing.T) {
 	job := linuxTestUserJob(t)
 	old := job
@@ -873,6 +891,10 @@ func TestResolveTrustedSystemctlAliasReturnsValidatedStorePath(t *testing.T) {
 	got, err := resolveTrustedSystemctlAlias(candidate, aliasRoot, storeRoot)
 	if err != nil || got != storeSystemctl {
 		t.Fatalf("resolveTrustedSystemctlAlias = %q, %v; want %q", got, err, storeSystemctl)
+	}
+	got, err = resolveTrustedSystemctlWithAlias([]string{candidate}, candidate, aliasRoot, storeRoot)
+	if err != nil || got != storeSystemctl {
+		t.Fatalf("resolveTrustedSystemctlWithAlias = %q, %v; want immutable %q", got, err, storeSystemctl)
 	}
 	outside := filepath.Join(root, "outside", "systemctl")
 	if err := os.MkdirAll(filepath.Dir(outside), 0o700); err != nil {

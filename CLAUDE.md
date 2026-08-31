@@ -13,7 +13,8 @@ contributors should also read [CONTRIBUTING.md](CONTRIBUTING.md).
 - The Linux, macOS, and Windows managed daemons are credential-free. Account-
   authenticated desired-state changes belong to the foreground `qurl`
   command. Linux uses a native systemd user service and fails clearly when a
-  real user manager is unavailable.
+  real user manager is unavailable. The manager must support `Type=exec`,
+  append log output, and `RestrictSUIDSGID`.
 - Session renewal is make-before-break and becomes ready only when every
   configured FRP proxy reaches its running phase.
 - Per-resource failures must not tear down healthy sibling shares.
