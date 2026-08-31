@@ -8,15 +8,15 @@ admits each shared resource with the Network-invisible Handshake Protocol
 local service -> qURL Connector -> qURL -> recipient
 ```
 
-Users install only the `qurl` CLI. It embeds this module. On macOS and Windows,
-the CLI uses the native per-user job manager when a local share is first
-published or started. The daemon resumes desired-on shares after login and
-recovers automatically across sleep, wake, network changes, assignment
-refreshes, and session rotation. On Windows, Task Scheduler restarts failure
-exits; the next logon or foreground `qurl` command repairs a clean daemon exit.
-Background lifecycle is not yet supported on Linux, where the explicit
-foreground path remains supported. The module fails closed instead of
-pretending that a background job was installed on an unsupported platform.
+Users install only the `qurl` CLI. It embeds this module. On Linux, macOS, and
+Windows, the CLI uses the native per-user job manager when a local share is
+first published or started. The daemon resumes desired-on shares after login
+and recovers automatically across sleep, wake, network changes, assignment
+refreshes, and session rotation. Linux uses a systemd user service; macOS uses
+launchd; Windows uses Task Scheduler. Each manager restarts failure exits, and
+the next login or foreground `qurl` command repairs a clean daemon exit. Linux
+fails clearly when the host has no real systemd user manager instead of
+pretending that it installed a persistent background process.
 
 `cmd/frpc` is retained for development and diagnostics. It is not a supported
 customer distribution, Homebrew formula, release binary, or container image.

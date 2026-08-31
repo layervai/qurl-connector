@@ -49,6 +49,26 @@ jobs:
           go-version-file: go.mod
       - name: Run tests
         run: make test
+      - name: Run Linux systemd user-job integration
+        run: |
+          set -euo pipefail
+          user_id="$(id -u)"
+          export XDG_RUNTIME_DIR="/run/user/${user_id}"
+          export DBUS_SESSION_BUS_ADDRESS="unix:path=${XDG_RUNTIME_DIR}/bus"
+          cleanup() {
+            systemctl --user disable --now ai.layerv.qurl.integration.service 2>/dev/null || true
+            sudo loginctl disable-linger "$USER" 2>/dev/null || true
+          }
+          trap cleanup EXIT
+          sudo loginctl enable-linger "$USER"
+          sudo systemctl start "user@${user_id}.service"
+          [[ -S "${XDG_RUNTIME_DIR}/bus" ]] || {
+            echo "systemd user bus is unavailable" >&2
+            exit 1
+          }
+          systemctl --user show-environment >/dev/null
+          QURL_LINUX_USER_JOB_INTEGRATION=1 \
+            go test -count=1 -run '^TestLinuxUserJobManagerIntegration$' ./pkg/service
       # cmd/frpc is a developer command, not a released customer artifact. It
       # must stay fail-closed unless the operator supplies an explicit custom
       # Hub trust configuration.
