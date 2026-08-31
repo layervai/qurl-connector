@@ -3023,6 +3023,9 @@ func TestPermanentNativeRetirementErrorIsConservative(t *testing.T) {
 		want bool
 	}{
 		{name: "authenticated deny", err: &qurl.ServerDenyError{ErrCode: "52004"}, want: true},
+		{name: "temporary server denial", err: &qurl.ServerDenyError{ErrCode: "52005"}, want: false},
+		{name: "session control not ready", err: &qurl.ServerDenyError{ErrCode: "52028"}, want: false},
+		{name: "future authenticated denial", err: &qurl.ServerDenyError{ErrCode: "52999"}, want: false},
 		{name: "invalid durable operation", err: fmt.Errorf("recover: %w", qurl.ErrInvalidNativeSessionOperation), want: true},
 		{name: "malformed authenticated reply", err: qurl.ErrMalformedReply, want: false},
 		{name: "journal conflict", err: agentstate.ErrSessionOperationConflict, want: true},

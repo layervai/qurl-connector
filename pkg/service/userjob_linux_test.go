@@ -883,6 +883,40 @@ func TestLinuxRemoveUnmasksManagedDefinitionBeforeCleanup(t *testing.T) {
 	}
 }
 
+func TestLinuxRemoveUnmasksDefinitionBeforeManagerCacheRefresh(t *testing.T) {
+	job := linuxTestUserJob(t)
+	unitPath := filepath.Join(t.TempDir(), "systemd", "user", job.Label+".service")
+	if err := os.MkdirAll(filepath.Dir(unitPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("/dev/null", unitPath); err != nil {
+		t.Fatal(err)
+	}
+	var verbs []string
+	manager := &linuxUserJobManager{
+		unitPath: func(string) (string, error) { return unitPath, nil },
+		run: func(args ...string) (string, error) {
+			verbs = append(verbs, args[0])
+			if args[0] == "show" {
+				return linuxSystemdState("", "not-found", "inactive", "dead", "", "no"), nil
+			}
+			if args[0] == "unmask" {
+				return "", os.Remove(unitPath)
+			}
+			return "", nil
+		},
+	}
+	if err := manager.Remove(job.Label); err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"show", "disable", "unmask", "daemon-reload"}; !reflect.DeepEqual(verbs, want) {
+		t.Fatalf("systemctl verbs = %v, want %v", verbs, want)
+	}
+	if _, err := os.Lstat(unitPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("masked definition remains: %v", err)
+	}
+}
+
 func TestLinuxRemoveDisablesDanglingEnablement(t *testing.T) {
 	job := linuxTestUserJob(t)
 	unitPath := filepath.Join(t.TempDir(), "systemd", "user", job.Label+".service")

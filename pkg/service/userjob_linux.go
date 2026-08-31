@@ -321,6 +321,10 @@ func (m *linuxUserJobManager) Remove(label string) error {
 	if err != nil {
 		return err
 	}
+	diskMasked, err := isMaskedLinuxUserJobDefinition(unitPath)
+	if err != nil {
+		return fmt.Errorf("inspect systemd user job %s definition before removal: %w", label, err)
+	}
 	if err := validateRemovableLinuxUserJobDefinition(unitPath); err != nil {
 		return fmt.Errorf("validate systemd user job %s before removal: %w", label, err)
 	}
@@ -337,12 +341,16 @@ func (m *linuxUserJobManager) Remove(label string) error {
 			return fmt.Errorf("stop systemd user job %s: %w", label, err)
 		}
 	}
-	if state.loaded || state.invalid || state.masked || state.unitFileState != "" {
+	managerKnowsDefinition := state.loaded || state.invalid || state.masked || state.unitFileState != ""
+	if managerKnowsDefinition || diskMasked {
 		if _, err := m.run("disable", unit); err != nil {
 			return fmt.Errorf("disable systemd user job %s: %w", label, err)
 		}
 	}
-	if state.masked {
+	// The on-disk definition can be masked before systemd reloads its cached
+	// state. Carry the trusted local observation through removal so that this
+	// valid managed mask never reaches the regular-file remover as ELOOP.
+	if state.masked || diskMasked {
 		if _, err := m.run("unmask", unit); err != nil {
 			return fmt.Errorf("unmask systemd user job %s before removal: %w", label, err)
 		}
@@ -353,7 +361,7 @@ func (m *linuxUserJobManager) Remove(label string) error {
 	if err := removeLinuxUserJobDefinition(unitPath); err != nil {
 		return fmt.Errorf("remove systemd user job %s: %w", label, err)
 	}
-	if state.loaded || state.invalid || state.masked || state.unitFileState != "" {
+	if managerKnowsDefinition || diskMasked {
 		if _, err := m.run("daemon-reload"); err != nil {
 			return fmt.Errorf("reload systemd user manager after removing %s: %w", label, err)
 		}

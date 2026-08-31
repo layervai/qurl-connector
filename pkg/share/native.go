@@ -1049,8 +1049,11 @@ func isPermanentNativeRetirementError(err error) bool {
 	}
 	// Match only this layer. errors.As would cross a mixed error tree and could
 	// incorrectly make a permanent sibling hide a retryable sibling.
-	if _, ok := err.(*qurl.ServerDenyError); ok { //nolint:errorlint
-		return true
+	if deny, ok := err.(*qurl.ServerDenyError); ok { //nolint:errorlint
+		// A missing resource cannot become recoverable. Other authenticated
+		// denials can describe temporary server readiness or a future retryable
+		// condition, so persisted recovery must retain them.
+		return deny.ErrCode == "52004"
 	}
 	for _, sentinel := range []error{
 		qurl.ErrInvalidNativeSessionOperation,
