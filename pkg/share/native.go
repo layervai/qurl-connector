@@ -257,9 +257,11 @@ func resumableNativeCredentialRecovery(err error) bool {
 	// malformed state also unwrap ErrCredentialRecoveryRequired, but qurl-go
 	// marks those with ErrDeviceCredentialMissing or ErrInvalidAgentState. They
 	// need deliberate operator action and must not spend a recovery credential.
-	return errors.Is(err, qurl.ErrCredentialRecoveryRequired) &&
-		!errors.Is(err, qurl.ErrDeviceCredentialMissing) &&
-		!errors.Is(err, qurl.ErrInvalidAgentState)
+	var pending *qurl.NativeCredentialRecoveryRequiredError
+	return errors.As(err, &pending) && pending != nil &&
+		errors.Is(pending.Cause, qurl.ErrCredentialRecoveryRequired) &&
+		!errors.Is(pending.Cause, qurl.ErrDeviceCredentialMissing) &&
+		!errors.Is(pending.Cause, qurl.ErrInvalidAgentState)
 }
 
 func recoverNativeCredential(ctx context.Context, cfg NativeRuntimeConfig, store nativeStateStore, triggerErr error, mode string) (*NativeRuntime, error) {

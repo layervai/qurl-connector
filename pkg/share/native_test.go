@@ -849,9 +849,10 @@ func TestResumableNativeCredentialRecoveryRejectsUnsafeLocalStates(t *testing.T)
 		want bool
 	}{
 		{"authenticated identity rejection", qurl.ErrAssignmentIdentityRejected, true},
-		{"valid pending episode", &qurl.NativeCredentialRecoveryRequiredError{Cause: qurl.ErrCredentialRecoveryRequired}, true},
+		{"valid pending episode", fmt.Errorf("open saved state: %w", &qurl.NativeCredentialRecoveryRequiredError{Cause: qurl.ErrCredentialRecoveryRequired}), true},
+		{"bare recovery sentinel", qurl.ErrCredentialRecoveryRequired, false},
 		{"missing credential", &qurl.NativeCredentialRecoveryRequiredError{Cause: qurl.ErrDeviceCredentialMissing}, false},
-		{"malformed pending state", errors.Join(qurl.ErrCredentialRecoveryRequired, qurl.ErrInvalidAgentState), false},
+		{"malformed pending state", &qurl.NativeCredentialRecoveryRequiredError{Cause: qurl.ErrInvalidAgentState}, false},
 		{"unrelated error", qurl.ErrInvalidAssignmentConfig, false},
 	}
 	for _, test := range tests {
