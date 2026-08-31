@@ -37,6 +37,20 @@ type windowsFileIdentity struct {
 	index  uint64
 }
 
+type windowsDirectoryIdentity struct {
+	volume uint64
+	fileID [16]byte
+}
+
+type windowsFileIDInfo struct {
+	volume uint64
+	fileID [16]byte
+}
+
+func (identity windowsDirectoryIdentity) available() bool {
+	return identity.fileID != [16]byte{}
+}
+
 type windowsSecurityMaterial struct {
 	current    *windows.SID
 	admin      *windows.SID
@@ -228,15 +242,28 @@ func windowsHandleIdentity(handle windows.Handle) (windowsFileIdentity, windows.
 	}, info, nil
 }
 
-func validateWindowsDirectoryHandle(handle windows.Handle, label string) (windowsFileIdentity, error) {
-	identity, info, err := windowsHandleIdentity(handle)
-	if err != nil {
-		return windowsFileIdentity{}, fmt.Errorf("stat %s: %w", label, err)
+func windowsStableDirectoryIdentity(handle windows.Handle, label string) (windowsDirectoryIdentity, error) {
+	var info windowsFileIDInfo
+	if err := windows.GetFileInformationByHandleEx(handle, windows.FileIdInfo,
+		(*byte)(unsafe.Pointer(&info)), uint32(unsafe.Sizeof(info))); err != nil {
+		return windowsDirectoryIdentity{}, fmt.Errorf("read stable %s identity: %w", label, err)
 	}
-	if info.FileAttributes&windows.FILE_ATTRIBUTE_DIRECTORY == 0 || info.FileAttributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-		return windowsFileIdentity{}, fmt.Errorf("%s must be a non-reparse directory", label)
+	identity := windowsDirectoryIdentity{volume: info.volume, fileID: info.fileID}
+	if !identity.available() {
+		return windowsDirectoryIdentity{}, fmt.Errorf("stable %s identity is unavailable", label)
 	}
 	return identity, nil
+}
+
+func validateWindowsDirectoryHandle(handle windows.Handle, label string) (windowsDirectoryIdentity, error) {
+	_, info, err := windowsHandleIdentity(handle)
+	if err != nil {
+		return windowsDirectoryIdentity{}, fmt.Errorf("stat %s: %w", label, err)
+	}
+	if info.FileAttributes&windows.FILE_ATTRIBUTE_DIRECTORY == 0 || info.FileAttributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+		return windowsDirectoryIdentity{}, fmt.Errorf("%s must be a non-reparse directory", label)
+	}
+	return windowsStableDirectoryIdentity(handle, label)
 }
 
 func openWindowsDirectoryAbsolute(path string, access uint32) (windows.Handle, error) {
@@ -331,7 +358,7 @@ func windowsHandleCreatedSecurity(handle windows.Handle, label string) (*windows
 		return nil, nil, fmt.Errorf("resolve current Windows identity for %s: %w", label, err)
 	}
 	sd, err := windows.GetSecurityInfo(handle, windows.SE_FILE_OBJECT,
-		windows.OWNER_SECURITY_INFORMATION|windows.GROUP_SECURITY_INFORMATION|windows.DACL_SECURITY_INFORMATION)
+		windows.OWNER_SECURITY_INFORMATION|windows.DACL_SECURITY_INFORMATION)
 	if err != nil {
 		return nil, nil, fmt.Errorf("read %s creation ACL: %w", label, err)
 	}
@@ -342,10 +369,12 @@ func windowsHandleCreatedSecurity(handle windows.Handle, label string) (*windows
 }
 
 // matchesCreatedWindowsACL reports whether handle has the exact access policy
-// installed by createPinnedDirectory. A successfully inspected but different
-// ACL is an ordinary ancestor and returns false. Inspection and descriptor
-// parsing failures remain hard errors so a retry cannot silently lose its
-// durability guarantee.
+// installed by createPinnedDirectory. The primary group is intentionally not
+// part of this classifier because it does not grant access; owner, protected
+// DACL, and the exact ACE set fully describe the creation policy. A
+// successfully inspected but different ACL is an ordinary ancestor and
+// returns false. Inspection and descriptor parsing failures remain hard errors
+// so a retry cannot silently lose its durability guarantee.
 func matchesCreatedWindowsACL(handle windows.Handle, label string) (bool, error) {
 	sd, current, err := windowsHandleCreatedSecurity(handle, label)
 	if err != nil {
@@ -356,13 +385,6 @@ func matchesCreatedWindowsACL(handle windows.Handle, label string) (bool, error)
 		return false, fmt.Errorf("read %s ACL owner: %w", label, err)
 	}
 	if owner == nil || !owner.Equals(current) {
-		return false, nil
-	}
-	group, _, err := sd.Group()
-	if err != nil {
-		return false, fmt.Errorf("read %s ACL group: %w", label, err)
-	}
-	if group == nil || !group.Equals(current) {
 		return false, nil
 	}
 	control, _, err := sd.Control()

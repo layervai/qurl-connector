@@ -28,7 +28,10 @@ the Connector does not adopt a state directory or file with inherited or
 foreign ACLs. If ACL validation fails, stop the Connector, move that state
 directory aside, and start again so it can create protected state and enroll a
 new identity. Connector and pinned qurl-go writers use the same protected-file
-contract for all production identity and session state.
+contract for all production identity and session state. A custom Windows state
+path must use a local filesystem under a user-owned namespace where Windows can
+flush directory updates. Network paths and system-owned parents are not
+supported state locations.
 
 `cmd/frpc` is retained for development and diagnostics. It is not a supported
 customer distribution, Homebrew formula, release binary, or container image.

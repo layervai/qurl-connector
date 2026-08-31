@@ -287,6 +287,16 @@ func TestWindowsPathHelpersRejectDeviceNamespacesAndBuildUNC(t *testing.T) {
 	}
 }
 
+func TestWindowsDirectoryIdentityAvailabilityRequiresNonzeroFileID(t *testing.T) {
+	if (windowsDirectoryIdentity{}).available() {
+		t.Fatal("zero Windows directory identity was available")
+	}
+	identity := windowsDirectoryIdentity{fileID: [16]byte{1}}
+	if !identity.available() {
+		t.Fatal("nonzero Windows directory identity was unavailable")
+	}
+}
+
 func TestNormalizeWindowsOpenErrorPreservesErrorsIs(t *testing.T) {
 	exists := &os.PathError{Op: "openat", Path: "state", Err: normalizeWindowsOpenError(windows.ERROR_ALREADY_EXISTS)}
 	if !errors.Is(exists, os.ErrExist) {
