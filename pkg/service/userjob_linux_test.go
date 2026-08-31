@@ -852,6 +852,48 @@ func TestResolveTrustedSystemctlRejectsPathAndUnsafeCandidates(t *testing.T) {
 	}
 }
 
+func TestResolveTrustedSystemctlAliasReturnsValidatedStorePath(t *testing.T) {
+	root := t.TempDir()
+	aliasRoot := filepath.Join(root, "run")
+	storeRoot := filepath.Join(root, "nix", "store")
+	storeSystemctl := filepath.Join(storeRoot, "generation", "sw", "bin", "systemctl")
+	if err := os.MkdirAll(filepath.Dir(storeSystemctl), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(storeSystemctl, []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(aliasRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(storeRoot, "generation"), filepath.Join(aliasRoot, "current-system")); err != nil {
+		t.Fatal(err)
+	}
+	candidate := filepath.Join(aliasRoot, "current-system", "sw", "bin", "systemctl")
+	got, err := resolveTrustedSystemctlAlias(candidate, aliasRoot, storeRoot)
+	if err != nil || got != storeSystemctl {
+		t.Fatalf("resolveTrustedSystemctlAlias = %q, %v; want %q", got, err, storeSystemctl)
+	}
+	outside := filepath.Join(root, "outside", "systemctl")
+	if err := os.MkdirAll(filepath.Dir(outside), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(outside, []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(aliasRoot, "current-system")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Dir(outside), filepath.Join(aliasRoot, "current-system")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := resolveTrustedSystemctlAlias(
+		filepath.Join(aliasRoot, "current-system", "systemctl"), aliasRoot, storeRoot,
+	); err == nil || !strings.Contains(err.Error(), "outside immutable store") {
+		t.Fatalf("outside-store systemctl error = %v", err)
+	}
+}
+
 func TestLinuxRemoveUnmasksManagedDefinitionBeforeCleanup(t *testing.T) {
 	job := linuxTestUserJob(t)
 	unitPath := filepath.Join(t.TempDir(), "systemd", "user", job.Label+".service")

@@ -27,6 +27,8 @@ const (
 	primarySystemctlPath  = "/usr/bin/systemctl"
 	fallbackSystemctlPath = "/bin/systemctl"
 	nixosSystemctlPath    = "/run/current-system/sw/bin/systemctl"
+	nixosAliasRoot        = "/run"
+	nixosStoreRoot        = "/nix/store"
 )
 
 const systemdUserJobTemplate = `[Unit]
@@ -760,16 +762,69 @@ func resolveTrustedSystemctl(candidates []string) (string, error) {
 			candidateErr = errors.Join(candidateErr, fmt.Errorf("systemctl candidate %q is not absolute", candidate))
 			continue
 		}
-		if err := validateLinuxUserJobExecutable(candidate); err != nil {
+		if err := validateLinuxUserJobExecutable(candidate); err == nil {
+			return candidate, nil
+		} else if candidate != nixosSystemctlPath {
 			candidateErr = errors.Join(candidateErr, fmt.Errorf("validate systemctl candidate %s: %w", candidate, err))
 			continue
 		}
-		return candidate, nil
+		resolved, err := resolveTrustedSystemctlAlias(candidate, nixosAliasRoot, nixosStoreRoot)
+		if err != nil {
+			candidateErr = errors.Join(candidateErr, fmt.Errorf("validate systemctl candidate %s: %w", candidate, err))
+			continue
+		}
+		return resolved, nil
 	}
 	if candidateErr == nil {
 		candidateErr = errors.New("no systemctl candidates configured")
 	}
 	return "", fmt.Errorf("resolve trusted systemctl control plane: %w", candidateErr)
+}
+
+// resolveTrustedSystemctlAlias supports NixOS's root-controlled
+// /run/current-system alias without executing through that mutable name. The
+// alias root is pinned while the candidate is resolved, and only the validated
+// immutable store path is returned to exec.
+func resolveTrustedSystemctlAlias(candidate, aliasRoot, storeRoot string) (string, error) {
+	for label, path := range map[string]string{
+		"candidate": candidate, "alias root": aliasRoot, "store root": storeRoot,
+	} {
+		if !filepath.IsAbs(path) {
+			return "", fmt.Errorf("systemctl %s %q is not absolute", label, path)
+		}
+	}
+	withinAlias, err := pathWithin(aliasRoot, candidate)
+	if err != nil || !withinAlias {
+		return "", fmt.Errorf("systemctl candidate %s is outside trusted alias root %s", candidate, aliasRoot)
+	}
+	alias, err := pinnedfs.OpenTrusted(aliasRoot)
+	if err != nil {
+		return "", fmt.Errorf("open trusted systemctl alias root: %w", err)
+	}
+	defer func() { _ = alias.Close() }()
+	resolved, err := filepath.EvalSymlinks(candidate)
+	if err != nil {
+		return "", fmt.Errorf("resolve systemctl alias: %w", err)
+	}
+	if err := alias.ValidateCurrent(); err != nil {
+		return "", fmt.Errorf("revalidate systemctl alias root: %w", err)
+	}
+	withinStore, err := pathWithin(storeRoot, resolved)
+	if err != nil || !withinStore {
+		return "", fmt.Errorf("resolved systemctl %s is outside immutable store %s", resolved, storeRoot)
+	}
+	if err := validateLinuxUserJobExecutable(resolved); err != nil {
+		return "", fmt.Errorf("validate resolved systemctl %s: %w", resolved, err)
+	}
+	return resolved, nil
+}
+
+func pathWithin(root, path string) (bool, error) {
+	relative, err := filepath.Rel(filepath.Clean(root), filepath.Clean(path))
+	if err != nil {
+		return false, err
+	}
+	return relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator)), nil
 }
 
 func systemctlUserOutputAt(systemctl string, args ...string) (string, error) {
