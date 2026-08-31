@@ -15,7 +15,7 @@ import (
 
 const (
 	checkoutAction           = "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
-	claudeAction             = "anthropics/claude-code-action@9d7150bc8a3dae8149739a88019d192b579ad90c"
+	claudeAction             = "anthropics/claude-code-action@e5ad3c7725bc2459721893f88879fef9dbcf97b0"
 	claudeModel              = "claude-opus-5"
 	automaticAllowedTools    = "mcp__github__get_pull_request,mcp__github__get_pull_request_diff,mcp__github__get_pull_request_files,mcp__github__get_pull_request_review_comments,mcp__github__get_pull_request_reviews,mcp__github__get_pull_request_status,mcp__github__get_issue_comments,mcp__github__get_file_contents,mcp__github__search_code,mcp__github__get_commit,mcp__github__add_issue_comment,mcp__github_inline_comment__create_inline_comment"
 	automaticDisallowedTools = "Bash,Read,Glob,Grep,LS,Task,Edit,Write,MultiEdit,NotebookEdit,WebFetch,WebSearch,mcp__github_file_ops__commit_files,mcp__github_file_ops__delete_files,mcp__github__create_or_update_file,mcp__github__push_files,mcp__github__delete_file"
