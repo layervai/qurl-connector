@@ -533,8 +533,11 @@ func validateTrustedWindowsACL(handle windows.Handle, label string, requireCurre
 	header := (*windowsACLHeader)(unsafe.Pointer(dacl))
 	for index := uint32(0); index < uint32(header.ACECount); index++ {
 		var ace *windows.ACCESS_ALLOWED_ACE
-		if err := windows.GetAce(dacl, index, &ace); err != nil || ace == nil {
+		if err := windows.GetAce(dacl, index, &ace); err != nil {
 			return fmt.Errorf("inspect %s DACL entry %d: %w", label, index, err)
+		}
+		if ace == nil {
+			return fmt.Errorf("inspect %s DACL entry %d: empty entry", label, index)
 		}
 		if ace.Header.AceType == windows.ACCESS_DENIED_ACE_TYPE || ace.Header.AceFlags&windows.INHERIT_ONLY_ACE != 0 {
 			continue

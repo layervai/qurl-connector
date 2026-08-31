@@ -5,6 +5,7 @@ package pinnedfs
 import (
 	"context"
 	"errors"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -42,6 +43,60 @@ func TestWindowsPrivateDirectoryRoundTripAndAtomicReplacement(t *testing.T) {
 	raw, err := os.ReadFile(filepath.Join(path, "state.json"))
 	if err != nil || string(raw) != "two" {
 		t.Fatalf("state = %q, %v", raw, err)
+	}
+}
+
+func TestWindowsAtomicReplacementSucceedsWhilePinnedReaderIsOpen(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "qurl", "connector")
+	namespace, err := EnsurePrivate(path, 0o700)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer namespace.Close()
+	writeWindowsPinnedTestFile(t, namespace, ".state-old.tmp", "state.json", []byte("old"))
+
+	reader, err := namespace.OpenFile("state.json", os.O_RDONLY|SafeOpenFlags(), 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+	if _, err := ValidateRegularFile(namespace, "state.json", reader, "open Windows state reader", 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	replacement, err := namespace.OpenFile(".state-new.tmp", os.O_WRONLY|os.O_CREATE|os.O_EXCL|SafeOpenFlags(), 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := replacement.Chmod(0o600); err != nil {
+		_ = replacement.Close()
+		t.Fatal(err)
+	}
+	if _, err := replacement.Write([]byte("new")); err != nil {
+		_ = replacement.Close()
+		t.Fatal(err)
+	}
+	if err := replacement.Sync(); err != nil {
+		_ = replacement.Close()
+		t.Fatal(err)
+	}
+	if err := replacement.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := namespace.Rename(".state-new.tmp", "state.json"); err != nil {
+		t.Fatalf("rename replacement over an open Windows reader: %v", err)
+	}
+	if err := namespace.Sync(); err != nil {
+		t.Fatal(err)
+	}
+
+	oldRaw, err := io.ReadAll(reader)
+	if err != nil || string(oldRaw) != "old" {
+		t.Fatalf("open reader after replacement = %q, %v, want old snapshot", oldRaw, err)
+	}
+	newRaw, err := os.ReadFile(filepath.Join(path, "state.json"))
+	if err != nil || string(newRaw) != "new" {
+		t.Fatalf("replacement state = %q, %v, want new snapshot", newRaw, err)
 	}
 }
 

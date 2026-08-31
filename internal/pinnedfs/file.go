@@ -5,6 +5,8 @@ import (
 	"os"
 )
 
+var beforeRegularFileFinalEntryValidation = func(*Directory, string, *os.File) {}
+
 // ValidateRegularFile proves that file is an owner-owned, single-link regular
 // file with the exact mode and that its descriptor still matches name in the
 // retained namespace. The final descriptor and entry checks close substitution
@@ -72,6 +74,7 @@ func validateRegularFile(
 	if err := validate(file, latest, label); err != nil {
 		return nil, err
 	}
+	beforeRegularFileFinalEntryValidation(namespace, name, file)
 	latestEntry, err := namespace.Lstat(name)
 	if err != nil {
 		return nil, fmt.Errorf("final inspect %s entry: %w", label, err)

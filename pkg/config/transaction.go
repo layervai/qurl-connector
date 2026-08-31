@@ -210,7 +210,7 @@ func openTransactionLock(ctx context.Context, namespace *pinnedfs.Directory, nam
 func validateTransactionFile(namespace *pinnedfs.Directory, name string, file *os.File, label string, mode os.FileMode) error {
 	beforeTransactionFileFinalValidation(label)
 	_, err := pinnedfs.ValidateRegularFile(namespace, name, file, label, mode)
-	return err
+	return wrapConfigFileValidationError(label, err)
 }
 
 func (tx *FileTransaction) validateNamespace() error {
