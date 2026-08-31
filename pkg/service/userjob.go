@@ -62,6 +62,9 @@ type UserJobManager interface {
 	// process is incompatible with that definition.
 	Replace(UserJob) error
 	Remove(label string) error
+	// Status reports persisted and running state. It can repair the mode of an
+	// owner-controlled definition before reading it, and rejects definitions
+	// owned by another principal.
 	Status(label string) (ServiceStatus, error)
 }
 

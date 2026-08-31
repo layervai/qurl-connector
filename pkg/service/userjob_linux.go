@@ -26,6 +26,7 @@ const maxLinuxUserJobDefinitionBytes = 64 << 10
 const (
 	primarySystemctlPath  = "/usr/bin/systemctl"
 	fallbackSystemctlPath = "/bin/systemctl"
+	nixosSystemctlPath    = "/run/current-system/sw/bin/systemctl"
 )
 
 const systemdUserJobTemplate = `[Unit]
@@ -741,11 +742,15 @@ func (e *systemctlUserError) Error() string {
 func (e *systemctlUserError) Unwrap() error { return e.err }
 
 func systemctlUserOutput(args ...string) (string, error) {
-	systemctl, err := resolveTrustedSystemctl([]string{primarySystemctlPath, fallbackSystemctlPath})
+	systemctl, err := resolveTrustedSystemctl(defaultSystemctlCandidates())
 	if err != nil {
 		return "", err
 	}
 	return systemctlUserOutputAt(systemctl, args...)
+}
+
+func defaultSystemctlCandidates() []string {
+	return []string{primarySystemctlPath, fallbackSystemctlPath, nixosSystemctlPath}
 }
 
 func resolveTrustedSystemctl(candidates []string) (string, error) {

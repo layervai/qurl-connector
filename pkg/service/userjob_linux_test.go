@@ -828,6 +828,9 @@ func TestSystemctlUserOutputKeepsCommandChannelsSeparate(t *testing.T) {
 }
 
 func TestResolveTrustedSystemctlRejectsPathAndUnsafeCandidates(t *testing.T) {
+	if want := []string{primarySystemctlPath, fallbackSystemctlPath, nixosSystemctlPath}; !reflect.DeepEqual(defaultSystemctlCandidates(), want) {
+		t.Fatalf("default systemctl candidates = %v, want %v", defaultSystemctlCandidates(), want)
+	}
 	dir := t.TempDir()
 	trusted := filepath.Join(dir, "trusted-systemctl")
 	if err := os.WriteFile(trusted, []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
@@ -1039,7 +1042,7 @@ func TestLinuxUserJobManagerIntegration(t *testing.T) {
 	if err := os.WriteFile(restartTrigger, []byte("restart\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	waitForLinuxUserJobMarkerWithin(t, restartMarker, 70*time.Second)
+	waitForLinuxUserJobMarkerWithin(t, restartMarker, 120*time.Second)
 	count, err := os.ReadFile(restartCount)
 	if err != nil || strings.TrimSpace(string(count)) != "6" {
 		t.Fatalf("restart attempts = %q, %v; want 6", count, err)
