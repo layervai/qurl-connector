@@ -1257,10 +1257,10 @@ func TestMayConsumeNativeRecoveryAuthorityAcceptsRealPendingState(t *testing.T) 
 		DeviceAPIKey:   "lv_live_" + base64.RawURLEncoding.EncodeToString(make([]byte, 32)),
 		DeviceAPIKeyID: "key_DeviceKey123",
 		Assignment: &qurl.AgentAssignment{
-			CellID: "cell0", AssignmentGeneration: 1, EndpointRevision: 1,
+			CellID: "cell-a", AssignmentGeneration: 1, EndpointRevision: 1,
 			LeaseExpiresAt: now.Add(time.Hour),
 			Endpoint: qurl.NHPUDPEndpoint{
-				Host: "cell0.nhp.layerv.xyz", Port: 443,
+				Host: "hub.nhp.layerv.ai", Port: 443,
 				ServerPublicKeyB64: base64.StdEncoding.EncodeToString(serverKey.PublicKey().Bytes()),
 			},
 		},
@@ -1269,7 +1269,7 @@ func TestMayConsumeNativeRecoveryAuthorityAcceptsRealPendingState(t *testing.T) 
 			ReplayNotAfter:                   now.Add(time.Hour),
 			RecoveryCredentialFingerprintB64: base64.RawURLEncoding.EncodeToString(make([]byte, 32)),
 			AgentID:                          "agent-one", AgentPublicKeyB64: publicKey,
-			HubHost: "hub.nhp.layerv.xyz", HubPort: 443,
+			HubHost: "hub.nhp.layerv.ai", HubPort: 443,
 			HubServerPublicKeyB64: base64.StdEncoding.EncodeToString(serverKey.PublicKey().Bytes()),
 		},
 	}
