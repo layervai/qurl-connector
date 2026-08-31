@@ -27,6 +27,20 @@ import (
 
 const windowsTaskDefinitionPrefix = "layerv-qurl-user-job-sha256:"
 
+const windowsTaskSchedulerCommandTimeout = 20 * time.Second
+
+// A cold Windows ScheduledTasks PowerShell provider can take more than 20
+// seconds to answer its first query. Give that process a one-minute deadline
+// without extending the deadline for direct schtasks.exe operations.
+const windowsPowerShellCommandTimeout = time.Minute
+
+// CommandContext kills a command at its deadline, but a descendant can retain
+// an inherited output pipe. Five seconds lets ordinary pipe copies drain
+// without letting a leaked handle pin the CLI. If the pipe is still open,
+// exec returns ErrWaitDelay; preserve that error instead of accepting
+// incomplete command output as a successful scheduler result.
+const windowsJobCommandDrainDelay = 5 * time.Second
+
 var errWindowsTaskUserResolution = errors.New("Windows task user identity could not be resolved")
 
 const (
@@ -95,7 +109,7 @@ type windowsRenderedUserJob struct {
 }
 
 type windowsUserJobManager struct {
-	run           func(string, ...string) (string, error)
+	runWithin     func(time.Duration, string, ...string) (string, error)
 	currentSID    func() (string, error)
 	powerShell    func() (string, error)
 	taskScheduler func() (string, error)
@@ -104,8 +118,10 @@ type windowsUserJobManager struct {
 // NewUserJobManager returns a per-user Windows Task Scheduler manager.
 func NewUserJobManager() UserJobManager {
 	return &windowsUserJobManager{
-		run: windowsJobCommandOutput, currentSID: currentWindowsUserSID,
-		powerShell: windowsPowerShellExecutable, taskScheduler: windowsTaskSchedulerExecutable,
+		runWithin:     windowsJobCommandOutputWithin,
+		currentSID:    currentWindowsUserSID,
+		powerShell:    windowsPowerShellExecutable,
+		taskScheduler: windowsTaskSchedulerExecutable,
 	}
 }
 
@@ -655,7 +671,8 @@ func (m *windowsUserJobManager) runPowerShell(command string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return m.run(executable, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", command)
+	return m.runCommandWithin(windowsPowerShellCommandTimeout, executable,
+		"-NoLogo", "-NoProfile", "-NonInteractive", "-Command", command)
 }
 
 func (m *windowsUserJobManager) runTaskScheduler(arguments ...string) (string, error) {
@@ -667,7 +684,14 @@ func (m *windowsUserJobManager) runTaskScheduler(arguments ...string) (string, e
 	if err != nil {
 		return "", err
 	}
-	return m.run(executable, arguments...)
+	return m.runCommandWithin(windowsTaskSchedulerCommandTimeout, executable, arguments...)
+}
+
+func (m *windowsUserJobManager) runCommandWithin(timeout time.Duration, executable string, arguments ...string) (string, error) {
+	if m == nil || m.runWithin == nil {
+		return "", errors.New("Windows user job manager is incomplete")
+	}
+	return m.runWithin(timeout, executable, arguments...)
 }
 
 func windowsScopedTaskName(label, sid string) string {
@@ -1178,14 +1202,11 @@ func decodeWindowsCommandText(value string) string {
 	return string(utf16.Decode(units))
 }
 
-func windowsJobCommandOutput(name string, args ...string) (string, error) {
-	return windowsJobCommandOutputWithin(20*time.Second, name, args...)
-}
-
 func windowsJobCommandOutputWithin(timeout time.Duration, name string, args ...string) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	command := exec.CommandContext(ctx, name, args...) //nolint:gosec // G204: production callers resolve fixed System32 executables; tests inject exact helper paths.
+	command.WaitDelay = windowsJobCommandDrainDelay
 	output, err := command.Output()
 	if err == nil {
 		return string(output), nil
