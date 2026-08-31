@@ -694,7 +694,7 @@ func TestLinuxRemoveUnmasksManagedDefinitionBeforeCleanup(t *testing.T) {
 	if err := manager.Remove(job.Label); err != nil {
 		t.Fatal(err)
 	}
-	if want := []string{"show", "unmask", "disable", "daemon-reload"}; !reflect.DeepEqual(verbs, want) {
+	if want := []string{"show", "disable", "unmask", "daemon-reload"}; !reflect.DeepEqual(verbs, want) {
 		t.Fatalf("systemctl verbs = %v, want %v", verbs, want)
 	}
 	if _, err := os.Lstat(unitPath); !errors.Is(err, os.ErrNotExist) {

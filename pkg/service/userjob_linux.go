@@ -317,17 +317,17 @@ func (m *linuxUserJobManager) Remove(label string) error {
 			return fmt.Errorf("stop systemd user job %s: %w", label, err)
 		}
 	}
+	if state.loaded || state.invalid || state.masked || state.unitFileState != "" {
+		if _, err := m.run("disable", unit); err != nil {
+			return fmt.Errorf("disable systemd user job %s: %w", label, err)
+		}
+	}
 	if state.masked {
 		if _, err := m.run("unmask", unit); err != nil {
 			return fmt.Errorf("unmask systemd user job %s before removal: %w", label, err)
 		}
 		if err := syncTrustedSystemdUnitDirectory(filepath.Dir(unitPath)); err != nil {
 			return fmt.Errorf("make unmasked systemd user job %s durable: %w", label, err)
-		}
-	}
-	if state.loaded || state.invalid || state.masked || state.unitFileState != "" {
-		if _, err := m.run("disable", unit); err != nil {
-			return fmt.Errorf("disable systemd user job %s: %w", label, err)
 		}
 	}
 	if err := removeLinuxUserJobDefinition(unitPath); err != nil {
