@@ -522,6 +522,16 @@ func (d *Directory) Lstat(name string) (os.FileInfo, error) {
 	return d.root.Lstat(name)
 }
 
+// Readlink reads one link in the retained directory namespace. Callers that
+// use the result for a security decision must bracket it with Lstat and
+// ValidateCurrent checks because a link does not provide an open descriptor.
+func (d *Directory) Readlink(name string) (string, error) {
+	if err := d.ValidateCurrent(); err != nil {
+		return "", err
+	}
+	return d.root.Readlink(name)
+}
+
 // ReadDirNames returns at most limit entry names from the retained directory.
 // The extra read distinguishes an exact-size result from a namespace that
 // exceeds the caller's bounded scan budget.

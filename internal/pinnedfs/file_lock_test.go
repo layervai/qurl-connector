@@ -36,6 +36,46 @@ func TestValidateRegularFileRejectsHardLink(t *testing.T) {
 	}
 }
 
+func TestValidateOwnerRegularFileAllowsModeRepairButKeepsFileSafety(t *testing.T) {
+	root := realTempDir(t)
+	path := filepath.Join(root, "state")
+	if err := os.Mkdir(path, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	namespace, err := OpenPrivate(path, 0o700)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer namespace.Close()
+	file, err := namespace.OpenFile("state.json", os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	if _, err := ValidateOwnerRegularFile(namespace, "state.json", file, "state"); err != nil {
+		t.Fatalf("ValidateOwnerRegularFile rejected repairable mode: %v", err)
+	}
+	alias := filepath.Join(root, "alias.json")
+	if err := os.Link(filepath.Join(path, "state.json"), alias); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ValidateOwnerRegularFile(namespace, "state.json", file, "state"); err == nil || !strings.Contains(err.Error(), "link count") {
+		t.Fatalf("ValidateOwnerRegularFile hard-link error = %v", err)
+	}
+	if err := os.Remove(alias); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(filepath.Join(path, "state.json"), filepath.Join(path, "actual.json")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("actual.json", filepath.Join(path, "state.json")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ValidateOwnerRegularFile(namespace, "state.json", file, "state"); err == nil || !strings.Contains(err.Error(), "non-symlink regular file") {
+		t.Fatalf("ValidateOwnerRegularFile symlink error = %v", err)
+	}
+}
+
 func TestFileLockHonorsCancellationAndDetectsEntryReplacement(t *testing.T) {
 	root := realTempDir(t)
 	path := filepath.Join(root, "state")

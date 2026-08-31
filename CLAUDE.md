@@ -10,10 +10,11 @@ contributors should also read [CONTRIBUTING.md](CONTRIBUTING.md).
   grow another native registration, refresh, knock, or FRP supervisor.
 - NHP admission is resource-bound. Keep public resource ID, knock resource ID,
   connector/routing ID, session ID, and serving epoch distinct.
-- The macOS and Windows managed daemons are credential-free. Account-
+- The Linux, macOS, and Windows managed daemons are credential-free. Account-
   authenticated desired-state changes belong to the foreground `qurl`
-  command. Linux uses the explicit foreground path until a reviewed per-user
-  service manager exists for that platform.
+  command. Linux uses a native systemd user service and fails clearly when a
+  real user manager is unavailable. The manager must support `Type=exec`,
+  append log output, and `RestrictSUIDSGID`.
 - Session renewal is make-before-break and becomes ready only when every
   configured FRP proxy reaches its running phase.
 - Per-resource failures must not tear down healthy sibling shares.
@@ -36,14 +37,15 @@ endpoints, cloud account identifiers, customer data, or live rollout evidence.
 
 ## State and security
 
-- Persistent state, IPC directories, macOS LaunchAgent state, and Windows Task
-  Scheduler staging and log paths are owner-only. Windows directory walks must
+- Persistent state, IPC directories, Linux systemd definitions and logs, macOS
+  LaunchAgent state, and Windows Task Scheduler staging and log paths are
+  owner-only. Windows directory walks must
   reject reparse points and ancestors that an untrusted principal can replace.
 - On Windows, `RunAtLoad` is a logon trigger and `KeepAlive` restarts failed
   tasks. The next logon or foreground `qurl` command repairs a clean exit. Task
-  Scheduler hard-stops the direct child during replacement/removal;
-  `ExitTimeout` and `Umask` are launchd-only controls. The executable and its
-  ancestors must not be replaceable by an untrusted principal.
+  Scheduler hard-stops the direct child during replacement/removal. `ExitTimeout`
+  and `Umask` configure systemd and launchd; Windows does not use them. The
+  executable and its ancestors must not be replaceable by an untrusted principal.
 - Persisted lifecycle updates are monotonic: serving epochs cannot regress and
   immutable resource identities cannot change in place.
 - Automatic assignment recovery uses bounded persisted backoff. Authenticated

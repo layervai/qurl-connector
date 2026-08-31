@@ -5,7 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -25,10 +27,11 @@ type NativeRuntimeConfig struct {
 	ClientBaseURL                string
 	EnrollmentCredential         string
 	EnrollmentCredentialProvider qurl.AgentEnrollmentCredentialProvider
-	// RecoveryCredentialProvider is invoked only after the pinned Hub
-	// authenticates the persisted agent and rejects its device credential.
-	// It must return a live qurl:agent account credential. The provider and its
-	// result are never retained after OpenNativeRuntime returns.
+	// RecoveryCredentialProvider is invoked after the pinned Hub authenticates
+	// the persisted agent and rejects its device credential, or when the same
+	// state contains a valid pending credential-recovery episode. It must return
+	// a live qurl:agent account credential. The provider and its result are never
+	// retained after OpenNativeRuntime returns.
 	RecoveryCredentialProvider func(context.Context) (string, error)
 	RefreshMode                string
 	UDPOptions                 []qurl.AgentRuntimeUDPOption
@@ -62,6 +65,9 @@ type NativeRuntime struct {
 
 	store      nativeStateStore
 	refreshCfg nativeRefreshConfig
+
+	credentialRecoveryMu                 sync.Mutex
+	deviceAuthorizationRecoveryAttempted bool
 }
 
 type NativeOpenKind string
@@ -95,7 +101,7 @@ var (
 	}
 	connectNativeRuntime = qurl.ConnectAgentRuntime
 	refreshNativeRuntime = qurl.RefreshAgentRuntime
-	recoverNativeRuntime = qurl.RecoverAgentRuntime
+	recoverNativeRuntime = qurl.RecoverAgentRuntimeWithCredentialProvider
 	waitNativeRefresh    = sleepWithContext
 	knockNativeRuntime   = qurl.KnockRegisteredAgent
 	retireNativeSession  = qurl.RetireRegisteredAgentSession
@@ -103,6 +109,12 @@ var (
 )
 
 var errNativeRefreshBackoffPending = errors.New("native assignment refresh backoff is pending")
+
+// errNativeDeviceAuthorizationRecoveryNotAllowed reports that a caller tried
+// to spend account recovery authority outside the one narrow explicit-login
+// repair. The repair is available only after a warm runtime receives the exact
+// registered-device invalid-api-key response, and only once per runtime.
+var errNativeDeviceAuthorizationRecoveryNotAllowed = errors.New("native device authorization recovery is not allowed")
 
 const (
 	nativeRefreshReasonImmediate = "stale or expired native assignment placement"
@@ -153,6 +165,9 @@ func OpenNativeRuntime(ctx context.Context, cfg NativeRuntimeConfig) (_ *NativeR
 		if openErr == nil {
 			return runtime, nil
 		}
+		if mayConsumeNativeRecoveryAuthority(openErr) {
+			return recoverNativeCredential(ctx, cfg, store, openErr, mode)
+		}
 		// Offline open and Hub refresh share the same local transient-error
 		// sentinels. Reuse the closed refresh classifier so new or corrupt local
 		// state still fails closed instead of widening unattended retries. Offline
@@ -168,7 +183,7 @@ func OpenNativeRuntime(ctx context.Context, cfg NativeRuntimeConfig) (_ *NativeR
 		if refreshErr == nil {
 			return runtime, nil
 		}
-		return recoverRejectedNativeIdentity(ctx, cfg, store, refreshErr, mode)
+		return recoverNativeCredential(ctx, cfg, store, refreshErr, mode)
 	}
 
 	runtime, openErr := warmOpenNativeRuntime(ctx, cfg, store, mode)
@@ -187,7 +202,10 @@ func OpenNativeRuntime(ctx context.Context, cfg NativeRuntimeConfig) (_ *NativeR
 		if refreshErr == nil {
 			return runtime, nil
 		}
-		return recoverRejectedNativeIdentity(ctx, cfg, store, refreshErr, mode)
+		return recoverNativeCredential(ctx, cfg, store, refreshErr, mode)
+	}
+	if mayConsumeNativeRecoveryAuthority(openErr) {
+		return recoverNativeCredential(ctx, cfg, store, openErr, mode)
 	}
 	if !errors.Is(openErr, qurl.ErrAgentStateNotFound) {
 		return nil, openErr
@@ -242,39 +260,83 @@ func warmOpenNativeRuntime(ctx context.Context, cfg NativeRuntimeConfig, store n
 	return assembleNativeRuntime(client, binding, store, refreshConfig(cfg, mode), NativeOpenWarm)
 }
 
-func recoverRejectedNativeIdentity(ctx context.Context, cfg NativeRuntimeConfig, store nativeStateStore, refreshErr error, mode string) (*NativeRuntime, error) {
-	if !errors.Is(refreshErr, qurl.ErrAssignmentIdentityRejected) || cfg.RecoveryCredentialProvider == nil {
-		return nil, refreshErr
+func mayConsumeNativeRecoveryAuthority(err error) bool {
+	for _, unsafe := range []error{
+		qurl.ErrInvalidAgentState,
+		qurl.ErrAgentStateContinuity,
+		qurl.ErrAgentSetupLock,
+		qurl.ErrDeviceCredentialMissing,
+		qurl.ErrRecoveryCredentialRejected,
+		qurl.ErrCredentialRecoveryIdentityRejected,
+		qurl.ErrCredentialRecoveryRevokeRequired,
+		qurl.ErrCredentialRecoveryRequestRejected,
+		qurl.ErrCredentialRecoveryAssignmentRequired,
+		qurl.ErrCredentialRecoveryCandidateConflict,
+		qurl.ErrCredentialRecoveryInvalidResponse,
+		qurl.ErrCredentialRecoveryExpired,
+		qurl.ErrCredentialRecoveredAssignmentRefreshRequired,
+	} {
+		if errors.Is(err, unsafe) {
+			return false
+		}
 	}
-	credential, err := cfg.RecoveryCredentialProvider(ctx)
-	if err != nil {
-		return nil, errors.Join(refreshErr, fmt.Errorf("resolve native credential recovery authority: %w", err))
+	if errors.Is(err, qurl.ErrAssignmentIdentityRejected) {
+		return true
 	}
-	credential = strings.TrimSpace(credential)
-	if credential == "" {
-		return nil, errors.Join(refreshErr, errors.New("native credential recovery authority is empty"))
+	// The outer typed pending error may be wrapped; only its Cause must be the
+	// exact unwrapped qurl-go pending-episode sentinel. Joined top-level unsafe
+	// causes are rejected above, while wrapped or joined pending causes fail
+	// closed so new, malformed, and terminal upstream states cannot spend it.
+	var pending *qurl.NativeCredentialRecoveryRequiredError
+	return errors.As(err, &pending) && pending != nil &&
+		pending.Cause == qurl.ErrCredentialRecoveryRequired //nolint:errorlint // Exact sentinel is the allowlist boundary.
+}
+
+func recoverNativeCredential(ctx context.Context, cfg NativeRuntimeConfig, store nativeStateStore, triggerErr error, mode string) (*NativeRuntime, error) {
+	if !mayConsumeNativeRecoveryAuthority(triggerErr) || cfg.RecoveryCredentialProvider == nil {
+		return nil, triggerErr
 	}
 	state, err := store.Handoff()
 	if err != nil {
-		return nil, errors.Join(refreshErr, err)
+		return nil, fmt.Errorf("open native state for credential recovery: %w", err)
 	}
-	options := make([]qurl.AgentRuntimeRecoveryOption, 0, len(cfg.UDPOptions)+3)
-	options = append(options, qurl.WithAgentRuntimeRecoveryHub(cfg.Hub))
-	if expected := strings.TrimSpace(cfg.AgentID); expected != "" {
-		options = append(options, qurl.WithExpectedAgentRuntimeRecoveryAgentID(expected))
-	}
-	if cfg.ClientBaseURL != "" {
-		options = append(options, qurl.WithAgentClientBaseURL(cfg.ClientBaseURL))
-	}
-	for _, option := range cfg.UDPOptions {
-		options = append(options, option)
-	}
-	client, binding, err := recoverNativeRuntime(ctx, credential, state, options...)
-	credential = ""
+	options := nativeCredentialRecoveryOptions(cfg.Hub, cfg.AgentID, cfg.ClientBaseURL, cfg.UDPOptions)
+	client, binding, err := recoverNativeRuntime(ctx, validatedNativeRecoveryCredentialProvider(cfg.RecoveryCredentialProvider), state, options...)
 	if err != nil {
-		return nil, fmt.Errorf("recover rejected native identity: %w", err)
+		// Do not join triggerErr here. A valid pending episode remains durable,
+		// while a Hub outage or rate limit must stay retryable for the daemon.
+		return nil, fmt.Errorf("recover native credential: %w", err)
 	}
 	return assembleRefreshedNativeRuntime(ctx, client, binding, store, refreshConfig(cfg, mode), NativeOpenRecovery)
+}
+
+func validatedNativeRecoveryCredentialProvider(provider func(context.Context) (string, error)) qurl.AgentRuntimeRecoveryCredentialProvider {
+	return func(ctx context.Context) (string, error) {
+		credential, err := provider(ctx)
+		if err != nil {
+			return "", err
+		}
+		credential = strings.TrimSpace(credential)
+		if credential == "" {
+			return "", errors.New("native credential recovery authority is empty")
+		}
+		return credential, nil
+	}
+}
+
+func nativeCredentialRecoveryOptions(hub qurl.HubBootstrap, agentID, clientBaseURL string, udpOptions []qurl.AgentRuntimeUDPOption) []qurl.AgentRuntimeRecoveryOption {
+	options := make([]qurl.AgentRuntimeRecoveryOption, 0, len(udpOptions)+3)
+	options = append(options, qurl.WithAgentRuntimeRecoveryHub(hub))
+	if expected := strings.TrimSpace(agentID); expected != "" {
+		options = append(options, qurl.WithExpectedAgentRuntimeRecoveryAgentID(expected))
+	}
+	if clientBaseURL != "" {
+		options = append(options, qurl.WithAgentClientBaseURL(clientBaseURL))
+	}
+	for _, option := range udpOptions {
+		options = append(options, option)
+	}
+	return options
 }
 
 func refreshConfig(cfg NativeRuntimeConfig, mode string) nativeRefreshConfig {
@@ -399,6 +461,8 @@ func IsPermanentNativeOpenError(err error) bool {
 		qurl.ErrInvalidBootstrapConfig,
 		qurl.ErrInvalidAgentState,
 		qurl.ErrInsecureAgentStatePermissions,
+		qurl.ErrAgentStateContinuity,
+		qurl.ErrAgentSetupLock,
 		qurl.ErrInvalidRegisterConfig,
 		qurl.ErrRegistrationInvalidInput,
 		qurl.ErrRegistrationDisabled,
@@ -420,6 +484,16 @@ func IsPermanentNativeOpenError(err error) bool {
 		qurl.ErrCompletionIdentityRejected,
 		qurl.ErrCompletionCredentialConflict,
 		qurl.ErrCompletionRequestRejected,
+		qurl.ErrCredentialRecoveryRequired,
+		qurl.ErrDeviceCredentialMissing,
+		qurl.ErrRecoveryCredentialRejected,
+		qurl.ErrCredentialRecoveryIdentityRejected,
+		qurl.ErrCredentialRecoveryRevokeRequired,
+		qurl.ErrCredentialRecoveryRequestRejected,
+		qurl.ErrCredentialRecoveryAssignmentRequired,
+		qurl.ErrCredentialRecoveryCandidateConflict,
+		qurl.ErrCredentialRecoveryInvalidResponse,
+		qurl.ErrCredentialRecoveryExpired,
 	} {
 		if errors.Is(err, sentinel) {
 			return true
@@ -507,6 +581,77 @@ func (r *NativeRuntime) ClearRegistrationRefreshMarker() error {
 	return r.MarkServingHealthy()
 }
 
+// RecoverCredentialAfterDeviceAuthorizationFailure performs the one recovery
+// attempt allowed after explicit login has already validated an account key,
+// a credential-free warm open succeeded, and the first registered-device REST
+// request returned HTTP 401 with problem code api_key_invalid. provider must
+// return that same validated account key.
+//
+// The method rejects every other status, problem code, open kind, and repeated
+// call before reading provider or touching durable state. It never retries the
+// recovery operation. The caller must have exclusive ownership of r and may
+// retry its registered-device request once only after this method succeeds.
+func (r *NativeRuntime) RecoverCredentialAfterDeviceAuthorizationFailure(
+	ctx context.Context,
+	statusCode int,
+	problemCode string,
+	provider func(context.Context) (string, error),
+) error {
+	if ctx == nil {
+		return fmt.Errorf("%w: context is nil", errNativeDeviceAuthorizationRecoveryNotAllowed)
+	}
+	if r == nil || r.store == nil {
+		return fmt.Errorf("%w: native runtime is closed", errNativeDeviceAuthorizationRecoveryNotAllowed)
+	}
+	if r.OpenKind != NativeOpenWarm || statusCode != http.StatusUnauthorized || problemCode != "api_key_invalid" {
+		return errNativeDeviceAuthorizationRecoveryNotAllowed
+	}
+	if provider == nil {
+		return fmt.Errorf("%w: validated account credential provider is nil", errNativeDeviceAuthorizationRecoveryNotAllowed)
+	}
+
+	r.credentialRecoveryMu.Lock()
+	defer r.credentialRecoveryMu.Unlock()
+	if r.deviceAuthorizationRecoveryAttempted {
+		return fmt.Errorf("%w: recovery was already attempted", errNativeDeviceAuthorizationRecoveryNotAllowed)
+	}
+	// Consume the in-process authority before any fallible work. A failed call
+	// must be resumed by a new explicit login, which reopens durable recovery
+	// state through qurl-go instead of looping on the same REST rejection.
+	r.deviceAuthorizationRecoveryAttempted = true
+
+	state, err := r.store.Handoff()
+	if err != nil {
+		return fmt.Errorf("open native state for device authorization recovery: %w", err)
+	}
+	options := nativeCredentialRecoveryOptions(r.refreshCfg.Hub, r.AgentID, r.refreshCfg.ClientBaseURL, r.refreshCfg.UDPOptions)
+	client, binding, err := recoverNativeRuntime(ctx, validatedNativeRecoveryCredentialProvider(provider), state, options...)
+	if err != nil {
+		return fmt.Errorf("recover native credential after device authorization rejection: %w", err)
+	}
+	replacement, err := assembleRefreshedNativeRuntime(ctx, client, binding, r.store, r.refreshCfg, NativeOpenRecovery)
+	if err != nil {
+		return err
+	}
+
+	oldBinding := r.Binding
+	r.Client = replacement.Client
+	r.Binding = replacement.Binding
+	r.AgentID = replacement.AgentID
+	r.Hub = replacement.Hub
+	r.UDPOptions = replacement.UDPOptions
+	r.OpenKind = replacement.OpenKind
+	r.SessionOperations = replacement.SessionOperations
+	r.refreshCfg = replacement.refreshCfg
+	// r continues to own the store. The short-lived replacement is only an
+	// assembly guard and must not become a second logical owner.
+	replacement.store = nil
+	if oldBinding != nil && oldBinding != r.Binding {
+		oldBinding.Destroy()
+	}
+	return nil
+}
+
 func (r *NativeRuntime) Close() error {
 	if r == nil {
 		return nil
@@ -530,27 +675,29 @@ type NativeAdmitter struct {
 	// runtimeMu prevents refresh or close from replacing the binding and key
 	// while a native exchange uses them. Ordinary operations take a read lock,
 	// so unrelated resources can recover and retire concurrently.
-	runtimeMu             sync.RWMutex
-	refreshMu             sync.Mutex
-	knockMu               sync.Mutex
-	stateMu               sync.Mutex
-	resources             keyedResourceLocks
-	recoveryWG            sync.WaitGroup
-	recoveryPermanentOnce sync.Once
+	runtimeMu              sync.RWMutex
+	refreshMu              sync.Mutex
+	knockMu                sync.Mutex
+	stateMu                sync.Mutex
+	resources              keyedResourceLocks
+	recoveryWG             sync.WaitGroup
+	recoveryPermanentOnce  sync.Once
+	retirementRecoveryWake chan struct{}
 
-	binding           *qurl.AgentRuntimeBinding
-	privateKey        []byte
-	udpOpts           []qurl.AgentRuntimeUDPOption
-	store             nativeStateStore
-	refreshCfg        nativeRefreshConfig
-	operations        nativeSessionOperationController
-	placementFailures map[string]nativePlacementFailureState
-	generation        uint64
-	closed            bool
-	live              map[nativeAdmissionKey]nativeLiveAdmission
-	pending           map[nativeAdmissionKey]bool
-	lifecycle         context.Context
-	cancel            context.CancelFunc
+	binding                     *qurl.AgentRuntimeBinding
+	privateKey                  []byte
+	udpOpts                     []qurl.AgentRuntimeUDPOption
+	store                       nativeStateStore
+	refreshCfg                  nativeRefreshConfig
+	operations                  nativeSessionOperationController
+	placementFailures           map[string]nativePlacementFailureState
+	generation                  uint64
+	closed                      bool
+	live                        map[nativeAdmissionKey]nativeLiveAdmission
+	pending                     map[nativeAdmissionKey]bool
+	retirementRecoveryResources map[string]struct{}
+	lifecycle                   context.Context
+	cancel                      context.CancelFunc
 }
 
 type nativePlacementFailureState struct {
@@ -572,6 +719,66 @@ const (
 	nativeOrphanRecoveryInitialBackoff = 250 * time.Millisecond
 	nativeOrphanRecoveryMaxBackoff     = 30 * time.Second
 )
+
+type nativeRetirementRecoveryAttempt struct {
+	notBefore time.Time
+	backoff   time.Duration
+}
+
+type nativeRetirementRecoverySchedule map[string]nativeRetirementRecoveryAttempt
+
+func (s nativeRetirementRecoverySchedule) queue(resourceID string, now time.Time) {
+	if resourceID == "" {
+		return
+	}
+	if _, exists := s[resourceID]; exists {
+		return
+	}
+	s[resourceID] = nativeRetirementRecoveryAttempt{
+		notBefore: now,
+		backoff:   nativeOrphanRecoveryInitialBackoff,
+	}
+}
+
+func (s nativeRetirementRecoverySchedule) retry(resourceID string, now time.Time) {
+	attempt, exists := s[resourceID]
+	if !exists {
+		attempt.backoff = nativeOrphanRecoveryInitialBackoff
+	}
+	if attempt.backoff <= 0 {
+		attempt.backoff = nativeOrphanRecoveryInitialBackoff
+	}
+	attempt.notBefore = now.Add(attempt.backoff)
+	attempt.backoff = min(attempt.backoff*2, nativeOrphanRecoveryMaxBackoff)
+	s[resourceID] = attempt
+}
+
+func (s nativeRetirementRecoverySchedule) due(now time.Time) []string {
+	resources := make([]string, 0, len(s))
+	for resourceID, attempt := range s {
+		if !attempt.notBefore.After(now) {
+			resources = append(resources, resourceID)
+		}
+	}
+	sort.Strings(resources)
+	return resources
+}
+
+func (s nativeRetirementRecoverySchedule) nextDelay(now time.Time) (time.Duration, bool) {
+	var earliest time.Time
+	for _, attempt := range s {
+		if earliest.IsZero() || attempt.notBefore.Before(earliest) {
+			earliest = attempt.notBefore
+		}
+	}
+	if earliest.IsZero() {
+		return 0, false
+	}
+	if !earliest.After(now) {
+		return 0, true
+	}
+	return earliest.Sub(now), true
+}
 
 type keyedResourceLocks struct {
 	mu    sync.Mutex
@@ -645,10 +852,12 @@ func NewNativeAdmitter(ctx context.Context, runtime *NativeRuntime) (*NativeAdmi
 		binding: runtime.Binding, privateKey: key, store: runtime.store,
 		udpOpts:    append([]qurl.AgentRuntimeUDPOption(nil), runtime.UDPOptions...),
 		refreshCfg: runtime.refreshCfg, operations: operations,
-		live:      make(map[nativeAdmissionKey]nativeLiveAdmission),
-		pending:   make(map[nativeAdmissionKey]bool),
-		lifecycle: lifecycle,
-		cancel:    cancel,
+		live:                        make(map[nativeAdmissionKey]nativeLiveAdmission),
+		pending:                     make(map[nativeAdmissionKey]bool),
+		retirementRecoveryWake:      make(chan struct{}, 1),
+		retirementRecoveryResources: make(map[string]struct{}),
+		lifecycle:                   lifecycle,
+		cancel:                      cancel,
 	}
 	runtime.Binding = nil
 	runtime.store = nil
@@ -659,34 +868,217 @@ func NewNativeAdmitter(ctx context.Context, runtime *NativeRuntime) (*NativeAdmi
 	// Startup cleanup must not take down healthy sibling shares. It is still
 	// fail-closed for each resource: that resource's lock and journal remain in
 	// place until authenticated recovery succeeds.
-	admitter.recoveryWG.Add(1)
-	go admitter.recoverOrphanedSessionOperations()
+	admitter.startRecoveryWorkers()
 	return admitter, nil
+}
+
+func (a *NativeAdmitter) startRecoveryWorkers() {
+	a.recoveryWG.Add(2)
+	go a.recoverOrphanedSessionOperations()
+	go func() {
+		defer a.recoveryWG.Done()
+		a.recoverQueuedNativeRetirements()
+	}()
 }
 
 func (a *NativeAdmitter) recoverOrphanedSessionOperations() {
 	defer a.recoveryWG.Done()
 	backoff := nativeOrphanRecoveryInitialBackoff
+	permanentResources := make(map[string]struct{})
 	for {
-		err := a.recoverAllPending(a.lifecycle)
-		if err == nil || a.lifecycle.Err() != nil {
+		err := a.recoverAllPendingExcludingPermanent(a.lifecycle, permanentResources)
+		if err == nil {
+			break
+		}
+		if a.lifecycle.Err() != nil {
 			return
 		}
 		slog.WarnContext(a.lifecycle, "durable native session cleanup failed; retrying", "err", err)
-		timer := time.NewTimer(backoff)
-		select {
-		case <-a.lifecycle.Done():
-			if !timer.Stop() {
-				<-timer.C
-			}
+		if !waitForNativeRetirementRecovery(a.lifecycle, backoff) {
 			return
-		case <-timer.C:
 		}
 		backoff = min(backoff*2, nativeOrphanRecoveryMaxBackoff)
 	}
 }
 
+func waitForNativeRetirementRecovery(ctx context.Context, delay time.Duration) bool {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
+}
+
+// queueNativeRetirementRecovery coalesces failures by protected resource. The
+// single background worker gives every retry its existing bounded cleanup
+// budget without creating one goroutine for every local share.
+func (a *NativeAdmitter) queueNativeRetirementRecovery(resourceID string) {
+	if a == nil || resourceID == "" || a.lifecycle == nil || a.retirementRecoveryWake == nil ||
+		a.lifecycle.Err() != nil {
+		return
+	}
+	a.stateMu.Lock()
+	if a.retirementRecoveryResources == nil {
+		a.retirementRecoveryResources = make(map[string]struct{})
+	}
+	_, queued := a.retirementRecoveryResources[resourceID]
+	a.retirementRecoveryResources[resourceID] = struct{}{}
+	a.stateMu.Unlock()
+	if queued {
+		return
+	}
+	select {
+	case a.retirementRecoveryWake <- struct{}{}:
+	default:
+	}
+}
+
+func (a *NativeAdmitter) takeNativeRetirementRecoveryResources() []string {
+	a.stateMu.Lock()
+	defer a.stateMu.Unlock()
+	resources := make([]string, 0, len(a.retirementRecoveryResources))
+	for resourceID := range a.retirementRecoveryResources {
+		resources = append(resources, resourceID)
+	}
+	clear(a.retirementRecoveryResources)
+	return resources
+}
+
+func (a *NativeAdmitter) recoverQueuedNativeRetirements() {
+	schedule := make(nativeRetirementRecoverySchedule)
+	for {
+		now := time.Now()
+		for _, resourceID := range a.takeNativeRetirementRecoveryResources() {
+			schedule.queue(resourceID, now)
+		}
+		for _, resourceID := range schedule.due(now) {
+			permanent, err := a.recoverPendingNativeRetirements(a.lifecycle, resourceID)
+			if a.lifecycle.Err() != nil {
+				return
+			}
+			switch {
+			case err == nil:
+				delete(schedule, resourceID)
+			case permanent:
+				delete(schedule, resourceID)
+				slog.ErrorContext(a.lifecycle, "durable native session retirement requires operator attention",
+					"resource_id", resourceID, "err", err)
+			default:
+				schedule.retry(resourceID, time.Now())
+				slog.WarnContext(a.lifecycle, "durable native session retirement failed; retrying",
+					"resource_id", resourceID, "err", err)
+			}
+		}
+		if a.lifecycle.Err() != nil {
+			return
+		}
+		delay, scheduled := schedule.nextDelay(time.Now())
+		if !scheduled {
+			select {
+			case <-a.lifecycle.Done():
+				return
+			case <-a.retirementRecoveryWake:
+			}
+			continue
+		}
+		timer := time.NewTimer(delay)
+		select {
+		case <-a.lifecycle.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			return
+		case <-a.retirementRecoveryWake:
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+		case <-timer.C:
+		}
+	}
+}
+
+func (a *NativeAdmitter) dropNativeRetirementRecovery(resourceID string) {
+	a.stateMu.Lock()
+	delete(a.retirementRecoveryResources, resourceID)
+	a.stateMu.Unlock()
+}
+
+func (a *NativeAdmitter) recoverPendingNativeRetirements(ctx context.Context, resourceID string) (bool, error) {
+	unlockResource := a.resources.lock(resourceID)
+	defer unlockResource()
+	a.runtimeMu.RLock()
+	defer a.runtimeMu.RUnlock()
+	if a.closed || a.binding == nil || len(a.privateKey) != 32 || a.operations == nil {
+		return false, errors.New("recover native retirement: native admitter is closed")
+	}
+	err := a.retirePendingForResource(ctx, resourceID)
+	permanent := isPermanentNativeRetirementError(err)
+	if permanent {
+		// retireOne queues every failure before returning. Remove that stale wake
+		// while the resource lock still excludes a new foreground retirement.
+		a.dropNativeRetirementRecovery(resourceID)
+	}
+	return permanent, err
+}
+
+func isPermanentNativeRetirementError(err error) bool {
+	if err == nil {
+		return false
+	}
+	type multiUnwrapper interface{ Unwrap() []error }
+	if joined, ok := err.(multiUnwrapper); ok {
+		causes := joined.Unwrap()
+		if len(causes) == 0 {
+			return false
+		}
+		for _, cause := range causes {
+			if !isPermanentNativeRetirementError(cause) {
+				return false
+			}
+		}
+		return true
+	}
+	// Match only this layer. errors.As would cross a mixed error tree and could
+	// incorrectly make a permanent sibling hide a retryable sibling.
+	if deny, ok := err.(*qurl.ServerDenyError); ok { //nolint:errorlint
+		// A missing resource cannot become recoverable. Other authenticated
+		// denials can describe temporary server readiness or a future retryable
+		// condition, so persisted recovery must retain them.
+		return deny.ErrCode == "52004"
+	}
+	for _, sentinel := range []error{
+		qurl.ErrInvalidNativeSessionOperation,
+		agentstate.ErrSessionOperationConflict,
+		agentstate.ErrSessionOperationJournalCorrupt,
+	} {
+		// Match only this layer for the same all-causes rule above. A wrapper is
+		// handled one layer at a time below.
+		if err == sentinel { //nolint:errorlint
+			return true
+		}
+	}
+	if cause := errors.Unwrap(err); cause != nil {
+		return isPermanentNativeRetirementError(cause)
+	}
+	return false
+}
+
 func (a *NativeAdmitter) recoverAllPending(ctx context.Context) error {
+	return a.recoverAllPendingExcludingPermanent(ctx, nil)
+}
+
+func (a *NativeAdmitter) recoverAllPendingExcludingPermanent(ctx context.Context,
+	permanentResources map[string]struct{},
+) error {
 	if ctx == nil {
 		return errors.New("recover native session operations: context is nil")
 	}
@@ -711,6 +1103,9 @@ func (a *NativeAdmitter) recoverAllPending(ctx context.Context) error {
 		recoveryErr = fmt.Errorf("enumerate native session operations: %w", scan.RetryableError)
 	}
 	for _, resourceID := range scan.ResourceIDs {
+		if _, permanent := permanentResources[resourceID]; permanent {
+			continue
+		}
 		if err := ctx.Err(); err != nil {
 			return errors.Join(recoveryErr, err)
 		}
@@ -726,6 +1121,14 @@ func (a *NativeAdmitter) recoverAllPending(ctx context.Context) error {
 		)
 		a.runtimeMu.RUnlock()
 		unlockResource()
+		if isPermanentNativeRetirementError(err) {
+			if permanentResources != nil {
+				permanentResources[resourceID] = struct{}{}
+			}
+			slog.ErrorContext(ctx, "durable native session retirement requires operator attention",
+				"resource_id", resourceID, "err", err)
+			continue
+		}
 		if err != nil {
 			recoveryErr = errors.Join(recoveryErr, err)
 		}
@@ -1291,6 +1694,7 @@ func (a *NativeAdmitter) retireOne(ctx context.Context, key nativeAdmissionKey, 
 		return errors.New("native admitter has no durable session-operation authority")
 	}
 	if err := a.operations.Retire(ctx, a.binding, a.privateKey, live.resourceID, live.operationID, live.receipt, a.udpOpts); err != nil {
+		a.queueNativeRetirementRecovery(live.resourceID)
 		return err
 	}
 	a.stateMu.Lock()
@@ -1418,6 +1822,7 @@ func (a *NativeAdmitter) Close() error {
 	a.stateMu.Lock()
 	a.live = nil
 	a.pending = nil
+	a.retirementRecoveryResources = nil
 	a.placementFailures = nil
 	a.stateMu.Unlock()
 	a.runtimeMu.Unlock()

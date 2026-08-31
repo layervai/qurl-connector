@@ -15,7 +15,8 @@ import (
 // UserJob is a credential-free per-user background process. It is used by
 // applications that embed the Connector runtime and need the native user job
 // manager to keep that process alive without installing a second executable or
-// requiring root.
+// requiring root. Linux uses a systemd user unit, macOS uses launchd, and
+// Windows uses Task Scheduler.
 //
 // Environment variables are deliberately not part of this contract. A plist
 // is durable, inspectable state and must never become a bearer-token store.
@@ -41,13 +42,13 @@ type UserJob struct {
 	Arguments   []string
 	StandardOut string
 	StandardErr string
-	// ExitTimeout and Umask are launchd controls. Windows Task Scheduler
-	// terminates the direct child process and relies on protected NTFS ACLs.
+	// ExitTimeout and Umask are systemd and launchd controls. Windows Task
+	// Scheduler terminates the direct child process and relies on protected NTFS ACLs.
 	ExitTimeout int
 	Umask       int
 	RunAtLoad   bool
-	// KeepAlive maps to launchd KeepAlive on macOS and restart-on-failure on
-	// Windows. Task Scheduler does not restart a process after a successful exit.
+	// KeepAlive maps to restart-on-failure on Linux and Windows and KeepAlive on
+	// macOS. No manager restarts a process after a successful exit.
 	KeepAlive bool
 }
 
@@ -61,6 +62,9 @@ type UserJobManager interface {
 	// process is incompatible with that definition.
 	Replace(UserJob) error
 	Remove(label string) error
+	// Status reports persisted and running state. It can repair the mode of an
+	// owner-controlled definition before reading it, and rejects definitions
+	// owned by another principal.
 	Status(label string) (ServiceStatus, error)
 }
 
