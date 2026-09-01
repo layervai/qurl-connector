@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.8.12](https://github.com/layervai/qurl-connector/compare/v0.8.11...v0.8.12) (2026-09-01)
+
+
+### Features
+
+* **agent:** relay registered session operations ([#39](https://github.com/layervai/qurl-connector/issues/39)) ([fe8436d](https://github.com/layervai/qurl-connector/commit/fe8436d6c9a00a5530f5ee2fe10ca75af986e6f2))
+
 ## [0.8.11](https://github.com/layervai/qurl-connector/compare/v0.8.10...v0.8.11) (2026-09-01)
 
 
