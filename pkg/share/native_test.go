@@ -2760,13 +2760,16 @@ func TestNativeRuntimeUDPOptionsCopyTransferAndClear(t *testing.T) {
 	t.Cleanup(func() { takeNativeKey = oldTakeKey })
 	takeNativeKey = func(*qurl.AgentRuntimeBinding) []byte { return make([]byte, 32) }
 
-	source := []qurl.AgentRuntimeUDPOption{testAgentRuntimeUDPOption()}
+	source := []qurl.AgentRuntimeUDPOption{
+		testAgentRuntimeUDPOption(),
+		qurl.WithAgentRuntimeUDPBounds(2*time.Second, 2),
+	}
 	cfg := refreshConfig(NativeRuntimeConfig{
 		StateDir: "/private/state", AgentID: "agent-one", UDPOptions: source,
 		SessionOperations: testNativeSessionAuthority(),
 	}, "auto")
 	source[0] = nil
-	if len(cfg.UDPOptions) != 1 || cfg.UDPOptions[0] == nil {
+	if len(cfg.UDPOptions) != 2 || cfg.UDPOptions[0] == nil || cfg.UDPOptions[1] == nil {
 		t.Fatal("refresh config aliased the caller's UDP option slice")
 	}
 	runtime, err := assembleNativeRuntime(
@@ -2776,14 +2779,14 @@ func TestNativeRuntimeUDPOptionsCopyTransferAndClear(t *testing.T) {
 		t.Fatal(err)
 	}
 	cfg.UDPOptions[0] = nil
-	if len(runtime.UDPOptions) != 1 || runtime.UDPOptions[0] == nil {
+	if len(runtime.UDPOptions) != 2 || runtime.UDPOptions[0] == nil || runtime.UDPOptions[1] == nil {
 		t.Fatal("native runtime aliased the retained UDP option slice")
 	}
 	admitter, err := NewNativeAdmitter(context.Background(), runtime)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(admitter.udpOpts) != 1 || admitter.udpOpts[0] == nil {
+	if len(admitter.udpOpts) != 2 || admitter.udpOpts[0] == nil || admitter.udpOpts[1] == nil {
 		t.Fatal("native admitter did not retain its UDP option")
 	}
 	if len(runtime.UDPOptions) != 0 || len(runtime.refreshCfg.UDPOptions) != 0 {
@@ -2823,20 +2826,23 @@ func TestNativeRuntimeUDPOptionsReachAdmissionAndDurableRecovery(t *testing.T) {
 		takeNativeKey = oldTakeKey
 	})
 	takeNativeKey = func(*qurl.AgentRuntimeBinding) []byte { return make([]byte, 32) }
-	udpOption := testAgentRuntimeUDPOption()
-	operations := &recordingSessionOperations{wantOptions: 1}
+	udpOptions := []qurl.AgentRuntimeUDPOption{
+		testAgentRuntimeUDPOption(),
+		qurl.WithAgentRuntimeUDPBounds(2*time.Second, 2),
+	}
+	operations := &recordingSessionOperations{wantOptions: 2}
 	runtime, err := assembleNativeRuntime(
 		&qurl.Client{}, &qurl.AgentRuntimeBinding{AgentID: "agent-one"}, &memoryNativeStore{},
 		refreshConfig(NativeRuntimeConfig{
-			AgentID: "agent-one", UDPOptions: []qurl.AgentRuntimeUDPOption{udpOption},
+			AgentID: "agent-one", UDPOptions: udpOptions,
 			SessionOperations: testNativeSessionAuthority(),
 		}, "auto"), NativeOpenWarm,
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(runtime.UDPOptions) != 1 || runtime.UDPOptions[0] == nil {
-		t.Fatal("native runtime did not retain the UDP option")
+	if len(runtime.UDPOptions) != 2 || runtime.UDPOptions[0] == nil || runtime.UDPOptions[1] == nil {
+		t.Fatal("native runtime did not retain both UDP options")
 	}
 	admitter := &NativeAdmitter{
 		binding: runtime.Binding, privateKey: make([]byte, 32),
@@ -2847,8 +2853,8 @@ func TestNativeRuntimeUDPOptionsReachAdmissionAndDurableRecovery(t *testing.T) {
 	knockNativeRuntime = func(_ context.Context, _ *qurl.AgentRuntimeBinding, _ []byte, _ string,
 		_ qurl.NativeKnockOptions, options ...qurl.AgentRuntimeUDPOption,
 	) (*qurl.NativeKnockResult, error) {
-		if len(options) != 1 || options[0] == nil {
-			t.Fatalf("admission received %d UDP options, want one", len(options))
+		if len(options) != 2 || options[0] == nil || options[1] == nil {
+			t.Fatalf("admission received %d UDP options, want two", len(options))
 		}
 		return nil, knockErr
 	}
