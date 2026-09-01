@@ -2,16 +2,903 @@ package share
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
+	"reflect"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	frpproxy "github.com/fatedier/frp/client/proxy"
 	v1 "github.com/fatedier/frp/pkg/config/v1"
+	"github.com/fatedier/frp/pkg/msg"
+	"gopkg.in/yaml.v3"
 
 	nhpconfig "github.com/layervai/qurl-connector/pkg/config"
 )
+
+func encryptedFRPCommon() *v1.ClientCommonConfig {
+	enabled := true
+	common := &v1.ClientCommonConfig{}
+	common.Transport.TLS.Enable = &enabled
+	return common
+}
+
+func TestLocalHTTPRouteFormattingRedactsRuntimeRequestHeaders(t *testing.T) {
+	const headerName = "X-QURL-Desktop-Proxy-Token"
+	const headerValue = "runtime-secret-do-not-format"
+	route := LocalHTTPRoute{
+		RouteID: "local-app", LocalIP: "127.0.0.1", LocalPort: 3000,
+		ResourceID: "public-resource", ConnectorRoutingID: "routing-resource",
+		RequestHeaders: map[string]string{headerName: headerValue},
+	}
+	config := FRPFactoryConfig{Common: encryptedFRPCommon(), Route: route}
+	factory := &FRPSessionFactory{cfg: config}
+
+	for _, test := range []struct {
+		name   string
+		format string
+		value  any
+	}{
+		{name: "route default", format: "%v", value: route},
+		{name: "route fields", format: "%+v", value: route},
+		{name: "route Go syntax", format: "%#v", value: route},
+		{name: "config default", format: "%v", value: config},
+		{name: "config fields", format: "%+v", value: config},
+		{name: "config Go syntax", format: "%#v", value: config},
+		{name: "factory default", format: "%v", value: factory},
+		{name: "factory fields", format: "%+v", value: factory},
+		{name: "factory Go syntax", format: "%#v", value: factory},
+		{name: "factory value default", format: "%v", value: *factory},
+		{name: "factory value fields", format: "%+v", value: *factory},
+		{name: "factory value Go syntax", format: "%#v", value: *factory},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			formatted := fmt.Sprintf(test.format, test.value)
+			if !strings.Contains(formatted, "RequestHeaders:[REDACTED]") {
+				t.Fatalf("formatted route omitted the redaction marker: %s", formatted)
+			}
+			for _, secret := range []string{headerName, headerValue} {
+				if strings.Contains(formatted, secret) {
+					t.Fatalf("formatted route disclosed runtime request headers: %s", formatted)
+				}
+			}
+		})
+	}
+}
+
+func TestLocalHTTPRouteSerializationOmitsRuntimeRequestHeaders(t *testing.T) {
+	const headerName = "X-QURL-Desktop-Proxy-Token"
+	const headerValue = "runtime-secret-do-not-marshal"
+	route := LocalHTTPRoute{
+		RouteID: "local-app", LocalIP: "127.0.0.1", LocalPort: 3000,
+		ResourceID: "public-resource", ConnectorRoutingID: "routing-resource",
+		RequestHeaders: map[string]string{headerName: headerValue},
+	}
+
+	for _, valueTest := range []struct {
+		name  string
+		value any
+	}{
+		{name: "route", value: route},
+		{name: "factory config", value: FRPFactoryConfig{Common: encryptedFRPCommon(), Route: route}},
+	} {
+		t.Run(valueTest.name, func(t *testing.T) {
+			for _, codecTest := range []struct {
+				name    string
+				marshal func(any) ([]byte, error)
+			}{
+				{name: "JSON", marshal: json.Marshal},
+				{name: "YAML", marshal: yaml.Marshal},
+			} {
+				t.Run(codecTest.name, func(t *testing.T) {
+					encoded, err := codecTest.marshal(valueTest.value)
+					if err != nil {
+						t.Fatal(err)
+					}
+					for _, forbidden := range []string{"RequestHeaders", "requestheaders", headerName, headerValue} {
+						if strings.Contains(string(encoded), forbidden) {
+							t.Fatalf("serialization disclosed runtime request headers: %s", encoded)
+						}
+					}
+				})
+			}
+		})
+	}
+}
+
+func TestNewFRPSessionFactoryRequiresEncryptedTransportForRuntimeRequestHeaders(t *testing.T) {
+	secretName := "X-QURL-Desktop-Proxy-Token"
+	secretValue := "runtime-secret-value"
+	for _, test := range []struct {
+		name   string
+		common *v1.ClientCommonConfig
+	}{
+		{name: "unset TLS", common: &v1.ClientCommonConfig{}},
+		{name: "explicitly disabled TLS", common: func() *v1.ClientCommonConfig {
+			disabled := false
+			common := &v1.ClientCommonConfig{}
+			common.Transport.TLS.Enable = &disabled
+			return common
+		}()},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := NewFRPSessionFactory(FRPFactoryConfig{
+				Common: test.common,
+				Route: LocalHTTPRoute{
+					RouteID: "local-app", LocalIP: "127.0.0.1", LocalPort: 3000,
+					ResourceID: "public-resource", ConnectorRoutingID: "routing-resource",
+					RequestHeaders: map[string]string{secretName: secretValue},
+				},
+			})
+			if err == nil {
+				t.Fatal("runtime request headers were accepted without encrypted FRP transport")
+			}
+			const wantErr = "build FRP session factory: runtime request headers require encrypted FRP transport"
+			if got := err.Error(); got != wantErr {
+				t.Fatalf("validation error = %q, want fixed error %q", got, wantErr)
+			}
+			for _, secret := range []string{secretName, secretValue} {
+				if strings.Contains(err.Error(), secret) {
+					t.Fatalf("validation error disclosed runtime request-header input: %q", err)
+				}
+			}
+		})
+	}
+}
+
+func TestNewFRPSessionFactoryAcceptsEncryptedTransportForRuntimeRequestHeaders(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		common func() *v1.ClientCommonConfig
+	}{
+		{name: "explicit TLS", common: encryptedFRPCommon},
+		{name: "secure websocket", common: func() *v1.ClientCommonConfig {
+			common := &v1.ClientCommonConfig{}
+			common.Transport.Protocol = "wss"
+			return common
+		}},
+		{name: "QUIC", common: func() *v1.ClientCommonConfig {
+			common := &v1.ClientCommonConfig{}
+			common.Transport.Protocol = "quic"
+			return common
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			factory, err := NewFRPSessionFactory(FRPFactoryConfig{
+				Common: test.common(),
+				Route: LocalHTTPRoute{
+					RouteID: "local-app", LocalIP: "127.0.0.1", LocalPort: 3000,
+					ResourceID: "public-resource", ConnectorRoutingID: "routing-resource",
+					RequestHeaders: map[string]string{"X-QURL-Desktop-Proxy-Token": "runtime-secret"},
+				},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if factory == nil {
+				t.Fatal("encrypted FRP transport did not create a runtime-header factory")
+			}
+		})
+	}
+}
+
+func TestFRPSessionFactoryRejectsLateTransportEncryptionDisablement(t *testing.T) {
+	common := encryptedFRPCommon()
+	factory, err := NewFRPSessionFactory(FRPFactoryConfig{
+		Common: common,
+		Route: LocalHTTPRoute{
+			RouteID: "local-app", LocalIP: "127.0.0.1", LocalPort: 3000,
+			ResourceID: "public-resource", ConnectorRoutingID: "routing-resource",
+			RequestHeaders: map[string]string{"X-QURL-Desktop-Proxy-Token": "runtime-secret"},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	disabled := false
+	common.Transport.TLS.Enable = &disabled
+
+	admission := Admission{
+		KnockResourceID: "q_catalog_key", ResourceID: "public-resource",
+		RunID: "run", RunAttempt: 1, Token: "token", ResourceHost: "frp.example:7000",
+		SessionID: 101, SessionReceipt: testSessionReceipt(101, "run", 1), OpenTime: time.Minute,
+	}
+	_, _, _, err = factory.BuildConfig(admission)
+	if err == nil {
+		t.Fatal("runtime request headers were accepted after FRP transport encryption was disabled")
+	}
+	const wantErr = "render FRP session config: runtime request headers require encrypted FRP transport"
+	if got := err.Error(); got != wantErr {
+		t.Fatalf("validation error = %q, want fixed error %q", got, wantErr)
+	}
+	for _, secret := range []string{"X-QURL-Desktop-Proxy-Token", "runtime-secret"} {
+		if strings.Contains(err.Error(), secret) {
+			t.Fatalf("validation error disclosed runtime request-header input: %q", err)
+		}
+	}
+}
+
+func TestFRPSessionFactoryBuildConfigClonesTransportEncryptionSetting(t *testing.T) {
+	common := encryptedFRPCommon()
+	factory, err := NewFRPSessionFactory(FRPFactoryConfig{
+		Common: common,
+		Route: LocalHTTPRoute{
+			RouteID: "local-app", LocalIP: "127.0.0.1", LocalPort: 3000,
+			ResourceID: "public-resource", ConnectorRoutingID: "routing-resource",
+			RequestHeaders: map[string]string{"X-QURL-Desktop-Proxy-Token": "runtime-secret"},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	admission := Admission{
+		KnockResourceID: "q_catalog_key", ResourceID: "public-resource",
+		RunID: "run", RunAttempt: 1, Token: "token", ResourceHost: "frp.example:7000",
+		SessionID: 101, SessionReceipt: testSessionReceipt(101, "run", 1), OpenTime: time.Minute,
+	}
+	rendered, _, _, err := factory.BuildConfig(admission)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rendered.Transport.TLS.Enable == common.Transport.TLS.Enable {
+		t.Fatal("rendered TLS enablement aliases the caller-owned pointer")
+	}
+
+	*common.Transport.TLS.Enable = false
+	if rendered.Transport.TLS.Enable == nil || !*rendered.Transport.TLS.Enable {
+		t.Fatal("caller mutation disabled transport encryption after config rendering")
+	}
+}
+
+func TestFRPSessionFactoryBuildConfigSetsRuntimeRequestHeaders(t *testing.T) {
+	route := LocalHTTPRoute{
+		RouteID: "local-app", LocalIP: "127.0.0.1", LocalPort: 3000,
+		ResourceID: "public-resource", ConnectorRoutingID: "routing-resource",
+		RequestHeaders: map[string]string{
+			"X-QURL-Share-Token": "runtime-secret",
+			"X-Request-Source":   "desktop",
+		},
+	}
+
+	factory, err := NewFRPSessionFactory(FRPFactoryConfig{
+		Common: encryptedFRPCommon(), Route: route,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	admission := Admission{
+		KnockResourceID: "q_catalog_key", ResourceID: "public-resource",
+		RunID: "run", RunAttempt: 1, Token: "token", ResourceHost: "frp.example:7000",
+		SessionID: 101, SessionReceipt: testSessionReceipt(101, "run", 1), OpenTime: time.Minute,
+	}
+	_, proxies, _, err := factory.BuildConfig(admission)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxy, ok := proxies[0].(*v1.HTTPProxyConfig)
+	if !ok {
+		t.Fatalf("proxy type = %T", proxies[0])
+	}
+	want := map[string]string{
+		"X-QURL-Share-Token": "runtime-secret",
+		"X-Request-Source":   "desktop",
+	}
+	if !reflect.DeepEqual(proxy.RequestHeaders.Set, want) {
+		t.Fatalf("request headers = %#v, want %#v", proxy.RequestHeaders.Set, want)
+	}
+}
+
+func TestFRPSessionFactoryClonesRequestHeadersAtConstruction(t *testing.T) {
+	requestHeaders := map[string]string{"X-QURL-Share-Token": "original-secret"}
+	factory, err := NewFRPSessionFactory(FRPFactoryConfig{
+		Common: encryptedFRPCommon(),
+		Route: LocalHTTPRoute{
+			RouteID: "local-app", LocalIP: "127.0.0.1", LocalPort: 3000,
+			ResourceID: "public-resource", ConnectorRoutingID: "routing-resource",
+			RequestHeaders: requestHeaders,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	requestHeaders["X-QURL-Share-Token"] = "mutated-secret"
+	requestHeaders["X-Added-Later"] = "unexpected"
+
+	admission := Admission{
+		KnockResourceID: "q_catalog_key", ResourceID: "public-resource",
+		RunID: "run", RunAttempt: 1, Token: "token", ResourceHost: "frp.example:7000",
+		SessionID: 101, SessionReceipt: testSessionReceipt(101, "run", 1), OpenTime: time.Minute,
+	}
+	_, proxies, _, err := factory.BuildConfig(admission)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxy, ok := proxies[0].(*v1.HTTPProxyConfig)
+	if !ok {
+		t.Fatalf("proxy type = %T", proxies[0])
+	}
+	want := map[string]string{"X-QURL-Share-Token": "original-secret"}
+	if !reflect.DeepEqual(proxy.RequestHeaders.Set, want) {
+		t.Fatalf("request headers after caller mutation = %#v, want %#v", proxy.RequestHeaders.Set, want)
+	}
+}
+
+func TestFRPSessionFactoryBuildConfigClonesRequestHeadersPerCycle(t *testing.T) {
+	factory, err := NewFRPSessionFactory(FRPFactoryConfig{
+		Common: encryptedFRPCommon(),
+		Route: LocalHTTPRoute{
+			RouteID: "local-app", LocalIP: "127.0.0.1", LocalPort: 3000,
+			ResourceID: "public-resource", ConnectorRoutingID: "routing-resource",
+			RequestHeaders: map[string]string{"X-QURL-Share-Token": "original-secret"},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	build := func(sessionID uint64) *v1.HTTPProxyConfig {
+		t.Helper()
+		admission := Admission{
+			KnockResourceID: "q_catalog_key", ResourceID: "public-resource",
+			RunID: "run", RunAttempt: 1, Token: "token", ResourceHost: "frp.example:7000",
+			SessionID: sessionID, SessionReceipt: testSessionReceipt(sessionID, "run", 1), OpenTime: time.Minute,
+		}
+		_, proxies, _, err := factory.BuildConfig(admission)
+		if err != nil {
+			t.Fatal(err)
+		}
+		proxy, ok := proxies[0].(*v1.HTTPProxyConfig)
+		if !ok {
+			t.Fatalf("proxy type = %T", proxies[0])
+		}
+		return proxy
+	}
+	first := build(101)
+	first.RequestHeaders.Set["X-QURL-Share-Token"] = "mutated-secret"
+	first.RequestHeaders.Set["X-Added-Later"] = "unexpected"
+	second := build(102)
+	want := map[string]string{"X-QURL-Share-Token": "original-secret"}
+	if !reflect.DeepEqual(second.RequestHeaders.Set, want) {
+		t.Fatalf("second-cycle request headers = %#v, want %#v", second.RequestHeaders.Set, want)
+	}
+}
+
+func TestNewFRPSessionFactoryRejectsInvalidRequestHeadersWithoutDisclosingThem(t *testing.T) {
+	tests := []struct {
+		name    string
+		headers map[string]string
+		wantErr string
+		secrets []string
+	}{
+		{
+			name: "invalid name",
+			headers: map[string]string{
+				"X Invalid top-secret-name": "top-secret-value",
+			},
+			wantErr: "build FRP session factory: request header name is invalid",
+			secrets: []string{"top-secret-name", "top-secret-value"},
+		},
+		{
+			name:    "empty name",
+			headers: map[string]string{"": "top-secret-value"},
+			wantErr: "build FRP session factory: request header name is invalid",
+			secrets: []string{"top-secret-value"},
+		},
+		{
+			name: "carriage return and line feed",
+			headers: map[string]string{
+				"X-QURL-Share-Token": "top-secret-value\r\nX-Injected: true",
+			},
+			wantErr: "build FRP session factory: request header value is invalid",
+			secrets: []string{"top-secret-value"},
+		},
+		{
+			name:    "bare line feed",
+			headers: map[string]string{"X-QURL-Share-Token": "top-secret-value\n"},
+			wantErr: "build FRP session factory: request header value is invalid",
+			secrets: []string{"top-secret-value"},
+		},
+		{
+			name:    "delete control byte",
+			headers: map[string]string{"X-QURL-Share-Token": "top-secret-value\x7f"},
+			wantErr: "build FRP session factory: request header value is invalid",
+			secrets: []string{"top-secret-value"},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := NewFRPSessionFactory(FRPFactoryConfig{
+				Common: &v1.ClientCommonConfig{},
+				Route: LocalHTTPRoute{
+					RouteID: "local-app", LocalIP: "127.0.0.1", LocalPort: 3000,
+					ResourceID: "public-resource", ConnectorRoutingID: "routing-resource",
+					RequestHeaders: test.headers,
+				},
+			})
+			if err == nil {
+				t.Fatal("invalid request headers were accepted")
+			}
+			if got := err.Error(); got != test.wantErr {
+				t.Fatalf("validation error = %q, want fixed error %q", got, test.wantErr)
+			}
+			for _, secret := range test.secrets {
+				if strings.Contains(err.Error(), secret) {
+					t.Fatalf("validation error disclosed request-header input: %q", err)
+				}
+			}
+		})
+	}
+}
+
+func TestNewFRPSessionFactoryAcceptsTransportSafeRequestHeaderValues(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		value string
+	}{
+		{name: "horizontal tab", value: "left\tright"},
+		{name: "obs text", value: "caf\u00e9"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			factory, err := NewFRPSessionFactory(FRPFactoryConfig{
+				Common: encryptedFRPCommon(),
+				Route: LocalHTTPRoute{
+					RouteID: "local-app", LocalIP: "127.0.0.1", LocalPort: 3000,
+					ResourceID: "public-resource", ConnectorRoutingID: "routing-resource",
+					RequestHeaders: map[string]string{"X-QURL-Metadata": test.value},
+				},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if factory == nil {
+				t.Fatal("transport-safe request header did not create a factory")
+			}
+		})
+	}
+}
+
+func TestNewFRPSessionFactoryValidatesRequestHeadersDeterministically(t *testing.T) {
+	headers := map[string]string{
+		"A-Bad-Value": "top-secret-value\n",
+		"B Bad Name":  "top-secret-value",
+		"Connection":  "top-secret-value",
+		"X-Duplicate": "top-secret-value",
+		"x-duplicate": "second-secret-value",
+	}
+	const wantErr = "build FRP session factory: request header value is invalid"
+	for i := 0; i < 128; i++ {
+		_, err := NewFRPSessionFactory(FRPFactoryConfig{
+			Common: &v1.ClientCommonConfig{},
+			Route: LocalHTTPRoute{
+				RouteID: "local-app", LocalIP: "127.0.0.1", LocalPort: 3000,
+				ResourceID: "public-resource", ConnectorRoutingID: "routing-resource",
+				RequestHeaders: headers,
+			},
+		})
+		if err == nil {
+			t.Fatal("multiply-invalid request headers were accepted")
+		}
+		if got := err.Error(); got != wantErr {
+			t.Fatalf("validation pass %d returned %q, want deterministic error %q", i, got, wantErr)
+		}
+	}
+}
+
+func TestNewFRPSessionFactoryBoundsRuntimeRequestHeaders(t *testing.T) {
+	const (
+		wantMaxHeaderCount = 16
+		wantMaxHeaderBytes = 1024
+		wantLimitError     = "build FRP session factory: request headers exceed runtime limits"
+	)
+	countHeaders := func(count int) map[string]string {
+		headers := make(map[string]string, count)
+		for i := 0; i < count; i++ {
+			headers["X-Empty-"+string(rune('A'+i))] = ""
+		}
+		return headers
+	}
+	aggregateName := "X-Limit"
+	tests := []struct {
+		name    string
+		headers map[string]string
+		wantErr string
+	}{
+		{
+			name:    "exact header count with empty values",
+			headers: countHeaders(wantMaxHeaderCount),
+		},
+		{
+			name:    "over header count",
+			headers: countHeaders(wantMaxHeaderCount + 1),
+			wantErr: wantLimitError,
+		},
+		{
+			name: "exact aggregate bytes",
+			headers: map[string]string{
+				aggregateName: strings.Repeat("s", wantMaxHeaderBytes-len(aggregateName)),
+			},
+		},
+		{
+			name: "over aggregate bytes",
+			headers: map[string]string{
+				aggregateName: strings.Repeat("s", wantMaxHeaderBytes-len(aggregateName)+1),
+			},
+			wantErr: wantLimitError,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			factory, err := NewFRPSessionFactory(FRPFactoryConfig{
+				Common: encryptedFRPCommon(),
+				Route: LocalHTTPRoute{
+					RouteID: "local-app", LocalIP: "127.0.0.1", LocalPort: 3000,
+					ResourceID: "public-resource", ConnectorRoutingID: "routing-resource",
+					RequestHeaders: test.headers,
+				},
+			})
+			if test.wantErr == "" {
+				if err != nil {
+					t.Fatal(err)
+				}
+				if factory == nil {
+					t.Fatal("request headers at the runtime limit did not create a factory")
+				}
+				return
+			}
+			if err == nil {
+				t.Fatal("request headers over the runtime limit were accepted")
+			}
+			if got := err.Error(); got != test.wantErr {
+				t.Fatalf("limit error = %q, want fixed error %q", got, test.wantErr)
+			}
+			if strings.Contains(err.Error(), aggregateName) || strings.Contains(err.Error(), "ssss") {
+				t.Fatalf("limit error disclosed request-header input: %q", err)
+			}
+		})
+	}
+}
+
+func TestFRPSessionFactoryMaximumRuntimeRequestHeadersFitPinnedControlMessage(t *testing.T) {
+	headers := make(map[string]string, maxRuntimeRequestHeaderCount)
+	aggregateBytes := 0
+	for i := 0; i < maxRuntimeRequestHeaderCount; i++ {
+		name := "X-Wire-" + string(rune('A'+i))
+		headers[name] = ""
+		aggregateBytes += len(name)
+	}
+	headers["X-Wire-A"] = strings.Repeat("&", maxRuntimeRequestHeaderBytes-aggregateBytes)
+	if len(headers) != maxRuntimeRequestHeaderCount {
+		t.Fatalf("header count = %d, want exact limit %d", len(headers), maxRuntimeRequestHeaderCount)
+	}
+	aggregateBytes = 0
+	for name, value := range headers {
+		aggregateBytes += len(name) + len(value)
+	}
+	if aggregateBytes != maxRuntimeRequestHeaderBytes {
+		t.Fatalf("aggregate header bytes = %d, want exact limit %d", aggregateBytes, maxRuntimeRequestHeaderBytes)
+	}
+
+	factory, err := NewFRPSessionFactory(FRPFactoryConfig{
+		Common: encryptedFRPCommon(),
+		Route: LocalHTTPRoute{
+			RouteID: "local-app", LocalIP: "127.0.0.1", LocalPort: 3000,
+			ResourceID: "public-resource", ConnectorRoutingID: "routing-resource",
+			RequestHeaders: headers,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	admission := Admission{
+		KnockResourceID: "q_catalog_key", ResourceID: "public-resource",
+		RunID: "run", RunAttempt: 1, Token: "token", ResourceHost: "frp.example:7000",
+		SessionID: 101, SessionReceipt: testSessionReceipt(101, "run", 1), OpenTime: time.Minute,
+	}
+	_, proxies, _, err := factory.BuildConfig(admission)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxy, ok := proxies[0].(*v1.HTTPProxyConfig)
+	if !ok {
+		t.Fatalf("proxy type = %T", proxies[0])
+	}
+	wireProxy := &msg.NewProxy{}
+	proxy.MarshalToMsg(wireProxy)
+	wireJSON, err := json.Marshal(wireProxy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(wireJSON), `\u0026`) {
+		t.Fatal("maximum-size wire assertion did not exercise JSON string expansion")
+	}
+	const pinnedControlMessageLimit = 10240
+	if len(wireJSON) > pinnedControlMessageLimit {
+		t.Fatalf("NewProxy JSON length = %d, exceeds pinned control-message limit %d", len(wireJSON), pinnedControlMessageLimit)
+	}
+}
+
+func TestNewFRPSessionFactoryRejectsCaseInsensitiveDuplicateRequestHeaderNames(t *testing.T) {
+	secretName := "X-QURL-Share-Token"
+	secretValue := "runtime-secret-value"
+	_, err := NewFRPSessionFactory(FRPFactoryConfig{
+		Common: &v1.ClientCommonConfig{},
+		Route: LocalHTTPRoute{
+			RouteID: "local-app", LocalIP: "127.0.0.1", LocalPort: 3000,
+			ResourceID: "public-resource", ConnectorRoutingID: "routing-resource",
+			RequestHeaders: map[string]string{
+				secretName:           secretValue,
+				"x-qurl-share-token": "second-secret-value",
+			},
+		},
+	})
+	if err == nil {
+		t.Fatal("case-insensitive duplicate request header names were accepted")
+	}
+	const wantErr = "build FRP session factory: request header names are duplicated"
+	if got := err.Error(); got != wantErr {
+		t.Fatalf("validation error = %q, want fixed error %q", got, wantErr)
+	}
+	for _, secret := range []string{secretName, secretValue, "second-secret-value"} {
+		if strings.Contains(err.Error(), secret) {
+			t.Fatalf("validation error disclosed request-header input: %q", err)
+		}
+	}
+}
+
+func TestNewFRPSessionFactoryRejectsSpecialRequestHeaderNames(t *testing.T) {
+	for _, headerName := range []string{
+		"Host",
+		"Content-Length",
+		"Connection",
+		"Proxy-Connection",
+		"Keep-Alive",
+		"Proxy-Authenticate",
+		"Proxy-Authorization",
+		"TE",
+		"Trailer",
+		"Transfer-Encoding",
+		"Upgrade",
+		"Forwarded",
+		"X-Forwarded-For",
+		"X-Forwarded-Host",
+		"X-Forwarded-Proto",
+		"X-Real-IP",
+		"X-Forwarded-Port",
+	} {
+		headerName := headerName
+		t.Run(headerName, func(t *testing.T) {
+			_, err := NewFRPSessionFactory(FRPFactoryConfig{
+				Common: &v1.ClientCommonConfig{},
+				Route: LocalHTTPRoute{
+					RouteID: "local-app", LocalIP: "127.0.0.1", LocalPort: 3000,
+					ResourceID: "public-resource", ConnectorRoutingID: "routing-resource",
+					RequestHeaders: map[string]string{
+						strings.ToLower(headerName): "runtime-secret-value",
+					},
+				},
+			})
+			if err == nil {
+				t.Fatalf("special request header %q was accepted", headerName)
+			}
+			const wantErr = "build FRP session factory: request header name is reserved"
+			if got := err.Error(); got != wantErr {
+				t.Fatalf("validation error = %q, want fixed error %q", got, wantErr)
+			}
+			for _, secret := range []string{headerName, "runtime-secret-value"} {
+				if strings.Contains(err.Error(), secret) {
+					t.Fatalf("validation error disclosed request-header input: %q", err)
+				}
+			}
+		})
+	}
+}
+
+func TestNewFRPSessionFactoryRejectsRuntimeRequestHeadersWhenWebServerEnabled(t *testing.T) {
+	secretName := "X-QURL-Share-Token"
+	secretValue := "runtime-secret-value"
+	common := encryptedFRPCommon()
+	common.WebServer.Port = 7400
+	_, err := NewFRPSessionFactory(FRPFactoryConfig{
+		Common: common,
+		Route: LocalHTTPRoute{
+			RouteID: "local-app", LocalIP: "127.0.0.1", LocalPort: 3000,
+			ResourceID: "public-resource", ConnectorRoutingID: "routing-resource",
+			RequestHeaders: map[string]string{secretName: secretValue},
+		},
+	})
+	if err == nil {
+		t.Fatal("runtime request headers were accepted with the FRP web server enabled")
+	}
+	const wantErr = "build FRP session factory: runtime request headers require FRP web server to be disabled"
+	if got := err.Error(); got != wantErr {
+		t.Fatalf("validation error = %q, want fixed error %q", got, wantErr)
+	}
+	for _, secret := range []string{secretName, secretValue} {
+		if strings.Contains(err.Error(), secret) {
+			t.Fatalf("validation error disclosed runtime request-header input: %q", err)
+		}
+	}
+}
+
+func TestNewFRPSessionFactoryAllowsHeaderlessRouteWhenWebServerEnabled(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		headers map[string]string
+	}{
+		{name: "nil map"},
+		{name: "empty non-nil map", headers: map[string]string{}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			factory, err := NewFRPSessionFactory(FRPFactoryConfig{
+				Common: &v1.ClientCommonConfig{WebServer: v1.WebServerConfig{Port: 7400}},
+				Route: LocalHTTPRoute{
+					RouteID: "local-app", LocalIP: "127.0.0.1", LocalPort: 3000,
+					ResourceID: "public-resource", ConnectorRoutingID: "routing-resource",
+					RequestHeaders: test.headers,
+				},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if factory == nil {
+				t.Fatal("headerless route did not create a factory")
+			}
+		})
+	}
+}
+
+func TestFRPSessionFactoryRejectsLateWebServerEnablementWithRuntimeRequestHeaders(t *testing.T) {
+	common := encryptedFRPCommon()
+	factory, err := NewFRPSessionFactory(FRPFactoryConfig{
+		Common: common,
+		Route: LocalHTTPRoute{
+			RouteID: "local-app", LocalIP: "127.0.0.1", LocalPort: 3000,
+			ResourceID: "public-resource", ConnectorRoutingID: "routing-resource",
+			RequestHeaders: map[string]string{"X-QURL-Share-Token": "runtime-secret"},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	common.WebServer.Port = 7400
+
+	admission := Admission{
+		KnockResourceID: "q_catalog_key", ResourceID: "public-resource",
+		RunID: "run", RunAttempt: 1, Token: "token", ResourceHost: "frp.example:7000",
+		SessionID: 101, SessionReceipt: testSessionReceipt(101, "run", 1), OpenTime: time.Minute,
+	}
+	_, _, _, err = factory.BuildConfig(admission)
+	if err == nil {
+		t.Fatal("runtime request headers were accepted after the FRP web server was enabled")
+	}
+	const wantErr = "render FRP session config: runtime request headers require FRP web server to be disabled"
+	if got := err.Error(); got != wantErr {
+		t.Fatalf("validation error = %q, want fixed error %q", got, wantErr)
+	}
+	for _, secret := range []string{"X-QURL-Share-Token", "runtime-secret"} {
+		if strings.Contains(err.Error(), secret) {
+			t.Fatalf("validation error disclosed runtime request-header input: %q", err)
+		}
+	}
+}
+
+func TestFRPSessionFactoryReadsCurrentCommonForHeaderlessRoute(t *testing.T) {
+	common := &v1.ClientCommonConfig{}
+	factory, err := NewFRPSessionFactory(FRPFactoryConfig{
+		Common: common,
+		Route: LocalHTTPRoute{
+			RouteID: "local-app", LocalIP: "127.0.0.1", LocalPort: 3000,
+			ResourceID: "public-resource", ConnectorRoutingID: "routing-resource",
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	common.WebServer.Port = 7400
+
+	admission := Admission{
+		KnockResourceID: "q_catalog_key", ResourceID: "public-resource",
+		RunID: "run", RunAttempt: 1, Token: "token", ResourceHost: "frp.example:7000",
+		SessionID: 101, SessionReceipt: testSessionReceipt(101, "run", 1), OpenTime: time.Minute,
+	}
+	builtCommon, _, _, err := factory.BuildConfig(admission)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := builtCommon.WebServer.Port; got != 7400 {
+		t.Fatalf("built web server port = %d, want current value 7400", got)
+	}
+}
+
+func TestFRPSessionFactoryBuildConfigKeepsHeaderlessProxyWireContract(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		headers map[string]string
+	}{
+		{name: "nil map"},
+		{name: "empty non-nil map", headers: map[string]string{}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			factory, err := NewFRPSessionFactory(FRPFactoryConfig{
+				Common: &v1.ClientCommonConfig{},
+				Route: LocalHTTPRoute{
+					RouteID: "local-app", LocalIP: "127.0.0.1", LocalPort: 3000,
+					ResourceID: "public-resource", ConnectorRoutingID: "routing-resource",
+					RequestHeaders: test.headers,
+				},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			admission := Admission{
+				KnockResourceID: "q_catalog_key", ResourceID: "public-resource",
+				RunID: "run", RunAttempt: 1, Token: "token", ResourceHost: "frp.example:7000",
+				SessionID: 101, SessionReceipt: testSessionReceipt(101, "run", 1), OpenTime: time.Minute,
+			}
+			_, proxies, _, err := factory.BuildConfig(admission)
+			if err != nil {
+				t.Fatal(err)
+			}
+			proxy, ok := proxies[0].(*v1.HTTPProxyConfig)
+			if !ok {
+				t.Fatalf("proxy type = %T", proxies[0])
+			}
+			wireProxy := &msg.NewProxy{}
+			proxy.MarshalToMsg(wireProxy)
+			got, err := json.Marshal(wireProxy)
+			if err != nil {
+				t.Fatal(err)
+			}
+			const want = `{"proxy_name":"local-app-nhp2t","proxy_type":"http","group":"routing-resource","group_key":"routing-resource","metas":{"resource_id":"public-resource"},"subdomain":"routing-resource"}`
+			if string(got) != want {
+				t.Fatalf("headerless proxy wire bytes = %s, want %s", got, want)
+			}
+		})
+	}
+}
+
+func TestFRPSessionFactoryBuildConfigRendersRuntimeRequestHeadersOnWire(t *testing.T) {
+	factory, err := NewFRPSessionFactory(FRPFactoryConfig{
+		Common: encryptedFRPCommon(),
+		Route: LocalHTTPRoute{
+			RouteID: "local-app", LocalIP: "127.0.0.1", LocalPort: 3000,
+			ResourceID: "public-resource", ConnectorRoutingID: "routing-resource",
+			RequestHeaders: map[string]string{
+				"X-QURL-Share-Token": "runtime-secret",
+				"X-Request-Source":   "desktop",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	admission := Admission{
+		KnockResourceID: "q_catalog_key", ResourceID: "public-resource",
+		RunID: "run", RunAttempt: 1, Token: "token", ResourceHost: "frp.example:7000",
+		SessionID: 101, SessionReceipt: testSessionReceipt(101, "run", 1), OpenTime: time.Minute,
+	}
+	_, proxies, _, err := factory.BuildConfig(admission)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxy, ok := proxies[0].(*v1.HTTPProxyConfig)
+	if !ok {
+		t.Fatalf("proxy type = %T", proxies[0])
+	}
+	wireProxy := &msg.NewProxy{}
+	proxy.MarshalToMsg(wireProxy)
+	got, err := json.Marshal(wireProxy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const want = `{"proxy_name":"local-app-nhp2t","proxy_type":"http","group":"routing-resource","group_key":"routing-resource","metas":{"resource_id":"public-resource"},"subdomain":"routing-resource","headers":{"X-QURL-Share-Token":"runtime-secret","X-Request-Source":"desktop"}}`
+	if string(got) != want {
+		t.Fatalf("headered proxy wire bytes = %s, want %s", got, want)
+	}
+}
 
 func TestFRPSessionFactoryBuildsOverlapSafeResourceCycles(t *testing.T) {
 	common := &v1.ClientCommonConfig{Metadatas: map[string]string{"preserved": "value"}}

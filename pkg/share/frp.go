@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -22,14 +23,44 @@ import (
 
 // LocalHTTPRoute is the exact local and platform identity of one managed HTTP
 // share. Public ResourceID is authorization metadata; ConnectorRoutingID is
-// the stable subdomain/load-balancer identity.
+// the stable subdomain/load-balancer identity. Its formatting methods redact
+// runtime request-header names and values, and JSON/YAML encoding omits them.
 type LocalHTTPRoute struct {
 	RouteID            string
 	LocalIP            string
 	LocalPort          int
 	ResourceID         string
 	ConnectorRoutingID string
+	// RequestHeaders contains runtime-only values for requests to the local
+	// origin. The map is cloned, sent to frps in NewProxy, retained there for the
+	// session, and applied server-side. A non-empty map requires an encrypted FRP
+	// transport and the local FRP web/admin server disabled; the latter gate
+	// bounds only local disclosure. The overlay is limited to 16 entries and
+	// 1,024 aggregate name/value bytes.
+	// Empty values are intentionally allowed for marker-header semantics and
+	// still count as entries.
+	RequestHeaders map[string]string `json:"-" yaml:"-"`
 }
+
+// String keeps runtime request-header names and values out of logs,
+// assertions, and diagnostics.
+func (r LocalHTTPRoute) String() string {
+	return fmt.Sprintf(
+		"share.LocalHTTPRoute{RouteID:%q, LocalIP:%q, LocalPort:%d, ResourceID:%q, ConnectorRoutingID:%q, RequestHeaders:[REDACTED]}",
+		r.RouteID, r.LocalIP, r.LocalPort, r.ResourceID, r.ConnectorRoutingID,
+	)
+}
+
+// GoString applies the same runtime request-header redaction to %#v formatting.
+func (r LocalHTTPRoute) GoString() string { return r.String() }
+
+// The pinned FRP JSON reader caps NewProxy content at 10,240 bytes.
+// encoding/json can expand each raw string byte to six wire bytes, so the
+// aggregate and entry caps leave roughly 4 KiB for the existing envelope.
+const (
+	maxRuntimeRequestHeaderCount = 16
+	maxRuntimeRequestHeaderBytes = 1024
+)
 
 type FRPFactoryConfig struct {
 	Common        *v1.ClientCommonConfig
@@ -43,6 +74,22 @@ type FRPSessionFactory struct {
 	cfg FRPFactoryConfig
 }
 
+// String prevents the factory's private configuration from being expanded by
+// fmt and exposing runtime request headers.
+func (f FRPSessionFactory) String() string {
+	common := "set"
+	if f.cfg.Common == nil {
+		common = "nil"
+	}
+	return fmt.Sprintf(
+		"share.FRPSessionFactory{Common:%s, Route:%s, ClientVersion:%q, ConfigPath:%q, ReadyPoll:%s}",
+		common, f.cfg.Route.String(), f.cfg.ClientVersion, f.cfg.ConfigPath, f.cfg.ReadyPoll,
+	)
+}
+
+// GoString applies the same private-configuration redaction to %#v formatting.
+func (f FRPSessionFactory) GoString() string { return f.String() }
+
 func NewFRPSessionFactory(cfg FRPFactoryConfig) (*FRPSessionFactory, error) {
 	if cfg.Common == nil {
 		return nil, errors.New("build FRP session factory: common config is nil")
@@ -53,6 +100,16 @@ func NewFRPSessionFactory(cfg FRPFactoryConfig) (*FRPSessionFactory, error) {
 	if cfg.Route.LocalIP == "" || cfg.Route.LocalPort < 1 || cfg.Route.LocalPort > 65535 {
 		return nil, errors.New("build FRP session factory: local target is invalid")
 	}
+	cfg.Route.RequestHeaders = cloneRequestHeaders(cfg.Route.RequestHeaders)
+	if err := validateRequestHeaders(cfg.Route.RequestHeaders); err != nil {
+		return nil, err
+	}
+	if len(cfg.Route.RequestHeaders) > 0 && !tlsEnabled(cfg.Common) {
+		return nil, errors.New("build FRP session factory: runtime request headers require encrypted FRP transport")
+	}
+	if len(cfg.Route.RequestHeaders) > 0 && cfg.Common.WebServer.Port > 0 {
+		return nil, errors.New("build FRP session factory: runtime request headers require FRP web server to be disabled")
+	}
 	if cfg.ReadyPoll <= 0 {
 		cfg.ReadyPoll = 100 * time.Millisecond
 	}
@@ -61,12 +118,23 @@ func NewFRPSessionFactory(cfg FRPFactoryConfig) (*FRPSessionFactory, error) {
 
 // BuildConfig renders one overlap-safe cycle. Proxy Name changes with the NHP
 // SessionID, while group, group key, subdomain, public resource metadata, and
-// local target remain stable.
+// local target remain stable. Returned configs are mutable, but Start is the
+// supported execution path; callers must not re-enable FRP web/admin on a
+// returned common config when request headers exist.
 func (f *FRPSessionFactory) BuildConfig(admission Admission) (*v1.ClientCommonConfig, []v1.ProxyConfigurer, []string, error) {
 	if err := validateAdmission(admission, admission.KnockResourceID, f.cfg.Route.ResourceID); err != nil {
 		return nil, nil, nil, err
 	}
 	common := cloneCommon(f.cfg.Common)
+	if len(f.cfg.Route.RequestHeaders) > 0 && !tlsEnabled(common) {
+		return nil, nil, nil, errors.New("render FRP session config: runtime request headers require encrypted FRP transport")
+	}
+	// cloneCommon copies the TLS enablement pointee, and WebServer.Port is
+	// value-typed, so these checks bind to the exact common config returned for
+	// the FRP session.
+	if len(f.cfg.Route.RequestHeaders) > 0 && common.WebServer.Port > 0 {
+		return nil, nil, nil, errors.New("render FRP session config: runtime request headers require FRP web server to be disabled")
+	}
 	host, port, err := parseAdmittedResourceHost(admission.ResourceHost)
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("parse admitted FRP host: %w", err)
@@ -96,6 +164,7 @@ func (f *FRPSessionFactory) BuildConfig(admission Admission) (*v1.ClientCommonCo
 	proxy.LoadBalancer.Group = f.cfg.Route.ConnectorRoutingID
 	proxy.LoadBalancer.GroupKey = f.cfg.Route.ConnectorRoutingID
 	proxy.Metadatas = map[string]string{nhpconfig.MetaResourceID: f.cfg.Route.ResourceID}
+	proxy.RequestHeaders.Set = cloneRequestHeaders(f.cfg.Route.RequestHeaders)
 	return common, []v1.ProxyConfigurer{proxy}, []string{proxyName}, nil
 }
 
@@ -301,6 +370,10 @@ func proxyStartErrorTag(value string) string {
 
 func cloneCommon(in *v1.ClientCommonConfig) *v1.ClientCommonConfig {
 	out := *in
+	if in.Transport.TLS.Enable != nil {
+		enabled := *in.Transport.TLS.Enable
+		out.Transport.TLS.Enable = &enabled
+	}
 	if in.Metadatas != nil {
 		out.Metadatas = make(map[string]string, len(in.Metadatas))
 		for key, value := range in.Metadatas {
@@ -308,6 +381,111 @@ func cloneCommon(in *v1.ClientCommonConfig) *v1.ClientCommonConfig {
 		}
 	}
 	return &out
+}
+
+func cloneRequestHeaders(in map[string]string) map[string]string {
+	if in == nil {
+		return nil
+	}
+	out := make(map[string]string, len(in))
+	for name, value := range in {
+		out[name] = value
+	}
+	return out
+}
+
+func validateRequestHeaders(headers map[string]string) error {
+	if len(headers) > maxRuntimeRequestHeaderCount {
+		return errors.New("build FRP session factory: request headers exceed runtime limits")
+	}
+	names := make([]string, 0, len(headers))
+	for name := range headers {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	aggregateBytes := 0
+	for _, name := range names {
+		if len(name) > maxRuntimeRequestHeaderBytes-aggregateBytes {
+			return errors.New("build FRP session factory: request headers exceed runtime limits")
+		}
+		aggregateBytes += len(name)
+		if len(headers[name]) > maxRuntimeRequestHeaderBytes-aggregateBytes {
+			return errors.New("build FRP session factory: request headers exceed runtime limits")
+		}
+		aggregateBytes += len(headers[name])
+	}
+
+	seen := make(map[string]struct{}, len(headers))
+	for _, name := range names {
+		value := headers[name]
+		if !validHTTPHeaderName(name) {
+			return errors.New("build FRP session factory: request header name is invalid")
+		}
+		canonicalName := strings.ToLower(name)
+		if reservedRequestHeaderName(canonicalName) {
+			return errors.New("build FRP session factory: request header name is reserved")
+		}
+		if _, ok := seen[canonicalName]; ok {
+			return errors.New("build FRP session factory: request header names are duplicated")
+		}
+		seen[canonicalName] = struct{}{}
+		if !validHTTPHeaderValue(value) {
+			return errors.New("build FRP session factory: request header value is invalid")
+		}
+	}
+	return nil
+}
+
+func reservedRequestHeaderName(canonicalName string) bool {
+	switch canonicalName {
+	case "host",
+		"content-length",
+		"connection",
+		"proxy-connection",
+		"keep-alive",
+		"proxy-authenticate",
+		"proxy-authorization",
+		"te",
+		"trailer",
+		"transfer-encoding",
+		"upgrade",
+		"forwarded",
+		"x-forwarded-for",
+		"x-forwarded-host",
+		"x-forwarded-proto",
+		"x-real-ip",
+		"x-forwarded-port":
+		return true
+	default:
+		return false
+	}
+}
+
+func validHTTPHeaderName(value string) bool {
+	if value == "" {
+		return false
+	}
+	for i := 0; i < len(value); i++ {
+		switch c := value[i]; {
+		case c >= '0' && c <= '9', c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z':
+		case strings.ContainsRune("!#$%&'*+-.^_`|~", rune(c)):
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// validHTTPHeaderValue matches Go's HTTP transport rule by rejecting control
+// bytes other than horizontal tab.
+func validHTTPHeaderValue(value string) bool {
+	for i := 0; i < len(value); i++ {
+		c := value[i]
+		if c != '\t' && (c < ' ' || c == 0x7f) {
+			return false
+		}
+	}
+	return true
 }
 
 // parseAdmittedResourceHost accepts only canonical host:port values. A bare
