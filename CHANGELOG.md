@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.8.13](https://github.com/layervai/qurl-connector/compare/v0.8.12...v0.8.13) (2026-09-01)
+
+
+### Bug Fixes
+
+* **service:** settle rapid launchd label reuse ([#41](https://github.com/layervai/qurl-connector/issues/41)) ([9fcd76c](https://github.com/layervai/qurl-connector/commit/9fcd76c5fa59a9bfdfee9563b34a02a9f68f6b16))
+
 ## [0.8.12](https://github.com/layervai/qurl-connector/compare/v0.8.11...v0.8.12) (2026-09-01)
 
 
