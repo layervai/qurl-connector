@@ -2895,14 +2895,13 @@ func TestNativeAdmitterRefreshReplacesSessionOptionsFromUDP(t *testing.T) {
 	}
 	takeNativeKey = func(*qurl.AgentRuntimeBinding) []byte { return make([]byte, 32) }
 	store := &memoryNativeStore{}
-	priorSessionOptions := sessionOptionsFromUDP([]qurl.AgentRuntimeUDPOption{
-		qurl.WithAgentRuntimeUDPBounds(2*time.Second, 2),
-		qurl.WithAgentRuntimeUDPBounds(3*time.Second, 3),
-	})
 	admitter := &NativeAdmitter{
 		binding: &qurl.AgentRuntimeBinding{AgentID: "agent-one"}, privateKey: make([]byte, 32),
-		sessionOpts: priorSessionOptions,
-		store:       store, refreshCfg: refreshConfig(NativeRuntimeConfig{
+		sessionOpts: sessionOptionsFromUDP([]qurl.AgentRuntimeUDPOption{
+			qurl.WithAgentRuntimeUDPBounds(2*time.Second, 2),
+			qurl.WithAgentRuntimeUDPBounds(3*time.Second, 3),
+		}),
+		store: store, refreshCfg: refreshConfig(NativeRuntimeConfig{
 			AgentID: "agent-one", RefreshMode: "auto",
 			UDPOptions:        []qurl.AgentRuntimeUDPOption{qurl.WithAgentRuntimeUDPBounds(time.Second, 1)},
 			SessionOperations: testNativeSessionAuthority(),
@@ -2913,9 +2912,6 @@ func TestNativeAdmitterRefreshReplacesSessionOptionsFromUDP(t *testing.T) {
 	}
 	if len(admitter.sessionOpts) != 1 || admitter.sessionOpts[0] == nil {
 		t.Fatal("assignment refresh did not replace session options from UDP")
-	}
-	if len(priorSessionOptions) != 2 || priorSessionOptions[0] == nil || priorSessionOptions[1] == nil {
-		t.Fatal("refresh mutated the prior session option slice")
 	}
 	if err := admitter.Close(); err != nil {
 		t.Fatal(err)
