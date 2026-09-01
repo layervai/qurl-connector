@@ -19,7 +19,6 @@ import (
 
 	qurl "github.com/layervai/qurl-go/qurl"
 	"github.com/layervai/qurl-go/relayknock/nativeudp"
-	"github.com/layervai/qurl-go/relayknock/sessionrelay"
 
 	"github.com/layervai/qurl-connector/pkg/agentstate"
 )
@@ -184,17 +183,21 @@ func (s *memoryNativeStore) DeleteSessionOperation(_ context.Context, terminal a
 
 type testNativeSessionOperations struct{}
 
-func testAgentRuntimeSessionOption() qurl.AgentRuntimeSessionOption {
-	return qurl.WithAgentRuntimeSessionRelay("https://relay.example", nil)
+func testAgentRuntimeUDPOption() qurl.AgentRuntimeUDPOption {
+	return qurl.WithAgentRuntimeUDPBounds(time.Second, 1)
+}
+
+func testAgentRuntimeUDPOptions() []qurl.AgentRuntimeUDPOption {
+	return []qurl.AgentRuntimeUDPOption{testAgentRuntimeUDPOption()}
 }
 
 var retireOperationForTest = func(_ context.Context, _ *qurl.AgentRuntimeBinding, _ []byte,
-	receipt qurl.NativeSessionReceipt, _ ...qurl.AgentRuntimeSessionOption,
+	receipt qurl.NativeSessionReceipt, _ ...qurl.AgentRuntimeUDPOption,
 ) (*qurl.NativeSessionRetirement, error) {
 	return &qurl.NativeSessionRetirement{SessionReceipt: receipt}, nil
 }
 
-func (testNativeSessionOperations) RecoverPending(context.Context, *qurl.AgentRuntimeBinding, []byte, string, map[string]struct{}, []qurl.AgentRuntimeSessionOption) error {
+func (testNativeSessionOperations) RecoverPending(context.Context, *qurl.AgentRuntimeBinding, []byte, string, map[string]struct{}, []qurl.AgentRuntimeUDPOption) error {
 	return nil
 }
 
@@ -225,14 +228,14 @@ type signalingRetirementOperations struct {
 }
 
 func (o *signalingRetirementOperations) Retire(_ context.Context, _ *qurl.AgentRuntimeBinding, _ []byte,
-	_, _ string, _ qurl.NativeSessionReceipt, _ []qurl.AgentRuntimeSessionOption,
+	_, _ string, _ qurl.NativeSessionReceipt, _ []qurl.AgentRuntimeUDPOption,
 ) error {
 	o.once.Do(func() { close(o.started) })
 	return nil
 }
 
 func (o *blockingQueuedRetirementOperations) Retire(ctx context.Context, _ *qurl.AgentRuntimeBinding, _ []byte,
-	_, _ string, _ qurl.NativeSessionReceipt, _ []qurl.AgentRuntimeSessionOption,
+	_, _ string, _ qurl.NativeSessionReceipt, _ []qurl.AgentRuntimeUDPOption,
 ) error {
 	o.mu.Lock()
 	o.calls++
@@ -287,7 +290,7 @@ func (o *fanoutDispatchFailureOperations) PrepareDispatch(context.Context, *qurl
 }
 
 func (o retirementFailureOperations) Retire(context.Context, *qurl.AgentRuntimeBinding, []byte,
-	string, string, qurl.NativeSessionReceipt, []qurl.AgentRuntimeSessionOption,
+	string, string, qurl.NativeSessionReceipt, []qurl.AgentRuntimeUDPOption,
 ) error {
 	return o.err
 }
@@ -304,17 +307,17 @@ type recordingSessionOperations struct {
 	events      []string
 }
 
-func (o *recordingSessionOperations) record(event string, options []qurl.AgentRuntimeSessionOption) error {
+func (o *recordingSessionOperations) record(event string, options []qurl.AgentRuntimeUDPOption) error {
 	want := o.wantOptions
 	if want == 0 {
 		want = 1
 	}
 	if len(options) != want {
-		return fmt.Errorf("%s received %d registered-session options, want %d", event, len(options), want)
+		return fmt.Errorf("%s received %d UDP options, want %d", event, len(options), want)
 	}
 	for _, option := range options {
 		if option == nil {
-			return fmt.Errorf("%s received a nil registered-session option", event)
+			return fmt.Errorf("%s received a nil UDP option", event)
 		}
 	}
 	o.mu.Lock()
@@ -324,19 +327,19 @@ func (o *recordingSessionOperations) record(event string, options []qurl.AgentRu
 }
 
 func (o *recordingSessionOperations) RecoverPending(_ context.Context, _ *qurl.AgentRuntimeBinding, _ []byte,
-	_ string, _ map[string]struct{}, options []qurl.AgentRuntimeSessionOption,
+	_ string, _ map[string]struct{}, options []qurl.AgentRuntimeUDPOption,
 ) error {
 	return o.record("recover-pending", options)
 }
 
 func (o *recordingSessionOperations) RecoverOperation(_ context.Context, _ *qurl.AgentRuntimeBinding, _ []byte,
-	_, _ string, options []qurl.AgentRuntimeSessionOption,
+	_, _ string, options []qurl.AgentRuntimeUDPOption,
 ) error {
 	return o.record("recover-operation", options)
 }
 
 func (o *recordingSessionOperations) Retire(_ context.Context, _ *qurl.AgentRuntimeBinding, _ []byte,
-	_, _ string, _ qurl.NativeSessionReceipt, options []qurl.AgentRuntimeSessionOption,
+	_, _ string, _ qurl.NativeSessionReceipt, options []qurl.AgentRuntimeUDPOption,
 ) error {
 	return o.record("retire", options)
 }
@@ -348,16 +351,16 @@ func (o *recordingSessionOperations) snapshot() []string {
 }
 
 func (o cleanupFailureOperations) RecoverOperation(context.Context, *qurl.AgentRuntimeBinding, []byte,
-	string, string, []qurl.AgentRuntimeSessionOption,
+	string, string, []qurl.AgentRuntimeUDPOption,
 ) error {
 	return o.err
 }
 
-func (o recoveryFailureOperations) RecoverPending(context.Context, *qurl.AgentRuntimeBinding, []byte, string, map[string]struct{}, []qurl.AgentRuntimeSessionOption) error {
+func (o recoveryFailureOperations) RecoverPending(context.Context, *qurl.AgentRuntimeBinding, []byte, string, map[string]struct{}, []qurl.AgentRuntimeUDPOption) error {
 	return o.err
 }
 
-func (testNativeSessionOperations) RecoverOperation(context.Context, *qurl.AgentRuntimeBinding, []byte, string, string, []qurl.AgentRuntimeSessionOption) error {
+func (testNativeSessionOperations) RecoverOperation(context.Context, *qurl.AgentRuntimeBinding, []byte, string, string, []qurl.AgentRuntimeUDPOption) error {
 	return nil
 }
 
@@ -375,7 +378,7 @@ func (testNativeSessionOperations) RecordMapped(context.Context, string, qurl.Na
 }
 
 func (testNativeSessionOperations) Retire(ctx context.Context, binding *qurl.AgentRuntimeBinding, privateKey []byte,
-	_, _ string, receipt qurl.NativeSessionReceipt, options []qurl.AgentRuntimeSessionOption,
+	_, _ string, receipt qurl.NativeSessionReceipt, options []qurl.AgentRuntimeUDPOption,
 ) error {
 	_, err := retireOperationForTest(ctx, binding, privateKey, receipt, options...)
 	return err
@@ -399,7 +402,7 @@ type blockingRecoveryOperations struct {
 }
 
 func (o *blockingRecoveryOperations) RecoverPending(ctx context.Context, _ *qurl.AgentRuntimeBinding, _ []byte,
-	resourceID string, _ map[string]struct{}, _ []qurl.AgentRuntimeSessionOption,
+	resourceID string, _ map[string]struct{}, _ []qurl.AgentRuntimeUDPOption,
 ) error {
 	if resourceID != o.resource {
 		return nil
@@ -428,15 +431,15 @@ type durableRetirementFenceOperations struct {
 }
 
 func (o *durableRetirementFenceOperations) RecoverPending(ctx context.Context, binding *qurl.AgentRuntimeBinding,
-	privateKey []byte, resourceID string, preserve map[string]struct{}, sessionOptions []qurl.AgentRuntimeSessionOption,
+	privateKey []byte, resourceID string, preserve map[string]struct{}, udpOptions []qurl.AgentRuntimeUDPOption,
 ) error {
-	return o.controller.RecoverPending(ctx, binding, privateKey, resourceID, preserve, sessionOptions)
+	return o.controller.RecoverPending(ctx, binding, privateKey, resourceID, preserve, udpOptions)
 }
 
 func (o *durableRetirementFenceOperations) RecoverOperation(ctx context.Context, binding *qurl.AgentRuntimeBinding,
-	privateKey []byte, resourceID, operationID string, sessionOptions []qurl.AgentRuntimeSessionOption,
+	privateKey []byte, resourceID, operationID string, udpOptions []qurl.AgentRuntimeUDPOption,
 ) error {
-	return o.controller.RecoverOperation(ctx, binding, privateKey, resourceID, operationID, sessionOptions)
+	return o.controller.RecoverOperation(ctx, binding, privateKey, resourceID, operationID, udpOptions)
 }
 
 func (*durableRetirementFenceOperations) PrepareDispatch(_ context.Context, _ *qurl.AgentRuntimeBinding, _ []byte,
@@ -454,13 +457,13 @@ func (*durableRetirementFenceOperations) RecordMapped(context.Context, string, q
 
 func (o *durableRetirementFenceOperations) Retire(ctx context.Context, binding *qurl.AgentRuntimeBinding,
 	privateKey []byte, resourceID, operationID string, receipt qurl.NativeSessionReceipt,
-	sessionOptions []qurl.AgentRuntimeSessionOption,
+	udpOptions []qurl.AgentRuntimeUDPOption,
 ) error {
-	return o.controller.Retire(ctx, binding, privateKey, resourceID, operationID, receipt, sessionOptions)
+	return o.controller.Retire(ctx, binding, privateKey, resourceID, operationID, receipt, udpOptions)
 }
 
 func (o *prepareFenceOperations) RecoverPending(_ context.Context, _ *qurl.AgentRuntimeBinding, _ []byte,
-	resourceID string, _ map[string]struct{}, _ []qurl.AgentRuntimeSessionOption,
+	resourceID string, _ map[string]struct{}, _ []qurl.AgentRuntimeUDPOption,
 ) error {
 	if resourceID == "resource-two" {
 		o.readyOnce.Do(func() { close(o.secondReady) })
@@ -484,7 +487,7 @@ func (o *prepareFenceOperations) PrepareDispatch(_ context.Context, _ *qurl.Agen
 }
 
 func (o *makeBeforeBreakTestOperations) RecoverPending(_ context.Context, _ *qurl.AgentRuntimeBinding, _ []byte,
-	_ string, preserve map[string]struct{}, _ []qurl.AgentRuntimeSessionOption,
+	_ string, preserve map[string]struct{}, _ []qurl.AgentRuntimeUDPOption,
 ) error {
 	copySet := make(map[string]struct{}, len(preserve))
 	for operationID := range preserve {
@@ -495,7 +498,7 @@ func (o *makeBeforeBreakTestOperations) RecoverPending(_ context.Context, _ *qur
 }
 
 func (*makeBeforeBreakTestOperations) RecoverOperation(context.Context, *qurl.AgentRuntimeBinding, []byte,
-	string, string, []qurl.AgentRuntimeSessionOption,
+	string, string, []qurl.AgentRuntimeUDPOption,
 ) error {
 	return nil
 }
@@ -515,7 +518,7 @@ func (*makeBeforeBreakTestOperations) RecordMapped(context.Context, string, qurl
 }
 
 func (*makeBeforeBreakTestOperations) Retire(context.Context, *qurl.AgentRuntimeBinding, []byte,
-	string, string, qurl.NativeSessionReceipt, []qurl.AgentRuntimeSessionOption,
+	string, string, qurl.NativeSessionReceipt, []qurl.AgentRuntimeUDPOption,
 ) error {
 	return nil
 }
@@ -611,7 +614,7 @@ func TestNativeAdmitterClassifiesKnockWithoutCleanupSentinels(t *testing.T) {
 	oldKnock := knockNativeRuntime
 	t.Cleanup(func() { knockNativeRuntime = oldKnock })
 	knockNativeRuntime = func(context.Context, *qurl.AgentRuntimeBinding, []byte, string,
-		qurl.NativeKnockOptions, ...qurl.AgentRuntimeSessionOption,
+		qurl.NativeKnockOptions, ...qurl.AgentRuntimeUDPOption,
 	) (*qurl.NativeKnockResult, error) {
 		return nil, nativeudp.ErrNoReply
 	}
@@ -631,27 +634,27 @@ func TestNativeAdmitterClassifiesKnockWithoutCleanupSentinels(t *testing.T) {
 	}
 }
 
-func TestNativeAdmitterAmbiguousRelayFailureRecoversSameOperationBeforeReturn(t *testing.T) {
+func TestNativeAdmitterAmbiguousUDPFailureRecoversSameOperationBeforeReturn(t *testing.T) {
 	oldKnock := knockNativeRuntime
 	t.Cleanup(func() { knockNativeRuntime = oldKnock })
 	operations := &recordingSessionOperations{}
 	knockNativeRuntime = func(_ context.Context, _ *qurl.AgentRuntimeBinding, _ []byte, _ string,
-		_ qurl.NativeKnockOptions, options ...qurl.AgentRuntimeSessionOption,
+		_ qurl.NativeKnockOptions, options ...qurl.AgentRuntimeUDPOption,
 	) (*qurl.NativeKnockResult, error) {
 		if err := operations.record("knock", options); err != nil {
 			return nil, err
 		}
-		return nil, sessionrelay.ErrTransport
+		return nil, nativeudp.ErrTransport
 	}
 	admitter := &NativeAdmitter{
 		binding: &qurl.AgentRuntimeBinding{AgentID: "agent-one"}, privateKey: make([]byte, 32),
-		sessionOpts: []qurl.AgentRuntimeSessionOption{testAgentRuntimeSessionOption()},
-		operations:  operations, store: &memoryNativeStore{},
+		udpOpts:    testAgentRuntimeUDPOptions(),
+		operations: operations, store: &memoryNativeStore{},
 		pending: make(map[nativeAdmissionKey]bool),
 	}
 	_, err := admitter.Admit(context.Background(), "q_catalog", "resource-one")
-	if !errors.Is(err, sessionrelay.ErrTransport) {
-		t.Fatalf("Admit() = %v, want relay transport failure", err)
+	if !errors.Is(err, nativeudp.ErrTransport) {
+		t.Fatalf("Admit() = %v, want UDP transport failure", err)
 	}
 	if got, want := operations.snapshot(), []string{"recover-pending", "knock", "recover-operation"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("registered-session order = %v, want %v", got, want)
@@ -956,7 +959,7 @@ func TestNativeRuntimeRepairsWarmDeviceAuthorizationOnce(t *testing.T) {
 	}
 	runtime, err := OpenNativeRuntime(context.Background(), NativeRuntimeConfig{
 		StateDir: "/private/state", AgentID: "agent-one", ClientBaseURL: "https://api.example.test",
-		SessionOptions: []qurl.AgentRuntimeSessionOption{testAgentRuntimeSessionOption()},
+		UDPOptions: []qurl.AgentRuntimeUDPOption{testAgentRuntimeUDPOption()},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -977,8 +980,8 @@ func TestNativeRuntimeRepairsWarmDeviceAuthorizationOnce(t *testing.T) {
 		if credential != "lv_test_validatedaccountcredentialabcdefghijklmnopqrstuvwxyz" {
 			t.Fatalf("recovery credential = %q", credential)
 		}
-		if len(options) != 3 {
-			t.Fatalf("recovery options = %d, want Hub, expected agent, and base URL", len(options))
+		if len(options) != 4 {
+			t.Fatalf("recovery options = %d, want Hub, expected agent, base URL, and native UDP", len(options))
 		}
 		return &qurl.Client{}, newBinding, nil
 	}
@@ -995,9 +998,9 @@ func TestNativeRuntimeRepairsWarmDeviceAuthorizationOnce(t *testing.T) {
 	if runtime.OpenKind != NativeOpenRecovery || runtime.Binding != newBinding || runtime.AgentID != "agent-one" {
 		t.Fatalf("repaired runtime = kind %q binding %p agent %q", runtime.OpenKind, runtime.Binding, runtime.AgentID)
 	}
-	if len(runtime.SessionOptions) != 1 || runtime.SessionOptions[0] == nil ||
-		len(runtime.refreshCfg.SessionOptions) != 1 || runtime.refreshCfg.SessionOptions[0] == nil {
-		t.Fatal("device-credential recovery dropped the registered-session option")
+	if len(runtime.UDPOptions) != 1 || runtime.UDPOptions[0] == nil ||
+		len(runtime.refreshCfg.UDPOptions) != 1 || runtime.refreshCfg.UDPOptions[0] == nil {
+		t.Fatal("device-credential recovery dropped the native UDP option")
 	}
 	if providerCalls != 1 || recoveryCalls != 1 || store.handoffCalls != 2 || store.succeeded != 1 {
 		t.Fatalf("repair calls provider/recovery/handoff/succeeded=%d/%d/%d/%d, want 1/1/2/1",
@@ -1696,7 +1699,7 @@ func TestNativeAdmitterRecoversSustainedStaleAssignmentWithoutOperatorInput(t *t
 	takeNativeKey = func(*qurl.AgentRuntimeBinding) []byte { return make([]byte, 32) }
 	refreshes := 0
 	knocks := 0
-	knockNativeRuntime = func(_ context.Context, _ *qurl.AgentRuntimeBinding, _ []byte, _ string, opts qurl.NativeKnockOptions, _ ...qurl.AgentRuntimeSessionOption) (*qurl.NativeKnockResult, error) {
+	knockNativeRuntime = func(_ context.Context, _ *qurl.AgentRuntimeBinding, _ []byte, _ string, opts qurl.NativeKnockOptions, _ ...qurl.AgentRuntimeUDPOption) (*qurl.NativeKnockResult, error) {
 		knocks++
 		if refreshes < 3 {
 			return nil, nativeudp.ErrTransport
@@ -1763,7 +1766,7 @@ func TestNativeAdmitterBindsProtectedResourceIntoKnock(t *testing.T) {
 	t.Cleanup(func() { knockNativeRuntime = oldKnock })
 	want := "protected-resource"
 	knockNativeRuntime = func(_ context.Context, _ *qurl.AgentRuntimeBinding, _ []byte, knockResourceID string,
-		opts qurl.NativeKnockOptions, _ ...qurl.AgentRuntimeSessionOption,
+		opts qurl.NativeKnockOptions, _ ...qurl.AgentRuntimeUDPOption,
 	) (*qurl.NativeKnockResult, error) {
 		if knockResourceID != "q_catalog_key" || opts.ProtectedResourceID != want || opts.Operation == nil ||
 			opts.Operation.ResourceID != knockResourceID || opts.Operation.ProtectedResourceID != want {
@@ -1790,7 +1793,7 @@ func TestNativeAdmitterSlowRecoveryDoesNotBlockSiblingResource(t *testing.T) {
 	var knockMu sync.Mutex
 	nextSession := uint64(90)
 	knockNativeRuntime = func(_ context.Context, _ *qurl.AgentRuntimeBinding, _ []byte, _ string,
-		opts qurl.NativeKnockOptions, _ ...qurl.AgentRuntimeSessionOption,
+		opts qurl.NativeKnockOptions, _ ...qurl.AgentRuntimeUDPOption,
 	) (*qurl.NativeKnockResult, error) {
 		knockMu.Lock()
 		nextSession++
@@ -1854,7 +1857,7 @@ func TestNativeAdmitterPreparedRefreshDoesNotBlockSiblingResource(t *testing.T) 
 	var knockMu sync.Mutex
 	nextSession := uint64(120)
 	knockNativeRuntime = func(_ context.Context, _ *qurl.AgentRuntimeBinding, _ []byte, _ string,
-		opts qurl.NativeKnockOptions, _ ...qurl.AgentRuntimeSessionOption,
+		opts qurl.NativeKnockOptions, _ ...qurl.AgentRuntimeUDPOption,
 	) (*qurl.NativeKnockResult, error) {
 		knockMu.Lock()
 		nextSession++
@@ -1990,7 +1993,7 @@ func TestNativeAdmitterSerializesOnlyPrepareCommitAndKnockAcrossResources(t *tes
 	var resultMu sync.Mutex
 	nextSession := uint64(100)
 	knockNativeRuntime = func(ctx context.Context, _ *qurl.AgentRuntimeBinding, _ []byte, _ string,
-		opts qurl.NativeKnockOptions, _ ...qurl.AgentRuntimeSessionOption,
+		opts qurl.NativeKnockOptions, _ ...qurl.AgentRuntimeUDPOption,
 	) (*qurl.NativeKnockResult, error) {
 		blocked := false
 		once.Do(func() {
@@ -2065,7 +2068,7 @@ func TestNativeAdmitterPreservesServingOperationDuringMakeBeforeBreak(t *testing
 	t.Cleanup(func() { knockNativeRuntime = oldKnock })
 	knocks := 0
 	knockNativeRuntime = func(_ context.Context, _ *qurl.AgentRuntimeBinding, _ []byte, _ string,
-		opts qurl.NativeKnockOptions, _ ...qurl.AgentRuntimeSessionOption,
+		opts qurl.NativeKnockOptions, _ ...qurl.AgentRuntimeUDPOption,
 	) (*qurl.NativeKnockResult, error) {
 		knocks++
 		receipt := testSessionReceipt(uint64(knocks), opts.RunID, opts.RunAttempt)
@@ -2118,11 +2121,6 @@ func TestRefreshableKnockErrorClassification(t *testing.T) {
 		{name: "invalid input", err: qurl.ErrInvalidNativeKnockInput},
 		{name: "malformed reply", err: qurl.ErrMalformedReply},
 		{name: "server overloaded", err: qurl.ErrServerOverloaded},
-		{name: "HTTPS session relay transport", err: sessionrelay.ErrTransport},
-		{name: "HTTPS session relay unauthenticated", err: sessionrelay.ErrServerUnauthenticated},
-		{name: "HTTPS session relay invalid config", err: sessionrelay.ErrInvalidConfig},
-		{name: "HTTPS session relay invalid request", err: sessionrelay.ErrInvalidRequest},
-		{name: "HTTPS relay outranks placement", err: errors.Join(sessionrelay.ErrTransport, qurl.ErrAssignmentUnavailable)},
 		{name: "caller canceled", err: context.Canceled},
 		{name: "caller deadline", err: context.DeadlineExceeded},
 		{name: "bare assignment unavailable", err: qurl.ErrAssignmentUnavailable},
@@ -2180,7 +2178,7 @@ func TestNativeAdmitterIsolatesSustainedFailuresByResource(t *testing.T) {
 		takeNativeKey = oldTakeKey
 	})
 	takeNativeKey = func(*qurl.AgentRuntimeBinding) []byte { return make([]byte, 32) }
-	knockNativeRuntime = func(context.Context, *qurl.AgentRuntimeBinding, []byte, string, qurl.NativeKnockOptions, ...qurl.AgentRuntimeSessionOption) (*qurl.NativeKnockResult, error) {
+	knockNativeRuntime = func(context.Context, *qurl.AgentRuntimeBinding, []byte, string, qurl.NativeKnockOptions, ...qurl.AgentRuntimeUDPOption) (*qurl.NativeKnockResult, error) {
 		return nil, nativeudp.ErrTransport
 	}
 	refreshes := 0
@@ -2394,7 +2392,7 @@ func TestNativeAdmitterDoesNotRearmImmediateRefreshAfterInterleavedFailure(t *te
 	})
 	takeNativeKey = func(*qurl.AgentRuntimeBinding) []byte { return make([]byte, 32) }
 	knocks := 0
-	knockNativeRuntime = func(context.Context, *qurl.AgentRuntimeBinding, []byte, string, qurl.NativeKnockOptions, ...qurl.AgentRuntimeSessionOption) (*qurl.NativeKnockResult, error) {
+	knockNativeRuntime = func(context.Context, *qurl.AgentRuntimeBinding, []byte, string, qurl.NativeKnockOptions, ...qurl.AgentRuntimeUDPOption) (*qurl.NativeKnockResult, error) {
 		knocks++
 		switch knocks {
 		case 1, 2, 4:
@@ -2441,7 +2439,7 @@ func TestNativeAdmitterDoesNotSpendImmediateRefreshAtSustainedThreshold(t *testi
 	})
 	takeNativeKey = func(*qurl.AgentRuntimeBinding) []byte { return make([]byte, 32) }
 	knocks := 0
-	knockNativeRuntime = func(context.Context, *qurl.AgentRuntimeBinding, []byte, string, qurl.NativeKnockOptions, ...qurl.AgentRuntimeSessionOption) (*qurl.NativeKnockResult, error) {
+	knockNativeRuntime = func(context.Context, *qurl.AgentRuntimeBinding, []byte, string, qurl.NativeKnockOptions, ...qurl.AgentRuntimeUDPOption) (*qurl.NativeKnockResult, error) {
 		knocks++
 		if knocks <= 4 {
 			return nil, nativeudp.ErrTransport
@@ -2638,11 +2636,6 @@ func TestNativeAdmitterRefreshesOnlySustainedPlacementFailures(t *testing.T) {
 		{name: "authenticated policy deny", err: &qurl.ServerDenyError{ErrCode: "52001"}},
 		{name: "authenticated future deny", err: &qurl.ServerDenyError{ErrCode: "52999"}},
 		{name: "overload", err: qurl.ErrServerOverloaded},
-		{name: "HTTPS session relay transport", err: sessionrelay.ErrTransport},
-		{name: "HTTPS session relay unauthenticated", err: sessionrelay.ErrServerUnauthenticated},
-		{name: "HTTPS session relay invalid config", err: sessionrelay.ErrInvalidConfig},
-		{name: "HTTPS session relay invalid request", err: sessionrelay.ErrInvalidRequest},
-		{name: "HTTPS relay outranks placement", err: errors.Join(sessionrelay.ErrTransport, qurl.ErrAssignmentUnavailable)},
 		{name: "malformed reply", err: qurl.ErrMalformedReply},
 		{name: "invalid input", err: qurl.ErrInvalidNativeKnockInput},
 		{name: "canceled", err: context.Canceled},
@@ -2656,7 +2649,7 @@ func TestNativeAdmitterRefreshesOnlySustainedPlacementFailures(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			store := &memoryNativeStore{}
-			knockNativeRuntime = func(context.Context, *qurl.AgentRuntimeBinding, []byte, string, qurl.NativeKnockOptions, ...qurl.AgentRuntimeSessionOption) (*qurl.NativeKnockResult, error) {
+			knockNativeRuntime = func(context.Context, *qurl.AgentRuntimeBinding, []byte, string, qurl.NativeKnockOptions, ...qurl.AgentRuntimeUDPOption) (*qurl.NativeKnockResult, error) {
 				return nil, test.err
 			}
 			refreshes := 0
@@ -2693,7 +2686,7 @@ func TestNativeAdmitterDisabledModeDoesNotRefreshAfterLiveFailures(t *testing.T)
 		knockNativeRuntime = oldKnock
 		refreshNativeRuntime = oldRefresh
 	})
-	knockNativeRuntime = func(context.Context, *qurl.AgentRuntimeBinding, []byte, string, qurl.NativeKnockOptions, ...qurl.AgentRuntimeSessionOption) (*qurl.NativeKnockResult, error) {
+	knockNativeRuntime = func(context.Context, *qurl.AgentRuntimeBinding, []byte, string, qurl.NativeKnockOptions, ...qurl.AgentRuntimeUDPOption) (*qurl.NativeKnockResult, error) {
 		return nil, nativeudp.ErrNoReply
 	}
 	refreshes := 0
@@ -2732,7 +2725,7 @@ func TestNativeAdmitterCountsOnlyConsecutivePlacementFailures(t *testing.T) {
 	})
 	takeNativeKey = func(*qurl.AgentRuntimeBinding) []byte { return make([]byte, 32) }
 	knocks := 0
-	knockNativeRuntime = func(context.Context, *qurl.AgentRuntimeBinding, []byte, string, qurl.NativeKnockOptions, ...qurl.AgentRuntimeSessionOption) (*qurl.NativeKnockResult, error) {
+	knockNativeRuntime = func(context.Context, *qurl.AgentRuntimeBinding, []byte, string, qurl.NativeKnockOptions, ...qurl.AgentRuntimeUDPOption) (*qurl.NativeKnockResult, error) {
 		knocks++
 		if knocks == 5 {
 			return nil, &qurl.ServerDenyError{ErrCode: "52001"}
@@ -2762,19 +2755,22 @@ func TestNativeAdmitterCountsOnlyConsecutivePlacementFailures(t *testing.T) {
 	}
 }
 
-func TestNativeRuntimeSessionOptionsCopyTransferAndClear(t *testing.T) {
+func TestNativeRuntimeUDPOptionsCopyTransferAndClear(t *testing.T) {
 	oldTakeKey := takeNativeKey
 	t.Cleanup(func() { takeNativeKey = oldTakeKey })
 	takeNativeKey = func(*qurl.AgentRuntimeBinding) []byte { return make([]byte, 32) }
 
-	source := []qurl.AgentRuntimeSessionOption{testAgentRuntimeSessionOption()}
+	source := []qurl.AgentRuntimeUDPOption{
+		testAgentRuntimeUDPOption(),
+		qurl.WithAgentRuntimeUDPBounds(2*time.Second, 2),
+	}
 	cfg := refreshConfig(NativeRuntimeConfig{
-		StateDir: "/private/state", AgentID: "agent-one", SessionOptions: source,
+		StateDir: "/private/state", AgentID: "agent-one", UDPOptions: source,
 		SessionOperations: testNativeSessionAuthority(),
 	}, "auto")
 	source[0] = nil
-	if len(cfg.SessionOptions) != 1 || cfg.SessionOptions[0] == nil {
-		t.Fatal("refresh config aliased the caller's registered-session option slice")
+	if len(cfg.UDPOptions) != 2 || cfg.UDPOptions[0] == nil || cfg.UDPOptions[1] == nil {
+		t.Fatal("refresh config aliased the caller's UDP option slice")
 	}
 	runtime, err := assembleNativeRuntime(
 		&qurl.Client{}, &qurl.AgentRuntimeBinding{AgentID: "agent-one"}, &memoryNativeStore{}, cfg, NativeOpenWarm,
@@ -2782,47 +2778,47 @@ func TestNativeRuntimeSessionOptionsCopyTransferAndClear(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	cfg.SessionOptions[0] = nil
-	if len(runtime.SessionOptions) != 1 || runtime.SessionOptions[0] == nil {
-		t.Fatal("native runtime aliased the retained registered-session option slice")
+	cfg.UDPOptions[0] = nil
+	if len(runtime.UDPOptions) != 2 || runtime.UDPOptions[0] == nil || runtime.UDPOptions[1] == nil {
+		t.Fatal("native runtime aliased the retained UDP option slice")
 	}
 	admitter, err := NewNativeAdmitter(context.Background(), runtime)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(admitter.sessionOpts) != 1 || admitter.sessionOpts[0] == nil {
-		t.Fatal("native admitter did not receive the registered-session option")
+	if len(admitter.udpOpts) != 2 || admitter.udpOpts[0] == nil || admitter.udpOpts[1] == nil {
+		t.Fatal("native admitter did not retain its UDP option")
 	}
-	if len(runtime.SessionOptions) != 0 || len(runtime.refreshCfg.SessionOptions) != 0 {
-		t.Fatal("consumed runtime retained registered-session options")
+	if len(runtime.UDPOptions) != 0 || len(runtime.refreshCfg.UDPOptions) != 0 {
+		t.Fatal("consumed runtime retained UDP options")
 	}
 	if err := admitter.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if len(admitter.sessionOpts) != 0 {
-		t.Fatal("closed admitter retained registered-session options")
+	if len(admitter.udpOpts) != 0 {
+		t.Fatal("closed admitter retained UDP options")
 	}
 }
 
-func TestNativeRuntimeCloseClearsRetainedSessionOptions(t *testing.T) {
-	option := testAgentRuntimeSessionOption()
+func TestNativeRuntimeCloseClearsRetainedUDPOptions(t *testing.T) {
+	option := testAgentRuntimeUDPOption()
 	runtime := &NativeRuntime{
-		SessionOptions: []qurl.AgentRuntimeSessionOption{option},
+		UDPOptions: []qurl.AgentRuntimeUDPOption{option},
 		refreshCfg: nativeRefreshConfig{
-			StateDir:       "/private/state",
-			SessionOptions: []qurl.AgentRuntimeSessionOption{option},
+			StateDir:   "/private/state",
+			UDPOptions: []qurl.AgentRuntimeUDPOption{option},
 		},
 	}
 	if err := runtime.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if len(runtime.SessionOptions) != 0 || runtime.refreshCfg.StateDir != "" ||
-		len(runtime.refreshCfg.SessionOptions) != 0 {
-		t.Fatal("closed native runtime retained registered-session options")
+	if len(runtime.UDPOptions) != 0 || runtime.refreshCfg.StateDir != "" ||
+		len(runtime.refreshCfg.UDPOptions) != 0 {
+		t.Fatal("closed native runtime retained UDP options")
 	}
 }
 
-func TestNativeRuntimeComposedSessionOptionsReachAdmissionAndDurableRecovery(t *testing.T) {
+func TestNativeRuntimeUDPOptionsReachAdmissionAndDurableRecovery(t *testing.T) {
 	oldKnock := knockNativeRuntime
 	oldTakeKey := takeNativeKey
 	t.Cleanup(func() {
@@ -2830,33 +2826,35 @@ func TestNativeRuntimeComposedSessionOptionsReachAdmissionAndDurableRecovery(t *
 		takeNativeKey = oldTakeKey
 	})
 	takeNativeKey = func(*qurl.AgentRuntimeBinding) []byte { return make([]byte, 32) }
-	udpOption := qurl.WithAgentRuntimeUDPBounds(time.Second, 1)
+	udpOptions := []qurl.AgentRuntimeUDPOption{
+		testAgentRuntimeUDPOption(),
+		qurl.WithAgentRuntimeUDPBounds(2*time.Second, 2),
+	}
 	operations := &recordingSessionOperations{wantOptions: 2}
 	runtime, err := assembleNativeRuntime(
 		&qurl.Client{}, &qurl.AgentRuntimeBinding{AgentID: "agent-one"}, &memoryNativeStore{},
 		refreshConfig(NativeRuntimeConfig{
-			AgentID: "agent-one", UDPOptions: []qurl.AgentRuntimeUDPOption{udpOption},
-			SessionOptions:    []qurl.AgentRuntimeSessionOption{testAgentRuntimeSessionOption()},
+			AgentID: "agent-one", UDPOptions: udpOptions,
 			SessionOperations: testNativeSessionAuthority(),
 		}, "auto"), NativeOpenWarm,
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(runtime.SessionOptions) != 2 || runtime.SessionOptions[0] == nil || runtime.SessionOptions[1] == nil {
-		t.Fatal("composed UDP and relay options did not reach the registered-session option set")
+	if len(runtime.UDPOptions) != 2 || runtime.UDPOptions[0] == nil || runtime.UDPOptions[1] == nil {
+		t.Fatal("native runtime did not retain both UDP options")
 	}
 	admitter := &NativeAdmitter{
 		binding: runtime.Binding, privateKey: make([]byte, 32),
-		sessionOpts: append([]qurl.AgentRuntimeSessionOption(nil), runtime.SessionOptions...),
-		operations:  operations, store: &memoryNativeStore{}, pending: make(map[nativeAdmissionKey]bool),
+		udpOpts:    append([]qurl.AgentRuntimeUDPOption(nil), runtime.UDPOptions...),
+		operations: operations, store: &memoryNativeStore{}, pending: make(map[nativeAdmissionKey]bool),
 	}
 	knockErr := errors.New("stop after option capture")
 	knockNativeRuntime = func(_ context.Context, _ *qurl.AgentRuntimeBinding, _ []byte, _ string,
-		_ qurl.NativeKnockOptions, options ...qurl.AgentRuntimeSessionOption,
+		_ qurl.NativeKnockOptions, options ...qurl.AgentRuntimeUDPOption,
 	) (*qurl.NativeKnockResult, error) {
 		if len(options) != 2 || options[0] == nil || options[1] == nil {
-			t.Fatalf("admission received %d session options, want UDP and relay options", len(options))
+			t.Fatalf("admission received %d UDP options, want two", len(options))
 		}
 		return nil, knockErr
 	}
@@ -2869,22 +2867,16 @@ func TestNativeRuntimeComposedSessionOptionsReachAdmissionAndDurableRecovery(t *
 	}
 }
 
-func TestComposeSessionOptionsKeepsExplicitSessionOptionsLast(t *testing.T) {
-	udpOption := qurl.WithAgentRuntimeUDPBounds(time.Second, 1)
-	sessionOption := testAgentRuntimeSessionOption()
-	got := composeSessionOptions(
-		[]qurl.AgentRuntimeUDPOption{udpOption},
-		[]qurl.AgentRuntimeSessionOption{sessionOption},
-	)
-	if len(got) != 2 {
-		t.Fatalf("composed session option count = %d, want two", len(got))
+func TestNativeRuntimeDoesNotExposeSessionOptions(t *testing.T) {
+	if _, ok := reflect.TypeOf(NativeRuntimeConfig{}).FieldByName("SessionOptions"); ok {
+		t.Fatal("native runtime config exposes a custom registered-session transport")
 	}
-	if reflect.TypeOf(got[0]) != reflect.TypeOf(udpOption) || reflect.TypeOf(got[1]) != reflect.TypeOf(sessionOption) {
-		t.Fatalf("composed session option order = [%T, %T], want UDP then explicit session", got[0], got[1])
+	if _, ok := reflect.TypeOf(NativeRuntime{}).FieldByName("SessionOptions"); ok {
+		t.Fatal("native runtime exposes a custom registered-session transport")
 	}
 }
 
-func TestNativeAdmitterRefreshReplacesRegisteredSessionOptions(t *testing.T) {
+func TestNativeAdmitterRefreshReplacesUDPOptions(t *testing.T) {
 	oldRefresh := refreshNativeRuntime
 	oldTakeKey := takeNativeKey
 	t.Cleanup(func() {
@@ -2898,42 +2890,31 @@ func TestNativeAdmitterRefreshReplacesRegisteredSessionOptions(t *testing.T) {
 	}
 	takeNativeKey = func(*qurl.AgentRuntimeBinding) []byte { return make([]byte, 32) }
 	store := &memoryNativeStore{}
-	priorSessionOptions := []qurl.AgentRuntimeSessionOption{
-		testAgentRuntimeSessionOption(),
-		qurl.WithAgentRuntimeUDPBounds(2*time.Second, 2),
-	}
 	admitter := &NativeAdmitter{
 		binding: &qurl.AgentRuntimeBinding{AgentID: "agent-one"}, privateKey: make([]byte, 32),
-		sessionOpts: priorSessionOptions,
-		store:       store, refreshCfg: refreshConfig(NativeRuntimeConfig{
+		udpOpts: []qurl.AgentRuntimeUDPOption{
+			qurl.WithAgentRuntimeUDPBounds(2*time.Second, 2),
+			qurl.WithAgentRuntimeUDPBounds(3*time.Second, 3),
+		},
+		store: store, refreshCfg: refreshConfig(NativeRuntimeConfig{
 			AgentID: "agent-one", RefreshMode: "auto",
 			UDPOptions:        []qurl.AgentRuntimeUDPOption{qurl.WithAgentRuntimeUDPBounds(time.Second, 1)},
-			SessionOptions:    []qurl.AgentRuntimeSessionOption{testAgentRuntimeSessionOption()},
 			SessionOperations: testNativeSessionAuthority(),
 		}, "auto"),
 	}
 	if err := admitter.refresh(context.Background(), 0, nativeRefreshReasonImmediate); err != nil {
 		t.Fatal(err)
 	}
-	if len(admitter.sessionOpts) != 2 || admitter.sessionOpts[0] == nil || admitter.sessionOpts[1] == nil {
-		t.Fatal("assignment refresh did not replace the composed registered-session options")
-	}
-	if reflect.TypeOf(admitter.sessionOpts[0]) != reflect.TypeOf(qurl.WithAgentRuntimeUDPBounds(time.Second, 1)) ||
-		reflect.TypeOf(admitter.sessionOpts[1]) != reflect.TypeOf(testAgentRuntimeSessionOption()) {
-		t.Fatalf("refreshed session option order = [%T, %T], want UDP then explicit session",
-			admitter.sessionOpts[0], admitter.sessionOpts[1])
-	}
-	if reflect.TypeOf(priorSessionOptions[0]) != reflect.TypeOf(testAgentRuntimeSessionOption()) ||
-		reflect.TypeOf(priorSessionOptions[1]) != reflect.TypeOf(qurl.WithAgentRuntimeUDPBounds(time.Second, 1)) {
-		t.Fatalf("refresh mutated captured session options = [%T, %T]", priorSessionOptions[0], priorSessionOptions[1])
+	if len(admitter.udpOpts) != 1 || admitter.udpOpts[0] == nil {
+		t.Fatal("assignment refresh did not replace UDP options")
 	}
 	if err := admitter.Close(); err != nil {
 		t.Fatal(err)
 	}
 }
 
-func TestNativeAdmitterSessionOptionsReachRestartRecoveryAndRetirement(t *testing.T) {
-	option := testAgentRuntimeSessionOption()
+func TestNativeAdmitterUDPOptionsReachRestartRecoveryAndRetirement(t *testing.T) {
+	options := testAgentRuntimeUDPOptions()
 	operations := &recordingSessionOperations{}
 	receipt := testSessionReceipt(7, "run-one", 1)
 	key := admissionKey(receipt)
@@ -2942,7 +2923,7 @@ func TestNativeAdmitterSessionOptionsReachRestartRecoveryAndRetirement(t *testin
 	}}
 	admitter := &NativeAdmitter{
 		binding: &qurl.AgentRuntimeBinding{AgentID: "agent-one"}, privateKey: make([]byte, 32),
-		sessionOpts: []qurl.AgentRuntimeSessionOption{option}, operations: operations, store: store,
+		udpOpts: options, operations: operations, store: store,
 		live: map[nativeAdmissionKey]nativeLiveAdmission{
 			key: {resourceID: "retire-resource", operationID: "retire-operation", receipt: receipt},
 		},
@@ -2971,7 +2952,7 @@ func TestNativeAdmitterDoesNotRetainEnrollmentCredential(t *testing.T) {
 		retireOperationForTest = oldRetire
 	})
 	takeNativeKey = func(*qurl.AgentRuntimeBinding) []byte { return make([]byte, 32) }
-	retireOperationForTest = func(context.Context, *qurl.AgentRuntimeBinding, []byte, qurl.NativeSessionReceipt, ...qurl.AgentRuntimeSessionOption) (*qurl.NativeSessionRetirement, error) {
+	retireOperationForTest = func(context.Context, *qurl.AgentRuntimeBinding, []byte, qurl.NativeSessionReceipt, ...qurl.AgentRuntimeUDPOption) (*qurl.NativeSessionRetirement, error) {
 		return &qurl.NativeSessionRetirement{}, nil
 	}
 	provider := func(context.Context, qurl.AgentEnrollmentCredentialRequest) (string, error) {
@@ -2999,8 +2980,8 @@ func TestNativeAdmitterDoesNotRetainEnrollmentCredential(t *testing.T) {
 	// fields; this assertion also guards accidental retention via the runtime.
 	if runtime.refreshCfg.StateDir != "" || runtime.refreshCfg.AgentID != "" ||
 		runtime.refreshCfg.ClientBaseURL != "" || runtime.refreshCfg.RefreshMode != "" ||
-		len(runtime.refreshCfg.UDPOptions) != 0 || len(runtime.refreshCfg.SessionOptions) != 0 ||
-		len(runtime.SessionOptions) != 0 || runtime.SessionOperations != (NativeSessionOperationAuthority{}) {
+		len(runtime.refreshCfg.UDPOptions) != 0 || len(runtime.UDPOptions) != 0 ||
+		runtime.SessionOperations != (NativeSessionOperationAuthority{}) {
 		t.Fatalf("transferred runtime retained refresh config = %+v", runtime.refreshCfg)
 	}
 }
@@ -3026,7 +3007,7 @@ func TestNewNativeAdmitterStartsWhileOrphanRecoveryRetriesAndCloseCancels(t *tes
 	started := make(chan struct{})
 	var once sync.Once
 	recoverNativeSessionOperation = func(ctx context.Context, _ *qurl.AgentRuntimeBinding, _ []byte,
-		_ qurl.NativeSessionOperation, _ qurl.NHPUDPEndpoint, _ ...qurl.AgentRuntimeSessionOption,
+		_ qurl.NativeSessionOperation, _ qurl.NHPUDPEndpoint, _ ...qurl.AgentRuntimeUDPOption,
 	) (*qurl.NativeSessionOperationRecovery, error) {
 		once.Do(func() { close(started) })
 		<-ctx.Done()
@@ -3075,7 +3056,7 @@ func TestNewNativeAdmitterCallerCancellationStopsOrphanRecovery(t *testing.T) {
 	stopped := make(chan struct{})
 	var once sync.Once
 	recoverNativeSessionOperation = func(ctx context.Context, _ *qurl.AgentRuntimeBinding, _ []byte,
-		_ qurl.NativeSessionOperation, _ qurl.NHPUDPEndpoint, _ ...qurl.AgentRuntimeSessionOption,
+		_ qurl.NativeSessionOperation, _ qurl.NHPUDPEndpoint, _ ...qurl.AgentRuntimeUDPOption,
 	) (*qurl.NativeSessionOperationRecovery, error) {
 		once.Do(func() { close(started) })
 		<-ctx.Done()
@@ -3127,7 +3108,7 @@ func TestNativeAdmitterCanceledRetireWakesBoundedResourceRecovery(t *testing.T) 
 	calls := 0
 	waitNativeSessionRecovery = func(ctx context.Context, _ time.Duration) error { return ctx.Err() }
 	recoverNativeSessionOperation = func(ctx context.Context, _ *qurl.AgentRuntimeBinding, _ []byte,
-		_ qurl.NativeSessionOperation, _ qurl.NHPUDPEndpoint, _ ...qurl.AgentRuntimeSessionOption,
+		_ qurl.NativeSessionOperation, _ qurl.NHPUDPEndpoint, _ ...qurl.AgentRuntimeUDPOption,
 	) (*qurl.NativeSessionOperationRecovery, error) {
 		callsMu.Lock()
 		calls++
@@ -3433,7 +3414,7 @@ func TestNativeAdmitterRetiresOnlyExactLiveSessions(t *testing.T) {
 	oldRetire := retireOperationForTest
 	t.Cleanup(func() { retireOperationForTest = oldRetire })
 	var retired []uint64
-	retireOperationForTest = func(_ context.Context, binding *qurl.AgentRuntimeBinding, key []byte, receipt qurl.NativeSessionReceipt, _ ...qurl.AgentRuntimeSessionOption) (*qurl.NativeSessionRetirement, error) {
+	retireOperationForTest = func(_ context.Context, binding *qurl.AgentRuntimeBinding, key []byte, receipt qurl.NativeSessionReceipt, _ ...qurl.AgentRuntimeUDPOption) (*qurl.NativeSessionRetirement, error) {
 		retired = append(retired, receipt.SessionID)
 		if binding == nil || len(key) != 32 {
 			t.Fatal("exact retirement lost native runtime identity")
@@ -3481,7 +3462,7 @@ func TestNativeAdmitterCloseAttemptsEveryLiveSessionWithinSharedBudget(t *testin
 	secondReceipt := testSessionReceipt(2, "run-two", 1)
 	secondStarted := make(chan struct{})
 	var secondOnce sync.Once
-	retireOperationForTest = func(ctx context.Context, _ *qurl.AgentRuntimeBinding, _ []byte, receipt qurl.NativeSessionReceipt, _ ...qurl.AgentRuntimeSessionOption) (*qurl.NativeSessionRetirement, error) {
+	retireOperationForTest = func(ctx context.Context, _ *qurl.AgentRuntimeBinding, _ []byte, receipt qurl.NativeSessionReceipt, _ ...qurl.AgentRuntimeUDPOption) (*qurl.NativeSessionRetirement, error) {
 		switch receipt.SessionID {
 		case firstReceipt.SessionID:
 			select {
@@ -3534,7 +3515,7 @@ func TestNativeAdmitterKeepsSameNumericSessionIDsFromDifferentCellsDistinct(t *t
 	})
 
 	knocks := 0
-	knockNativeRuntime = func(_ context.Context, _ *qurl.AgentRuntimeBinding, _ []byte, _ string, opts qurl.NativeKnockOptions, _ ...qurl.AgentRuntimeSessionOption) (*qurl.NativeKnockResult, error) {
+	knockNativeRuntime = func(_ context.Context, _ *qurl.AgentRuntimeBinding, _ []byte, _ string, opts qurl.NativeKnockOptions, _ ...qurl.AgentRuntimeUDPOption) (*qurl.NativeKnockResult, error) {
 		knocks++
 		receipt := testSessionReceipt(77, opts.RunID, opts.RunAttempt)
 		receipt.CellID = fmt.Sprintf("cell%d", knocks)
@@ -3545,7 +3526,7 @@ func TestNativeAdmitterKeepsSameNumericSessionIDsFromDifferentCellsDistinct(t *t
 		}, nil
 	}
 	var retired []qurl.NativeSessionReceipt
-	retireOperationForTest = func(_ context.Context, _ *qurl.AgentRuntimeBinding, _ []byte, receipt qurl.NativeSessionReceipt, _ ...qurl.AgentRuntimeSessionOption) (*qurl.NativeSessionRetirement, error) {
+	retireOperationForTest = func(_ context.Context, _ *qurl.AgentRuntimeBinding, _ []byte, receipt qurl.NativeSessionReceipt, _ ...qurl.AgentRuntimeUDPOption) (*qurl.NativeSessionRetirement, error) {
 		retired = append(retired, receipt)
 		return &qurl.NativeSessionRetirement{SessionReceipt: receipt}, nil
 	}
@@ -3589,7 +3570,7 @@ func TestNativeAdmitterRetiresPostACKAdmissionRejectedByLocalValidation(t *testi
 	})
 
 	malformed := true
-	knockNativeRuntime = func(_ context.Context, _ *qurl.AgentRuntimeBinding, _ []byte, _ string, opts qurl.NativeKnockOptions, _ ...qurl.AgentRuntimeSessionOption) (*qurl.NativeKnockResult, error) {
+	knockNativeRuntime = func(_ context.Context, _ *qurl.AgentRuntimeBinding, _ []byte, _ string, opts qurl.NativeKnockOptions, _ ...qurl.AgentRuntimeUDPOption) (*qurl.NativeKnockResult, error) {
 		receipt := testSessionReceipt(91, opts.RunID, opts.RunAttempt)
 		host := "127.0.0.1:7000"
 		if malformed {
@@ -3602,7 +3583,7 @@ func TestNativeAdmitterRetiresPostACKAdmissionRejectedByLocalValidation(t *testi
 	}
 	retireCalls := 0
 	failRetirement := false
-	retireOperationForTest = func(_ context.Context, _ *qurl.AgentRuntimeBinding, _ []byte, receipt qurl.NativeSessionReceipt, _ ...qurl.AgentRuntimeSessionOption) (*qurl.NativeSessionRetirement, error) {
+	retireOperationForTest = func(_ context.Context, _ *qurl.AgentRuntimeBinding, _ []byte, receipt qurl.NativeSessionReceipt, _ ...qurl.AgentRuntimeUDPOption) (*qurl.NativeSessionRetirement, error) {
 		retireCalls++
 		if failRetirement {
 			return nil, nativeudp.ErrNoReply
@@ -3664,7 +3645,7 @@ func TestNativeAdmitterRetriesFailedRetirementBeforeSameResourceReplacement(t *t
 
 	retireCalls := 0
 	var retireMu sync.Mutex
-	retireOperationForTest = func(_ context.Context, _ *qurl.AgentRuntimeBinding, _ []byte, receipt qurl.NativeSessionReceipt, _ ...qurl.AgentRuntimeSessionOption) (*qurl.NativeSessionRetirement, error) {
+	retireOperationForTest = func(_ context.Context, _ *qurl.AgentRuntimeBinding, _ []byte, receipt qurl.NativeSessionReceipt, _ ...qurl.AgentRuntimeUDPOption) (*qurl.NativeSessionRetirement, error) {
 		retireMu.Lock()
 		retireCalls++
 		call := retireCalls
@@ -3675,7 +3656,7 @@ func TestNativeAdmitterRetriesFailedRetirementBeforeSameResourceReplacement(t *t
 		return &qurl.NativeSessionRetirement{SessionReceipt: receipt}, nil
 	}
 	nextSession := uint64(10)
-	knockNativeRuntime = func(_ context.Context, _ *qurl.AgentRuntimeBinding, _ []byte, _ string, opts qurl.NativeKnockOptions, _ ...qurl.AgentRuntimeSessionOption) (*qurl.NativeKnockResult, error) {
+	knockNativeRuntime = func(_ context.Context, _ *qurl.AgentRuntimeBinding, _ []byte, _ string, opts qurl.NativeKnockOptions, _ ...qurl.AgentRuntimeUDPOption) (*qurl.NativeKnockResult, error) {
 		if opts.RunAttempt != 1 {
 			t.Fatalf("RunAttempt = %d, want 1", opts.RunAttempt)
 		}
@@ -3746,7 +3727,7 @@ func TestNativeAdmitterFencesServingReplacementUntilDurableRetirementTerminal(t 
 	waits := 0
 	oldAuthorityLive := true
 	recoverNativeSessionOperation = func(_ context.Context, _ *qurl.AgentRuntimeBinding, _ []byte,
-		operation qurl.NativeSessionOperation, _ qurl.NHPUDPEndpoint, _ ...qurl.AgentRuntimeSessionOption,
+		operation qurl.NativeSessionOperation, _ qurl.NHPUDPEndpoint, _ ...qurl.AgentRuntimeUDPOption,
 	) (*qurl.NativeSessionOperationRecovery, error) {
 		if operation.OperationID != mapped.Operation.OperationID {
 			err := fmt.Errorf("recovered operation = %q, want original %q", operation.OperationID, mapped.Operation.OperationID)
@@ -3773,7 +3754,7 @@ func TestNativeAdmitterFencesServingReplacementUntilDurableRetirementTerminal(t 
 		return nil
 	}
 	knockNativeRuntime = func(_ context.Context, _ *qurl.AgentRuntimeBinding, _ []byte, _ string,
-		opts qurl.NativeKnockOptions, _ ...qurl.AgentRuntimeSessionOption,
+		opts qurl.NativeKnockOptions, _ ...qurl.AgentRuntimeUDPOption,
 	) (*qurl.NativeKnockResult, error) {
 		if oldAuthorityLive {
 			err := errors.New("replacement admission overlapped nonterminal durable retirement")
