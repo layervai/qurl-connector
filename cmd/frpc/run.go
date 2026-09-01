@@ -1069,6 +1069,16 @@ func startSharedService(ctx context.Context, common *v1.ClientCommonConfig, cfgP
 	runner, err := share.NewResourceRunner(share.ResourceConfig{
 		KnockResourceID: knockResourceID, ResourceID: resourceID,
 		Admitter: admitter, Sessions: factory,
+		// Without this, ResourceRunner.reportRetry is a no-op: startReadyCycle's
+		// error reaches waitToRetry, which drops it when OnRetry is nil. The
+		// Connector then retries forever emitting nothing, so a Connector that
+		// cannot open a session is indistinguishable from an idle healthy one.
+		OnRetry: func(err error, wait time.Duration) {
+			if err != nil {
+				slog.ErrorContext(ctx, "connector: session attempt failed",
+					"err", err.Error(), "retry_in", wait.String())
+			}
+		},
 		OnServing: func(share.Admission) {
 			if err := admitter.MarkServingHealthy(); err != nil {
 				slog.WarnContext(ctx, "connector: failed to clear assignment-refresh state after serving", "err", err.Error())
