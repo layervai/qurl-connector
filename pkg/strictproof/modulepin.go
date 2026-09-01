@@ -18,9 +18,9 @@ import (
 const (
 	QurlGoModulePath        = "github.com/layervai/qurl-go"
 	QurlGoRepoURL           = "https://github.com/layervai/qurl-go"
-	QurlGoSelectedCommitSHA = "2bdc10955584075aece50a973b0f4d115f8cba5b"
-	QurlGoSelectedVersion   = "v0.8.3"
-	QurlGoSelectedSum       = "h1:dhhYL6SFoboNLUXvNJDj9PQSQDt44i52DJcMnCwtTy8="
+	QurlGoSelectedCommitSHA = "3ab77b919bd0d640c3f0b4b352a8cc40ad84197a"
+	QurlGoSelectedVersion   = "v0.10.0"
+	QurlGoSelectedSum       = "h1:00AsD6H2B0gkeKvULAa4E9kbr7MqH8IelMrTjvSVmUY="
 	QurlGoSelectedGoModSum  = "h1:zujbZnolKJzJEDyKwgUqulhHSi0sZeU2w1x+nle/yeM="
 )
 
