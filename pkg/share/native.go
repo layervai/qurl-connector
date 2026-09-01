@@ -14,7 +14,6 @@ import (
 
 	qurl "github.com/layervai/qurl-go/qurl"
 	"github.com/layervai/qurl-go/relayknock/nativeudp"
-	"github.com/layervai/qurl-go/relayknock/sessionrelay"
 
 	"github.com/layervai/qurl-connector/pkg/agentstate"
 )
@@ -36,14 +35,7 @@ type NativeRuntimeConfig struct {
 	RecoveryCredentialProvider func(context.Context) (string, error)
 	RefreshMode                string
 	UDPOptions                 []qurl.AgentRuntimeUDPOption
-	// SessionOptions configure registered-session admission and durable
-	// operation recovery/close. They are never passed to Hub assignment,
-	// enrollment, registration, or Connector-resource lifecycle exchanges.
-	// They are retained for assignment refresh and therefore must not close
-	// over enrollment credentials or account bearer tokens. A custom relay
-	// http.Client, including its Transport and Jar, must also be credential-free.
-	SessionOptions    []qurl.AgentRuntimeSessionOption
-	SessionOperations NativeSessionOperationAuthority
+	SessionOperations          NativeSessionOperationAuthority
 }
 
 // nativeRefreshConfig is the credential-free subset retained after opening
@@ -56,7 +48,6 @@ type nativeRefreshConfig struct {
 	ClientBaseURL     string
 	RefreshMode       string
 	UDPOptions        []qurl.AgentRuntimeUDPOption
-	SessionOptions    []qurl.AgentRuntimeSessionOption
 	SessionOperations NativeSessionOperationAuthority
 }
 
@@ -68,13 +59,9 @@ type NativeRuntime struct {
 	Binding *qurl.AgentRuntimeBinding
 	AgentID string
 	Hub     qurl.HubBootstrap
-	// UDPOptions are the original lifecycle/discovery subset for direct qurl-go
-	// UDP calls. They are already included once in SessionOptions.
-	UDPOptions []qurl.AgentRuntimeUDPOption
-	// SessionOptions contain UDPOptions followed by the explicit registered-
-	// session options. Pass them only to admission and durable recovery/close;
-	// do not append UDPOptions again.
-	SessionOptions    []qurl.AgentRuntimeSessionOption
+	// UDPOptions configure direct qurl-go UDP calls, including registered-session
+	// admission and durable recovery/close.
+	UDPOptions        []qurl.AgentRuntimeUDPOption
 	OpenKind          NativeOpenKind
 	SessionOperations NativeSessionOperationAuthority
 
@@ -358,20 +345,16 @@ func refreshConfig(cfg NativeRuntimeConfig, mode string) nativeRefreshConfig {
 		StateDir: cfg.StateDir, AgentID: strings.TrimSpace(cfg.AgentID), Hub: cfg.Hub,
 		ClientBaseURL: cfg.ClientBaseURL, RefreshMode: mode,
 		UDPOptions:        append([]qurl.AgentRuntimeUDPOption(nil), cfg.UDPOptions...),
-		SessionOptions:    append([]qurl.AgentRuntimeSessionOption(nil), cfg.SessionOptions...),
 		SessionOperations: cfg.SessionOperations,
 	}
 }
 
-func composeSessionOptions(udpOptions []qurl.AgentRuntimeUDPOption, sessionOptions []qurl.AgentRuntimeSessionOption) []qurl.AgentRuntimeSessionOption {
-	composed := make([]qurl.AgentRuntimeSessionOption, 0, len(udpOptions)+len(sessionOptions))
+func sessionOptionsFromUDP(udpOptions []qurl.AgentRuntimeUDPOption) []qurl.AgentRuntimeSessionOption {
+	options := make([]qurl.AgentRuntimeSessionOption, 0, len(udpOptions))
 	for _, option := range udpOptions {
-		composed = append(composed, option)
+		options = append(options, option)
 	}
-	// qurl-go applies options in order. Keep explicit session options last so
-	// they win when they repeat a UDP knob; a relay option then selects HTTPS
-	// while the retained UDP defaults remain available for non-session calls.
-	return append(composed, sessionOptions...)
+	return options
 }
 
 func refreshUntilOpen(ctx context.Context, cfg nativeRefreshConfig, store nativeStateStore, marker agentstate.RefreshMarker, mode string) (*NativeRuntime, error) {
@@ -545,12 +528,10 @@ func assembleNativeRuntime(client *qurl.Client, binding *qurl.AgentRuntimeBindin
 	}
 	retained := cfg
 	retained.UDPOptions = append([]qurl.AgentRuntimeUDPOption(nil), cfg.UDPOptions...)
-	retained.SessionOptions = append([]qurl.AgentRuntimeSessionOption(nil), cfg.SessionOptions...)
 	return &NativeRuntime{
 		Client: client, Binding: binding, AgentID: binding.AgentID, Hub: cfg.Hub, OpenKind: kind,
 		store: store, UDPOptions: append([]qurl.AgentRuntimeUDPOption(nil), cfg.UDPOptions...),
-		SessionOptions: composeSessionOptions(cfg.UDPOptions, cfg.SessionOptions),
-		refreshCfg:     retained, SessionOperations: cfg.SessionOperations,
+		refreshCfg: retained, SessionOperations: cfg.SessionOperations,
 	}, nil
 }
 
@@ -670,7 +651,6 @@ func (r *NativeRuntime) RecoverCredentialAfterDeviceAuthorizationFailure(
 	r.AgentID = replacement.AgentID
 	r.Hub = replacement.Hub
 	r.UDPOptions = replacement.UDPOptions
-	r.SessionOptions = replacement.SessionOptions
 	r.OpenKind = replacement.OpenKind
 	r.SessionOperations = replacement.SessionOperations
 	r.refreshCfg = replacement.refreshCfg
@@ -698,7 +678,6 @@ func (r *NativeRuntime) Close() error {
 	}
 	r.Client = nil
 	r.UDPOptions = nil
-	r.SessionOptions = nil
 	r.refreshCfg = nativeRefreshConfig{}
 	r.SessionOperations = NativeSessionOperationAuthority{}
 	return err
@@ -883,7 +862,7 @@ func NewNativeAdmitter(ctx context.Context, runtime *NativeRuntime) (*NativeAdmi
 	lifecycle, cancel := context.WithCancel(ctx)
 	admitter := &NativeAdmitter{
 		binding: runtime.Binding, privateKey: key, store: runtime.store,
-		sessionOpts: append([]qurl.AgentRuntimeSessionOption(nil), runtime.SessionOptions...),
+		sessionOpts: sessionOptionsFromUDP(runtime.UDPOptions),
 		refreshCfg:  runtime.refreshCfg, operations: operations,
 		live:                        make(map[nativeAdmissionKey]nativeLiveAdmission),
 		pending:                     make(map[nativeAdmissionKey]bool),
@@ -896,7 +875,6 @@ func NewNativeAdmitter(ctx context.Context, runtime *NativeRuntime) (*NativeAdmi
 	runtime.store = nil
 	runtime.Client = nil
 	runtime.UDPOptions = nil
-	runtime.SessionOptions = nil
 	runtime.refreshCfg = nativeRefreshConfig{}
 	runtime.SessionOperations = NativeSessionOperationAuthority{}
 	// Startup cleanup must not take down healthy sibling shares. It is still
@@ -1379,24 +1357,9 @@ func refreshableKnockError(err error) bool {
 		// Reassigning cannot repair resource, policy, or access-control failures.
 		return false
 	}
-	if errors.Is(err, sessionrelay.ErrInvalidConfig) ||
-		errors.Is(err, sessionrelay.ErrInvalidRequest) ||
-		errors.Is(err, sessionrelay.ErrTransport) ||
-		errors.Is(err, sessionrelay.ErrServerUnauthenticated) {
-		// A relay failure can mean either that the caller-configured relay is
-		// unavailable or that its assignment-derived cell fingerprint no longer
-		// routes. It remains non-refreshable because the HTTPS knock may already
-		// have crossed the relay. Switching assignment or cell before the durable,
-		// source-fenced operation is terminal could create authority in two cells.
-		// Even after cleanup completes, this opaque relay result is not trusted as
-		// a placement signal. The no-cross-cell behavior is deliberately asymmetric
-		// with native UDP and requires an independent assignment lifecycle event.
-		return false
-	}
 	// These sentinels are produced when the binding's live placement can no
 	// longer admit a session. They deliberately take precedence over the
-	// invalid-input/deadline errors a bounded renewal may also wrap. The relay
-	// sentinels above deliberately take precedence over this placement set.
+	// invalid-input/deadline errors a bounded renewal may also wrap.
 	if immediatePlacementRefresh(err) {
 		return true
 	}
@@ -1450,7 +1413,7 @@ func (a *NativeAdmitter) refresh(ctx context.Context, failedGeneration uint64, r
 	oldKey := a.privateKey
 	a.binding = runtime.Binding
 	a.privateKey = key
-	a.sessionOpts = append([]qurl.AgentRuntimeSessionOption(nil), runtime.SessionOptions...)
+	a.sessionOpts = sessionOptionsFromUDP(runtime.UDPOptions)
 	runtime.Binding = nil
 	runtime.store = nil
 	a.generation++

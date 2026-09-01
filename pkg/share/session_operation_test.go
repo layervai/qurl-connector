@@ -176,7 +176,7 @@ func TestDurableNativeSessionOperationPersistsEveryNetworkBoundary(t *testing.T)
 		return &qurl.NativeSessionOperationRecovery{Complete: true}, nil
 	}
 	if err := controller.Retire(context.Background(), binding, make([]byte, 32), protected, operation.OperationID,
-		receipt, []qurl.AgentRuntimeSessionOption{testAgentRuntimeSessionOption()}); err != nil {
+		receipt, testAgentRuntimeSessionOptions()); err != nil {
 		t.Fatal(err)
 	}
 	if recoverCalls != 1 {
@@ -244,7 +244,7 @@ func TestDurableNativeSessionOperationSurvivesSDKStoreRestart(t *testing.T) {
 	}
 	if err := recovery.RecoverPending(context.Background(), &qurl.AgentRuntimeBinding{AgentID: "agent-one"},
 		make([]byte, 32), testProtectedResourceID, nil,
-		[]qurl.AgentRuntimeSessionOption{testAgentRuntimeSessionOption()}); err != nil {
+		testAgentRuntimeSessionOptions()); err != nil {
 		t.Fatal(err)
 	}
 	if records, err := reopened.LoadSessionOperations(context.Background(), testProtectedResourceID); err != nil || len(records) != 0 {
