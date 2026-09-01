@@ -42,6 +42,10 @@ const (
 
 var (
 	ErrSessionOperationConflict = errors.New("native session operation state conflict")
+	// ErrSessionOperationCASLost means another writer changed or removed the
+	// exact durable record before this writer committed. It remains a state
+	// conflict for callers that do not need to distinguish safe CAS recovery.
+	ErrSessionOperationCASLost = fmt.Errorf("%w: compare-and-swap lost", ErrSessionOperationConflict)
 	// ErrSessionOperationJournalCorrupt means durable ambiguity cannot be
 	// resolved safely. Callers must not delete the journal or open a replacement
 	// session because the prior admission may still be live.
@@ -243,7 +247,7 @@ func (s *SDKStore) TransitionSessionOperation(ctx context.Context, previous, nex
 		}
 		index := findSessionOperationRecord(journal.Records, previous)
 		if !present || journal.ProtectedResourceID != previous.Operation.ProtectedResourceID || index < 0 {
-			return fmt.Errorf("%w: prior record changed", ErrSessionOperationConflict)
+			return fmt.Errorf("%w: prior record changed", ErrSessionOperationCASLost)
 		}
 		journal.Records[index] = next
 		return writeSessionOperationJournal(namespace, name, journal)
@@ -253,8 +257,9 @@ func (s *SDKStore) TransitionSessionOperation(ctx context.Context, previous, nex
 // DeleteSessionOperation removes one exact terminal record. Keeping the
 // compare-and-swap guard prevents cleanup from deleting a replacement.
 func (s *SDKStore) DeleteSessionOperation(ctx context.Context, terminal SessionOperationRecord) error {
-	if terminal.Status != SessionOperationCanceled && terminal.Status != SessionOperationClosed {
-		return fmt.Errorf("%w: record is not terminal", ErrSessionOperationConflict)
+	if (terminal.Status != SessionOperationCanceled && terminal.Status != SessionOperationClosed) ||
+		!validSessionOperationRecord(terminal) {
+		return fmt.Errorf("%w: record is not a valid terminal", ErrSessionOperationConflict)
 	}
 	return s.withSessionOperationLock(ctx, terminal.Operation.ProtectedResourceID, func(namespace *pinnedfs.Directory, name string) error {
 		journal, present, err := loadSessionOperationJournal(namespace, name)
@@ -263,7 +268,7 @@ func (s *SDKStore) DeleteSessionOperation(ctx context.Context, terminal SessionO
 		}
 		index := findSessionOperationRecord(journal.Records, terminal)
 		if !present || journal.ProtectedResourceID != terminal.Operation.ProtectedResourceID || index < 0 {
-			return fmt.Errorf("%w: terminal record changed", ErrSessionOperationConflict)
+			return fmt.Errorf("%w: terminal record changed", ErrSessionOperationCASLost)
 		}
 		journal.Records = append(journal.Records[:index], journal.Records[index+1:]...)
 		if len(journal.Records) > 0 {

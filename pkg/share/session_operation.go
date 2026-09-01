@@ -165,19 +165,53 @@ func (d *durableNativeSessionOperations) RecoverOperation(ctx context.Context, b
 		}
 		switch record.Status {
 		case agentstate.SessionOperationCanceled, agentstate.SessionOperationClosed:
-			return d.store.DeleteSessionOperation(ctx, record)
+			if err := d.store.DeleteSessionOperation(ctx, record); err != nil {
+				complete, reconcileErr := d.reconcileRecoveryConflict(ctx, protectedResourceID, record, err)
+				if reconcileErr != nil {
+					return reconcileErr
+				}
+				if complete {
+					return nil
+				}
+				continue
+			}
+			return nil
 		case agentstate.SessionOperationPrepared:
 			next := record
 			next.Status = agentstate.SessionOperationCanceled
 			if err := d.store.TransitionSessionOperation(ctx, record, next); err != nil {
-				return err
+				complete, reconcileErr := d.reconcileRecoveryConflict(ctx, protectedResourceID, record, err)
+				if reconcileErr != nil {
+					return reconcileErr
+				}
+				if complete {
+					return nil
+				}
+				continue
 			}
-			return d.store.DeleteSessionOperation(ctx, next)
+			if err := d.store.DeleteSessionOperation(ctx, next); err != nil {
+				complete, reconcileErr := d.reconcileRecoveryConflict(ctx, protectedResourceID, next, err)
+				if reconcileErr != nil {
+					return reconcileErr
+				}
+				if complete {
+					return nil
+				}
+				continue
+			}
+			return nil
 		case agentstate.SessionOperationMapped:
 			next := record
 			next.Status = agentstate.SessionOperationClosing
 			if err := d.store.TransitionSessionOperation(ctx, record, next); err != nil {
-				return err
+				complete, reconcileErr := d.reconcileRecoveryConflict(ctx, protectedResourceID, record, err)
+				if reconcileErr != nil {
+					return reconcileErr
+				}
+				if complete {
+					return nil
+				}
+				continue
 			}
 			record = next
 		case agentstate.SessionOperationDispatching, agentstate.SessionOperationClosing:
@@ -213,7 +247,14 @@ func (d *durableNativeSessionOperations) RecoverOperation(ctx context.Context, b
 		}
 		attempt.RecoveryNotBeforeMilli = nextAttemptMilli
 		if err := d.store.TransitionSessionOperation(ctx, record, attempt); err != nil {
-			return fmt.Errorf("persist native session recovery backoff: %w", err)
+			complete, reconcileErr := d.reconcileRecoveryConflict(ctx, protectedResourceID, record, err)
+			if reconcileErr != nil {
+				return fmt.Errorf("persist native session recovery backoff: %w", reconcileErr)
+			}
+			if complete {
+				return nil
+			}
+			continue
 		}
 		record = attempt
 		result, err := recoverNativeSessionOperation(ctx, binding, privateKey, record.Operation, record.RecoveryEndpoint, udpOptions...)
@@ -236,6 +277,9 @@ func (d *durableNativeSessionOperations) RecoverOperation(ctx context.Context, b
 			mapped.Status = agentstate.SessionOperationMapped
 			mapped.Admission = admissionFromReceipt(*result.UnexpectedAdmission)
 			if transitionErr := d.store.TransitionSessionOperation(ctx, record, mapped); transitionErr != nil {
+				// This process holds an authenticated admission that is not durable.
+				// A competing write cannot prove that exact session was retired, so
+				// preserve the ambiguity and fail closed without another exchange.
 				return fmt.Errorf("persist unexpected recovery admission: %w", transitionErr)
 			}
 			continue
@@ -253,9 +297,26 @@ func (d *durableNativeSessionOperations) RecoverOperation(ctx context.Context, b
 			next.Status = agentstate.SessionOperationClosed
 		}
 		if err := d.store.TransitionSessionOperation(ctx, record, next); err != nil {
-			return fmt.Errorf("persist recovered native session operation: %w", err)
+			complete, reconcileErr := d.reconcileRecoveryConflict(ctx, protectedResourceID, record, err)
+			if reconcileErr != nil {
+				return fmt.Errorf("persist recovered native session operation: %w", reconcileErr)
+			}
+			if complete {
+				return nil
+			}
+			continue
 		}
-		return d.store.DeleteSessionOperation(ctx, next)
+		if err := d.store.DeleteSessionOperation(ctx, next); err != nil {
+			complete, reconcileErr := d.reconcileRecoveryConflict(ctx, protectedResourceID, next, err)
+			if reconcileErr != nil {
+				return reconcileErr
+			}
+			if complete {
+				return nil
+			}
+			continue
+		}
+		return nil
 	}
 }
 
@@ -273,19 +334,139 @@ func (d *durableNativeSessionOperations) Retire(ctx context.Context, binding *qu
 		// exact operation is already absent.
 		return nil
 	}
-	if (record.Status != agentstate.SessionOperationMapped && record.Status != agentstate.SessionOperationClosing) ||
+	// CLOSED and journal deletion are separate durable transitions. A process
+	// interruption or ambiguous local write can leave the authenticated CLOSED
+	// tombstone in place; resume its deletion without another network exchange.
+	if (record.Status != agentstate.SessionOperationMapped && record.Status != agentstate.SessionOperationClosing &&
+		record.Status != agentstate.SessionOperationClosed) ||
 		record.Admission == nil || *record.Admission != *admissionFromReceipt(receipt) {
 		return fmt.Errorf("%w: live receipt does not match durable operation", agentstate.ErrSessionOperationConflict)
 	}
-	if record.Status == agentstate.SessionOperationMapped {
-		closing := record
-		closing.Status = agentstate.SessionOperationClosing
-		if err := d.store.TransitionSessionOperation(ctx, record, closing); err != nil {
-			return err
-		}
-		record = closing
-	}
 	return d.RecoverOperation(ctx, binding, privateKey, protectedResourceID, operationID, udpOptions)
+}
+
+// reconcileRecoveryConflict resolves only an optimistic-write loss on the
+// same durable operation. Absence means another recovery deleted the terminal
+// record. A present record must be an exact, monotonic successor; any identity,
+// receipt, or state divergence remains fail closed.
+func (d *durableNativeSessionOperations) reconcileRecoveryConflict(ctx context.Context,
+	protectedResourceID string, previous agentstate.SessionOperationRecord, writeErr error,
+) (complete bool, retErr error) {
+	if !onlySessionOperationCASLoss(writeErr) {
+		return false, writeErr
+	}
+	current, present, err := d.loadOperation(ctx, protectedResourceID, previous.Operation.OperationID)
+	if err != nil {
+		return false, errors.Join(writeErr, err)
+	}
+	if !present {
+		return true, nil
+	}
+	if !monotonicSessionOperationAdvance(previous, current) {
+		return false, fmt.Errorf("%w: recovery journal did not advance monotonically",
+			agentstate.ErrSessionOperationConflict)
+	}
+	return false, nil
+}
+
+func onlySessionOperationCASLoss(err error) bool {
+	if err == nil {
+		return false
+	}
+	type multiUnwrapper interface{ Unwrap() []error }
+	if joined, ok := err.(multiUnwrapper); ok {
+		causes := joined.Unwrap()
+		if len(causes) == 0 {
+			return false
+		}
+		for _, cause := range causes {
+			if !onlySessionOperationCASLoss(cause) {
+				return false
+			}
+		}
+		return true
+	}
+	if err == agentstate.ErrSessionOperationCASLost { //nolint:errorlint // Exact sentinel is the allowlist boundary.
+		return true
+	}
+	if cause := errors.Unwrap(err); cause != nil {
+		return onlySessionOperationCASLoss(cause)
+	}
+	return false
+}
+
+func monotonicSessionOperationAdvance(previous, current agentstate.SessionOperationRecord) bool {
+	if !sameSessionOperationIdentity(previous, current) || current.RecoveryAttempt < previous.RecoveryAttempt ||
+		current.RecoveryNotBeforeMilli < previous.RecoveryNotBeforeMilli {
+		return false
+	}
+	if previous.RecoveryAttempt == current.RecoveryAttempt &&
+		previous.RecoveryNotBeforeMilli != current.RecoveryNotBeforeMilli {
+		return false
+	}
+	if current.RecoveryAttempt > previous.RecoveryAttempt &&
+		current.RecoveryNotBeforeMilli <= previous.RecoveryNotBeforeMilli {
+		return false
+	}
+	if previous.Admission != nil &&
+		(current.Admission == nil || *previous.Admission != *current.Admission) {
+		return false
+	}
+	if current.Admission != nil &&
+		(current.Admission.CellID != current.Operation.CellID || current.Admission.SessionID == 0 ||
+			current.Admission.SessionIssuedAtMillis <= 0 || current.Admission.RunID != current.Operation.RunID ||
+			current.Admission.RunAttempt != current.Operation.RunAttempt) {
+		return false
+	}
+	switch current.Status {
+	case agentstate.SessionOperationPrepared, agentstate.SessionOperationDispatching, agentstate.SessionOperationCanceled:
+		if current.Admission != nil {
+			return false
+		}
+	case agentstate.SessionOperationMapped, agentstate.SessionOperationClosing, agentstate.SessionOperationClosed:
+		if current.Admission == nil {
+			return false
+		}
+	default:
+		return false
+	}
+	if !reachableSessionOperationStatus(previous.Status, current.Status) {
+		return false
+	}
+	return previous.Status != current.Status || previous.RecoveryAttempt != current.RecoveryAttempt ||
+		previous.RecoveryNotBeforeMilli != current.RecoveryNotBeforeMilli ||
+		(previous.Admission == nil && current.Admission != nil)
+}
+
+// sameSessionOperationIdentity treats only lifecycle status, admission, and
+// recovery progress as mutable. A future record field therefore stays
+// immutable and fails closed here until its transition semantics are reviewed.
+// Record shape and direct-transition rules remain owned by pkg/agentstate.
+func sameSessionOperationIdentity(previous, current agentstate.SessionOperationRecord) bool {
+	previous.Status, current.Status = "", ""
+	previous.Admission, current.Admission = nil, nil
+	previous.RecoveryAttempt, current.RecoveryAttempt = 0, 0
+	previous.RecoveryNotBeforeMilli, current.RecoveryNotBeforeMilli = 0, 0
+	return previous == current
+}
+
+func reachableSessionOperationStatus(previous, current string) bool {
+	switch previous {
+	case agentstate.SessionOperationPrepared:
+		// Recovery selected a PREPARED operation for cancellation. A concurrent
+		// dispatch or admission has a different intent and must fail closed.
+		return current == agentstate.SessionOperationCanceled
+	case agentstate.SessionOperationDispatching:
+		return current == agentstate.SessionOperationDispatching || current == agentstate.SessionOperationMapped ||
+			current == agentstate.SessionOperationClosing || current == agentstate.SessionOperationCanceled ||
+			current == agentstate.SessionOperationClosed
+	case agentstate.SessionOperationMapped:
+		return current == agentstate.SessionOperationClosing || current == agentstate.SessionOperationClosed
+	case agentstate.SessionOperationClosing:
+		return current == agentstate.SessionOperationClosing || current == agentstate.SessionOperationClosed
+	default:
+		return false
+	}
 }
 
 func sameNativeSessionReceipt(left *qurl.NativeSessionReceipt, right qurl.NativeSessionReceipt) bool {
