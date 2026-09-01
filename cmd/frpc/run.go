@@ -1044,6 +1044,32 @@ func startFRPFromConfig(ctx context.Context, cfgPath, machineID string, cfg *nhp
 	return startSharedService(ctx, common, cfgPath, cfg, admitter)
 }
 
+// retryReporter surfaces admission and connection retries.
+//
+// ResourceConfig.OnRetry has always existed and no caller ever set it, so a
+// Connector that could not be admitted retried forever in complete silence:
+// no log line, no admin API, no exit. From the outside that is indistinguishable
+// from a hang, and it is exactly what made a qURL Desktop startup failure
+// undiagnosable -- the process was alive and healthy-looking while every attempt
+// failed unseen.
+//
+// The error is reported at two levels on purpose. OnRetry's contract warns the
+// error "is not guaranteed to be safe for persistent logs", so the default level
+// records only that an attempt failed and how long until the next one, which is
+// enough to tell a hang apart from a retry loop. The text itself is debug-only,
+// where an operator has explicitly asked for detail.
+func retryReporter(ctx context.Context) func(error, time.Duration) {
+	return func(err error, wait time.Duration) {
+		if err == nil {
+			return
+		}
+		slog.InfoContext(ctx, "connector: resource admission attempt failed; retrying",
+			"retry_in", wait.String())
+		slog.DebugContext(ctx, "connector: resource admission attempt failed; retrying",
+			"retry_in", wait.String(), "err", err.Error())
+	}
+}
+
 func startSharedService(ctx context.Context, common *v1.ClientCommonConfig, cfgPath string, qcfg *nhpconfig.Config, admitter *share.NativeAdmitter) error {
 	if len(qcfg.Routes) != 1 {
 		return fmt.Errorf("shared Connector runtime requires exactly one resource per process; got %d", len(qcfg.Routes))
@@ -1075,6 +1101,7 @@ func startSharedService(ctx context.Context, common *v1.ClientCommonConfig, cfgP
 			}
 			announcer.announce()
 		},
+		OnRetry: retryReporter(ctx),
 	})
 	if err != nil {
 		return err
