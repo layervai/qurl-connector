@@ -29,11 +29,11 @@ type NativeSessionOperationAuthority struct {
 }
 
 type nativeSessionOperationController interface {
-	RecoverPending(context.Context, *qurl.AgentRuntimeBinding, []byte, string, map[string]struct{}, []qurl.AgentRuntimeSessionOption) error
-	RecoverOperation(context.Context, *qurl.AgentRuntimeBinding, []byte, string, string, []qurl.AgentRuntimeSessionOption) error
+	RecoverPending(context.Context, *qurl.AgentRuntimeBinding, []byte, string, map[string]struct{}, []qurl.AgentRuntimeUDPOption) error
+	RecoverOperation(context.Context, *qurl.AgentRuntimeBinding, []byte, string, string, []qurl.AgentRuntimeUDPOption) error
 	PrepareDispatch(context.Context, *qurl.AgentRuntimeBinding, []byte, string, string, string, uint64) (*qurl.NativeSessionOperation, error)
 	RecordMapped(context.Context, string, qurl.NativeSessionOperation, qurl.NativeSessionReceipt) error
-	Retire(context.Context, *qurl.AgentRuntimeBinding, []byte, string, string, qurl.NativeSessionReceipt, []qurl.AgentRuntimeSessionOption) error
+	Retire(context.Context, *qurl.AgentRuntimeBinding, []byte, string, string, qurl.NativeSessionReceipt, []qurl.AgentRuntimeUDPOption) error
 }
 
 type durableNativeSessionOperations struct {
@@ -123,7 +123,7 @@ func (d *durableNativeSessionOperations) RecordMapped(ctx context.Context, prote
 }
 
 func (d *durableNativeSessionOperations) RecoverPending(ctx context.Context, binding *qurl.AgentRuntimeBinding,
-	privateKey []byte, protectedResourceID string, preserve map[string]struct{}, sessionOptions []qurl.AgentRuntimeSessionOption,
+	privateKey []byte, protectedResourceID string, preserve map[string]struct{}, udpOptions []qurl.AgentRuntimeUDPOption,
 ) error {
 	if ctx == nil || binding == nil || len(privateKey) != 32 {
 		return errors.New("recover native session operation: runtime is incomplete")
@@ -142,7 +142,7 @@ func (d *durableNativeSessionOperations) RecoverPending(ctx context.Context, bin
 		if _, keep := preserve[record.Operation.OperationID]; keep {
 			continue
 		}
-		if err := d.RecoverOperation(recoveryCtx, binding, privateKey, protectedResourceID, record.Operation.OperationID, sessionOptions); err != nil {
+		if err := d.RecoverOperation(recoveryCtx, binding, privateKey, protectedResourceID, record.Operation.OperationID, udpOptions); err != nil {
 			recoveryErr = errors.Join(recoveryErr, err)
 		}
 	}
@@ -150,7 +150,7 @@ func (d *durableNativeSessionOperations) RecoverPending(ctx context.Context, bin
 }
 
 func (d *durableNativeSessionOperations) RecoverOperation(ctx context.Context, binding *qurl.AgentRuntimeBinding,
-	privateKey []byte, protectedResourceID, operationID string, sessionOptions []qurl.AgentRuntimeSessionOption,
+	privateKey []byte, protectedResourceID, operationID string, udpOptions []qurl.AgentRuntimeUDPOption,
 ) error {
 	if ctx == nil || binding == nil || len(privateKey) != 32 || operationID == "" {
 		return errors.New("recover native session operation: runtime is incomplete")
@@ -257,10 +257,7 @@ func (d *durableNativeSessionOperations) RecoverOperation(ctx context.Context, b
 			continue
 		}
 		record = attempt
-		// A session relay uses the persisted recovery endpoint's server public-key
-		// fingerprint for routing. HTTPS replaces only the UDP address transport;
-		// it cannot change the source-fenced cell identity recorded here.
-		result, err := recoverNativeSessionOperation(ctx, binding, privateKey, record.Operation, record.RecoveryEndpoint, sessionOptions...)
+		result, err := recoverNativeSessionOperation(ctx, binding, privateKey, record.Operation, record.RecoveryEndpoint, udpOptions...)
 		if err != nil {
 			var unexpected *qurl.NativeSessionOperationUnexpectedAdmissionError
 			if !errors.As(err, &unexpected) {
@@ -325,7 +322,7 @@ func (d *durableNativeSessionOperations) RecoverOperation(ctx context.Context, b
 
 func (d *durableNativeSessionOperations) Retire(ctx context.Context, binding *qurl.AgentRuntimeBinding,
 	privateKey []byte, protectedResourceID, operationID string, receipt qurl.NativeSessionReceipt,
-	sessionOptions []qurl.AgentRuntimeSessionOption,
+	udpOptions []qurl.AgentRuntimeUDPOption,
 ) error {
 	record, present, err := d.loadOperation(ctx, protectedResourceID, operationID)
 	if err != nil {
@@ -345,7 +342,7 @@ func (d *durableNativeSessionOperations) Retire(ctx context.Context, binding *qu
 		record.Admission == nil || *record.Admission != *admissionFromReceipt(receipt) {
 		return fmt.Errorf("%w: live receipt does not match durable operation", agentstate.ErrSessionOperationConflict)
 	}
-	return d.RecoverOperation(ctx, binding, privateKey, protectedResourceID, operationID, sessionOptions)
+	return d.RecoverOperation(ctx, binding, privateKey, protectedResourceID, operationID, udpOptions)
 }
 
 // reconcileRecoveryConflict resolves only an optimistic-write loss on the
