@@ -2870,14 +2870,14 @@ func TestNativeRuntimeDoesNotExposeSessionOptions(t *testing.T) {
 	}
 }
 
-func TestSessionOptionsFromUDPUsesOnlyUDPOptions(t *testing.T) {
-	udpOptions := []qurl.AgentRuntimeUDPOption{
-		qurl.WithAgentRuntimeUDPBounds(time.Second, 1),
-		qurl.WithAgentRuntimeUDPBounds(2*time.Second, 2),
-	}
-	got := sessionOptionsFromUDP(udpOptions)
-	if len(got) != len(udpOptions) || got[0] == nil || got[1] == nil {
-		t.Fatalf("derived session options = %v, want two native UDP options", got)
+func TestSessionOptionsFromUDPPreservesEveryPosition(t *testing.T) {
+	option := qurl.WithAgentRuntimeUDPBounds(time.Second, 1)
+	for _, udpOptions := range [][]qurl.AgentRuntimeUDPOption{{nil, option}, {option, nil}} {
+		got := sessionOptionsFromUDP(udpOptions)
+		if len(got) != 2 || (got[0] == nil) != (udpOptions[0] == nil) || (got[1] == nil) != (udpOptions[1] == nil) {
+			t.Fatalf("derived session option positions = [%v %v], want [%v %v]",
+				got[0] != nil, got[1] != nil, udpOptions[0] != nil, udpOptions[1] != nil)
+		}
 	}
 }
 
