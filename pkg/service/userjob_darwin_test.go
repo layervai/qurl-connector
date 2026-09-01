@@ -231,20 +231,30 @@ func TestLaunchdEnsureRetriesBootstrapAfterConfirmedBootoutRace(t *testing.T) {
 	}
 }
 
-func TestLaunchdEnsureConvergesAmbiguousLoadedBootstrapFailure(t *testing.T) {
+func TestLaunchdRapidRemoveThenEnsureConvergesAmbiguousLoadedBootstrapFailures(t *testing.T) {
 	dir := t.TempDir()
 	job := testUserJob(dir, "daemon", "run", "--job-version", "1/new")
 	plist := filepath.Join(dir, "job.plist")
+	content, err := RenderLaunchdUserJob(job)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(plist, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	printCalls := 0
 	bootstrapAttempts := 0
 	bootouts := 0
-	loaded := false
+	kickstarts := 0
+	loaded := true
+	var waited time.Duration
 	manager := &launchdUserJobManager{
 		plistPath: func(string) (string, error) { return plist, nil },
 		sleep: func(delay time.Duration) {
 			if delay != launchdBootstrapRetryDelay {
 				t.Fatalf("bootstrap settle wait=%s, want %s", delay, launchdBootstrapRetryDelay)
 			}
+			waited += delay
 		},
 		launchctlQuery: func(args ...string) (string, error) {
 			switch args[0] {
@@ -259,29 +269,136 @@ func TestLaunchdEnsureConvergesAmbiguousLoadedBootstrapFailure(t *testing.T) {
 				loaded = false
 			case "bootstrap":
 				bootstrapAttempts++
-				if bootstrapAttempts == 1 {
+				if bootstrapAttempts <= 2 {
 					loaded = true
 					return "", errors.New("ambiguous launchd failure")
 				}
 				loaded = true
+			case "kickstart":
+				kickstarts++
 			}
 			return "", nil
 		},
 	}
+	if err := manager.Remove(job.Label); err != nil {
+		t.Fatalf("Remove() = %v", err)
+	}
 	if err := manager.Ensure(job); err != nil {
 		t.Fatalf("Ensure() = %v, want same-call convergence", err)
-	}
-	if bootstrapAttempts != 2 {
-		t.Fatalf("bootstrap attempts=%d, want 2", bootstrapAttempts)
 	}
 	if retained, readErr := os.ReadFile(plist); readErr != nil || len(retained) == 0 {
 		t.Fatalf("ambiguous bootstrap did not retain the replacement plist: %q/%v", retained, readErr)
 	}
-	if bootstrapAttempts != 2 || bootouts != 1 {
-		t.Fatalf("same-call bootstrap attempts=%d bootouts=%d, want 2/1", bootstrapAttempts, bootouts)
+	wantWait := 4 * launchdBootstrapRetryDelay
+	if bootstrapAttempts != 3 || bootouts != 3 || kickstarts != 1 || waited != wantWait {
+		t.Fatalf("rapid label reuse = bootstrap %d bootout %d kickstart %d wait %s, want 3/3/1/%s",
+			bootstrapAttempts, bootouts, kickstarts, waited, wantWait)
 	}
 	if _, statErr := os.Lstat(plist); statErr != nil {
 		t.Fatalf("successful retry did not restore plist: %v", statErr)
+	}
+}
+
+func TestLaunchdRapidRemoveThenEnsureConvergesAbsentBootstrapFailures(t *testing.T) {
+	dir := t.TempDir()
+	job := testUserJob(dir, "daemon", "run", "--job-version", "1/current")
+	plist := filepath.Join(dir, "job.plist")
+	content, err := RenderLaunchdUserJob(job)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(plist, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	bootstrapAttempts := 0
+	bootouts := 0
+	kickstarts := 0
+	loaded := true
+	var waited time.Duration
+	manager := &launchdUserJobManager{
+		plistPath: func(string) (string, error) { return plist, nil },
+		sleep:     func(delay time.Duration) { waited += delay },
+		launchctlQuery: func(args ...string) (string, error) {
+			switch args[0] {
+			case "print":
+				if loaded {
+					return "state = running\npid = 4242\n", nil
+				}
+				return "", &launchctlError{args: append([]string(nil), args...), output: "Could not find service", err: errors.New("exit status 113")}
+			case "bootstrap":
+				bootstrapAttempts++
+				if bootstrapAttempts <= 4 {
+					return "", errors.New("launchd label still settling")
+				}
+				loaded = true
+			case "bootout":
+				bootouts++
+				loaded = false
+			case "kickstart":
+				kickstarts++
+			}
+			return "", nil
+		},
+	}
+	if err := manager.Remove(job.Label); err != nil {
+		t.Fatalf("Remove() = %v", err)
+	}
+	if err := manager.Ensure(job); err != nil {
+		t.Fatalf("Ensure() = %v, want same-call convergence", err)
+	}
+	wantWait := 4 * launchdBootstrapRetryDelay
+	if bootstrapAttempts != 5 || bootouts != 1 || kickstarts != 1 || waited != wantWait {
+		t.Fatalf("rapid absent label reuse = bootstrap %d bootout %d kickstart %d wait %s, want 5/1/1/%s",
+			bootstrapAttempts, bootouts, kickstarts, waited, wantWait)
+	}
+}
+
+func TestLaunchdEnsureBoundsRepeatedAmbiguousLoadedBootstrapFailures(t *testing.T) {
+	dir := t.TempDir()
+	job := testUserJob(dir, "daemon", "run", "--job-version", "1/current")
+	plist := filepath.Join(dir, "job.plist")
+	bootstrapAttempts := 0
+	bootouts := 0
+	kickstarts := 0
+	loaded := false
+	var waited time.Duration
+	manager := &launchdUserJobManager{
+		plistPath: func(string) (string, error) { return plist, nil },
+		sleep:     func(delay time.Duration) { waited += delay },
+		launchctlQuery: func(args ...string) (string, error) {
+			switch args[0] {
+			case "print":
+				if loaded {
+					return "state = running\npid = 4242\n", nil
+				}
+				return "", &launchctlError{args: append([]string(nil), args...), output: "Could not find service", err: errors.New("exit status 113")}
+			case "bootstrap":
+				bootstrapAttempts++
+				loaded = true
+				return "", errors.New("ambiguous launchd failure")
+			case "bootout":
+				bootouts++
+				loaded = false
+			case "kickstart":
+				kickstarts++
+			}
+			return "", nil
+		},
+	}
+	err := manager.Ensure(job)
+	if err == nil || !strings.Contains(err.Error(), "ambiguous launchd failure") {
+		t.Fatalf("Ensure() = %v, want bounded bootstrap failure", err)
+	}
+	wantWait := time.Duration(2*launchdBootstrapMaxCycles-1) * launchdBootstrapRetryDelay
+	if bootstrapAttempts != launchdBootstrapMaxCycles || bootouts != launchdBootstrapMaxCycles ||
+		kickstarts != 0 || loaded || waited != wantWait {
+		t.Fatalf("bounded ambiguous recovery = bootstrap %d bootout %d kickstart %d loaded %t wait %s, want %d/%d/0/false/%s",
+			bootstrapAttempts, bootouts, kickstarts, loaded, waited,
+			launchdBootstrapMaxCycles, launchdBootstrapMaxCycles, wantWait)
+	}
+	retained, readErr := os.ReadFile(plist)
+	if readErr != nil || len(retained) == 0 {
+		t.Fatalf("bounded recovery did not retain the reviewed plist: %q/%v", retained, readErr)
 	}
 }
 
@@ -383,13 +500,14 @@ func TestLaunchdEnsurePreservesChangedPlistWhenAmbiguousStatusCanBeUnloaded(t *t
 	}
 	newContent, renderErr := RenderLaunchdUserJob(job)
 	retained, readErr := os.ReadFile(plist)
-	if renderErr != nil || readErr != nil || !bytes.Equal(retained, []byte(newContent)) || bootouts != 3 {
-		t.Fatalf("ambiguous status recovery = content %q render %v read %v bootouts %d, want new plist and 3 bootouts",
-			retained, renderErr, readErr, bootouts)
+	wantBootouts := 1 + launchdBootstrapMaxCycles
+	if renderErr != nil || readErr != nil || !bytes.Equal(retained, []byte(newContent)) || bootouts != wantBootouts {
+		t.Fatalf("ambiguous status recovery = content %q render %v read %v bootouts %d, want new plist and %d bootouts",
+			retained, renderErr, readErr, bootouts, wantBootouts)
 	}
 }
 
-func TestLaunchdEnsureRemovesChangedPlistWhenAmbiguousUnloadFails(t *testing.T) {
+func TestLaunchdEnsureRemovesChangedPlistWhenLaterAmbiguousUnloadFails(t *testing.T) {
 	dir := t.TempDir()
 	job := testUserJob(dir, "daemon", "run", "--job-version", "1/new")
 	plist := filepath.Join(dir, "job.plist")
@@ -418,7 +536,7 @@ func TestLaunchdEnsureRemovesChangedPlistWhenAmbiguousUnloadFails(t *testing.T) 
 				return "", errors.New("bootstrap failed")
 			case "bootout":
 				bootouts++
-				if bootouts == 2 {
+				if bootouts == 3 {
 					return "", errors.New("ambiguous bootout failed")
 				}
 			}
@@ -427,8 +545,12 @@ func TestLaunchdEnsureRemovesChangedPlistWhenAmbiguousUnloadFails(t *testing.T) 
 	}
 	if err := manager.Ensure(job); err == nil ||
 		!strings.Contains(err.Error(), "launchd status unavailable") ||
-		!strings.Contains(err.Error(), "ambiguous bootout failed") {
-		t.Fatalf("Ensure() = %v, want joined status and bootout failures", err)
+		!strings.Contains(err.Error(), "ambiguous bootout failed") ||
+		!strings.Contains(err.Error(), "settle cycle 2") {
+		t.Fatalf("Ensure() = %v, want joined later-cycle status and bootout failures", err)
+	}
+	if bootouts != 3 {
+		t.Fatalf("bootouts=%d, want initial replacement plus two ambiguous unloads", bootouts)
 	}
 	if _, err := os.Lstat(plist); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("ambiguous unload failure left a converged-looking plist: %v", err)
@@ -447,9 +569,10 @@ func TestLaunchdEnsurePreservesMatchingPlistWhenBothBootstrapAttemptsFailAbsent(
 		t.Fatal(err)
 	}
 	bootstrapAttempts := 0
+	var waited time.Duration
 	manager := &launchdUserJobManager{
 		plistPath: func(string) (string, error) { return plist, nil },
-		sleep:     func(time.Duration) {},
+		sleep:     func(delay time.Duration) { waited += delay },
 		launchctlQuery: func(args ...string) (string, error) {
 			if args[0] == "print" {
 				return "", &launchctlError{args: append([]string(nil), args...), output: "Could not find service", err: errors.New("exit status 113")}
@@ -461,11 +584,16 @@ func TestLaunchdEnsurePreservesMatchingPlistWhenBothBootstrapAttemptsFailAbsent(
 			return "", nil
 		},
 	}
-	if err := manager.Ensure(job); err == nil || !strings.Contains(err.Error(), "launchd domain unavailable") {
-		t.Fatalf("Ensure() = %v, want bootstrap failure", err)
+	ensureErr := manager.Ensure(job)
+	if ensureErr == nil || !strings.Contains(ensureErr.Error(), "launchd domain unavailable") ||
+		!strings.Contains(ensureErr.Error(), "did not settle after "+strconv.Itoa(launchdBootstrapMaxCycles)+" cycles") {
+		t.Fatalf("Ensure() = %v, want bounded bootstrap failure with cycle count", ensureErr)
 	}
-	if bootstrapAttempts != 2 {
-		t.Fatalf("bootstrap attempts=%d, want 2", bootstrapAttempts)
+	wantAttempts := 2 * launchdBootstrapMaxCycles
+	wantWait := time.Duration(2*launchdBootstrapMaxCycles-1) * launchdBootstrapRetryDelay
+	if bootstrapAttempts != wantAttempts || waited != wantWait {
+		t.Fatalf("bounded absent bootstrap = attempts %d wait %s, want %d/%s",
+			bootstrapAttempts, waited, wantAttempts, wantWait)
 	}
 	retained, err := os.ReadFile(plist)
 	if err != nil || !bytes.Equal(retained, []byte(content)) {
@@ -490,9 +618,10 @@ func TestLaunchdEnsurePreservesChangedPlistWhenBothBootstrapAttemptsFailAbsent(t
 		t.Fatal(err)
 	}
 	bootstrapAttempts := 0
+	var waited time.Duration
 	manager := &launchdUserJobManager{
 		plistPath: func(string) (string, error) { return plist, nil },
-		sleep:     func(time.Duration) {},
+		sleep:     func(delay time.Duration) { waited += delay },
 		launchctlQuery: func(args ...string) (string, error) {
 			if args[0] == "print" {
 				return "", &launchctlError{args: append([]string(nil), args...), output: "Could not find service", err: errors.New("exit status 113")}
@@ -507,8 +636,11 @@ func TestLaunchdEnsurePreservesChangedPlistWhenBothBootstrapAttemptsFailAbsent(t
 	if err := manager.Ensure(job); err == nil || !strings.Contains(err.Error(), "launchd domain unavailable") {
 		t.Fatalf("Ensure() = %v, want bootstrap failure", err)
 	}
-	if bootstrapAttempts != 2 {
-		t.Fatalf("bootstrap attempts=%d, want 2", bootstrapAttempts)
+	wantAttempts := 2 * launchdBootstrapMaxCycles
+	wantWait := time.Duration(2*launchdBootstrapMaxCycles-1) * launchdBootstrapRetryDelay
+	if bootstrapAttempts != wantAttempts || waited != wantWait {
+		t.Fatalf("bounded absent bootstrap = attempts %d wait %s, want %d/%s",
+			bootstrapAttempts, waited, wantAttempts, wantWait)
 	}
 	retained, err := os.ReadFile(plist)
 	if err != nil || !bytes.Equal(retained, []byte(newContent)) {
