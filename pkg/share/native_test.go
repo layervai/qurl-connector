@@ -165,7 +165,7 @@ func (s *memoryNativeStore) TransitionSessionOperation(_ context.Context, previo
 			return nil
 		}
 	}
-	return agentstate.ErrSessionOperationConflict
+	return agentstate.ErrSessionOperationCASLost
 }
 
 func (s *memoryNativeStore) DeleteSessionOperation(_ context.Context, terminal agentstate.SessionOperationRecord) error {
@@ -178,7 +178,7 @@ func (s *memoryNativeStore) DeleteSessionOperation(_ context.Context, terminal a
 			return nil
 		}
 	}
-	return agentstate.ErrSessionOperationConflict
+	return agentstate.ErrSessionOperationCASLost
 }
 
 type testNativeSessionOperations struct{}

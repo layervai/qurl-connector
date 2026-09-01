@@ -6,8 +6,10 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -672,6 +674,360 @@ func TestDurableNativeSessionRetirementResumesClosingWithPersistedBackoff(t *tes
 	}
 	if records, loadErr := store.LoadSessionOperations(context.Background(), testProtectedResourceID); loadErr != nil || len(records) != 0 {
 		t.Fatalf("resumed terminal records=%+v err=%v", records, loadErr)
+	}
+}
+
+type failFirstSessionOperationDeleteStore struct {
+	*memoryNativeStore
+	err     error
+	deletes int
+}
+
+func (s *failFirstSessionOperationDeleteStore) DeleteSessionOperation(ctx context.Context,
+	terminal agentstate.SessionOperationRecord,
+) error {
+	s.deletes++
+	if s.deletes == 1 {
+		return s.err
+	}
+	return s.memoryNativeStore.DeleteSessionOperation(ctx, terminal)
+}
+
+func TestDurableNativeSessionRetirementResumesCommittedClosedTombstone(t *testing.T) {
+	oldRecover := recoverNativeSessionOperation
+	t.Cleanup(func() { recoverNativeSessionOperation = oldRecover })
+	want := errors.New("delete terminal tombstone interrupted")
+	store := &failFirstSessionOperationDeleteStore{memoryNativeStore: &memoryNativeStore{}, err: want}
+	mapped, receipt := seedMappedDurableRecord(t, store.memoryNativeStore)
+	controller, err := newDurableNativeSessionOperations(store, testNativeSessionAuthority())
+	if err != nil {
+		t.Fatal(err)
+	}
+	controller.clock = func() time.Time { return time.UnixMilli(1_800_000_011_000).UTC() }
+	recoverCalls := 0
+	recoverNativeSessionOperation = func(context.Context, *qurl.AgentRuntimeBinding, []byte,
+		qurl.NativeSessionOperation, qurl.NHPUDPEndpoint, ...qurl.AgentRuntimeUDPOption,
+	) (*qurl.NativeSessionOperationRecovery, error) {
+		recoverCalls++
+		return &qurl.NativeSessionOperationRecovery{Complete: true}, nil
+	}
+	binding := &qurl.AgentRuntimeBinding{AgentID: mapped.Operation.AgentID}
+	err = controller.Retire(context.Background(), binding, make([]byte, 32), testProtectedResourceID,
+		mapped.Operation.OperationID, receipt, nil)
+	if !errors.Is(err, want) {
+		t.Fatalf("first Retire() = %v, want interrupted terminal deletion", err)
+	}
+	records, loadErr := store.LoadSessionOperations(context.Background(), testProtectedResourceID)
+	if loadErr != nil || len(records) != 1 || records[0].Status != agentstate.SessionOperationClosed {
+		t.Fatalf("committed terminal record = %+v, %v; want one CLOSED tombstone", records, loadErr)
+	}
+	if err := controller.Retire(context.Background(), binding, make([]byte, 32), testProtectedResourceID,
+		mapped.Operation.OperationID, receipt, nil); err != nil {
+		t.Fatalf("resume Retire() = %v, want terminal tombstone deletion", err)
+	}
+	if recoverCalls != 1 || store.deletes != 2 {
+		t.Fatalf("resume network calls=%d deletes=%d, want 1/2", recoverCalls, store.deletes)
+	}
+	if records, loadErr := store.LoadSessionOperations(context.Background(), testProtectedResourceID); loadErr != nil || len(records) != 0 {
+		t.Fatalf("resumed terminal records=%+v err=%v", records, loadErr)
+	}
+}
+
+func TestDurableNativeSessionRetirementRejectsMismatchedClosedTombstone(t *testing.T) {
+	oldRecover := recoverNativeSessionOperation
+	t.Cleanup(func() { recoverNativeSessionOperation = oldRecover })
+	store := &memoryNativeStore{}
+	mapped, receipt := seedMappedDurableRecord(t, store)
+	closing := mapped
+	closing.Status = agentstate.SessionOperationClosing
+	if err := store.TransitionSessionOperation(context.Background(), mapped, closing); err != nil {
+		t.Fatal(err)
+	}
+	closed := closing
+	closed.Status = agentstate.SessionOperationClosed
+	if err := store.TransitionSessionOperation(context.Background(), closing, closed); err != nil {
+		t.Fatal(err)
+	}
+	recoverCalls := 0
+	recoverNativeSessionOperation = func(context.Context, *qurl.AgentRuntimeBinding, []byte,
+		qurl.NativeSessionOperation, qurl.NHPUDPEndpoint, ...qurl.AgentRuntimeUDPOption,
+	) (*qurl.NativeSessionOperationRecovery, error) {
+		recoverCalls++
+		return &qurl.NativeSessionOperationRecovery{Complete: true}, nil
+	}
+	controller, err := newDurableNativeSessionOperations(store, testNativeSessionAuthority())
+	if err != nil {
+		t.Fatal(err)
+	}
+	receipt.SessionID++
+	err = controller.Retire(context.Background(), &qurl.AgentRuntimeBinding{AgentID: mapped.Operation.AgentID},
+		make([]byte, 32), testProtectedResourceID, mapped.Operation.OperationID, receipt, nil)
+	if !errors.Is(err, agentstate.ErrSessionOperationConflict) || recoverCalls != 0 {
+		t.Fatalf("mismatched CLOSED retirement = err %v, calls %d; want conflict without exchange", err, recoverCalls)
+	}
+	records, loadErr := store.LoadSessionOperations(context.Background(), testProtectedResourceID)
+	if loadErr != nil || len(records) != 1 || records[0] != closed {
+		t.Fatalf("mismatched CLOSED tombstone changed: records=%+v err=%v", records, loadErr)
+	}
+}
+
+type concurrentSessionOperationRecoveryStore struct {
+	*memoryNativeStore
+	mu              sync.Mutex
+	attempts        int
+	firstArrived    chan struct{}
+	secondCommitted chan struct{}
+	staleReturned   chan struct{}
+}
+
+func (s *concurrentSessionOperationRecoveryStore) TransitionSessionOperation(ctx context.Context,
+	previous, next agentstate.SessionOperationRecord,
+) error {
+	if previous.Status != agentstate.SessionOperationClosing || next.Status != agentstate.SessionOperationClosing ||
+		next.RecoveryAttempt != 1 {
+		return s.memoryNativeStore.TransitionSessionOperation(ctx, previous, next)
+	}
+	s.mu.Lock()
+	s.attempts++
+	attempt := s.attempts
+	s.mu.Unlock()
+	switch attempt {
+	case 1:
+		close(s.firstArrived)
+		<-s.secondCommitted
+		err := s.memoryNativeStore.TransitionSessionOperation(ctx, previous, next)
+		close(s.staleReturned)
+		return err
+	case 2:
+		<-s.firstArrived
+		err := s.memoryNativeStore.TransitionSessionOperation(ctx, previous, next)
+		close(s.secondCommitted)
+		<-s.staleReturned
+		return err
+	default:
+		return s.memoryNativeStore.TransitionSessionOperation(ctx, previous, next)
+	}
+}
+
+func TestDurableNativeSessionRecoveryReconcilesConcurrentMonotonicCASLoss(t *testing.T) {
+	oldRecover := recoverNativeSessionOperation
+	oldWait := waitNativeSessionRecovery
+	t.Cleanup(func() {
+		recoverNativeSessionOperation = oldRecover
+		waitNativeSessionRecovery = oldWait
+	})
+	memory := &memoryNativeStore{}
+	mapped, _ := seedMappedDurableRecord(t, memory)
+	closing := mapped
+	closing.Status = agentstate.SessionOperationClosing
+	if err := memory.TransitionSessionOperation(context.Background(), mapped, closing); err != nil {
+		t.Fatal(err)
+	}
+	store := &concurrentSessionOperationRecoveryStore{
+		memoryNativeStore: memory,
+		firstArrived:      make(chan struct{}), secondCommitted: make(chan struct{}), staleReturned: make(chan struct{}),
+	}
+	first, err := newDurableNativeSessionOperations(store, testNativeSessionAuthority())
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := newDurableNativeSessionOperations(store, testNativeSessionAuthority())
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.UnixMilli(1_800_000_011_000).UTC()
+	first.clock = func() time.Time { return now }
+	second.clock = func() time.Time { return now }
+	waitNativeSessionRecovery = func(context.Context, time.Duration) error { return nil }
+	var recoverMu sync.Mutex
+	recoverCalls := 0
+	recoverNativeSessionOperation = func(context.Context, *qurl.AgentRuntimeBinding, []byte,
+		qurl.NativeSessionOperation, qurl.NHPUDPEndpoint, ...qurl.AgentRuntimeUDPOption,
+	) (*qurl.NativeSessionOperationRecovery, error) {
+		recoverMu.Lock()
+		recoverCalls++
+		recoverMu.Unlock()
+		return &qurl.NativeSessionOperationRecovery{Complete: true}, nil
+	}
+	binding := &qurl.AgentRuntimeBinding{AgentID: mapped.Operation.AgentID}
+	errs := make(chan error, 2)
+	for _, controller := range []*durableNativeSessionOperations{first, second} {
+		go func() {
+			errs <- controller.RecoverOperation(context.Background(), binding, make([]byte, 32),
+				testProtectedResourceID, mapped.Operation.OperationID, nil)
+		}()
+	}
+	for range 2 {
+		if err := <-errs; err != nil {
+			t.Fatalf("concurrent RecoverOperation() = %v, want reconciled completion", err)
+		}
+	}
+	store.mu.Lock()
+	attempts := store.attempts
+	store.mu.Unlock()
+	recoverMu.Lock()
+	calls := recoverCalls
+	recoverMu.Unlock()
+	if attempts != 2 || calls == 0 {
+		t.Fatalf("concurrent CAS attempts=%d network calls=%d, want 2 and at least 1", attempts, calls)
+	}
+	if records, loadErr := store.LoadSessionOperations(context.Background(), testProtectedResourceID); loadErr != nil || len(records) != 0 {
+		t.Fatalf("concurrent terminal records=%+v err=%v", records, loadErr)
+	}
+}
+
+func TestDurableNativeSessionRecoveryRejectsDivergentConflictReload(t *testing.T) {
+	store := &memoryNativeStore{}
+	previous := testPreparedDurableRecord(t)
+	previous.Status = agentstate.SessionOperationDispatching
+	current := previous
+	current.Operation.OwnerID = "different-owner"
+	store.operations = map[string][]agentstate.SessionOperationRecord{
+		testProtectedResourceID: {current},
+	}
+	controller, err := newDurableNativeSessionOperations(store, testNativeSessionAuthority())
+	if err != nil {
+		t.Fatal(err)
+	}
+	complete, err := controller.reconcileRecoveryConflict(
+		context.Background(), testProtectedResourceID, previous, agentstate.ErrSessionOperationCASLost,
+	)
+	if complete || !errors.Is(err, agentstate.ErrSessionOperationConflict) {
+		t.Fatalf("divergent conflict reload = (%t, %v), want fail-closed conflict", complete, err)
+	}
+}
+
+func TestDurableNativeSessionRecoveryRejectsConcurrentPreparedAdmission(t *testing.T) {
+	store := &memoryNativeStore{}
+	previous := testPreparedDurableRecord(t)
+	current := previous
+	current.Status = agentstate.SessionOperationMapped
+	current.Admission = &agentstate.SessionOperationAdmission{
+		CellID: current.Operation.CellID, SessionID: 91,
+		SessionIssuedAtMillis: 1_800_000_011_000,
+		RunID:                 current.Operation.RunID, RunAttempt: current.Operation.RunAttempt,
+	}
+	store.operations = map[string][]agentstate.SessionOperationRecord{
+		testProtectedResourceID: {current},
+	}
+	controller, err := newDurableNativeSessionOperations(store, testNativeSessionAuthority())
+	if err != nil {
+		t.Fatal(err)
+	}
+	complete, err := controller.reconcileRecoveryConflict(
+		context.Background(), testProtectedResourceID, previous, agentstate.ErrSessionOperationCASLost,
+	)
+	if complete || !errors.Is(err, agentstate.ErrSessionOperationConflict) {
+		t.Fatalf("concurrent PREPARED admission = (%t, %v), want fail-closed conflict", complete, err)
+	}
+}
+
+func TestDurableNativeSessionRecoveryDoesNotReconcileValidationConflict(t *testing.T) {
+	store := &memoryNativeStore{}
+	previous := testPreparedDurableRecord(t)
+	store.operations = map[string][]agentstate.SessionOperationRecord{}
+	controller, err := newDurableNativeSessionOperations(store, testNativeSessionAuthority())
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := fmt.Errorf("%w: invalid transition", agentstate.ErrSessionOperationConflict)
+	complete, err := controller.reconcileRecoveryConflict(
+		context.Background(), testProtectedResourceID, previous, want,
+	)
+	if complete || !errors.Is(err, want) {
+		t.Fatalf("validation conflict reconciliation = (%t, %v), want original failure", complete, err)
+	}
+}
+
+func TestDurableNativeSessionRecoveryDoesNotDropJoinedLockReleaseError(t *testing.T) {
+	store := &memoryNativeStore{}
+	previous := testPreparedDurableRecord(t)
+	controller, err := newDurableNativeSessionOperations(store, testNativeSessionAuthority())
+	if err != nil {
+		t.Fatal(err)
+	}
+	lockErr := errors.New("release operation lock")
+	want := errors.Join(fmt.Errorf("write operation: %w", agentstate.ErrSessionOperationCASLost), lockErr)
+	complete, err := controller.reconcileRecoveryConflict(
+		context.Background(), testProtectedResourceID, previous, want,
+	)
+	if complete || !errors.Is(err, agentstate.ErrSessionOperationCASLost) || !errors.Is(err, lockErr) {
+		t.Fatalf("joined lock release reconciliation = (%t, %v), want both failures", complete, err)
+	}
+}
+
+func TestDurableNativeSessionRecoveryAcceptsPureWrappedCASLoss(t *testing.T) {
+	store := &memoryNativeStore{}
+	previous := testPreparedDurableRecord(t)
+	controller, err := newDurableNativeSessionOperations(store, testNativeSessionAuthority())
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := errors.Join(fmt.Errorf("write operation: %w", agentstate.ErrSessionOperationCASLost))
+	complete, err := controller.reconcileRecoveryConflict(
+		context.Background(), testProtectedResourceID, previous, want,
+	)
+	if !complete || err != nil {
+		t.Fatalf("pure wrapped CAS reconciliation = (%t, %v), want completed deletion", complete, err)
+	}
+}
+
+type removeUnexpectedAdmissionStore struct {
+	*memoryNativeStore
+	removed bool
+}
+
+func (s *removeUnexpectedAdmissionStore) TransitionSessionOperation(ctx context.Context,
+	previous, next agentstate.SessionOperationRecord,
+) error {
+	if !s.removed && previous.Status == agentstate.SessionOperationDispatching &&
+		next.Status == agentstate.SessionOperationMapped && next.Admission != nil {
+		s.removed = true
+		if err := s.memoryNativeStore.DeleteSessionOperation(ctx, previous); err != nil {
+			return err
+		}
+		return agentstate.ErrSessionOperationCASLost
+	}
+	return s.memoryNativeStore.TransitionSessionOperation(ctx, previous, next)
+}
+
+func TestDurableNativeSessionRecoveryFailsClosedWhenUnexpectedAdmissionJournalDisappears(t *testing.T) {
+	oldRecover := recoverNativeSessionOperation
+	t.Cleanup(func() { recoverNativeSessionOperation = oldRecover })
+	memory := &memoryNativeStore{}
+	prepared := testPreparedDurableRecord(t)
+	if err := memory.CreateSessionOperation(context.Background(), prepared); err != nil {
+		t.Fatal(err)
+	}
+	dispatching := prepared
+	dispatching.Status = agentstate.SessionOperationDispatching
+	if err := memory.TransitionSessionOperation(context.Background(), prepared, dispatching); err != nil {
+		t.Fatal(err)
+	}
+	store := &removeUnexpectedAdmissionStore{memoryNativeStore: memory}
+	controller, err := newDurableNativeSessionOperations(store, testNativeSessionAuthority())
+	if err != nil {
+		t.Fatal(err)
+	}
+	controller.clock = func() time.Time { return time.UnixMilli(1_800_000_011_000).UTC() }
+	receipt := qurl.NativeSessionReceipt{
+		CellID: dispatching.Operation.CellID, SessionID: 91,
+		SessionIssuedAtMillis: 1_800_000_011_000,
+		RunID:                 dispatching.Operation.RunID, RunAttempt: dispatching.Operation.RunAttempt,
+	}
+	recoverCalls := 0
+	recoverNativeSessionOperation = func(context.Context, *qurl.AgentRuntimeBinding, []byte,
+		qurl.NativeSessionOperation, qurl.NHPUDPEndpoint, ...qurl.AgentRuntimeUDPOption,
+	) (*qurl.NativeSessionOperationRecovery, error) {
+		recoverCalls++
+		return &qurl.NativeSessionOperationRecovery{UnexpectedAdmission: &receipt},
+			&qurl.NativeSessionOperationUnexpectedAdmissionError{SessionReceipt: receipt}
+	}
+	err = controller.RecoverOperation(context.Background(), &qurl.AgentRuntimeBinding{AgentID: "agent-one"},
+		make([]byte, 32), testProtectedResourceID, dispatching.Operation.OperationID, nil)
+	if !errors.Is(err, agentstate.ErrSessionOperationConflict) || recoverCalls != 1 || !store.removed {
+		t.Fatalf("disappeared unexpected admission = err %v, calls %d, removed %t; want fail closed after one exchange",
+			err, recoverCalls, store.removed)
 	}
 }
 

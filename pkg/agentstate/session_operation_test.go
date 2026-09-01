@@ -236,13 +236,23 @@ func TestSDKStoreSessionOperationRejectsStaleCASAndReplacementDelete(t *testing.
 	if err := store.TransitionSessionOperation(context.Background(), prepared, dispatching); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.TransitionSessionOperation(context.Background(), prepared, dispatching); !errors.Is(err, ErrSessionOperationConflict) {
+	if err := store.TransitionSessionOperation(context.Background(), prepared, dispatching); !errors.Is(err, ErrSessionOperationCASLost) || !errors.Is(err, ErrSessionOperationConflict) {
 		t.Fatalf("stale transition = %v", err)
 	}
 	terminal := dispatching
 	terminal.Status = SessionOperationCanceled
-	if err := store.DeleteSessionOperation(context.Background(), terminal); !errors.Is(err, ErrSessionOperationConflict) {
+	if err := store.DeleteSessionOperation(context.Background(), terminal); !errors.Is(err, ErrSessionOperationCASLost) || !errors.Is(err, ErrSessionOperationConflict) {
 		t.Fatalf("uncommitted terminal delete = %v", err)
+	}
+	malformedTerminal := terminal
+	malformedTerminal.Operation.OwnerID = ""
+	if err := store.DeleteSessionOperation(context.Background(), malformedTerminal); !errors.Is(err, ErrSessionOperationConflict) || errors.Is(err, ErrSessionOperationCASLost) {
+		t.Fatalf("malformed terminal delete classification = %v", err)
+	}
+	invalid := dispatching
+	invalid.Status = SessionOperationPrepared
+	if err := store.TransitionSessionOperation(context.Background(), dispatching, invalid); !errors.Is(err, ErrSessionOperationConflict) || errors.Is(err, ErrSessionOperationCASLost) {
+		t.Fatalf("invalid transition classification = %v", err)
 	}
 }
 
