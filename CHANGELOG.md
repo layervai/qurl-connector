@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.9.0](https://github.com/layervai/qurl-connector/compare/v0.8.13...v0.9.0) (2026-09-01)
+
+
+### ⚠ BREAKING CHANGES
+
+* **share:** NativeRuntimeConfig and NativeRuntime no longer expose SessionOptions. No separate session-only option channel remains. Configure credential-free UDPOptions for registered-session operations; these retained options also apply to native lifecycle, discovery, assignment refresh, and the account-credential-authenticated device-authorization recovery client.
+
+### Bug Fixes
+
+* **share:** keep registered sessions on native UDP ([#44](https://github.com/layervai/qurl-connector/issues/44)) ([e99252b](https://github.com/layervai/qurl-connector/commit/e99252bbcb74a5cde88e17cef42429d8858f9d75))
+
 ## [0.8.13](https://github.com/layervai/qurl-connector/compare/v0.8.12...v0.8.13) (2026-09-01)
 
 
