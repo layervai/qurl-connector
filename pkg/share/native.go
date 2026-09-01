@@ -34,8 +34,12 @@ type NativeRuntimeConfig struct {
 	// retained after OpenNativeRuntime returns.
 	RecoveryCredentialProvider func(context.Context) (string, error)
 	RefreshMode                string
-	UDPOptions                 []qurl.AgentRuntimeUDPOption
-	SessionOperations          NativeSessionOperationAuthority
+	// UDPOptions configure native UDP lifecycle, discovery, registered-session
+	// admission, and durable recovery/close. They are retained for assignment
+	// refresh and therefore must not close over enrollment credentials or account
+	// bearer tokens.
+	UDPOptions        []qurl.AgentRuntimeUDPOption
+	SessionOperations NativeSessionOperationAuthority
 }
 
 // nativeRefreshConfig is the credential-free subset retained after opening
@@ -60,7 +64,8 @@ type NativeRuntime struct {
 	AgentID string
 	Hub     qurl.HubBootstrap
 	// UDPOptions configure direct qurl-go UDP calls, including registered-session
-	// admission and durable recovery/close.
+	// admission and durable recovery/close. NewNativeAdmitter transfers and then
+	// clears them from this runtime.
 	UDPOptions        []qurl.AgentRuntimeUDPOption
 	OpenKind          NativeOpenKind
 	SessionOperations NativeSessionOperationAuthority

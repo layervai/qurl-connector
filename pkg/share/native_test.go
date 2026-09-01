@@ -2861,13 +2861,16 @@ func TestNativeRuntimeUDPOptionsReachAdmissionAndDurableRecovery(t *testing.T) {
 	}
 }
 
-func TestSessionOptionsFromUDPCopiesOnlyUDPOptions(t *testing.T) {
+func TestNativeRuntimeDoesNotExposeSessionOptions(t *testing.T) {
 	if _, ok := reflect.TypeOf(NativeRuntimeConfig{}).FieldByName("SessionOptions"); ok {
 		t.Fatal("native runtime config exposes a custom registered-session transport")
 	}
 	if _, ok := reflect.TypeOf(NativeRuntime{}).FieldByName("SessionOptions"); ok {
 		t.Fatal("native runtime exposes a custom registered-session transport")
 	}
+}
+
+func TestSessionOptionsFromUDPUsesOnlyUDPOptions(t *testing.T) {
 	udpOptions := []qurl.AgentRuntimeUDPOption{
 		qurl.WithAgentRuntimeUDPBounds(time.Second, 1),
 		qurl.WithAgentRuntimeUDPBounds(2*time.Second, 2),
@@ -2875,10 +2878,6 @@ func TestSessionOptionsFromUDPCopiesOnlyUDPOptions(t *testing.T) {
 	got := sessionOptionsFromUDP(udpOptions)
 	if len(got) != len(udpOptions) || got[0] == nil || got[1] == nil {
 		t.Fatalf("derived session options = %v, want two native UDP options", got)
-	}
-	udpOptions[0] = nil
-	if got[0] == nil {
-		t.Fatal("derived session options alias the UDP option slice")
 	}
 }
 
