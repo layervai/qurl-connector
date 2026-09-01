@@ -14,6 +14,7 @@ import (
 
 	qurl "github.com/layervai/qurl-go/qurl"
 	"github.com/layervai/qurl-go/relayknock/nativeudp"
+	"github.com/layervai/qurl-go/relayknock/sessionrelay"
 
 	"github.com/layervai/qurl-connector/pkg/agentstate"
 )
@@ -35,7 +36,14 @@ type NativeRuntimeConfig struct {
 	RecoveryCredentialProvider func(context.Context) (string, error)
 	RefreshMode                string
 	UDPOptions                 []qurl.AgentRuntimeUDPOption
-	SessionOperations          NativeSessionOperationAuthority
+	// SessionOptions configure registered-session admission and durable
+	// operation recovery/close. They are never passed to Hub assignment,
+	// enrollment, registration, or Connector-resource lifecycle exchanges.
+	// They are retained for assignment refresh and therefore must not close
+	// over enrollment credentials or account bearer tokens. A custom relay
+	// http.Client, including its Transport and Jar, must also be credential-free.
+	SessionOptions    []qurl.AgentRuntimeSessionOption
+	SessionOperations NativeSessionOperationAuthority
 }
 
 // nativeRefreshConfig is the credential-free subset retained after opening
@@ -48,6 +56,7 @@ type nativeRefreshConfig struct {
 	ClientBaseURL     string
 	RefreshMode       string
 	UDPOptions        []qurl.AgentRuntimeUDPOption
+	SessionOptions    []qurl.AgentRuntimeSessionOption
 	SessionOperations NativeSessionOperationAuthority
 }
 
@@ -55,11 +64,17 @@ type nativeRefreshConfig struct {
 // Client and Binding for native resource discovery before transferring the
 // runtime into NewNativeAdmitter.
 type NativeRuntime struct {
-	Client            *qurl.Client
-	Binding           *qurl.AgentRuntimeBinding
-	AgentID           string
-	Hub               qurl.HubBootstrap
-	UDPOptions        []qurl.AgentRuntimeUDPOption
+	Client  *qurl.Client
+	Binding *qurl.AgentRuntimeBinding
+	AgentID string
+	Hub     qurl.HubBootstrap
+	// UDPOptions are the original lifecycle/discovery subset for direct qurl-go
+	// UDP calls. They are already included once in SessionOptions.
+	UDPOptions []qurl.AgentRuntimeUDPOption
+	// SessionOptions contain UDPOptions followed by the explicit registered-
+	// session options. Pass them only to admission and durable recovery/close;
+	// do not append UDPOptions again.
+	SessionOptions    []qurl.AgentRuntimeSessionOption
 	OpenKind          NativeOpenKind
 	SessionOperations NativeSessionOperationAuthority
 
@@ -104,7 +119,6 @@ var (
 	recoverNativeRuntime = qurl.RecoverAgentRuntimeWithCredentialProvider
 	waitNativeRefresh    = sleepWithContext
 	knockNativeRuntime   = qurl.KnockRegisteredAgent
-	retireNativeSession  = qurl.RetireRegisteredAgentSession
 	takeNativeKey        = func(binding *qurl.AgentRuntimeBinding) []byte { return binding.TakeDeviceStaticPrivateKey() }
 )
 
@@ -344,8 +358,20 @@ func refreshConfig(cfg NativeRuntimeConfig, mode string) nativeRefreshConfig {
 		StateDir: cfg.StateDir, AgentID: strings.TrimSpace(cfg.AgentID), Hub: cfg.Hub,
 		ClientBaseURL: cfg.ClientBaseURL, RefreshMode: mode,
 		UDPOptions:        append([]qurl.AgentRuntimeUDPOption(nil), cfg.UDPOptions...),
+		SessionOptions:    append([]qurl.AgentRuntimeSessionOption(nil), cfg.SessionOptions...),
 		SessionOperations: cfg.SessionOperations,
 	}
+}
+
+func composeSessionOptions(udpOptions []qurl.AgentRuntimeUDPOption, sessionOptions []qurl.AgentRuntimeSessionOption) []qurl.AgentRuntimeSessionOption {
+	composed := make([]qurl.AgentRuntimeSessionOption, 0, len(udpOptions)+len(sessionOptions))
+	for _, option := range udpOptions {
+		composed = append(composed, option)
+	}
+	// qurl-go applies options in order. Keep explicit session options last so
+	// they win when they repeat a UDP knob; a relay option then selects HTTPS
+	// while the retained UDP defaults remain available for non-session calls.
+	return append(composed, sessionOptions...)
 }
 
 func refreshUntilOpen(ctx context.Context, cfg nativeRefreshConfig, store nativeStateStore, marker agentstate.RefreshMarker, mode string) (*NativeRuntime, error) {
@@ -517,10 +543,14 @@ func assembleNativeRuntime(client *qurl.Client, binding *qurl.AgentRuntimeBindin
 		binding.Destroy()
 		return nil, err
 	}
+	retained := cfg
+	retained.UDPOptions = append([]qurl.AgentRuntimeUDPOption(nil), cfg.UDPOptions...)
+	retained.SessionOptions = append([]qurl.AgentRuntimeSessionOption(nil), cfg.SessionOptions...)
 	return &NativeRuntime{
 		Client: client, Binding: binding, AgentID: binding.AgentID, Hub: cfg.Hub, OpenKind: kind,
 		store: store, UDPOptions: append([]qurl.AgentRuntimeUDPOption(nil), cfg.UDPOptions...),
-		refreshCfg: cfg, SessionOperations: cfg.SessionOperations,
+		SessionOptions: composeSessionOptions(cfg.UDPOptions, cfg.SessionOptions),
+		refreshCfg:     retained, SessionOperations: cfg.SessionOperations,
 	}, nil
 }
 
@@ -640,6 +670,7 @@ func (r *NativeRuntime) RecoverCredentialAfterDeviceAuthorizationFailure(
 	r.AgentID = replacement.AgentID
 	r.Hub = replacement.Hub
 	r.UDPOptions = replacement.UDPOptions
+	r.SessionOptions = replacement.SessionOptions
 	r.OpenKind = replacement.OpenKind
 	r.SessionOperations = replacement.SessionOperations
 	r.refreshCfg = replacement.refreshCfg
@@ -667,6 +698,8 @@ func (r *NativeRuntime) Close() error {
 	}
 	r.Client = nil
 	r.UDPOptions = nil
+	r.SessionOptions = nil
+	r.refreshCfg = nativeRefreshConfig{}
 	r.SessionOperations = NativeSessionOperationAuthority{}
 	return err
 }
@@ -686,7 +719,7 @@ type NativeAdmitter struct {
 
 	binding                     *qurl.AgentRuntimeBinding
 	privateKey                  []byte
-	udpOpts                     []qurl.AgentRuntimeUDPOption
+	sessionOpts                 []qurl.AgentRuntimeSessionOption
 	store                       nativeStateStore
 	refreshCfg                  nativeRefreshConfig
 	operations                  nativeSessionOperationController
@@ -850,8 +883,8 @@ func NewNativeAdmitter(ctx context.Context, runtime *NativeRuntime) (*NativeAdmi
 	lifecycle, cancel := context.WithCancel(ctx)
 	admitter := &NativeAdmitter{
 		binding: runtime.Binding, privateKey: key, store: runtime.store,
-		udpOpts:    append([]qurl.AgentRuntimeUDPOption(nil), runtime.UDPOptions...),
-		refreshCfg: runtime.refreshCfg, operations: operations,
+		sessionOpts: append([]qurl.AgentRuntimeSessionOption(nil), runtime.SessionOptions...),
+		refreshCfg:  runtime.refreshCfg, operations: operations,
 		live:                        make(map[nativeAdmissionKey]nativeLiveAdmission),
 		pending:                     make(map[nativeAdmissionKey]bool),
 		retirementRecoveryWake:      make(chan struct{}, 1),
@@ -863,6 +896,7 @@ func NewNativeAdmitter(ctx context.Context, runtime *NativeRuntime) (*NativeAdmi
 	runtime.store = nil
 	runtime.Client = nil
 	runtime.UDPOptions = nil
+	runtime.SessionOptions = nil
 	runtime.refreshCfg = nativeRefreshConfig{}
 	runtime.SessionOperations = NativeSessionOperationAuthority{}
 	// Startup cleanup must not take down healthy sibling shares. It is still
@@ -1117,7 +1151,7 @@ func (a *NativeAdmitter) recoverAllPendingExcludingPermanent(ctx context.Context
 			return errors.Join(recoveryErr, errors.New("recover native session operations: native admitter is closed"))
 		}
 		err := a.operations.RecoverPending(
-			ctx, a.binding, a.privateKey, resourceID, a.liveOperationIDs(resourceID), a.udpOpts,
+			ctx, a.binding, a.privateKey, resourceID, a.liveOperationIDs(resourceID), a.sessionOpts,
 		)
 		a.runtimeMu.RUnlock()
 		unlockResource()
@@ -1221,7 +1255,7 @@ func (a *NativeAdmitter) admitOnce(ctx context.Context, knockResourceID,
 		return Admission{}, errors.New("native admitter has no durable session-operation authority"), a.generation, false
 	}
 	generation := a.generation
-	if err := a.operations.RecoverPending(ctx, a.binding, a.privateKey, resourceID, a.liveOperationIDs(resourceID), a.udpOpts); err != nil {
+	if err := a.operations.RecoverPending(ctx, a.binding, a.privateKey, resourceID, a.liveOperationIDs(resourceID), a.sessionOpts); err != nil {
 		// Recovery is source-fenced to the operation's persisted cell. Assignment
 		// refresh cannot change that endpoint, so this resource remains blocked by
 		// its durable record without changing the live-placement failure budget.
@@ -1253,7 +1287,7 @@ func (a *NativeAdmitter) knock(ctx context.Context, knockResourceID, resourceID 
 	}
 	result, err := knockNativeRuntime(
 		ctx, a.binding, a.privateKey, knockResourceID,
-		qurl.NativeKnockOptions{RunID: runID, RunAttempt: runAttempt, ProtectedResourceID: resourceID, Operation: operation}, a.udpOpts...,
+		qurl.NativeKnockOptions{RunID: runID, RunAttempt: runAttempt, ProtectedResourceID: resourceID, Operation: operation}, a.sessionOpts...,
 	)
 	a.knockMu.Unlock()
 	if err != nil {
@@ -1308,7 +1342,7 @@ func (a *NativeAdmitter) recoverOperationCleanup(resourceID, operationID string)
 	cleanupCtx, cancelCleanup := context.WithTimeout(parent, nativeSessionCleanupBudget)
 	defer cancelCleanup()
 	return a.operations.RecoverOperation(
-		cleanupCtx, a.binding, a.privateKey, resourceID, operationID, a.udpOpts,
+		cleanupCtx, a.binding, a.privateKey, resourceID, operationID, a.sessionOpts,
 	)
 }
 
@@ -1345,9 +1379,24 @@ func refreshableKnockError(err error) bool {
 		// Reassigning cannot repair resource, policy, or access-control failures.
 		return false
 	}
+	if errors.Is(err, sessionrelay.ErrInvalidConfig) ||
+		errors.Is(err, sessionrelay.ErrInvalidRequest) ||
+		errors.Is(err, sessionrelay.ErrTransport) ||
+		errors.Is(err, sessionrelay.ErrServerUnauthenticated) {
+		// A relay failure can mean either that the caller-configured relay is
+		// unavailable or that its assignment-derived cell fingerprint no longer
+		// routes. It remains non-refreshable because the HTTPS knock may already
+		// have crossed the relay. Switching assignment or cell before the durable,
+		// source-fenced operation is terminal could create authority in two cells.
+		// Even after cleanup completes, this opaque relay result is not trusted as
+		// a placement signal. The no-cross-cell behavior is deliberately asymmetric
+		// with native UDP and requires an independent assignment lifecycle event.
+		return false
+	}
 	// These sentinels are produced when the binding's live placement can no
 	// longer admit a session. They deliberately take precedence over the
-	// invalid-input/deadline errors a bounded renewal may also wrap.
+	// invalid-input/deadline errors a bounded renewal may also wrap. The relay
+	// sentinels above deliberately take precedence over this placement set.
 	if immediatePlacementRefresh(err) {
 		return true
 	}
@@ -1401,7 +1450,7 @@ func (a *NativeAdmitter) refresh(ctx context.Context, failedGeneration uint64, r
 	oldKey := a.privateKey
 	a.binding = runtime.Binding
 	a.privateKey = key
-	a.udpOpts = append(a.udpOpts[:0], runtime.UDPOptions...)
+	a.sessionOpts = append([]qurl.AgentRuntimeSessionOption(nil), runtime.SessionOptions...)
 	runtime.Binding = nil
 	runtime.store = nil
 	a.generation++
@@ -1693,7 +1742,7 @@ func (a *NativeAdmitter) retireOne(ctx context.Context, key nativeAdmissionKey, 
 	if a.operations == nil {
 		return errors.New("native admitter has no durable session-operation authority")
 	}
-	if err := a.operations.Retire(ctx, a.binding, a.privateKey, live.resourceID, live.operationID, live.receipt, a.udpOpts); err != nil {
+	if err := a.operations.Retire(ctx, a.binding, a.privateKey, live.resourceID, live.operationID, live.receipt, a.sessionOpts); err != nil {
 		a.queueNativeRetirementRecovery(live.resourceID)
 		return err
 	}
@@ -1764,7 +1813,7 @@ func (a *NativeAdmitter) Close() error {
 	a.closed = true
 	binding := a.binding
 	privateKey := a.privateKey
-	udpOpts := a.udpOpts
+	sessionOpts := a.sessionOpts
 	store := a.store
 	operations := a.operations
 	var closeErr error
@@ -1795,7 +1844,7 @@ func (a *NativeAdmitter) Close() error {
 				if operations == nil {
 					err = errors.New("native admitter has no durable session-operation authority")
 				} else {
-					err = operations.Retire(ctx, binding, privateKey, live.resourceID, live.operationID, live.receipt, udpOpts)
+					err = operations.Retire(ctx, binding, privateKey, live.resourceID, live.operationID, live.receipt, sessionOpts)
 				}
 				results <- closeResult{key: key, err: err}
 			}(key, live)
@@ -1816,7 +1865,7 @@ func (a *NativeAdmitter) Close() error {
 	}
 	a.binding = nil
 	a.privateKey = nil
-	a.udpOpts = nil
+	a.sessionOpts = nil
 	a.store = nil
 	a.operations = nil
 	a.stateMu.Lock()
