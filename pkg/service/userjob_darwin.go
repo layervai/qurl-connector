@@ -22,7 +22,12 @@ type launchdUserJobManager struct {
 	sleep          func(time.Duration)
 }
 
-const launchdBootstrapRetryDelay = 250 * time.Millisecond
+const (
+	launchdBootstrapRetryDelay = 250 * time.Millisecond
+	// Each cycle can make two bootstrap attempts. The full failure budget is
+	// therefore eight attempts and seven waits, or 1.75 seconds of settle time.
+	launchdBootstrapMaxCycles = 4
+)
 
 // NewUserJobManager returns a per-user launchd manager.
 func NewUserJobManager() UserJobManager {
@@ -89,32 +94,7 @@ func (m *launchdUserJobManager) ensure(job UserJob, forceReplace bool) error {
 			return fmt.Errorf("write launchd job %s: %w", job.Label, err)
 		}
 	}
-	possiblyLoaded, err := m.bootstrapWithSettleRetry(domain, service, plistPath)
-	if err != nil {
-		// Unload an ambiguous job so a later Ensure cannot mistake it for this
-		// definition. Keep the new plist for login-time autostart when the unload
-		// succeeds. possiblyLoaded is deliberately conservative: it also includes
-		// a new job that bootstrap loaded before returning an error. Unload that
-		// job rather than trust unparsed launchctl arguments. After a confirmed
-		// unload, make one bounded bootstrap cycle in the same Ensure call so a
-		// transient EIO does not require the user to repeat publish. If even the
-		// unload is ambiguous, remove a changed plist fail-closed.
-		if possiblyLoaded {
-			unloadErr := m.unloadAmbiguous(service, plistPath, "ambiguous", definitionChanged)
-			err = errors.Join(err, unloadErr)
-			if unloadErr == nil {
-				retryLoaded, retryErr := m.bootstrapWithSettleRetry(domain, service, plistPath)
-				if retryErr == nil {
-					err = nil
-				} else {
-					err = errors.Join(err, fmt.Errorf("retry bootstrap after ambiguous unload: %w", retryErr))
-					if retryLoaded {
-						err = errors.Join(err, m.unloadAmbiguous(service, plistPath, "retry-ambiguous", definitionChanged))
-					}
-				}
-			}
-		}
-	}
+	err = m.bootstrapWithLaunchdSettleRecovery(domain, service, plistPath, definitionChanged)
 	if err != nil {
 		return fmt.Errorf("bootstrap launchd job %s: %w", job.Label, err)
 	}
@@ -122,6 +102,53 @@ func (m *launchdUserJobManager) ensure(job UserJob, forceReplace bool) error {
 		return fmt.Errorf("start launchd job %s: %w", job.Label, err)
 	}
 	return nil
+}
+
+// bootstrapWithLaunchdSettleRecovery converges launchd label reuse within one
+// bounded call. A failed bootstrap can leave the service absent while launchd
+// still holds the old label, or it can leave a service loaded whose exact
+// arguments are not proven. Unload only the ambiguous service, let launchd
+// settle, and retry without ever accepting an uncertain process. The fixed
+// cycle budget covers rapid Remove-then-Ensure and definition replacement
+// without turning a persistent launchd failure into an unbounded wait.
+// launchctl does not expose stable machine-readable error categories, so state
+// checks, not localized error text, decide whether an unload is required.
+func (m *launchdUserJobManager) bootstrapWithLaunchdSettleRecovery(
+	domain, service, plistPath string,
+	definitionChanged bool,
+) error {
+	var lastErr error
+	for cycle := 0; cycle < launchdBootstrapMaxCycles; cycle++ {
+		possiblyLoaded, err := m.bootstrapWithSettleRetry(domain, service, plistPath)
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+		if possiblyLoaded {
+			what := "ambiguous"
+			if cycle > 0 {
+				what = "retry-ambiguous"
+			}
+			if unloadErr := m.unloadAmbiguous(service, plistPath, what, definitionChanged); unloadErr != nil {
+				return errors.Join(
+					fmt.Errorf("launchd bootstrap failed during settle cycle %d: %w", cycle+1, err),
+					unloadErr,
+				)
+			}
+		}
+		if cycle+1 < launchdBootstrapMaxCycles {
+			m.settle()
+		}
+	}
+	return fmt.Errorf("launchd bootstrap did not settle after %d cycles: %w", launchdBootstrapMaxCycles, lastErr)
+}
+
+func (m *launchdUserJobManager) settle() {
+	sleep := m.sleep
+	if sleep == nil {
+		sleep = time.Sleep
+	}
+	sleep(launchdBootstrapRetryDelay)
 }
 
 // unloadAmbiguous boots out a job whose loaded definition cannot be proven.
@@ -150,11 +177,7 @@ func (m *launchdUserJobManager) bootstrapWithSettleRetry(domain, service, plistP
 	if firstErr == nil {
 		return false, nil
 	}
-	sleep := m.sleep
-	if sleep == nil {
-		sleep = time.Sleep
-	}
-	sleep(launchdBootstrapRetryDelay)
+	m.settle()
 	if _, statusErr := m.launchctlQuery("print", service); statusErr == nil {
 		return true, firstErr
 	} else if !isLaunchdNotFound(statusErr) {
