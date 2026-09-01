@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.8.11](https://github.com/layervai/qurl-connector/compare/v0.8.10...v0.8.11) (2026-09-01)
+
+
+### Bug Fixes
+
+* resume terminal session retirement ([#37](https://github.com/layervai/qurl-connector/issues/37)) ([df1e388](https://github.com/layervai/qurl-connector/commit/df1e388419b14c412d69469c47b2c4e696b5c1b1))
+
 ## [0.8.10](https://github.com/layervai/qurl-connector/compare/v0.8.9...v0.8.10) (2026-08-31)
 
 
