@@ -246,10 +246,23 @@ func (d *durableNativeSessionOperations) RecoverOperation(ctx context.Context, b
 				"expired_at_ms", expiry,
 				"recovery_attempts", record.RecoveryAttempt)
 			// Terminal first: a CLOSING record is not deletable directly, and the
-			// same two-step the Prepared branch uses keeps the journal valid if
-			// this is interrupted between the transition and the delete.
+			// same two-step the success path uses keeps the journal valid if this
+			// is interrupted between the transition and the delete.
+			//
+			// The terminal status has to follow the admission, not be assumed:
+			// the store rejects CANCELED unless Admission is nil, and from
+			// CLOSING only CLOSING and CLOSED are reachable at all. Forcing
+			// CANCELED here failed validation for exactly the CLOSING records
+			// this exists to retire, so they kept retrying -- on
+			// "invalid transition" instead of a deadline -- while the branch
+			// short-circuited the server exchange that could still have retired
+			// them legitimately.
 			retired := record
-			retired.Status = agentstate.SessionOperationCanceled
+			if record.Admission == nil {
+				retired.Status = agentstate.SessionOperationCanceled
+			} else {
+				retired.Status = agentstate.SessionOperationClosed
+			}
 			if err := d.store.TransitionSessionOperation(ctx, record, retired); err != nil {
 				complete, reconcileErr := d.reconcileRecoveryConflict(ctx, protectedResourceID, record, err)
 				if reconcileErr != nil {
