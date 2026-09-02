@@ -1350,7 +1350,7 @@ func TestRecoverPendingStillAttemptsAnExpiredRecordWithFewAttempts(t *testing.T)
 	}
 }
 
-// A record still inside its lifetime must keep the existing retry behaviour;
+// A record still inside its lifetime must keep the existing retry behavior;
 // abandoning those would discard sessions the server still holds.
 func TestRecoverPendingStillRecoversAnUnexpiredOperation(t *testing.T) {
 	oldPrepare := prepareLiveNativeSessionOperation
