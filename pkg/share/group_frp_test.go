@@ -462,9 +462,12 @@ func TestFRPGroupSessionUpdateRegistersOnlyChangedProxies(t *testing.T) {
 }
 
 func TestFRPGroupSessionUpdatedProxiesMatchServiceCompletedConfigs(t *testing.T) {
-	// FRP diffs live proxies against an update with reflect.DeepEqual; the
-	// update must therefore carry exactly the completed shape the service
-	// stored at start, or every unchanged proxy restarts on each update.
+	// FRP diffs live proxies against an update with reflect.DeepEqual, so an
+	// update must carry the completed shape the start path seeds. This proves
+	// the session's Update output is self-consistent with the same completion
+	// the start path applies (and that completion changes the shape at all);
+	// agreement with FRP's own Service is covered by the FRPS-backed
+	// TestHermeticSessionGroupServesManyRoutesOnOneAdmission.
 	common := &v1.ClientCommonConfig{}
 	factory, err := NewFRPSessionGroupFactory(FRPGroupFactoryConfig{Common: common})
 	if err != nil {
@@ -551,8 +554,12 @@ func TestFRPGroupSessionRetriesFailedProxyPush(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "update FRP proxy set") {
 		t.Fatalf("Update with a failing push = %v, want the push error", err)
 	}
-	if state := session.RouteStates()["b"]; state.Phase != RoutePending {
-		t.Fatalf("route b after a failed push = %+v, want pending, never serving", state)
+	states := session.RouteStates()
+	if state := states["b"]; state.Phase != RoutePending || state.Err == nil || !strings.Contains(state.Err.Error(), "control connection reset") {
+		t.Fatalf("route b after a failed push = %+v, want pending and carrying the push error", state)
+	}
+	if state := states["a"]; state.Phase != RouteServing || state.Err != nil {
+		t.Fatalf("registered route a after a failed push = %+v, want still serving with no error", state)
 	}
 	if !session.pushOwed() {
 		t.Fatal("failed push did not leave the table owed to FRP")
@@ -567,6 +574,9 @@ func TestFRPGroupSessionRetriesFailedProxyPush(t *testing.T) {
 	updates := svc.updateNames()
 	if want := []string{"a-nhp7", "b-nhp7"}; len(updates) != 1 || !reflect.DeepEqual(updates[0], want) {
 		t.Fatalf("accepted pushes = %q, want exactly one carrying %q", updates, want)
+	}
+	if state := session.RouteStates()["b"]; state.Phase != RoutePending || state.Err != nil {
+		t.Fatalf("route b after the accepted push = %+v, want pending with the push error cleared", state)
 	}
 	status.set("b-nhp7", frpproxy.ProxyPhaseRunning, "")
 	waitForRouteStates(t, session, func(s map[string]RouteState) bool { return phaseOf(s, "b") == RouteServing })

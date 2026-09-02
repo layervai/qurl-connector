@@ -515,6 +515,45 @@ func TestSessionGroupRunnerWithdrawsGoneRouteWithoutDisturbingSiblings(t *testin
 	}
 }
 
+func TestSessionGroupRunnerReturnsWhenEveryRouteIsGone(t *testing.T) {
+	h := startGroupHarness(t, time.Hour, 0, nil, "a", "b", "c")
+	h.waitServing(t, 1, "a", "b", "c")
+	session := h.factory.session(1)
+	gone := fmt.Errorf("%w: resource_not_found: resource not found", ErrResourceGone)
+	session.failRoute("a", gone)
+	waitUntil(t, time.Second, func() bool { return len(h.events.failedFor("a")) == 1 }, "route a reported gone")
+	select {
+	case err := <-h.done:
+		t.Fatalf("runner exited while routes b and c were still serving: %v", err)
+	default:
+	}
+	session.failRoute("b", gone)
+	session.failRoute("c", gone)
+	select {
+	case err := <-h.done:
+		if !errors.Is(err, ErrGroupEmpty) {
+			t.Fatalf("Run() = %v, want ErrGroupEmpty once every route is gone", err)
+		}
+		h.done <- err
+	case <-time.After(2 * time.Second):
+		t.Fatal("runner kept running (and would keep knocking) with no routes left")
+	}
+	for _, routeID := range []string{"a", "b", "c"} {
+		if got := h.events.failedFor(routeID); len(got) != 1 || !errors.Is(got[0], ErrResourceGone) {
+			t.Fatalf("route %q failures = %v, want one ErrResourceGone", routeID, got)
+		}
+	}
+	if got := h.admissions(); got != 1 {
+		t.Fatalf("admissions = %d, want no knock for an empty group", got)
+	}
+	if got := h.retired(); len(got) != 1 || got[0] != 1 {
+		t.Fatalf("retired admissions = %v, want the group's one admission retired on exit", got)
+	}
+	if !session.isStopped() {
+		t.Fatal("session left running after the group emptied")
+	}
+}
+
 func TestSessionGroupRunnerRotationRegistersEveryRouteBeforeRetiringOld(t *testing.T) {
 	hold := func(sessionIndex int, _ string) bool { return sessionIndex == 2 }
 	h := startGroupHarness(t, time.Second, 0, hold, "a", "b", "c")

@@ -21,7 +21,11 @@ import (
 
 // MaxGroupRoutes bounds one session group. Every route is one FRP proxy on
 // the group's single control session, so the bound caps the proxy set one
-// admission may carry, not the number of admissions.
+// admission may carry, not the number of admissions. At the bound the
+// rotation lead needs 2000 × 50ms = 100s, which fits only when the admission
+// OpenTime is at least 200s; a shorter window reports OnRotationLeadCapped on
+// every admission and may promote a replacement before every route has
+// re-registered.
 const MaxGroupRoutes = 2000
 
 // ErrRouteNotServing reports a route that stayed configured but did not reach
@@ -70,9 +74,11 @@ type RouteState struct {
 // GroupServingSession is one FRP control session that carries many proxies
 // under one Admission. Ready closes once every route that is not permanently
 // failed is running (and at least one is); later additions never reopen it,
-// so callers that add routes must consult RouteStates. Update replaces the
-// proxy set on the live session: unchanged proxies keep serving, removed
-// proxies are withdrawn, added or regenerated proxies register.
+// so callers that add routes must consult RouteStates. SessionGroupRunner
+// itself never reads Ready: it drives entirely off Changes and RouteStates,
+// and Ready exists for simple single-shot callers. Update replaces the proxy
+// set on the live session: unchanged proxies keep serving, removed proxies
+// are withdrawn, added or regenerated proxies register.
 //
 // The server admits NewProxy only while the Login's knock token is inside its
 // admission window, so a route may be added to a session only within the
@@ -334,6 +340,10 @@ type frpGroupSession struct {
 	// retries every tick until they meet.
 	version uint64
 	pushed  uint64
+	// pushErr is the last failed push while one is still owed; RouteStates
+	// surfaces it on every pending route so a stuck push is distinguishable
+	// from a proxy FRP simply has not registered yet.
+	pushErr error
 	err     error
 	stopped bool
 
@@ -394,37 +404,63 @@ func (s *frpGroupSession) watch(ctx context.Context) {
 	}
 }
 
+type routeObservation struct {
+	routeID string
+	name    string
+	phase   RoutePhase
+	err     error
+}
+
 // observe folds FRP's per-proxy status into route phases. A route that
 // permanently failed is withdrawn from the proxy set (the table version
 // advances so watch pushes the smaller set); an admission-level rejection is
-// returned and ends the whole session.
+// returned and ends the whole session. The status exporter is queried
+// outside the table lock so a 2000-route scan never blocks Update or
+// RouteStates; an entry replaced meanwhile is simply skipped this tick.
 func (s *frpGroupSession) observe() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	if s.status == nil {
 		return nil
 	}
-	changed := false
-	live, serving := 0, 0
+	s.mu.Lock()
+	observations := make([]routeObservation, 0, len(s.routes))
 	for routeID, entry := range s.routes {
+		if entry.phase != RouteFailed {
+			observations = append(observations, routeObservation{routeID: routeID, name: entry.name})
+		}
+	}
+	s.mu.Unlock()
+	for i := range observations {
+		phase, err, terminal := inspectRouteStatus(s.status, observations[i].name)
+		if terminal != nil {
+			return fmt.Errorf("route %q: %w", observations[i].routeID, terminal)
+		}
+		observations[i].phase, observations[i].err = phase, err
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	changed := false
+	for _, observed := range observations {
+		entry, ok := s.routes[observed.routeID]
+		if !ok || entry.name != observed.name || entry.phase == RouteFailed {
+			continue
+		}
+		if observed.phase == RouteFailed {
+			s.version++
+		}
+		if entry.phase != observed.phase || errText(entry.err) != errText(observed.err) {
+			entry.phase, entry.err = observed.phase, observed.err
+			changed = true
+		}
+	}
+	live, serving := 0, 0
+	for _, entry := range s.routes {
 		if entry.phase == RouteFailed {
 			continue
 		}
-		phase, err, terminal := inspectRouteStatus(s.status, entry.name)
-		if terminal != nil {
-			return fmt.Errorf("route %q: %w", routeID, terminal)
-		}
-		if phase == RouteFailed {
-			s.version++
-		} else {
-			live++
-			if phase == RouteServing {
-				serving++
-			}
-		}
-		if entry.phase != phase || errText(entry.err) != errText(err) {
-			entry.phase, entry.err = phase, err
-			changed = true
+		live++
+		if entry.phase == RouteServing {
+			serving++
 		}
 	}
 	if live > 0 && serving == live {
@@ -519,7 +555,7 @@ func (s *frpGroupSession) Update(ctx context.Context, routes []GroupRoute) error
 	s.version++
 	s.mu.Unlock()
 	s.notify()
-	return s.pushLocked()
+	return s.pushUnderUpdateMu()
 }
 
 func (s *frpGroupSession) pushOwed() bool {
@@ -534,10 +570,12 @@ func (s *frpGroupSession) pushOwed() bool {
 func (s *frpGroupSession) push() error {
 	s.updateMu.Lock()
 	defer s.updateMu.Unlock()
-	return s.pushLocked()
+	return s.pushUnderUpdateMu()
 }
 
-func (s *frpGroupSession) pushLocked() error {
+// pushUnderUpdateMu is the push body; the caller holds updateMu (not mu),
+// which is what keeps successive pushes in table order.
+func (s *frpGroupSession) pushUnderUpdateMu() error {
 	s.mu.Lock()
 	if s.stopped {
 		s.mu.Unlock()
@@ -549,14 +587,21 @@ func (s *frpGroupSession) pushLocked() error {
 	if err != nil {
 		return err
 	}
-	if err := s.svc.UpdateAllConfigurer(proxies, nil); err != nil {
-		return fmt.Errorf("update FRP proxy set: %w", err)
-	}
+	pushErr := s.svc.UpdateAllConfigurer(proxies, nil)
 	s.mu.Lock()
+	defer s.mu.Unlock()
+	if pushErr != nil {
+		s.pushErr = fmt.Errorf("update FRP proxy set: %w", pushErr)
+		s.notify()
+		return s.pushErr
+	}
 	if s.pushed < version {
 		s.pushed = version
 	}
-	s.mu.Unlock()
+	if s.pushed == s.version && s.pushErr != nil {
+		s.pushErr = nil
+		s.notify()
+	}
 	return nil
 }
 
@@ -575,12 +620,23 @@ func (s *frpGroupSession) liveProxiesLocked() ([]v1.ProxyConfigurer, error) {
 	return completeGroupProxies(s.common, proxies)
 }
 
+// RouteStates reports every route's registration. While a push to FRP is
+// owed and the last attempt failed, pending routes without a more specific
+// start error carry that push error.
 func (s *frpGroupSession) RouteStates() map[string]RouteState {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	var pushErr error
+	if s.pushed != s.version {
+		pushErr = s.pushErr
+	}
 	states := make(map[string]RouteState, len(s.routes))
 	for routeID, entry := range s.routes {
-		states[routeID] = RouteState{Route: entry.route, ProxyName: entry.name, Phase: entry.phase, Err: entry.err}
+		state := RouteState{Route: entry.route, ProxyName: entry.name, Phase: entry.phase, Err: entry.err}
+		if state.Phase == RoutePending && state.Err == nil {
+			state.Err = pushErr
+		}
+		states[routeID] = state
 	}
 	return states
 }

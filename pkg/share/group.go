@@ -9,6 +9,12 @@ import (
 	"time"
 )
 
+// ErrGroupEmpty ends Run once every route has been withdrawn as permanently
+// unavailable (ErrResourceGone). There is nothing left to admit, so the
+// runner retires its admission and returns instead of knocking for an empty
+// proxy set; start a new group once routes exist again.
+var ErrGroupEmpty = errors.New("qURL share session group has no routes left")
+
 // SessionGroupConfig configures one SessionGroupRunner.
 //
 // KnockResourceID and ResourceID identify the single NHP admission the whole
@@ -190,8 +196,9 @@ func (r *SessionGroupRunner) rotateAt(cycle *groupCycle) time.Time {
 
 // Run serves until ctx ends. Admission and connection failures retry forever
 // with bounded jitter. Run returns early only when the group's protected
-// resource is permanently gone (ErrResourceGone from admission) or an exact
-// retirement fails.
+// resource is permanently gone (ErrResourceGone from admission), when every
+// route has been withdrawn as permanently unavailable (ErrGroupEmpty), or
+// when an exact retirement fails.
 func (r *SessionGroupRunner) Run(ctx context.Context) (retErr error) {
 	if ctx == nil {
 		return errors.New("run session group: context is nil")
@@ -222,7 +229,7 @@ func (r *SessionGroupRunner) Run(ctx context.Context) (retErr error) {
 		if active == nil {
 			cycle, err := r.startReadyCycle(ctx, nil)
 			if err != nil {
-				if errors.Is(err, ErrResourceGone) {
+				if errors.Is(err, ErrResourceGone) || errors.Is(err, ErrGroupEmpty) {
 					return err
 				}
 				if retryErr := retryAfter(ctx, r.cfg.OnRetry, err, jitter(backoff)); retryErr != nil {
@@ -233,6 +240,9 @@ func (r *SessionGroupRunner) Run(ctx context.Context) (retErr error) {
 			}
 			backoff = r.cfg.MinBackoff
 			r.promote(ctx, cycle)
+			if r.desiredCount() == 0 {
+				return ErrGroupEmpty
+			}
 			active = cycle
 		}
 
@@ -254,11 +264,14 @@ func (r *SessionGroupRunner) Run(ctx context.Context) (retErr error) {
 		case <-active.session.Changes():
 			stopTimer(rotate)
 			r.reportActive(ctx)
+			if r.desiredCount() == 0 {
+				return ErrGroupEmpty
+			}
 		case <-rotate.C:
 			r.setRotating(true)
 			replacement, err := r.startReadyCycle(ctx, active)
 			if err != nil {
-				if errors.Is(err, ErrResourceGone) {
+				if errors.Is(err, ErrResourceGone) || errors.Is(err, ErrGroupEmpty) {
 					return err
 				}
 				// Keep the old serving session while a replacement is still
@@ -277,6 +290,9 @@ func (r *SessionGroupRunner) Run(ctx context.Context) (retErr error) {
 			}
 			r.promote(ctx, replacement)
 			drains.start(active.session, r.cfg.StopTimeout, func() { _ = r.retireAdmission(active.admission) })
+			if r.desiredCount() == 0 {
+				return ErrGroupEmpty
+			}
 		}
 	}
 }
@@ -432,7 +448,7 @@ func (r *SessionGroupRunner) startReadyCycle(ctx context.Context, old *groupCycl
 		if err == nil || old == nil {
 			return cycle, err
 		}
-		if errors.Is(err, ErrResourceGone) {
+		if errors.Is(err, ErrResourceGone) || errors.Is(err, ErrGroupEmpty) {
 			return nil, err
 		}
 		remaining := time.Until(old.expiresAt)
@@ -458,6 +474,10 @@ func (r *SessionGroupRunner) startCycleAttempt(ctx context.Context, old *groupCy
 	}
 	defer cancelAttempt()
 
+	// Never spend a knock on an empty proxy set.
+	if r.desiredCount() == 0 {
+		return nil, ErrGroupEmpty
+	}
 	started := time.Now()
 	admission, err := r.cfg.Admitter.Admit(attemptCtx, r.cfg.KnockResourceID, r.cfg.ResourceID)
 	if err != nil {
@@ -490,6 +510,9 @@ func (r *SessionGroupRunner) startCycleAttempt(ctx context.Context, old *groupCy
 		}
 		states := session.RouteStates()
 		r.withdrawGone(ctx, states)
+		if r.desiredCount() == 0 {
+			return nil, r.failCycle(cycle, ErrGroupEmpty)
+		}
 		if r.cycleServing(states, old) {
 			return cycle, nil
 		}
@@ -497,6 +520,9 @@ func (r *SessionGroupRunner) startCycleAttempt(ctx context.Context, old *groupCy
 		case <-readyCtx.Done():
 			states = session.RouteStates()
 			r.withdrawGone(ctx, states)
+			if r.desiredCount() == 0 {
+				return nil, r.failCycle(cycle, ErrGroupEmpty)
+			}
 			if old != nil && anyRouteServing(states) {
 				// The old admission is expiring: promote what came up and
 				// report what the old session served that did not.
