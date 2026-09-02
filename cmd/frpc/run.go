@@ -1069,6 +1069,14 @@ func startSharedService(ctx context.Context, common *v1.ClientCommonConfig, cfgP
 	runner, err := share.NewResourceRunner(share.ResourceConfig{
 		KnockResourceID: knockResourceID, ResourceID: resourceID,
 		Admitter: admitter, Sessions: factory,
+		// Without this the ResourceRunner's only failure channel is unset and
+		// every admission error is discarded: the log shows an endless
+		// "retrying" with no reason, which is why a Connector that could never
+		// be admitted looked identical to one that was merely slow.
+		OnRetry: func(err error, wait time.Duration) {
+			slog.WarnContext(ctx, "connector: resource admission attempt failed; retrying",
+				"err", err.Error(), "retry_in", wait.String())
+		},
 		OnServing: func(share.Admission) {
 			if err := admitter.MarkServingHealthy(); err != nil {
 				slog.WarnContext(ctx, "connector: failed to clear assignment-refresh state after serving", "err", err.Error())

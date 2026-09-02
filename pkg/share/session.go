@@ -120,9 +120,15 @@ type ResourceConfig struct {
 	// OnRetry reports a failed admission or connection attempt and the
 	// bounded delay before the next attempt. The error may come from the
 	// configured Admitter or SessionFactory, connector-side validation, cleanup,
-	// or deadline handling; it is not guaranteed to be safe for persistent logs.
-	// It does not report terminal rotation expiry or a serving session exit. The
-	// callback must return promptly.
+	// or deadline handling. It does not report terminal rotation expiry or a
+	// serving session exit. The callback must return promptly.
+	//
+	// The error is log-safe: an unadmittable Connector is only diagnosable from
+	// this reason, so the reference caller writes it to the daemon log verbatim.
+	// Producers on this path must therefore keep secrets out of their error text
+	// -- Admission.String() redacts its bearer, and validation interpolates only
+	// resource identifiers and hosts. Anything reached through a %w wrap owes the
+	// same guarantee; redact at the producer rather than dropping the reason.
 	OnRetry func(error, time.Duration)
 }
 
