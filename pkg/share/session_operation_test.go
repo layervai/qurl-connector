@@ -1266,45 +1266,29 @@ func TestNativeSessionOperationAuthorityFailsClosed(t *testing.T) {
 // 28,845 attempts across 16 hours, with sharing stuck on "Reconnecting" and no
 // way back short of deleting the file by hand.
 func TestRecoverPendingAbandonsAnExpiredOperation(t *testing.T) {
-	oldPrepare := prepareLiveNativeSessionOperation
 	oldRecover := recoverNativeSessionOperation
+	oldWait := waitNativeSessionRecovery
 	t.Cleanup(func() {
-		prepareLiveNativeSessionOperation = oldPrepare
 		recoverNativeSessionOperation = oldRecover
+		waitNativeSessionRecovery = oldWait
 	})
-	t.Setenv(agentstate.EnvKeyProvider, agentstate.KeyProviderFile)
-	parent, err := filepath.EvalSymlinks(t.TempDir())
-	if err != nil {
+	store := &memoryNativeStore{}
+	record := testPreparedDurableRecord(t)
+	// The state a suspended laptop wakes up in: mid-retirement, with the attempt
+	// count an overnight retry loop builds.
+	record.Status = agentstate.SessionOperationClosing
+	record.RecoveryAttempt = nativeSessionRecoveryExpiredAttempts
+	if err := store.CreateSessionOperation(context.Background(), record); err != nil {
 		t.Fatal(err)
 	}
-	dir := filepath.Join(parent, "state")
-	store, err := agentstate.NewSDKStore(dir, "")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer store.Close()
 	controller, err := newDurableNativeSessionOperations(store, testNativeSessionAuthority())
 	if err != nil {
 		t.Fatal(err)
 	}
-	prepared := time.UnixMilli(1_800_000_009_000).UTC()
-	controller.clock = func() time.Time { return prepared }
-	prepareLiveNativeSessionOperation = func(context.Context, *qurl.AgentRuntimeBinding, []byte,
-		qurl.NativeSessionOperationInput,
-	) (*qurl.NativeSessionOperation, qurl.NHPUDPEndpoint, error) {
-		operation := testDurableOperation()
-		return &operation, testDurableRecoveryEndpoint(), nil
-	}
-	if _, err := controller.PrepareDispatch(context.Background(), &qurl.AgentRuntimeBinding{AgentID: "agent-one"},
-		make([]byte, 32), "resource-a", testProtectedResourceID, "0123456789abcdef", 7); err != nil {
-		t.Fatal(err)
-	}
-
-	// Wake up well past the operation's own expiry, as a laptop resuming the
-	// next morning does.
 	controller.clock = func() time.Time {
-		return prepared.Add(nativeSessionOperationLifetime + nativeSessionRecoveryExpiryGrace + time.Hour)
+		return time.UnixMilli(record.Operation.ExpiresAtMillis).Add(time.Hour).UTC()
 	}
+	waitNativeSessionRecovery = func(context.Context, time.Duration) error { return nil }
 	attempted := false
 	recoverNativeSessionOperation = func(context.Context, *qurl.AgentRuntimeBinding, []byte,
 		qurl.NativeSessionOperation, qurl.NHPUDPEndpoint, ...qurl.AgentRuntimeUDPOption,
@@ -1313,19 +1297,56 @@ func TestRecoverPendingAbandonsAnExpiredOperation(t *testing.T) {
 		return nil, errors.New("context deadline exceeded")
 	}
 
-	if err := controller.RecoverPending(context.Background(), &qurl.AgentRuntimeBinding{AgentID: "agent-one"},
-		make([]byte, 32), testProtectedResourceID, nil, testAgentRuntimeUDPOptions()); err != nil {
+	if err := controller.RecoverOperation(context.Background(), &qurl.AgentRuntimeBinding{AgentID: "agent-one"},
+		make([]byte, 32), testProtectedResourceID, record.Operation.OperationID, nil); err != nil {
 		t.Fatalf("recovering an expired operation must succeed by abandoning it: %v", err)
 	}
 	if attempted {
 		t.Error("an expired operation must not be driven through server recovery; the server has already discarded it")
 	}
-	records, err := store.LoadSessionOperations(context.Background(), testProtectedResourceID)
+	if records, err := store.LoadSessionOperations(context.Background(), testProtectedResourceID); err != nil || len(records) != 0 {
+		t.Fatalf("expired record was retained and will be retried forever: %+v err=%v", records, err)
+	}
+}
+
+// An expired record that has not yet failed repeatedly must still be attempted.
+// Persisted time can appear far in the future after a clock correction, so
+// expiry alone must never retire a session the server may still hold.
+func TestRecoverPendingStillAttemptsAnExpiredRecordWithFewAttempts(t *testing.T) {
+	oldRecover := recoverNativeSessionOperation
+	oldWait := waitNativeSessionRecovery
+	t.Cleanup(func() {
+		recoverNativeSessionOperation = oldRecover
+		waitNativeSessionRecovery = oldWait
+	})
+	store := &memoryNativeStore{}
+	record := testPreparedDurableRecord(t)
+	record.Status = agentstate.SessionOperationClosing
+	record.RecoveryAttempt = 1
+	if err := store.CreateSessionOperation(context.Background(), record); err != nil {
+		t.Fatal(err)
+	}
+	controller, err := newDurableNativeSessionOperations(store, testNativeSessionAuthority())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(records) != 0 {
-		t.Fatalf("expired record was retained and will be retried forever: %+v", records)
+	controller.clock = func() time.Time {
+		return time.UnixMilli(record.Operation.ExpiresAtMillis).Add(100 * time.Hour).UTC()
+	}
+	waitNativeSessionRecovery = func(context.Context, time.Duration) error { return nil }
+	attempted := false
+	recoverNativeSessionOperation = func(context.Context, *qurl.AgentRuntimeBinding, []byte,
+		qurl.NativeSessionOperation, qurl.NHPUDPEndpoint, ...qurl.AgentRuntimeUDPOption,
+	) (*qurl.NativeSessionOperationRecovery, error) {
+		attempted = true
+		return &qurl.NativeSessionOperationRecovery{Complete: true}, nil
+	}
+	if err := controller.RecoverOperation(context.Background(), &qurl.AgentRuntimeBinding{AgentID: "agent-one"},
+		make([]byte, 32), testProtectedResourceID, record.Operation.OperationID, nil); err != nil {
+		t.Fatal(err)
+	}
+	if !attempted {
+		t.Error("a clock jump alone must not retire a record; only sustained failure may")
 	}
 }
 

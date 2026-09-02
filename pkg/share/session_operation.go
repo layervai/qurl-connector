@@ -19,11 +19,15 @@ const (
 	nativeSessionRecoveryInitialDelay = 100 * time.Millisecond
 	nativeSessionRecoveryMaxDelay     = 2 * time.Second
 	nativeSessionCleanupBudget        = 30 * time.Second
-	// How far past its own expiry a durable record may still be driven through
-	// server recovery. The server has already expired the operation by then, so
-	// every further attempt is guaranteed to fail; the grace only absorbs clock
-	// skew between this host and the server.
-	nativeSessionRecoveryExpiryGrace = 10 * time.Minute
+	// Attempts after which a record past its own expiry is abandoned.
+	//
+	// Deliberately not wall-clock alone: persisted time can appear far in the
+	// future after a clock correction, which is why RecoveryNotBeforeMilli is
+	// already clamped rather than trusted. Requiring the attempt count too means
+	// a clock jump cannot retire a live session, because a jump does not
+	// manufacture attempts. Backoff saturates at nativeSessionRecoveryMaxDelay,
+	// so this many attempts is minutes of genuine failure, not a transient blip.
+	nativeSessionRecoveryExpiredAttempts = 100
 )
 
 // NativeSessionOperationAuthority is authenticated account context used by
@@ -235,7 +239,8 @@ func (d *durableNativeSessionOperations) RecoverOperation(ctx context.Context, b
 		// Retire it locally instead. This abandons only bookkeeping the server
 		// has already discarded.
 		if expiry := record.Operation.ExpiresAtMillis; expiry > 0 &&
-			now.UnixMilli() > expiry+nativeSessionRecoveryExpiryGrace.Milliseconds() {
+			now.UnixMilli() > expiry &&
+			record.RecoveryAttempt >= nativeSessionRecoveryExpiredAttempts {
 			slog.WarnContext(ctx, "abandoning durable native session recovery; the operation expired before it could be retired",
 				"operation_id", record.Operation.OperationID,
 				"expired_at_ms", expiry,
