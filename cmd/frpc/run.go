@@ -17,6 +17,8 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"golang.org/x/sync/errgroup"
+
 	"github.com/denisbrodbeck/machineid"
 	frpconfig "github.com/fatedier/frp/pkg/config"
 	v1 "github.com/fatedier/frp/pkg/config/v1"
@@ -1044,42 +1046,81 @@ func startFRPFromConfig(ctx context.Context, cfgPath, machineID string, cfg *nhp
 	return startSharedService(ctx, common, cfgPath, cfg, admitter)
 }
 
+// startSharedService serves every configured resource from this one process.
+//
+// One process per resource was the original shape, but it makes a
+// multi-resource client impossible without supervising a process per share --
+// qURL Desktop hit exactly that, crashlooping the moment a user shared a second
+// file. NativeAdmitter is already built for this: it locks per resource
+// (a.resources.lock), enumerates resources plurally during recovery, and guards
+// MarkServingHealthy with a mutex, so several runners can share one admitter.
+//
+// Each resource gets its own session factory and runner, all canceled together
+// so a terminal failure on one cannot leave the others half-serving.
 func startSharedService(ctx context.Context, common *v1.ClientCommonConfig, cfgPath string, qcfg *nhpconfig.Config, admitter *share.NativeAdmitter) error {
-	if len(qcfg.Routes) != 1 {
-		return fmt.Errorf("shared Connector runtime requires exactly one resource per process; got %d", len(qcfg.Routes))
+	if len(qcfg.Routes) == 0 {
+		return errors.New("shared Connector runtime requires at least one resource")
 	}
-	route := qcfg.Routes[0]
-	resourceID := route.ResourceID
-	knockResourceID := knockResourceIDOrEmpty(qcfg, resourceID)
-	factory, err := share.NewFRPSessionFactory(share.FRPFactoryConfig{
-		Common: common,
-		Route: share.LocalHTTPRoute{
-			RouteID: route.ID, LocalIP: route.LocalIP, LocalPort: route.LocalPort,
-			ResourceID: resourceID, ConnectorRoutingID: route.ConnectorRoutingID,
-		},
-		ClientVersion: clientVersionMeta(version.Version), ConfigPath: cfgPath,
-	})
-	if err != nil {
-		return err
+	announced := make([]readyRoute, 0, len(qcfg.Routes))
+	for _, route := range qcfg.Routes {
+		announced = append(announced, readyRoute{
+			routeID: route.ID,
+			target:  net.JoinHostPort(route.LocalIP, strconv.Itoa(route.LocalPort)),
+		})
 	}
-	announcer := &readyAnnouncer{
-		routes: []readyRoute{{routeID: route.ID, target: net.JoinHostPort(route.LocalIP, strconv.Itoa(route.LocalPort))}},
-		out:    os.Stdout, interactive: stdoutIsTerminal(),
+	// One announcer for the process: it latches, so whichever resource serves
+	// first prints the block for all of them.
+	announcer := &readyAnnouncer{routes: announced, out: os.Stdout, interactive: stdoutIsTerminal()}
+
+	runners := make([]*share.ResourceRunner, 0, len(qcfg.Routes))
+	for _, route := range qcfg.Routes {
+		resourceID := route.ResourceID
+		knockResourceID := knockResourceIDOrEmpty(qcfg, resourceID)
+		factory, err := share.NewFRPSessionFactory(share.FRPFactoryConfig{
+			Common: common,
+			Route: share.LocalHTTPRoute{
+				RouteID: route.ID, LocalIP: route.LocalIP, LocalPort: route.LocalPort,
+				ResourceID: resourceID, ConnectorRoutingID: route.ConnectorRoutingID,
+			},
+			ClientVersion: clientVersionMeta(version.Version), ConfigPath: cfgPath,
+		})
+		if err != nil {
+			return fmt.Errorf("route %q: %w", route.ID, err)
+		}
+		runner, err := share.NewResourceRunner(share.ResourceConfig{
+			KnockResourceID: knockResourceID, ResourceID: resourceID,
+			Admitter: admitter, Sessions: factory,
+			OnServing: func(share.Admission) {
+				if err := admitter.MarkServingHealthy(); err != nil {
+					slog.WarnContext(ctx, "connector: failed to clear assignment-refresh state after serving", "err", err.Error())
+				}
+				announcer.announce()
+			},
+		})
+		if err != nil {
+			return fmt.Errorf("route %q: %w", route.ID, err)
+		}
+		runners = append(runners, runner)
 	}
-	runner, err := share.NewResourceRunner(share.ResourceConfig{
-		KnockResourceID: knockResourceID, ResourceID: resourceID,
-		Admitter: admitter, Sessions: factory,
-		OnServing: func(share.Admission) {
-			if err := admitter.MarkServingHealthy(); err != nil {
-				slog.WarnContext(ctx, "connector: failed to clear assignment-refresh state after serving", "err", err.Error())
+
+	if len(runners) == 1 {
+		return runners[0].Run(ctx)
+	}
+
+	// Cancel the siblings as soon as any runner returns: Run only returns on a
+	// terminal condition, so continuing to serve the rest would leave the
+	// process half-alive with no supervisor able to tell.
+	group, groupCtx := errgroup.WithContext(ctx)
+	for i, runner := range runners {
+		routeID := qcfg.Routes[i].ID
+		group.Go(func() error {
+			if err := runner.Run(groupCtx); err != nil {
+				return fmt.Errorf("route %q: %w", routeID, err)
 			}
-			announcer.announce()
-		},
-	})
-	if err != nil {
-		return err
+			return nil
+		})
 	}
-	return runner.Run(ctx)
+	return group.Wait()
 }
 
 // applyLogPresentation stamps the FRP client's log settings from this process's
