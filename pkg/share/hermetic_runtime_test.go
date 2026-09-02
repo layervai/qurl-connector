@@ -54,16 +54,18 @@ func (a *hermeticAdmitter) retiredSnapshot() []Admission {
 }
 
 type hermeticNewProxyObservation struct {
-	runID    string
-	rejected bool
+	runID     string
+	proxyName string
+	rejected  bool
 }
 
 type hermeticQRTSPlugin struct {
 	server *httptest.Server
 
-	mu           sync.Mutex
-	stale        map[string]bool
-	observations []hermeticNewProxyObservation
+	mu            sync.Mutex
+	stale         map[string]bool
+	rejectProxies map[string]string
+	observations  []hermeticNewProxyObservation
 }
 
 type hermeticTCPForwarder struct {
@@ -125,7 +127,7 @@ func (f *hermeticTCPForwarder) serve() {
 
 func newHermeticQRTSPlugin(t *testing.T) *hermeticQRTSPlugin {
 	t.Helper()
-	plugin := &hermeticQRTSPlugin{stale: make(map[string]bool)}
+	plugin := &hermeticQRTSPlugin{stale: make(map[string]bool), rejectProxies: make(map[string]string)}
 	plugin.server = httptest.NewServer(http.HandlerFunc(plugin.handle))
 	t.Cleanup(plugin.server.Close)
 	return plugin
@@ -138,6 +140,7 @@ func (p *hermeticQRTSPlugin) handle(w http.ResponseWriter, r *http.Request) {
 			User struct {
 				RunID string `json:"run_id"`
 			} `json:"user"`
+			ProxyName string `json:"proxy_name"`
 		} `json:"content"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
@@ -147,13 +150,16 @@ func (p *hermeticQRTSPlugin) handle(w http.ResponseWriter, r *http.Request) {
 	response := map[string]any{"reject": false, "unchange": true}
 	if request.Op == "NewProxy" {
 		p.mu.Lock()
-		rejected := p.stale[request.Content.User.RunID]
+		reason, rejected := p.rejectProxies[request.Content.ProxyName]
+		if !rejected && p.stale[request.Content.User.RunID] {
+			reason, rejected = hermeticOwnerMissing, true
+		}
 		p.observations = append(p.observations, hermeticNewProxyObservation{
-			runID: request.Content.User.RunID, rejected: rejected,
+			runID: request.Content.User.RunID, proxyName: request.Content.ProxyName, rejected: rejected,
 		})
 		p.mu.Unlock()
 		if rejected {
-			response = map[string]any{"reject": true, "reject_reason": hermeticOwnerMissing}
+			response = map[string]any{"reject": true, "reject_reason": reason}
 		}
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -164,6 +170,27 @@ func (p *hermeticQRTSPlugin) markStale(runID string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.stale[runID] = true
+}
+
+// rejectProxy makes every NewProxy for the exact proxy name fail with the
+// given wire text, independent of the Login RunID.
+func (p *hermeticQRTSPlugin) rejectProxy(proxyName, reason string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.rejectProxies[proxyName] = reason
+}
+
+// admittedNewProxies counts admitted NewProxy calls per proxy name.
+func (p *hermeticQRTSPlugin) admittedNewProxies() map[string]int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	counts := make(map[string]int)
+	for _, observation := range p.observations {
+		if !observation.rejected {
+			counts[observation.proxyName]++
+		}
+	}
+	return counts
 }
 
 func (p *hermeticQRTSPlugin) snapshot() []hermeticNewProxyObservation {
@@ -208,6 +235,13 @@ func startHermeticFRPS(t *testing.T, bindPort, vhostPort int, subdomainHost, plu
 
 func pollHermeticHTTP(t *testing.T, port int, host, want string, runner <-chan error) {
 	t.Helper()
+	pollHermeticRoute(t, port, "hermetic."+host, want, runner)
+}
+
+// pollHermeticRoute sends vhost requests for one exact Host until the expected
+// body traverses the admitted route.
+func pollHermeticRoute(t *testing.T, port int, hostHeader, want string, runner <-chan error) {
+	t.Helper()
 	client := &http.Client{Timeout: 500 * time.Millisecond}
 	deadline := time.Now().Add(15 * time.Second)
 	var lastErr error
@@ -221,7 +255,7 @@ func pollHermeticHTTP(t *testing.T, port int, host, want string, runner <-chan e
 		if err != nil {
 			t.Fatal(err)
 		}
-		request.Host = "hermetic." + host
+		request.Host = hostHeader
 		response, err := client.Do(request)
 		if err != nil {
 			lastErr = err
