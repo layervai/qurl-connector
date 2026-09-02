@@ -1,6 +1,7 @@
 package share
 
 import (
+	"log/slog"
 	"context"
 	"errors"
 	"fmt"
@@ -18,6 +19,11 @@ const (
 	nativeSessionRecoveryInitialDelay = 100 * time.Millisecond
 	nativeSessionRecoveryMaxDelay     = 2 * time.Second
 	nativeSessionCleanupBudget        = 30 * time.Second
+	// How far past its own expiry a durable record may still be driven through
+	// server recovery. The server has already expired the operation by then, so
+	// every further attempt is guaranteed to fail; the grace only absorbs clock
+	// skew between this host and the server.
+	nativeSessionRecoveryExpiryGrace = 10 * time.Minute
 )
 
 // NativeSessionOperationAuthority is authenticated account context used by
@@ -219,6 +225,48 @@ func (d *durableNativeSessionOperations) RecoverOperation(ctx context.Context, b
 			return fmt.Errorf("%w: unsupported recovery state", agentstate.ErrSessionOperationConflict)
 		}
 		now := d.clock().UTC()
+		// An operation the server has already expired can never be recovered:
+		// every attempt fails identically, forever, and the existing guards do
+		// not stop it -- the attempt counter caps at 2^32 and the deadline at
+		// MaxInt64. A suspended laptop reaches this state routinely, and the
+		// observed result was a record retried 28,845 times across 16 hours
+		// while sharing sat on "Reconnecting" with no way back.
+		//
+		// Retire it locally instead. This abandons only bookkeeping the server
+		// has already discarded.
+		if expiry := record.Operation.ExpiresAtMillis; expiry > 0 &&
+			now.UnixMilli() > expiry+nativeSessionRecoveryExpiryGrace.Milliseconds() {
+			slog.WarnContext(ctx, "abandoning durable native session recovery; the operation expired before it could be retired",
+				"operation_id", record.Operation.OperationID,
+				"expired_at_ms", expiry,
+				"recovery_attempts", record.RecoveryAttempt)
+			// Terminal first: a CLOSING record is not deletable directly, and the
+			// same two-step the Prepared branch uses keeps the journal valid if
+			// this is interrupted between the transition and the delete.
+			retired := record
+			retired.Status = agentstate.SessionOperationCanceled
+			if err := d.store.TransitionSessionOperation(ctx, record, retired); err != nil {
+				complete, reconcileErr := d.reconcileRecoveryConflict(ctx, protectedResourceID, record, err)
+				if reconcileErr != nil {
+					return reconcileErr
+				}
+				if complete {
+					return nil
+				}
+				continue
+			}
+			if err := d.store.DeleteSessionOperation(ctx, retired); err != nil {
+				complete, reconcileErr := d.reconcileRecoveryConflict(ctx, protectedResourceID, retired, err)
+				if reconcileErr != nil {
+					return reconcileErr
+				}
+				if complete {
+					return nil
+				}
+				continue
+			}
+			return nil
+		}
 		if record.RecoveryNotBeforeMilli > now.UnixMilli() {
 			waitMillis := record.RecoveryNotBeforeMilli - now.UnixMilli()
 			if waitMillis > nativeSessionRecoveryMaxDelay.Milliseconds() {
