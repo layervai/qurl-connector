@@ -30,7 +30,10 @@ const MaxGroupRoutes = 2000
 // NewProxy retry; it is not permanently unavailable like ErrResourceGone.
 var ErrRouteNotServing = errors.New("qURL share route is not serving")
 
-var errGroupSessionEnded = errors.New("FRP session group has ended")
+// ErrSessionGroupEnded is returned by GroupServingSession.Update once the
+// session has stopped. SessionGroupRunner treats it as benign: the desired
+// set is authoritative and the next cycle starts from it.
+var ErrSessionGroupEnded = errors.New("FRP session group has ended")
 
 // GroupRoute is one route of a session group. Generation is the route's
 // restart generation: it is folded into the FRP proxy name, so a restarted
@@ -142,7 +145,10 @@ func validateGroupRouteIdentities(count int, at func(int) LocalHTTPRoute) error 
 // groupProxyName renders the proxy name for one route generation on one
 // admission. Generation 0 is the single-route name; later generations append
 // a hyphen-separated restart suffix so a restarted route and any other cycle
-// can never collide.
+// can never collide. FRPProxyName caps the discriminator at
+// replica.MaxDiscriminatorLen; a session ID wide enough to fill it renders a
+// restart generation as a short prefix plus a digest of the full
+// discriminator, which stays unique but is no longer readable in server logs.
 func groupProxyName(route GroupRoute, sessionID uint64) string {
 	discriminator := sessionProxyDiscriminator(sessionID)
 	if route.Generation > 0 {
@@ -172,6 +178,11 @@ type FRPSessionGroupFactory struct {
 func NewFRPSessionGroupFactory(cfg FRPGroupFactoryConfig) (*FRPSessionGroupFactory, error) {
 	if cfg.Common == nil {
 		return nil, errors.New("build FRP session group factory: common config is nil")
+	}
+	// The group owns its proxy set; a Login-level start filter would drop
+	// routes on the floor as permanently pending.
+	if len(cfg.Common.Start) > 0 {
+		return nil, errors.New("build FRP session group factory: common config must not set a proxy start filter")
 	}
 	if cfg.ReadyPoll <= 0 {
 		cfg.ReadyPoll = 100 * time.Millisecond
@@ -219,10 +230,24 @@ func renderGroupProxies(routes []GroupRoute, sessionID uint64) ([]v1.ProxyConfig
 // completeGroupProxies applies exactly the filtering and defaulting FRP's
 // service applies to its initial proxy set. UpdateAllConfigurer diffs live
 // proxies against the new set with reflect.DeepEqual, so an incomplete config
-// would restart every unchanged proxy on each hot update.
-func completeGroupProxies(common *v1.ClientCommonConfig, proxies []v1.ProxyConfigurer) []v1.ProxyConfigurer {
+// would restart every unchanged proxy on each hot update. A proxy the filter
+// would drop is an error rather than a silently pending route.
+func completeGroupProxies(common *v1.ClientCommonConfig, proxies []v1.ProxyConfigurer) ([]v1.ProxyConfigurer, error) {
 	filtered, _ := frpconfig.FilterClientConfigurers(common, proxies, nil)
-	return frpconfig.CompleteProxyConfigurers(filtered)
+	if len(filtered) != len(proxies) {
+		kept := make(map[string]struct{}, len(filtered))
+		for _, proxy := range filtered {
+			kept[proxy.GetBaseConfig().Name] = struct{}{}
+		}
+		var dropped []string
+		for _, proxy := range proxies {
+			if _, ok := kept[proxy.GetBaseConfig().Name]; !ok {
+				dropped = append(dropped, proxy.GetBaseConfig().Name)
+			}
+		}
+		return nil, fmt.Errorf("FRP client config filters out proxies %q", dropped)
+	}
+	return frpconfig.CompleteProxyConfigurers(filtered), nil
 }
 
 func (f *FRPSessionGroupFactory) Start(ctx context.Context, admission Admission, routes []GroupRoute) (GroupServingSession, error) {
@@ -236,8 +261,12 @@ func (f *FRPSessionGroupFactory) Start(ctx context.Context, admission Admission,
 	if err != nil {
 		return nil, err
 	}
+	completed, err := completeGroupProxies(common, proxies)
+	if err != nil {
+		return nil, err
+	}
 	cfgSource := source.NewConfigSource()
-	if err := cfgSource.ReplaceAll(completeGroupProxies(common, proxies), nil); err != nil {
+	if err := cfgSource.ReplaceAll(completed, nil); err != nil {
 		return nil, fmt.Errorf("set FRP proxy configs: %w", err)
 	}
 	session := newFRPGroupSession(nil, nil, common, admission.SessionID, f.cfg.ReadyPoll, routes)
@@ -300,8 +329,13 @@ type frpGroupSession struct {
 	updateMu sync.Mutex
 	mu       sync.Mutex
 	routes   map[string]*groupRouteEntry
-	err      error
-	stopped  bool
+	// version counts route-table changes; pushed is the version FRP has
+	// accepted. They differ while a push is owed or has failed, and watch
+	// retries every tick until they meet.
+	version uint64
+	pushed  uint64
+	err     error
+	stopped bool
 
 	stopOnce  sync.Once
 	readyOnce sync.Once
@@ -332,7 +366,7 @@ func (s *frpGroupSession) run(ctx context.Context) {
 	s.stopped = true
 	for _, entry := range s.routes {
 		if entry.phase == RouteServing {
-			entry.phase, entry.err = RoutePending, errGroupSessionEnded
+			entry.phase, entry.err = RoutePending, ErrSessionGroupEnded
 		}
 	}
 	s.mu.Unlock()
@@ -344,13 +378,13 @@ func (s *frpGroupSession) watch(ctx context.Context) {
 	ticker := time.NewTicker(s.poll)
 	defer ticker.Stop()
 	for {
-		withdrawn, terminalErr := s.observe()
+		terminalErr := s.observe()
 		if terminalErr != nil {
 			s.fail(terminalErr)
 			return
 		}
-		if withdrawn {
-			s.pushLiveProxies()
+		if s.pushOwed() {
+			_ = s.push()
 		}
 		select {
 		case <-ctx.Done():
@@ -360,14 +394,15 @@ func (s *frpGroupSession) watch(ctx context.Context) {
 	}
 }
 
-// observe folds FRP's per-proxy status into route phases. It reports whether
-// a route was newly withdrawn (permanently failed) and any admission-level
-// rejection that must end the whole session.
-func (s *frpGroupSession) observe() (withdrawn bool, terminalErr error) {
+// observe folds FRP's per-proxy status into route phases. A route that
+// permanently failed is withdrawn from the proxy set (the table version
+// advances so watch pushes the smaller set); an admission-level rejection is
+// returned and ends the whole session.
+func (s *frpGroupSession) observe() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.status == nil {
-		return false, nil
+		return nil
 	}
 	changed := false
 	live, serving := 0, 0
@@ -377,10 +412,10 @@ func (s *frpGroupSession) observe() (withdrawn bool, terminalErr error) {
 		}
 		phase, err, terminal := inspectRouteStatus(s.status, entry.name)
 		if terminal != nil {
-			return false, fmt.Errorf("route %q: %w", routeID, terminal)
+			return fmt.Errorf("route %q: %w", routeID, terminal)
 		}
 		if phase == RouteFailed {
-			withdrawn = true
+			s.version++
 		} else {
 			live++
 			if phase == RouteServing {
@@ -398,7 +433,7 @@ func (s *frpGroupSession) observe() (withdrawn bool, terminalErr error) {
 	if changed {
 		s.notify()
 	}
-	return withdrawn, nil
+	return nil
 }
 
 // inspectRouteStatus classifies one proxy's FRP status. Admission-level
@@ -439,6 +474,16 @@ func errText(err error) string {
 
 // Update replaces the session's route set. Entries whose route and proxy name
 // are unchanged keep their observed state; everything else registers afresh.
+// The route table is authoritative from the moment Update returns: if the
+// push to FRP fails, the error is returned and the session keeps retrying the
+// push on every poll until FRP accepts it, so RouteStates never reports a
+// route as serving that FRP has not registered.
+//
+// On the pinned FRP fork (github.com/layervai/frp, see go.mod), a push before
+// the first Login is stored and becomes the Login's proxy set, every re-Login
+// after a control loss re-registers the most recently pushed set, and the
+// client never re-applies its startup snapshot on its own; hot changes
+// therefore survive reconnects.
 func (s *frpGroupSession) Update(ctx context.Context, routes []GroupRoute) error {
 	if ctx == nil {
 		return errors.New("update FRP session group: context is nil")
@@ -459,7 +504,7 @@ func (s *frpGroupSession) Update(ctx context.Context, routes []GroupRoute) error
 	s.mu.Lock()
 	if s.stopped {
 		s.mu.Unlock()
-		return errGroupSessionEnded
+		return ErrSessionGroupEnded
 	}
 	next := make(map[string]*groupRouteEntry, len(routes))
 	for _, route := range routes {
@@ -471,31 +516,48 @@ func (s *frpGroupSession) Update(ctx context.Context, routes []GroupRoute) error
 		next[route.RouteID] = &groupRouteEntry{route: route, name: name, phase: RoutePending}
 	}
 	s.routes = next
+	s.version++
+	s.mu.Unlock()
+	s.notify()
+	return s.pushLocked()
+}
+
+func (s *frpGroupSession) pushOwed() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return !s.stopped && s.pushed != s.version
+}
+
+// push hands the live proxy set to FRP. It withdraws permanently failed
+// proxies so the service stops re-sending a NewProxy the server will keep
+// rejecting, and it is retried by watch until FRP accepts the current table.
+func (s *frpGroupSession) push() error {
+	s.updateMu.Lock()
+	defer s.updateMu.Unlock()
+	return s.pushLocked()
+}
+
+func (s *frpGroupSession) pushLocked() error {
+	s.mu.Lock()
+	if s.stopped {
+		s.mu.Unlock()
+		return ErrSessionGroupEnded
+	}
+	version := s.version
 	proxies, err := s.liveProxiesLocked()
 	s.mu.Unlock()
 	if err != nil {
 		return err
 	}
-	s.notify()
-	return s.svc.UpdateAllConfigurer(proxies, nil)
-}
-
-// pushLiveProxies withdraws permanently failed proxies from FRP so the
-// service stops re-sending a NewProxy the server will keep rejecting.
-func (s *frpGroupSession) pushLiveProxies() {
-	s.updateMu.Lock()
-	defer s.updateMu.Unlock()
+	if err := s.svc.UpdateAllConfigurer(proxies, nil); err != nil {
+		return fmt.Errorf("update FRP proxy set: %w", err)
+	}
 	s.mu.Lock()
-	if s.stopped {
-		s.mu.Unlock()
-		return
+	if s.pushed < version {
+		s.pushed = version
 	}
-	proxies, err := s.liveProxiesLocked()
 	s.mu.Unlock()
-	if err != nil {
-		return
-	}
-	_ = s.svc.UpdateAllConfigurer(proxies, nil)
+	return nil
 }
 
 func (s *frpGroupSession) liveProxiesLocked() ([]v1.ProxyConfigurer, error) {
@@ -510,7 +572,7 @@ func (s *frpGroupSession) liveProxiesLocked() ([]v1.ProxyConfigurer, error) {
 	if err != nil {
 		return nil, err
 	}
-	return completeGroupProxies(s.common, proxies), nil
+	return completeGroupProxies(s.common, proxies)
 }
 
 func (s *frpGroupSession) RouteStates() map[string]RouteState {

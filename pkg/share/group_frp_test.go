@@ -3,6 +3,7 @@ package share
 import (
 	"context"
 	"errors"
+	"math"
 	"reflect"
 	"strconv"
 	"strings"
@@ -125,6 +126,56 @@ func TestGroupProxyNameMatchesSingleRouteNameAtGenerationZero(t *testing.T) {
 	}
 }
 
+func TestGroupProxyNameStaysUniquePastDiscriminatorCap(t *testing.T) {
+	// A session ID wide enough to fill the 16-character discriminator cap
+	// pushes a restart generation through Normalize's prefix+digest form.
+	route := groupTestRoutes("x")[0]
+	single, err := NewFRPSessionFactory(FRPFactoryConfig{Common: &v1.ClientCommonConfig{}, Route: route})
+	if err != nil {
+		t.Fatal(err)
+	}
+	admission := groupTestAdmission(math.MaxUint64)
+	admission.ResourceID = route.ResourceID
+	_, _, singleNames, err := single.BuildConfig(admission)
+	if err != nil {
+		t.Fatal(err)
+	}
+	names := map[uint64]string{}
+	for generation := uint64(0); generation < 3; generation++ {
+		name := groupProxyName(GroupRoute{LocalHTTPRoute: route, Generation: generation}, math.MaxUint64)
+		if discriminator := strings.TrimPrefix(name, "x-"); len(discriminator) > 16 {
+			t.Fatalf("generation %d discriminator %q exceeds the 16-character cap", generation, discriminator)
+		}
+		for other, otherName := range names {
+			if otherName == name {
+				t.Fatalf("generation %d and %d render the same proxy name %q", generation, other, name)
+			}
+		}
+		names[generation] = name
+	}
+	if names[0] != singleNames[0] || names[0] != "x-nhp3w5e11264sgsf" {
+		t.Fatalf("generation-0 name = %q, single-route name = %q, want the readable full-width session discriminator", names[0], singleNames[0])
+	}
+	if !strings.HasPrefix(names[1], "x-nhp3w5e-") || len(names[1]) != len("x-nhp3w5e-")+8 {
+		t.Fatalf("capped restart name = %q, want the 7-character prefix plus an 8-hex digest", names[1])
+	}
+}
+
+func TestNewFRPSessionGroupFactoryRejectsStartFilter(t *testing.T) {
+	common := &v1.ClientCommonConfig{Start: []string{"other-proxy"}}
+	if _, err := NewFRPSessionGroupFactory(FRPGroupFactoryConfig{Common: common}); err == nil {
+		t.Fatal("a Login-level proxy start filter was accepted for a session group")
+	}
+	// Defense in depth: the completion step itself refuses to drop routes.
+	_, proxies, _, err := (&FRPSessionGroupFactory{cfg: FRPGroupFactoryConfig{Common: common}}).BuildConfig(groupTestAdmission(1), groupRoutesOf(groupTestRoutes("a", "b")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := completeGroupProxies(common, proxies); err == nil || !strings.Contains(err.Error(), `"a-nhp1"`) {
+		t.Fatalf("completeGroupProxies() = %v, want an error naming the dropped proxies", err)
+	}
+}
+
 func TestValidateGroupRoutes(t *testing.T) {
 	base := groupTestRoutes("a", "b", "c")
 	mutate := func(fn func(routes []LocalHTTPRoute)) []LocalHTTPRoute {
@@ -193,7 +244,10 @@ func TestFRPSessionGroupFactoryBuildsThousandRouteGroupQuickly(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	completed := completeGroupProxies(common, proxies)
+	completed, err := completeGroupProxies(common, proxies)
+	if err != nil {
+		t.Fatal(err)
+	}
 	elapsed := time.Since(started)
 	if len(proxies) != 1000 || len(names) != 1000 || len(completed) != 1000 {
 		t.Fatalf("rendered %d proxies, %d names, %d completed for 1000 routes", len(proxies), len(names), len(completed))
@@ -426,7 +480,10 @@ func TestFRPGroupSessionUpdatedProxiesMatchServiceCompletedConfigs(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	initial := completeGroupProxies(common, rendered)
+	initial, err := completeGroupProxies(common, rendered)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if reflect.DeepEqual(initial[0], uncompleted[0]) {
 		t.Fatal("completion changed nothing; this guard no longer proves anything")
 	}
@@ -461,9 +518,58 @@ func TestFRPGroupSessionStaleAdmissionEndsWholeSession(t *testing.T) {
 	if err := session.Err(); !errors.Is(err, ErrAdmissionStale) || !strings.Contains(err.Error(), `route "b"`) {
 		t.Fatalf("session error = %v, want stale admission naming route b", err)
 	}
-	if err := session.Update(context.Background(), groupRoutesOf(groupTestRoutes("a"))); !errors.Is(err, errGroupSessionEnded) {
-		t.Fatalf("Update after the session ended = %v, want %v", err, errGroupSessionEnded)
+	if err := session.Update(context.Background(), groupRoutesOf(groupTestRoutes("a"))); !errors.Is(err, ErrSessionGroupEnded) {
+		t.Fatalf("Update after the session ended = %v, want %v", err, ErrSessionGroupEnded)
 	}
+}
+
+// flakyGroupService rejects the first N proxy-set pushes.
+type flakyGroupService struct {
+	recordingGroupService
+	failuresLeft int
+}
+
+func (s *flakyGroupService) UpdateAllConfigurer(proxies []v1.ProxyConfigurer, visitors []v1.VisitorConfigurer) error {
+	s.mu.Lock()
+	if s.failuresLeft > 0 {
+		s.failuresLeft--
+		s.mu.Unlock()
+		return errors.New("control connection reset")
+	}
+	s.mu.Unlock()
+	return s.recordingGroupService.UpdateAllConfigurer(proxies, visitors)
+}
+
+func TestFRPGroupSessionRetriesFailedProxyPush(t *testing.T) {
+	svc := &flakyGroupService{failuresLeft: 2}
+	status := &lockedStatusMap{}
+	session := startTestGroupSession(t, svc, status, groupRoutesOf(groupTestRoutes("a")))
+	status.set("a-nhp7", frpproxy.ProxyPhaseRunning, "")
+	waitForRouteStates(t, session, func(s map[string]RouteState) bool { return phaseOf(s, "a") == RouteServing })
+
+	err := session.Update(context.Background(), groupRoutesOf(groupTestRoutes("a", "b")))
+	if err == nil || !strings.Contains(err.Error(), "update FRP proxy set") {
+		t.Fatalf("Update with a failing push = %v, want the push error", err)
+	}
+	if state := session.RouteStates()["b"]; state.Phase != RoutePending {
+		t.Fatalf("route b after a failed push = %+v, want pending, never serving", state)
+	}
+	if !session.pushOwed() {
+		t.Fatal("failed push did not leave the table owed to FRP")
+	}
+	deadline := time.Now().Add(time.Second)
+	for session.pushOwed() {
+		if time.Now().After(deadline) {
+			t.Fatalf("session never retried the failed push; updates = %q", svc.updateNames())
+		}
+		time.Sleep(time.Millisecond)
+	}
+	updates := svc.updateNames()
+	if want := []string{"a-nhp7", "b-nhp7"}; len(updates) != 1 || !reflect.DeepEqual(updates[0], want) {
+		t.Fatalf("accepted pushes = %q, want exactly one carrying %q", updates, want)
+	}
+	status.set("b-nhp7", frpproxy.ProxyPhaseRunning, "")
+	waitForRouteStates(t, session, func(s map[string]RouteState) bool { return phaseOf(s, "b") == RouteServing })
 }
 
 func TestFRPGroupSessionTransientStartErrorStaysPending(t *testing.T) {

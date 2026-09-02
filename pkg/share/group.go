@@ -48,6 +48,11 @@ type SessionGroupConfig struct {
 	OnRouteFailed func(routeID string, err error)
 	// OnRetry has the same contract as ResourceConfig.OnRetry.
 	OnRetry func(error, time.Duration)
+	// OnRotationLeadCapped reports, once per route count per admission,
+	// that the admission window is too short for the lead the route count
+	// needs: the replacement gets only lead (half the window) instead of
+	// need, so a rotation may promote before every route re-registers.
+	OnRotationLeadCapped func(routes int, need, lead time.Duration)
 }
 
 // SessionGroupRunner serves many routes on one NHP admission and one FRP
@@ -73,8 +78,17 @@ type SessionGroupRunner struct {
 	// session observes route changes in the order they were made.
 	applyMu sync.Mutex
 
-	mu       sync.Mutex
-	desired  map[string]LocalHTTPRoute
+	// wake nudges Run after a desired-set change so the rotation timer is
+	// recomputed from the new route count.
+	wake chan struct{}
+
+	mu      sync.Mutex
+	desired map[string]LocalHTTPRoute
+	// restarts holds each route's generation for the runner's lifetime,
+	// including routes that have left the group: a route that comes back
+	// must register under a fresh proxy name, never the one a lingering
+	// server-side registration may still hold. One small entry per distinct
+	// route ID ever in the group is the bound.
 	restarts map[string]uint64
 	active   *groupCycle
 	pending  *groupCycle
@@ -89,7 +103,9 @@ type groupCycle struct {
 	admission Admission
 	session   GroupServingSession
 	expiresAt time.Time
-	rotateAt  time.Time
+	// capReported is the route count for which the lead cap was last
+	// reported on this cycle; it is touched only by the Run goroutine.
+	capReported int
 }
 
 func NewSessionGroupRunner(cfg SessionGroupConfig) (*SessionGroupRunner, error) {
@@ -128,6 +144,7 @@ func NewSessionGroupRunner(cfg SessionGroupConfig) (*SessionGroupRunner, error) 
 		desired:  make(map[string]LocalHTTPRoute, len(cfg.Routes)),
 		restarts: make(map[string]uint64),
 		reported: make(map[string]string),
+		wake:     make(chan struct{}, 1),
 	}
 	for _, route := range cfg.Routes {
 		runner.desired[route.RouteID] = route
@@ -136,26 +153,39 @@ func NewSessionGroupRunner(cfg SessionGroupConfig) (*SessionGroupRunner, error) 
 	return runner, nil
 }
 
+// Rotation-lead scaling; variables so tests can shrink the time scale.
+var (
+	groupLeadFloor    = 30 * time.Second
+	groupLeadPerRoute = 50 * time.Millisecond
+)
+
 // groupRotationLead is how long before the admission expires the replacement
 // cycle starts. Registering N proxies on a fresh session is sequential on the
 // server: every NewProxy is one authorization round trip plus registration,
-// a few milliseconds each, after Login itself. The lead therefore grows at
-// 50ms per route (50s for 1000 routes) above a 30s floor that covers the knock
-// and Login, and is capped at half the admission window so the old session
-// still serves for at least half its lifetime. The configured lead is a
-// floor, never a ceiling.
-func groupRotationLead(openTime, configured time.Duration, routes int) time.Duration {
-	lead := max(configured, 30*time.Second, time.Duration(routes)*50*time.Millisecond)
-	if lead > openTime/2 {
-		lead = openTime / 2
+// a few milliseconds each, after Login itself. The needed lead therefore
+// grows at 50ms per route (50s for 1000 routes) above a 30s floor that covers
+// the knock and Login; the configured lead is a floor, never a ceiling. The
+// result is clamped to [1s, openTime/2] (or exactly openTime/2 when that is
+// below 1s) so the old session still serves for at least half its lifetime.
+// need is returned unclamped so a caller can see when the cap binds.
+func groupRotationLead(openTime, configured time.Duration, routes int) (lead, need time.Duration) {
+	need = max(configured, groupLeadFloor, time.Duration(routes)*groupLeadPerRoute)
+	upper := openTime / 2
+	lower := min(time.Second, upper)
+	return min(max(need, lower), upper), need
+}
+
+// rotateAt is computed from the current route count every time Run arms
+// its timer, so a group that grows inside an admission window rotates with
+// the lead the larger set needs rather than the lead it was admitted with.
+func (r *SessionGroupRunner) rotateAt(cycle *groupCycle) time.Time {
+	routes := r.desiredCount()
+	lead, need := groupRotationLead(cycle.admission.OpenTime, r.cfg.RotationLead, routes)
+	if lead < need && cycle.capReported != routes && r.cfg.OnRotationLeadCapped != nil {
+		cycle.capReported = routes
+		r.cfg.OnRotationLeadCapped(routes, need, lead)
 	}
-	if lead < time.Second {
-		lead = time.Second
-	}
-	if lead >= openTime {
-		lead = openTime / 2
-	}
-	return lead
+	return cycle.expiresAt.Add(-lead)
 }
 
 // Run serves until ctx ends. Admission and connection failures retry forever
@@ -206,11 +236,13 @@ func (r *SessionGroupRunner) Run(ctx context.Context) (retErr error) {
 			active = cycle
 		}
 
-		rotate := time.NewTimer(time.Until(active.rotateAt))
+		rotate := time.NewTimer(time.Until(r.rotateAt(active)))
 		select {
 		case <-ctx.Done():
 			stopTimer(rotate)
 			return ctx.Err()
+		case <-r.wake:
+			stopTimer(rotate)
 		case <-active.session.Done():
 			stopTimer(rotate)
 			sessionErr := active.session.Err()
@@ -251,8 +283,11 @@ func (r *SessionGroupRunner) Run(ctx context.Context) (retErr error) {
 
 // SetRoutes replaces the group's desired route set. Additions and removals
 // apply to the live session immediately (no new admission); a replacement
-// that is still being built receives the new set as well. A route that was
-// removed and later re-added registers under a fresh proxy name.
+// that is still being built receives the new set as well, and the rotation
+// timer is re-armed for the new route count. A route that was removed and
+// later re-added registers under a fresh proxy name. A session that ends
+// while the set is being applied is not an error: the desired set is
+// authoritative and the next cycle starts from it.
 func (r *SessionGroupRunner) SetRoutes(ctx context.Context, routes []LocalHTTPRoute) error {
 	if ctx == nil {
 		return errors.New("set session group routes: context is nil")
@@ -272,12 +307,16 @@ func (r *SessionGroupRunner) SetRoutes(ctx context.Context, routes []LocalHTTPRo
 	}
 	r.desired = next
 	r.mu.Unlock()
+	r.signalWake()
 	return r.apply(ctx)
 }
 
 // RestartRoute withdraws one route's proxy and registers it again under a new
 // proxy name on the same admission, so the server sees a fresh NewProxy for
-// that route alone. Siblings and the admission are untouched.
+// that route alone. Siblings and the admission are untouched. While the group
+// is rotating, the active session keeps its current registration (a rotating
+// session never registers anything) and the restart lands on the replacement
+// at promotion, at most one rotation lead later.
 func (r *SessionGroupRunner) RestartRoute(ctx context.Context, routeID string) error {
 	if ctx == nil {
 		return errors.New("restart session group route: context is nil")
@@ -289,7 +328,15 @@ func (r *SessionGroupRunner) RestartRoute(ctx context.Context, routeID string) e
 	}
 	r.restarts[routeID]++
 	r.mu.Unlock()
+	r.signalWake()
 	return r.apply(ctx)
+}
+
+func (r *SessionGroupRunner) signalWake() {
+	select {
+	case r.wake <- struct{}{}:
+	default:
+	}
 }
 
 // RouteStates reports every route's registration on the active session, or
@@ -316,7 +363,7 @@ func (r *SessionGroupRunner) apply(ctx context.Context) error {
 
 	var errs []error
 	if pending != nil && pending != active && !sessionEnded(pending.session) {
-		if err := pending.session.Update(ctx, desired); err != nil {
+		if err := pending.session.Update(ctx, desired); err != nil && !errors.Is(err, ErrSessionGroupEnded) {
 			errs = append(errs, fmt.Errorf("replacement session: %w", err))
 		}
 	}
@@ -325,7 +372,9 @@ func (r *SessionGroupRunner) apply(ctx context.Context) error {
 		if rotating {
 			routes = retainRoutes(active.session.RouteStates(), desired)
 		}
-		if err := active.session.Update(ctx, routes); err != nil {
+		// A session that is retiring underneath the update is benign: the
+		// desired set is authoritative for every later cycle.
+		if err := active.session.Update(ctx, routes); err != nil && !errors.Is(err, ErrSessionGroupEnded) {
 			errs = append(errs, fmt.Errorf("active session: %w", err))
 		}
 	}
@@ -359,6 +408,12 @@ func (r *SessionGroupRunner) desiredRoutes() []GroupRoute {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.desiredRoutesLocked()
+}
+
+func (r *SessionGroupRunner) desiredCount() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return len(r.desired)
 }
 
 func (r *SessionGroupRunner) desiredRoutesLocked() []GroupRoute {
@@ -413,12 +468,11 @@ func (r *SessionGroupRunner) startCycleAttempt(ctx context.Context, old *groupCy
 	}
 	routes := r.desiredRoutes()
 	expiresAt := started.Add(admission.OpenTime)
-	rotateAt := expiresAt.Add(-groupRotationLead(admission.OpenTime, r.cfg.RotationLead, len(routes)))
 	session, err := r.cfg.Sessions.Start(attemptCtx, admission, routes)
 	if err != nil {
 		return nil, errors.Join(err, r.retireAdmission(admission))
 	}
-	cycle := &groupCycle{admission: admission, session: session, expiresAt: expiresAt, rotateAt: rotateAt}
+	cycle := &groupCycle{admission: admission, session: session, expiresAt: expiresAt, capReported: -1}
 	r.setPending(cycle)
 	// Route changes that raced with Start land on the new session now; a
 	// session that already ended is caught below.

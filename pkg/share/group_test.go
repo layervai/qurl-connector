@@ -115,7 +115,7 @@ func (s *fakeGroupSession) Update(_ context.Context, routes []GroupRoute) error 
 	s.mu.Lock()
 	if s.stopped {
 		s.mu.Unlock()
-		return errGroupSessionEnded
+		return ErrSessionGroupEnded
 	}
 	s.updates = append(s.updates, append([]GroupRoute(nil), routes...))
 	s.mu.Unlock()
@@ -168,6 +168,14 @@ func (s *fakeGroupSession) end(err error) {
 	})
 }
 
+// retire mimics the real session between shutdown and exit: Update is
+// refused while Done has not closed yet.
+func (s *fakeGroupSession) retire() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.stopped = true
+}
+
 func (s *fakeGroupSession) isStopped() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -196,12 +204,30 @@ type groupFailedEvent struct {
 	err     error
 }
 
+type groupLeadCap struct {
+	routes     int
+	need, lead time.Duration
+}
+
 type groupEvents struct {
 	mu       sync.Mutex
 	serving  []groupServingEvent
 	failed   []groupFailedEvent
 	promoted []uint64
 	retries  []retryReport
+	capped   []groupLeadCap
+}
+
+func (e *groupEvents) onLeadCapped(routes int, need, lead time.Duration) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.capped = append(e.capped, groupLeadCap{routes: routes, need: need, lead: lead})
+}
+
+func (e *groupEvents) leadCaps() []groupLeadCap {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return append([]groupLeadCap(nil), e.capped...)
 }
 
 func (e *groupEvents) callbacks() (func(Admission), func(string, Admission), func(string, error), func(error, time.Duration)) {
@@ -298,6 +324,7 @@ func startGroupHarness(t *testing.T, openTime, rotationLead time.Duration, hold 
 		MinBackoff: time.Millisecond, MaxBackoff: 2 * time.Millisecond,
 		RotationLead: rotationLead, StopTimeout: time.Second,
 		OnServing: onServing, OnRouteServing: onRouteServing, OnRouteFailed: onRouteFailed, OnRetry: onRetry,
+		OnRotationLeadCapped: h.events.onLeadCapped,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -628,30 +655,72 @@ func TestGroupRotationLeadScalesWithRouteCount(t *testing.T) {
 	tests := []struct {
 		openTime, configured time.Duration
 		routes               int
-		want                 time.Duration
+		want, need           time.Duration
 	}{
-		{openTime: 5 * time.Minute, routes: 1, want: 30 * time.Second},
-		{openTime: 5 * time.Minute, routes: 3, want: 30 * time.Second},
-		{openTime: 5 * time.Minute, routes: 600, want: 30 * time.Second},
-		{openTime: 5 * time.Minute, routes: 1000, want: 50 * time.Second},
-		{openTime: 5 * time.Minute, routes: 2000, want: 100 * time.Second},
-		{openTime: 5 * time.Minute, configured: 45 * time.Second, routes: 100, want: 45 * time.Second},
-		{openTime: 5 * time.Minute, configured: 45 * time.Second, routes: 1000, want: 50 * time.Second},
-		{openTime: time.Minute, routes: 2000, want: 30 * time.Second},
-		{openTime: 3 * time.Second, routes: 1, want: 1500 * time.Millisecond},
-		{openTime: 1500 * time.Millisecond, routes: 1, want: time.Second},
-		{openTime: time.Second, routes: 1, want: 500 * time.Millisecond},
-		{openTime: 100 * time.Millisecond, routes: 1, want: 50 * time.Millisecond},
+		{openTime: 5 * time.Minute, routes: 1, want: 30 * time.Second, need: 30 * time.Second},
+		{openTime: 5 * time.Minute, routes: 3, want: 30 * time.Second, need: 30 * time.Second},
+		{openTime: 5 * time.Minute, routes: 600, want: 30 * time.Second, need: 30 * time.Second},
+		{openTime: 5 * time.Minute, routes: 1000, want: 50 * time.Second, need: 50 * time.Second},
+		{openTime: 5 * time.Minute, routes: 2000, want: 100 * time.Second, need: 100 * time.Second},
+		{openTime: 5 * time.Minute, configured: 45 * time.Second, routes: 100, want: 45 * time.Second, need: 45 * time.Second},
+		{openTime: 5 * time.Minute, configured: 45 * time.Second, routes: 1000, want: 50 * time.Second, need: 50 * time.Second},
+		{openTime: time.Minute, routes: 2000, want: 30 * time.Second, need: 100 * time.Second},
+		{openTime: 3 * time.Second, routes: 1, want: 1500 * time.Millisecond, need: 30 * time.Second},
+		{openTime: 1500 * time.Millisecond, routes: 1, want: 750 * time.Millisecond, need: 30 * time.Second},
+		{openTime: time.Second, routes: 1, want: 500 * time.Millisecond, need: 30 * time.Second},
+		{openTime: 100 * time.Millisecond, routes: 1, want: 50 * time.Millisecond, need: 30 * time.Second},
 	}
 	for _, test := range tests {
-		got := groupRotationLead(test.openTime, test.configured, test.routes)
-		if got != test.want {
-			t.Errorf("groupRotationLead(%s, %s, %d) = %s, want %s", test.openTime, test.configured, test.routes, got, test.want)
+		got, need := groupRotationLead(test.openTime, test.configured, test.routes)
+		if got != test.want || need != test.need {
+			t.Errorf("groupRotationLead(%s, %s, %d) = (%s, %s), want (%s, %s)", test.openTime, test.configured, test.routes, got, need, test.want, test.need)
 		}
-		if got >= test.openTime {
-			t.Errorf("groupRotationLead(%s, %s, %d) = %s is not inside the admission window", test.openTime, test.configured, test.routes, got)
+		if got > test.openTime/2 || got < min(time.Second, test.openTime/2) {
+			t.Errorf("groupRotationLead(%s, %s, %d) = %s is outside [min(1s, openTime/2), openTime/2]", test.openTime, test.configured, test.routes, got)
 		}
 	}
+}
+
+func TestSessionGroupRunnerRecomputesRotationLeadWhenGroupGrows(t *testing.T) {
+	floor, perRoute := groupLeadFloor, groupLeadPerRoute
+	groupLeadFloor, groupLeadPerRoute = 100*time.Millisecond, 2*time.Millisecond
+	t.Cleanup(func() { groupLeadFloor, groupLeadPerRoute = floor, perRoute })
+
+	const openTime = 6 * time.Second
+	h := startGroupHarness(t, openTime, 0, nil, "a", "b", "c")
+	h.waitServing(t, 1, "a", "b", "c")
+	admittedAt := time.Now()
+	// Three routes need the 100ms floor, clamped up to 1s, so rotation is
+	// armed for 5s after admission. A group of 2000 needs 4s, capped at half
+	// the window: rotation must move to 3s and the cap must be reported.
+	if err := h.runner.SetRoutes(context.Background(), thousandRoutes(2000)); err != nil {
+		t.Fatal(err)
+	}
+	waitUntil(t, openTime, func() bool { return h.factory.startCount() == 2 }, "replacement start")
+	elapsed := time.Since(admittedAt)
+	if elapsed < openTime/2-500*time.Millisecond || elapsed >= openTime-1500*time.Millisecond {
+		t.Fatalf("replacement started %s after admission, want about %s for 2000 routes, not the 5s the 3-route admission armed", elapsed, openTime/2)
+	}
+	caps := h.events.leadCaps()
+	if len(caps) != 1 || caps[0] != (groupLeadCap{routes: 2000, need: 4 * time.Second, lead: openTime / 2}) {
+		t.Fatalf("lead cap reports = %+v, want one report of 2000 routes needing 4s and getting 3s", caps)
+	}
+	waitUntil(t, 3*time.Second, func() bool { return len(h.events.promotions()) == 2 }, "replacement promotion")
+	if got := len(h.factory.session(2).RouteStates()); got != 2000 {
+		t.Fatalf("replacement carries %d routes, want all 2000", got)
+	}
+}
+
+func TestSessionGroupRunnerSetRoutesToleratesRetiringSession(t *testing.T) {
+	h := startGroupHarness(t, time.Hour, 0, nil, "a")
+	h.waitServing(t, 1, "a")
+	first := h.factory.session(1)
+	first.retire()
+	if err := h.runner.SetRoutes(context.Background(), groupTestRoutes("a", "b")); err != nil {
+		t.Fatalf("SetRoutes against a retiring session = %v, want nil", err)
+	}
+	first.end(nil)
+	h.waitServing(t, 2, "a", "b")
 }
 
 func TestNewSessionGroupRunnerRejectsInvalidGroups(t *testing.T) {
