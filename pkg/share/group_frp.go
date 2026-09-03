@@ -70,10 +70,16 @@ var groupRegistrationWindow = 16
 // without a ceiling a wave of transient refusals would release as many new
 // routes as it errored and the re-sent batch would land on top of a full
 // window. An errored proxy counts only for groupErroredHold after its
-// error was observed, two of FRP's start-error intervals: a refusal the
-// server keeps repeating is that route's own problem and must not stop its
-// siblings from registering, so it ages out of the ceiling while it stays
-// pending in the table. A variable so tests can shrink the hold.
+// first refusal was observed, two of FRP's start-error intervals: a refusal
+// the server keeps repeating is that route's own problem and must not stop
+// its siblings from registering, so it ages out of the ceiling while it
+// stays pending in the table. Once aged out it is no longer bounded at all:
+// FRP re-sends every released-but-refused proxy together every 30s, up to
+// the group bound, so a large durably refused set is a client-side path
+// into the server's serial NewProxy queue that the window cannot shorten.
+// Sibling isolation was judged to outweigh that, since keeping such proxies
+// in the ceiling wedges the whole session instead. A variable so tests can
+// shrink the hold.
 const groupReleasedPendingFactor = 2
 
 var groupErroredHold = 60 * time.Second
@@ -386,9 +392,10 @@ type groupRouteEntry struct {
 	// entry that is not released is waiting for a registration-window slot;
 	// it is pending, and FRP does not know it yet.
 	released bool
-	// erroredAt is when the entry's current transient start error was first
-	// observed (zero while it has none); it bounds how long the error counts
-	// against the released-pending ceiling.
+	// erroredAt is when the entry's first transient start error under this
+	// proxy name was observed (zero until then, and again once it registers);
+	// it bounds how long the entry's refusals count against the
+	// released-pending ceiling.
 	erroredAt time.Time
 	// replaces marks a regenerated route whose previous proxy was already
 	// released: the old proxy leaves the pushed set with this entry's first
@@ -609,13 +616,19 @@ func (s *frpGroupSession) observe() error {
 			s.version++
 		}
 		if entry.phase != observed.phase || errText(entry.err) != errText(observed.err) {
-			// A fresh refusal (none before, or a re-sent NewProxy refused
-			// again) restarts the entry's hold in the ceiling count.
-			if observed.err != nil && (entry.err == nil || entry.phase != observed.phase) {
-				entry.erroredAt = time.Now()
-			}
 			entry.phase, entry.err = observed.phase, observed.err
 			changed = true
+		}
+		// The hold is anchored to the first refusal under this proxy name:
+		// FRP's 30s re-send takes a refused proxy through wait-start and
+		// back to a start error, and a stamp on every such edge would refresh
+		// the hold faster than it can expire. It clears only once the proxy
+		// registers; a regenerated route starts with a fresh entry.
+		switch {
+		case observed.phase == RouteServing:
+			entry.erroredAt = time.Time{}
+		case observed.err != nil && entry.erroredAt.IsZero():
+			entry.erroredAt = time.Now()
 		}
 	}
 	// Proxies that registered (or failed) free window slots; the next routes
