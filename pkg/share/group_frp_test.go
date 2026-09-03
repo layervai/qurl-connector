@@ -530,10 +530,12 @@ func TestFRPGroupSessionStaleAdmissionEndsWholeSession(t *testing.T) {
 type flakyGroupService struct {
 	recordingGroupService
 	failuresLeft int
+	attempts     int
 }
 
 func (s *flakyGroupService) UpdateAllConfigurer(proxies []v1.ProxyConfigurer, visitors []v1.VisitorConfigurer) error {
 	s.mu.Lock()
+	s.attempts++
 	if s.failuresLeft > 0 {
 		s.failuresLeft--
 		s.mu.Unlock()
@@ -541,6 +543,71 @@ func (s *flakyGroupService) UpdateAllConfigurer(proxies []v1.ProxyConfigurer, vi
 	}
 	s.mu.Unlock()
 	return s.recordingGroupService.UpdateAllConfigurer(proxies, visitors)
+}
+
+func (s *flakyGroupService) attemptCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.attempts
+}
+
+func TestFRPGroupSessionBacksOffFailedPushRetries(t *testing.T) {
+	svc := &flakyGroupService{failuresLeft: 1 << 20}
+	session := startTestGroupSession(t, svc, &lockedStatusMap{}, groupRoutesOf(groupTestRoutes("a")))
+	if err := session.Update(context.Background(), groupRoutesOf(groupTestRoutes("a", "b"))); err == nil {
+		t.Fatal("Update against a failing service returned nil")
+	}
+	// At a 1ms poll an unbacked retry would fire ~60 times in 60ms; the
+	// exponential delay (1, 2, 4, 8, 16, 32ms) allows only a handful.
+	time.Sleep(60 * time.Millisecond)
+	if got := svc.attemptCount(); got > 12 {
+		t.Fatalf("push attempts in 60ms = %d, want a backed-off retry", got)
+	}
+	if !session.pushOwed() {
+		t.Fatal("push no longer owed although FRP never accepted it")
+	}
+}
+
+func TestFRPGroupSessionSurfacesRenderFailureOnPendingRoutes(t *testing.T) {
+	// A common config that filters proxies cannot pass the factory, but the
+	// session still reports a render failure through RouteStates rather
+	// than retrying invisibly forever.
+	svc := &recordingGroupService{}
+	ctx, cancel := context.WithCancel(context.Background())
+	session := newFRPGroupSession(svc, &lockedStatusMap{}, &v1.ClientCommonConfig{Start: []string{"other"}}, 7, time.Millisecond, groupRoutesOf(groupTestRoutes("a")))
+	session.cancel = cancel
+	go session.run(ctx)
+	t.Cleanup(func() { _ = session.Stop(context.Background()) })
+	err := session.Update(context.Background(), groupRoutesOf(groupTestRoutes("a", "b")))
+	if err == nil || !strings.Contains(err.Error(), "render FRP proxy set") {
+		t.Fatalf("Update with an unrenderable set = %v, want the render error", err)
+	}
+	for _, routeID := range []string{"a", "b"} {
+		if state := session.RouteStates()[routeID]; state.Phase != RoutePending || state.Err == nil || !strings.Contains(state.Err.Error(), "filters out proxies") {
+			t.Fatalf("route %q after a render failure = %+v, want pending and carrying the render error", routeID, state)
+		}
+	}
+	if len(svc.updateNames()) != 0 {
+		t.Fatalf("a set that failed to render reached FRP: %q", svc.updateNames())
+	}
+}
+
+func TestFRPGroupSessionServingRouteIDs(t *testing.T) {
+	status := &lockedStatusMap{}
+	session := startTestGroupSession(t, &recordingGroupService{}, status, groupRoutesOf(groupTestRoutes("a", "b", "c")))
+	status.set("a-nhp7", frpproxy.ProxyPhaseRunning, "")
+	status.set("c-nhp7", frpproxy.ProxyPhaseRunning, "")
+	waitForRouteStates(t, session, func(s map[string]RouteState) bool {
+		return phaseOf(s, "a") == RouteServing && phaseOf(s, "c") == RouteServing
+	})
+	if got := session.ServingRouteIDs(); len(got) != 2 || !hasKey(got, "a") || !hasKey(got, "c") {
+		t.Fatalf("ServingRouteIDs() = %v, want a and c", got)
+	}
+}
+
+func hasKey(set map[string]struct{}, key string) bool {
+	_, ok := set[key]
+	return ok
 }
 
 func TestFRPGroupSessionRetriesFailedProxyPush(t *testing.T) {

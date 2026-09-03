@@ -90,6 +90,9 @@ type SessionGroupRunner struct {
 
 	mu      sync.Mutex
 	desired map[string]LocalHTTPRoute
+	// divergent records that a caller's apply failed before the live
+	// sessions saw the desired set; Run re-applies under its own context.
+	divergent bool
 	// restarts holds each route's generation for the runner's lifetime,
 	// including routes that have left the group: a route that comes back
 	// must register under a fresh proxy name, never the one a lingering
@@ -253,6 +256,7 @@ func (r *SessionGroupRunner) Run(ctx context.Context) (retErr error) {
 			return ctx.Err()
 		case <-r.wake:
 			stopTimer(rotate)
+			r.healDivergence(ctx)
 		case <-active.session.Done():
 			stopTimer(rotate)
 			sessionErr := active.session.Err()
@@ -263,6 +267,7 @@ func (r *SessionGroupRunner) Run(ctx context.Context) (retErr error) {
 			}
 		case <-active.session.Changes():
 			stopTimer(rotate)
+			r.healDivergence(ctx)
 			r.reportActive(ctx)
 			if r.desiredCount() == 0 {
 				return ErrGroupEmpty
@@ -303,7 +308,11 @@ func (r *SessionGroupRunner) Run(ctx context.Context) (retErr error) {
 // timer is re-armed for the new route count. A route that was removed and
 // later re-added registers under a fresh proxy name. A session that ends
 // while the set is being applied is not an error: the desired set is
-// authoritative and the next cycle starts from it.
+// authoritative and the next cycle starts from it, and if applying fails for
+// any other reason (a canceled caller context, for instance) the error is
+// returned and Run re-applies the desired set under its own context. An
+// empty set is not expressible here: a group always has at least one route,
+// and a group whose routes have all gone ends Run with ErrGroupEmpty.
 func (r *SessionGroupRunner) SetRoutes(ctx context.Context, routes []LocalHTTPRoute) error {
 	if ctx == nil {
 		return errors.New("set session group routes: context is nil")
@@ -323,8 +332,7 @@ func (r *SessionGroupRunner) SetRoutes(ctx context.Context, routes []LocalHTTPRo
 	}
 	r.desired = next
 	r.mu.Unlock()
-	r.signalWake()
-	return r.apply(ctx)
+	return r.applyAndWake(ctx)
 }
 
 // RestartRoute withdraws one route's proxy and registers it again under a new
@@ -344,8 +352,38 @@ func (r *SessionGroupRunner) RestartRoute(ctx context.Context, routeID string) e
 	}
 	r.restarts[routeID]++
 	r.mu.Unlock()
+	return r.applyAndWake(ctx)
+}
+
+// applyAndWake pushes the desired set from a caller, records a failure for
+// Run to heal, and wakes Run so the rotation timer follows the route count.
+func (r *SessionGroupRunner) applyAndWake(ctx context.Context) error {
+	err := r.apply(ctx)
+	if err != nil {
+		r.mu.Lock()
+		r.divergent = true
+		r.mu.Unlock()
+	}
 	r.signalWake()
-	return r.apply(ctx)
+	return err
+}
+
+// healDivergence re-applies the desired set under Run's context after a
+// caller's apply failed, so desired state converges on the next wake or
+// change signal instead of at the next rotation.
+func (r *SessionGroupRunner) healDivergence(ctx context.Context) {
+	r.mu.Lock()
+	divergent := r.divergent
+	r.divergent = false
+	r.mu.Unlock()
+	if !divergent {
+		return
+	}
+	if err := r.apply(ctx); err != nil {
+		r.mu.Lock()
+		r.divergent = true
+		r.mu.Unlock()
+	}
 }
 
 func (r *SessionGroupRunner) signalWake() {
@@ -540,7 +578,9 @@ func (r *SessionGroupRunner) startCycleAttempt(ctx context.Context, old *groupCy
 // cycleServing decides whether a new cycle may be promoted. The first cycle
 // serves as soon as any route runs. A replacement must first carry every
 // route the old session is still serving, so promotion never regresses a
-// route that was up.
+// route that was up. An old session that serves nothing, including one that
+// died mid-rotation, has nothing to regress, so the gate deliberately relaxes
+// to "any route serving" rather than waiting for the old admission to expire.
 func (r *SessionGroupRunner) cycleServing(states map[string]RouteState, old *groupCycle) bool {
 	needed := r.routesServedBy(old)
 	if len(needed) == 0 {
@@ -554,20 +594,37 @@ func (r *SessionGroupRunner) cycleServing(states map[string]RouteState, old *gro
 	return true
 }
 
+// servingRouteLister is an optional GroupServingSession refinement that
+// returns only the serving route IDs, sparing the promotion gate a full
+// RouteStates copy on every change signal during a large rotation.
+type servingRouteLister interface {
+	ServingRouteIDs() map[string]struct{}
+}
+
 func (r *SessionGroupRunner) routesServedBy(cycle *groupCycle) map[string]struct{} {
 	if cycle == nil {
 		return nil
 	}
-	states := cycle.session.RouteStates()
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	served := make(map[string]struct{}, len(states))
-	for routeID, state := range states {
-		if _, desired := r.desired[routeID]; desired && state.Phase == RouteServing {
-			served[routeID] = struct{}{}
+	var serving map[string]struct{}
+	if lister, ok := cycle.session.(servingRouteLister); ok {
+		serving = lister.ServingRouteIDs()
+	} else {
+		states := cycle.session.RouteStates()
+		serving = make(map[string]struct{}, len(states))
+		for routeID, state := range states {
+			if state.Phase == RouteServing {
+				serving[routeID] = struct{}{}
+			}
 		}
 	}
-	return served
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for routeID := range serving {
+		if _, desired := r.desired[routeID]; !desired {
+			delete(serving, routeID)
+		}
+	}
+	return serving
 }
 
 func anyRouteServing(states map[string]RouteState) bool {
@@ -730,7 +787,12 @@ func (r *SessionGroupRunner) clearPending(cycle *groupCycle) {
 	}
 }
 
+// setRotating is serialized with apply so an in-flight apply that read
+// rotating == false completes before the flag flips: no addition can land on
+// a session after it has entered rotation.
 func (r *SessionGroupRunner) setRotating(rotating bool) {
+	r.applyMu.Lock()
+	defer r.applyMu.Unlock()
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.rotating = rotating

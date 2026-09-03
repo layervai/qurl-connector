@@ -53,12 +53,13 @@ type fakeGroupSession struct {
 	hold      func(int, string) bool
 	admission Admission
 
-	mu      sync.Mutex
-	routes  map[string]RouteState
-	updates [][]GroupRoute
-	err     error
-	stopped bool
-	drained bool
+	mu          sync.Mutex
+	routes      map[string]RouteState
+	updates     [][]GroupRoute
+	err         error
+	stopped     bool
+	drained     bool
+	failUpdates int
 
 	ready    chan struct{}
 	done     chan struct{}
@@ -111,11 +112,21 @@ func (s *fakeGroupSession) failRoute(routeID string, err error) {
 	s.notifyLocked()
 }
 
-func (s *fakeGroupSession) Update(_ context.Context, routes []GroupRoute) error {
+func (s *fakeGroupSession) Update(ctx context.Context, routes []GroupRoute) error {
+	// Mirror the real session: a canceled caller context is refused before
+	// the table changes.
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	s.mu.Lock()
 	if s.stopped {
 		s.mu.Unlock()
 		return ErrSessionGroupEnded
+	}
+	if s.failUpdates > 0 {
+		s.failUpdates--
+		s.mu.Unlock()
+		return errors.New("fake update failure")
 	}
 	s.updates = append(s.updates, append([]GroupRoute(nil), routes...))
 	s.mu.Unlock()
@@ -155,12 +166,20 @@ func (s *fakeGroupSession) Drain(context.Context) error {
 	return nil
 }
 
+// end mirrors the real session's exit: serving routes are demoted because
+// a dead session serves nothing.
 func (s *fakeGroupSession) end(err error) {
 	s.stopOnce.Do(func() {
 		s.mu.Lock()
 		s.stopped = true
 		if s.err == nil {
 			s.err = err
+		}
+		for routeID, state := range s.routes {
+			if state.Phase == RouteServing {
+				state.Phase, state.Err = RoutePending, ErrSessionGroupEnded
+				s.routes[routeID] = state
+			}
 		}
 		s.notifyLocked()
 		s.mu.Unlock()
@@ -748,6 +767,60 @@ func TestSessionGroupRunnerRecomputesRotationLeadWhenGroupGrows(t *testing.T) {
 	if got := len(h.factory.session(2).RouteStates()); got != 2000 {
 		t.Fatalf("replacement carries %d routes, want all 2000", got)
 	}
+}
+
+func TestSessionGroupRunnerHealsFailedSetRoutesApply(t *testing.T) {
+	h := startGroupHarness(t, time.Hour, 0, nil, "a", "b", "c")
+	h.waitServing(t, 1, "a", "b", "c")
+	session := h.factory.session(1)
+
+	// A caller context that is already canceled: the desired set is recorded
+	// but the live session refuses the update, so SetRoutes reports it and
+	// Run must converge the session under its own context.
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := h.runner.SetRoutes(canceled, groupTestRoutes("a", "b", "c", "d")); !errors.Is(err, context.Canceled) {
+		t.Fatalf("SetRoutes with a canceled context = %v, want the context error surfaced", err)
+	}
+	h.waitServing(t, 1, "d")
+	if _, present := session.RouteStates()["d"]; !present {
+		t.Fatal("route added under a canceled context never reached the live session")
+	}
+	if got := h.admissions(); got != 1 {
+		t.Fatalf("admissions = %d, want convergence without a new knock", got)
+	}
+
+	// A transient session-side failure heals the same way.
+	session.mu.Lock()
+	session.failUpdates = 1
+	session.mu.Unlock()
+	_ = h.runner.SetRoutes(context.Background(), groupTestRoutes("a", "b", "c", "d", "e"))
+	h.waitServing(t, 1, "e")
+}
+
+func TestSessionGroupRunnerPromotesWhenOldSessionDiesMidRotation(t *testing.T) {
+	hold := func(sessionIndex int, _ string) bool { return sessionIndex == 2 }
+	h := startGroupHarness(t, 2*time.Second, 0, hold, "a", "b", "c")
+	h.waitServing(t, 1, "a", "b", "c")
+	first := h.factory.session(1)
+	waitUntil(t, 3*time.Second, func() bool { return h.factory.startCount() == 2 }, "replacement session start")
+	second := h.factory.session(2)
+
+	// The old session dies with the replacement still registering: nothing
+	// is left to regress, so one serving route is enough to promote.
+	first.end(errors.New("control connection lost"))
+	second.serve("a")
+	waitUntil(t, time.Second, func() bool { return len(h.events.promotions()) == 2 }, "promotion after the old session died")
+	h.waitServing(t, 2, "a")
+	if h.events.servingCount("b", 2) != 0 || h.events.servingCount("c", 2) != 0 {
+		t.Fatal("routes still pending on the replacement were reported serving")
+	}
+	if got := h.admissions(); got != 2 {
+		t.Fatalf("admissions = %d, want the replacement's one knock and no re-admission for the dead session", got)
+	}
+	second.serve("b")
+	second.serve("c")
+	h.waitServing(t, 2, "b", "c")
 }
 
 func TestSessionGroupRunnerSetRoutesToleratesRetiringSession(t *testing.T) {

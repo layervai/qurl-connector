@@ -34,6 +34,10 @@ const MaxGroupRoutes = 2000
 // NewProxy retry; it is not permanently unavailable like ErrResourceGone.
 var ErrRouteNotServing = errors.New("qURL share route is not serving")
 
+// maxPushRetryDelay caps the backoff between retries of a failed proxy-set
+// push; the first retry waits one poll interval.
+const maxPushRetryDelay = 5 * time.Second
+
 // ErrSessionGroupEnded is returned by GroupServingSession.Update once the
 // session has stopped. SessionGroupRunner treats it as benign: the desired
 // set is authoritative and the next cycle starts from it.
@@ -342,10 +346,15 @@ type frpGroupSession struct {
 	pushed  uint64
 	// pushErr is the last failed push while one is still owed; RouteStates
 	// surfaces it on every pending route so a stuck push is distinguishable
-	// from a proxy FRP simply has not registered yet.
-	pushErr error
-	err     error
-	stopped bool
+	// from a proxy FRP simply has not registered yet. pushFailures and
+	// nextPushAt back the watch retry off exponentially (from one poll up to
+	// maxPushRetryDelay) so a wedged service is not re-pushed 2000 proxies
+	// at every tick.
+	pushErr      error
+	pushFailures int
+	nextPushAt   time.Time
+	err          error
+	stopped      bool
 
 	stopOnce  sync.Once
 	readyOnce sync.Once
@@ -393,7 +402,7 @@ func (s *frpGroupSession) watch(ctx context.Context) {
 			s.fail(terminalErr)
 			return
 		}
-		if s.pushOwed() {
+		if s.pushDue() {
 			_ = s.push()
 		}
 		select {
@@ -558,10 +567,18 @@ func (s *frpGroupSession) Update(ctx context.Context, routes []GroupRoute) error
 	return s.pushUnderUpdateMu()
 }
 
+// pushOwed reports whether FRP has not yet accepted the current table.
 func (s *frpGroupSession) pushOwed() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return !s.stopped && s.pushed != s.version
+}
+
+// pushDue is pushOwed gated by the retry backoff after a failed push.
+func (s *frpGroupSession) pushDue() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return !s.stopped && s.pushed != s.version && !time.Now().Before(s.nextPushAt)
 }
 
 // push hands the live proxy set to FRP. It withdraws permanently failed
@@ -574,7 +591,10 @@ func (s *frpGroupSession) push() error {
 }
 
 // pushUnderUpdateMu is the push body; the caller holds updateMu (not mu),
-// which is what keeps successive pushes in table order.
+// which is what keeps successive pushes in table order. The table is
+// snapshotted under mu and rendered after it is released, so a 2000-route
+// render never blocks observe or RouteStates; the version snapshot is what
+// the retry protocol keys on.
 func (s *frpGroupSession) pushUnderUpdateMu() error {
 	s.mu.Lock()
 	if s.stopped {
@@ -582,30 +602,48 @@ func (s *frpGroupSession) pushUnderUpdateMu() error {
 		return ErrSessionGroupEnded
 	}
 	version := s.version
-	proxies, err := s.liveProxiesLocked()
+	live := s.liveRoutesLocked()
 	s.mu.Unlock()
+	proxies, err := s.renderLiveProxies(live)
 	if err != nil {
-		return err
+		return s.recordPushFailure(fmt.Errorf("render FRP proxy set: %w", err))
 	}
-	pushErr := s.svc.UpdateAllConfigurer(proxies, nil)
+	if err := s.svc.UpdateAllConfigurer(proxies, nil); err != nil {
+		return s.recordPushFailure(fmt.Errorf("update FRP proxy set: %w", err))
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if pushErr != nil {
-		s.pushErr = fmt.Errorf("update FRP proxy set: %w", pushErr)
-		s.notify()
-		return s.pushErr
-	}
 	if s.pushed < version {
 		s.pushed = version
 	}
-	if s.pushed == s.version && s.pushErr != nil {
+	s.pushFailures, s.nextPushAt = 0, time.Time{}
+	// FRP accepted a set; a still-owed newer version reports its own failure
+	// if it has one, so the old failure must not linger on pending routes.
+	if s.pushErr != nil {
 		s.pushErr = nil
 		s.notify()
 	}
 	return nil
 }
 
-func (s *frpGroupSession) liveProxiesLocked() ([]v1.ProxyConfigurer, error) {
+func (s *frpGroupSession) recordPushFailure(err error) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.pushErr = err
+	s.pushFailures++
+	delay := s.poll
+	for i := 1; i < s.pushFailures && delay < maxPushRetryDelay; i++ {
+		delay *= 2
+	}
+	if delay > maxPushRetryDelay {
+		delay = maxPushRetryDelay
+	}
+	s.nextPushAt = time.Now().Add(delay)
+	s.notify()
+	return err
+}
+
+func (s *frpGroupSession) liveRoutesLocked() []GroupRoute {
 	live := make([]GroupRoute, 0, len(s.routes))
 	for _, entry := range s.routes {
 		if entry.phase != RouteFailed {
@@ -613,11 +651,29 @@ func (s *frpGroupSession) liveProxiesLocked() ([]v1.ProxyConfigurer, error) {
 		}
 	}
 	sortGroupRoutes(live)
+	return live
+}
+
+func (s *frpGroupSession) renderLiveProxies(live []GroupRoute) ([]v1.ProxyConfigurer, error) {
 	proxies, _, err := renderGroupProxies(live, s.sessionID)
 	if err != nil {
 		return nil, err
 	}
 	return completeGroupProxies(s.common, proxies)
+}
+
+// ServingRouteIDs returns only the routes in FRP's running phase; the runner
+// prefers it over RouteStates for the promotion gate during rotation.
+func (s *frpGroupSession) ServingRouteIDs() map[string]struct{} {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	serving := make(map[string]struct{})
+	for routeID, entry := range s.routes {
+		if entry.phase == RouteServing {
+			serving[routeID] = struct{}{}
+		}
+	}
+	return serving
 }
 
 // RouteStates reports every route's registration. While a push to FRP is
