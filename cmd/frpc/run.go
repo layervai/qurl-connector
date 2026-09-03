@@ -1113,15 +1113,17 @@ func newSharedServiceSessions(common *v1.ClientCommonConfig, cfgPath string) (*s
 
 // runSharedService runs the group until a terminal condition.
 //
-// A revocation can reach the process through the knock as well as through a
-// NewProxy: the admitted resource is the primary route's, and the SDK
-// authenticates it on every knock separately from the shared knock resource.
-// An admission refused with ErrResourceGone therefore retires the primary
-// route in place and re-admits the rest under the next route, so the healthy
-// siblings survive either path. If the refusal is really about the knock
-// resource every route shares, each successive admission is refused too; the
-// cost is one knock per remaining route before the process exits with the
-// same error, never a stuck loop.
+// A revocation can reach the process through the admission as well as
+// through a NewProxy: the admitted resource is the primary route's, the SDK
+// authenticates it on every knock separately from the shared knock resource,
+// and a Login the tunnel server rejects as resource-gone ends the session
+// with the same error. Either way the group returns ErrResourceGone; the
+// primary route is then retired in place and the rest re-admitted under the
+// next route, so the healthy siblings survive. Routes already retired per
+// proxy stay retired across that re-admission. If the refusal is really
+// about the knock resource every route shares, each successive admission is
+// refused too; the cost is one knock per remaining route before the process
+// exits with the same error, never a stuck loop.
 func runSharedService(ctx context.Context, qcfg *nhpconfig.Config, admitter sharedServiceAdmitter, sessions share.SessionGroupFactory, announcer *readyAnnouncer) error {
 	if qcfg == nil {
 		return errors.New("shared Connector runtime requires at least one resource")
@@ -1134,6 +1136,15 @@ func runSharedService(ctx context.Context, qcfg *nhpconfig.Config, admitter shar
 		if err != nil {
 			return err
 		}
+		announcer.setLiveProbe(func() []string {
+			var serving []string
+			for routeID, state := range runner.RouteStates() {
+				if state.Phase == share.RouteServing {
+					serving = append(serving, routeID)
+				}
+			}
+			return serving
+		})
 		err = runner.Run(ctx)
 		if errors.Is(err, share.ErrGroupEmpty) {
 			return allRoutesRetiredError(err)
@@ -1146,11 +1157,27 @@ func runSharedService(ctx context.Context, qcfg *nhpconfig.Config, admitter shar
 			return err
 		}
 		retireSharedRoute(ctx, announcer, primary.ID, primary.ResourceID, "admission_resource_gone", err)
+		rest = withoutRoutes(rest, announcer.retiredRoutes())
 		if len(rest) == 0 {
 			return allRoutesRetiredError(err)
 		}
 		remaining.Routes = rest
 	}
+}
+
+// withoutRoutes drops the routes with the given IDs, preserving order.
+func withoutRoutes(routes []nhpconfig.Route, ids []string) []nhpconfig.Route {
+	drop := make(map[string]struct{}, len(ids))
+	for _, id := range ids {
+		drop[id] = struct{}{}
+	}
+	kept := make([]nhpconfig.Route, 0, len(routes))
+	for _, route := range routes {
+		if _, gone := drop[route.ID]; !gone {
+			kept = append(kept, route)
+		}
+	}
+	return kept
 }
 
 func allRoutesRetiredError(err error) error {

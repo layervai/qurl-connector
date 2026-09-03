@@ -94,6 +94,11 @@ type readyAnnouncer struct {
 	fallback     *time.Timer
 	fallbackWait time.Duration
 	stopped      bool
+	// live, when set, answers which routes serve on the active session right
+	// now. The fallback consults it instead of the accumulated serving set:
+	// a session can end and a replacement be under construction when the
+	// wait elapses, with no promotion in between to clear the set.
+	live func() []string
 }
 
 func newReadyAnnouncer(routes []readyRoute, out io.Writer, interactive bool) *readyAnnouncer {
@@ -131,6 +136,33 @@ func (a *readyAnnouncer) sessionPromoted(wait time.Duration) {
 	}
 	a.fallbackWait = wait
 	a.fallback = time.AfterFunc(wait, a.announceOutstanding)
+}
+
+// setLiveProbe installs the runtime's answer to "which routes serve on the
+// active session now", used by the bounded wait when it fires.
+func (a *readyAnnouncer) setLiveProbe(live func() []string) {
+	if a == nil {
+		return
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.live = live
+}
+
+// retiredRoutes lists the routes retired so far, in config order.
+func (a *readyAnnouncer) retiredRoutes() []string {
+	if a == nil {
+		return nil
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	var ids []string
+	for _, route := range a.routes {
+		if _, gone := a.retired[route.routeID]; gone {
+			ids = append(ids, route.routeID)
+		}
+	}
+	return ids
 }
 
 // stop ends the bounded wait for good. The block is not printed by stop.
@@ -243,6 +275,20 @@ func (a *readyAnnouncer) announceOutstanding() {
 	defer a.mu.Unlock()
 	if a.announced || a.stopped {
 		return
+	}
+	if a.live != nil {
+		// Rebuild the serving set from the runtime's view so a session that
+		// ended since the last promotion cannot lend its routes to the block.
+		clear(a.serving)
+		for _, routeID := range a.live() {
+			if _, ok := a.index[routeID]; !ok {
+				continue
+			}
+			if _, gone := a.retired[routeID]; gone {
+				continue
+			}
+			a.serving[routeID] = struct{}{}
+		}
 	}
 	live, outstanding := a.partitionLocked()
 	if len(live) == 0 {
