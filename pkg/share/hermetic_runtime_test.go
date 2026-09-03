@@ -95,7 +95,7 @@ type hermeticQRTSPlugin struct {
 
 // hermeticLatency is a uniform per-call delay range.
 type hermeticLatency struct {
-	min, max time.Duration
+	low, high time.Duration
 }
 
 type hermeticTCPForwarder struct {
@@ -193,8 +193,8 @@ func (p *hermeticQRTSPlugin) handle(w http.ResponseWriter, r *http.Request) {
 		})
 		var delay time.Duration
 		if latency, ok := p.latency[request.Content.User.RunID]; ok {
-			delay = latency.min
-			if spread := latency.max - latency.min; spread > 0 {
+			delay = latency.low
+			if spread := latency.high - latency.low; spread > 0 {
 				delay += time.Duration(p.rng.Int64N(int64(spread)))
 			}
 		}
@@ -211,11 +211,11 @@ func (p *hermeticQRTSPlugin) handle(w http.ResponseWriter, r *http.Request) {
 }
 
 // delayNewProxy makes every NewProxy authorization for the Login RunID take
-// a uniformly random time in [min, max], the way a platform round trip does.
-func (p *hermeticQRTSPlugin) delayNewProxy(runID string, min, max time.Duration) {
+// a uniformly random time in [low, high], the way a platform round trip does.
+func (p *hermeticQRTSPlugin) delayNewProxy(runID string, low, high time.Duration) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	p.latency[runID] = hermeticLatency{min: min, max: max}
+	p.latency[runID] = hermeticLatency{low: low, high: high}
 }
 
 func (p *hermeticQRTSPlugin) markStale(runID string) {

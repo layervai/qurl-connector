@@ -986,3 +986,69 @@ func TestFRPGroupSessionRegeneratedRouteTakesNextSlot(t *testing.T) {
 	status.set("m-nhp7-r1", frpproxy.ProxyPhaseRunning, "")
 	waitForLastPush(t, svc, []string{"a-nhp7", "m-nhp7-r1", "n-nhp7"})
 }
+
+func TestFRPGroupSessionCeilingAgesOutDurableStartErrors(t *testing.T) {
+	withRegistrationWindow(t, 1)
+	// One second keeps the "still held back" checks below clear of scheduling
+	// hiccups on a loaded race-detector runner (they must all land inside
+	// the hold measured from a's first refusal) while staying inside
+	// waitForLastPush's deadline for the release that follows.
+	hold := groupErroredHold
+	groupErroredHold = time.Second
+	t.Cleanup(func() { groupErroredHold = hold })
+	svc := &recordingGroupService{}
+	status := &lockedStatusMap{}
+	session := startTestGroupSession(t, svc, status, groupRoutesOf(groupTestRoutes("a", "b", "c", "d")))
+	erroredAt := func(routeID string) time.Time {
+		session.mu.Lock()
+		defer session.mu.Unlock()
+		return session.routes[routeID].erroredAt
+	}
+	// Two refusals fill the ceiling; while they are recent, c waits.
+	status.set("a-nhp7", frpproxy.ProxyPhaseStartErr, "subdomain_conflict: taken")
+	waitForLastPush(t, svc, []string{"a-nhp7", "b-nhp7"})
+	status.set("b-nhp7", frpproxy.ProxyPhaseStartErr, "subdomain_conflict: taken")
+	waitForRouteStates(t, session, func(s map[string]RouteState) bool { return s["b"].Err != nil })
+	if got := liveProxyNames(session); !reflect.DeepEqual(got, []string{"a-nhp7", "b-nhp7"}) {
+		t.Fatalf("FRP proxy set with two fresh refusals = %q, want c held back", got)
+	}
+	firstA, firstB := erroredAt("a"), erroredAt("b")
+	if firstA.IsZero() || firstB.IsZero() {
+		t.Fatal("refused proxies carry no hold stamp")
+	}
+	// FRP re-sends a refused NewProxy after its start-error interval, which
+	// takes the proxy through wait-start and back to the same refusal. The
+	// hold is anchored to the first refusal, so the round trip must not
+	// refresh it; otherwise a 30s re-send would keep a 60s hold alive
+	// forever and the ceiling would wedge on durable refusals after all.
+	for _, name := range []string{"a-nhp7", "b-nhp7"} {
+		status.set(name, frpproxy.ProxyPhaseWaitStart, "")
+	}
+	waitForRouteStates(t, session, func(s map[string]RouteState) bool { return s["a"].Err == nil && s["b"].Err == nil })
+	for _, name := range []string{"a-nhp7", "b-nhp7"} {
+		status.set(name, frpproxy.ProxyPhaseStartErr, "subdomain_conflict: taken")
+	}
+	waitForRouteStates(t, session, func(s map[string]RouteState) bool { return s["a"].Err != nil && s["b"].Err != nil })
+	if erroredAt("a") != firstA || erroredAt("b") != firstB {
+		t.Fatalf("re-sent refusal refreshed the hold: a %s -> %s, b %s -> %s", firstA, erroredAt("a"), firstB, erroredAt("b"))
+	}
+	// A refusal the server keeps repeating is those routes' own problem:
+	// once it is older than the hold, their siblings register through the
+	// window as if the errored routes were not there.
+	waitForLastPush(t, svc, []string{"a-nhp7", "b-nhp7", "c-nhp7"})
+	states := session.RouteStates()
+	for _, routeID := range []string{"a", "b"} {
+		if state := states[routeID]; state.Phase != RoutePending || state.Err == nil {
+			t.Fatalf("durably refused route %q = %+v, want still pending with its error", routeID, state)
+		}
+	}
+	status.set("c-nhp7", frpproxy.ProxyPhaseRunning, "")
+	waitForLastPush(t, svc, []string{"a-nhp7", "b-nhp7", "c-nhp7", "d-nhp7"})
+	// Registering clears the stamp, so a later refusal of the same proxy
+	// starts a fresh hold.
+	status.set("a-nhp7", frpproxy.ProxyPhaseRunning, "")
+	waitForRouteStates(t, session, func(s map[string]RouteState) bool { return phaseOf(s, "a") == RouteServing })
+	if !erroredAt("a").IsZero() {
+		t.Fatalf("registered proxy a still carries a hold stamp: %s", erroredAt("a"))
+	}
+}

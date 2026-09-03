@@ -1011,3 +1011,129 @@ func TestSessionGroupRunnerRefusesConcurrentRun(t *testing.T) {
 		t.Fatalf("second Run() = %v, want refusal", err)
 	}
 }
+
+func TestSessionGroupRunnerRotationLeadMeasuresWithoutEveryRouteServing(t *testing.T) {
+	floor, perRoute := groupLeadFloor, groupLeadPerRoute
+	groupLeadFloor, groupLeadPerRoute = 100*time.Millisecond, 20*time.Millisecond
+	t.Cleanup(func() { groupLeadFloor, groupLeadPerRoute = floor, perRoute })
+
+	// Route c never registers on the first session, the way a route the
+	// server keeps refusing never does. The measurement must still follow
+	// the routes that did: b served `spacing` after a, 1.8s per route with
+	// the margin, so three routes need 5.4s, which the 4s cap binds. The
+	// replacement therefore starts at the cap, about 4s after admission,
+	// not the 7.9s the a-priori estimate would arm, and the cap is reported.
+	const (
+		openTime = 8 * time.Second
+		spacing  = 1200 * time.Millisecond
+	)
+	hold := func(sessionIndex int, routeID string) bool { return sessionIndex == 1 && routeID != "a" }
+	h := startGroupHarness(t, openTime, 0, hold, "a", "b", "c")
+	h.waitServing(t, 1, "a")
+	admittedAt := time.Now()
+	session := h.factory.session(1)
+	time.Sleep(spacing)
+	session.serve("b")
+	h.waitServing(t, 1, "b")
+	waitUntil(t, openTime, func() bool { return h.factory.startCount() == 2 }, "replacement start")
+	elapsed := time.Since(admittedAt)
+	if elapsed < openTime/2-500*time.Millisecond || elapsed > openTime-1500*time.Millisecond {
+		t.Fatalf("replacement started %s after admission, want about %s (the cap), not the %s the a-priori estimate arms",
+			elapsed, openTime/2, openTime-100*time.Millisecond)
+	}
+	caps := h.events.leadCaps()
+	if len(caps) == 0 || caps[0].routes != 3 || caps[0].lead != openTime/2 || caps[0].need < 5*time.Second {
+		t.Fatalf("lead cap reports = %+v, want three routes needing about 5.4s and getting 4s", caps)
+	}
+	waitUntil(t, 3*time.Second, func() bool { return len(h.events.promotions()) == 2 }, "replacement promotion")
+	h.waitServing(t, 2, "a", "b", "c")
+}
+
+func TestSessionGroupRunnerRotationLeadIgnoresRoutesAddedAfterStart(t *testing.T) {
+	floor, perRoute := groupLeadFloor, groupLeadPerRoute
+	groupLeadFloor, groupLeadPerRoute = 100*time.Millisecond, 20*time.Millisecond
+	t.Cleanup(func() { groupLeadFloor, groupLeadPerRoute = floor, perRoute })
+
+	// The cycle starts with a, b, and c; c never registers, b serves
+	// `spacing` after a (450ms per route with the margin), and d joins the
+	// group `later` on and serves at once. d is not part of the cycle's
+	// initial set, so it neither completes the measurement in c's place nor
+	// stretches the spacing to the cycle's wall-clock age: four routes need
+	// 4 × 450ms = 1.8s and the replacement starts about 6.2s after
+	// admission with no cap report. Counting d would measure `later` over
+	// two routes, 1.5s each, need 6s, and rotate at the 4s cap.
+	const (
+		openTime = 8 * time.Second
+		spacing  = 300 * time.Millisecond
+		later    = 2 * time.Second
+	)
+	hold := func(sessionIndex int, routeID string) bool {
+		return sessionIndex == 1 && (routeID == "b" || routeID == "c")
+	}
+	h := startGroupHarness(t, openTime, 0, hold, "a", "b", "c")
+	h.waitServing(t, 1, "a")
+	admittedAt := time.Now()
+	session := h.factory.session(1)
+	time.Sleep(spacing)
+	session.serve("b")
+	h.waitServing(t, 1, "b")
+	time.Sleep(later - time.Since(admittedAt))
+	if err := h.runner.SetRoutes(context.Background(), groupTestRoutes("a", "b", "c", "d")); err != nil {
+		t.Fatal(err)
+	}
+	h.waitServing(t, 1, "d")
+	waitUntil(t, openTime, func() bool { return h.factory.startCount() == 2 }, "replacement start")
+	// The measured spacing is amplified sixfold into the need (four routes,
+	// 1.5x margin), so the band below the 6.2s target leaves 200ms of
+	// observation lag on a and b before it is crossed; the cap a wall-clock
+	// measurement over d would arm sits a full second below the band.
+	elapsed := time.Since(admittedAt)
+	if elapsed < openTime-3000*time.Millisecond || elapsed > openTime-1200*time.Millisecond {
+		t.Fatalf("replacement started %s after admission, want about %s (four routes at the 450ms measured on a and b), not the %s cap a wall-clock measurement over d would arm",
+			elapsed, openTime-1800*time.Millisecond, openTime/2)
+	}
+	if caps := h.events.leadCaps(); len(caps) != 0 {
+		t.Fatalf("lead cap reports = %+v, want none for a 1.8s need inside a 4s cap", caps)
+	}
+	waitUntil(t, 3*time.Second, func() bool { return len(h.events.promotions()) == 2 }, "replacement promotion")
+	h.waitServing(t, 2, "a", "b", "c", "d")
+}
+
+func TestSessionGroupRunnerSingleRouteCycleKeepsPriorMeasurement(t *testing.T) {
+	runner, err := NewSessionGroupRunner(SessionGroupConfig{
+		KnockResourceID: "q_catalog_key", ResourceID: "group-resource",
+		Routes: groupTestRoutes("a"), Admitter: &rotatingAdmitter{openTime: time.Hour}, Sessions: &fakeGroupFactory{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const prior = 900 * time.Millisecond
+	runner.measuredPerRoute = prior
+	now := time.Now()
+	serving := func(ids ...string) map[string]RouteState {
+		states := make(map[string]RouteState, len(ids))
+		for _, id := range ids {
+			states[id] = RouteState{Phase: RouteServing}
+		}
+		return states
+	}
+	// A cycle with one route (or a replacement promoted at expiry with one
+	// route up) has no spacing to measure and leaves the prior estimate in
+	// place, whether or not that finishes its initial set.
+	single := &groupCycle{initial: map[string]struct{}{"a": {}}}
+	runner.observeRegistration(single, serving("a"), now)
+	if runner.measuredPerRoute != prior || !single.measured {
+		t.Fatalf("after a single-route cycle: measured = %s (want the prior %s), frozen = %t (want true)", runner.measuredPerRoute, prior, single.measured)
+	}
+	partial := &groupCycle{initial: map[string]struct{}{"a": {}, "b": {}}}
+	runner.observeRegistration(partial, serving("a"), now)
+	if runner.measuredPerRoute != prior || partial.measured {
+		t.Fatalf("after one of two routes served: measured = %s (want the prior %s), frozen = %t (want false)", runner.measuredPerRoute, prior, partial.measured)
+	}
+	// Two routes inside one observation do measure: below the estimate,
+	// recorded as zero.
+	runner.observeRegistration(partial, serving("a", "b"), now)
+	if runner.measuredPerRoute != 0 || !partial.measured {
+		t.Fatalf("after both routes served at once: measured = %s (want 0), frozen = %t (want true)", runner.measuredPerRoute, partial.measured)
+	}
+}

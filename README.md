@@ -148,8 +148,10 @@ Measured on darwin/arm64 (Apple M5 Max, 18 cores, Go 1.27.1):
 Registration and rotation are linear and fast: about 80 µs per route on the
 server's serial `NewProxy` path, and about 0.6 ms per route end to end
 because proxies are handed to FRP through a 16-wide registration window
-that the session refills once per 10 ms status poll in the proof (100 ms in
-production). The production rotation lead's a-priori estimate of 50 ms per
+that the session refills once per status poll: 10 ms in the proof, 100 ms in
+production, where the refill alone therefore bounds a 1000-route
+registration at about 6 s and a 2000-route one at about 13 s, inside the
+30 s lead floor. The production rotation lead's a-priori estimate of 50 ms per
 route is still well over a hundred times what this machine needs. A
 platform behind the server is slower: its per-`NewProxy` authorization and
 registration round trips take hundreds of milliseconds, and because the
