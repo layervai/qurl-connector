@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.11.4](https://github.com/layervai/qurl-connector/compare/v0.11.3...v0.11.4) (2026-09-03)
+
+
+### Bug Fixes
+
+* **share:** window NewProxy registration; lead follows measured rate ([#67](https://github.com/layervai/qurl-connector/issues/67)) ([a1ee171](https://github.com/layervai/qurl-connector/commit/a1ee171876bcd861e335b13c08ea5e9da25c76c8))
+
 ## [0.11.3](https://github.com/layervai/qurl-connector/compare/v0.11.2...v0.11.3) (2026-09-03)
 
 
