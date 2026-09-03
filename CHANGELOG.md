@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.11.5](https://github.com/layervai/qurl-connector/compare/v0.11.4...v0.11.5) (2026-09-03)
+
+
+### Bug Fixes
+
+* **share:** age refused proxies out of the ceiling; measure the lead from the second route ([#69](https://github.com/layervai/qurl-connector/issues/69)) ([a6423c0](https://github.com/layervai/qurl-connector/commit/a6423c086589ed0c3d201ee7204e676761761200))
+
 ## [0.11.4](https://github.com/layervai/qurl-connector/compare/v0.11.3...v0.11.4) (2026-09-03)
 
 
