@@ -250,6 +250,44 @@ func TestReadyAnnouncerFallbackListsOnlyTheActiveSessionsRoutes(t *testing.T) {
 	}
 }
 
+func TestReadyAnnouncerFallbackAsksTheRuntimeWhatIsLive(t *testing.T) {
+	out := &lockedBuffer{}
+	announcer := newReadyAnnouncer(readyTestRoutes("a", "b", "c", "d"), out, false)
+	t.Cleanup(announcer.stop)
+
+	// a, b, c served, then the session ended and its replacement is still
+	// being built: nothing is live and no promotion has cleared the set.
+	announcer.sessionPromoted(time.Hour)
+	for _, id := range []string{"a", "b", "c"} {
+		announcer.routeServing(id)
+	}
+	live := []string{}
+	announcer.setLiveProbe(func() []string { return live })
+	announcer.announceOutstanding()
+	if out.String() != "" {
+		t.Fatalf("fallback block printed routes from an ended session:\n%s", out.String())
+	}
+
+	// The replacement has a alone so far, plus a stranger the block must
+	// ignore; d was retired meanwhile.
+	live = []string{"a", "stranger"}
+	announcer.routeRetired("d")
+	announcer.announceOutstanding()
+	block := out.String()
+	if !strings.Contains(block, "1 of 3 route(s) live") {
+		t.Errorf("fallback block should count what the runtime reports live; got:\n%s", block)
+	}
+	if got := readyBlockRoutes(block); strings.Join(got, ",") != "a" {
+		t.Errorf("fallback block rows = %v, want [a]", got)
+	}
+	if !strings.Contains(block, "Still registering: b, c ") || strings.Contains(block, "b, c, d") {
+		t.Errorf("fallback block should name b and c as still registering and not the retired d; got:\n%s", block)
+	}
+	if got := announcer.retiredRoutes(); strings.Join(got, ",") != "d" {
+		t.Errorf("retiredRoutes = %v, want [d]", got)
+	}
+}
+
 func TestReadyAnnouncerStopEndsTheFallbackForGood(t *testing.T) {
 	out := &lockedBuffer{}
 	announcer := newReadyAnnouncer(readyTestRoutes("a", "b"), out, false)

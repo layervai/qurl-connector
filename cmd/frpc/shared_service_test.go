@@ -39,9 +39,21 @@ type fakeSharedAdmitter struct {
 	deny map[string]error
 	// knocks records the knock resource of every Admit, in order.
 	knocks []string
+	// gate, when set, holds every Admit until it is closed (or ctx ends).
+	gate chan struct{}
 }
 
-func (a *fakeSharedAdmitter) Admit(_ context.Context, knockResourceID, resourceID string) (share.Admission, error) {
+func (a *fakeSharedAdmitter) Admit(ctx context.Context, knockResourceID, resourceID string) (share.Admission, error) {
+	a.mu.Lock()
+	gate := a.gate
+	a.mu.Unlock()
+	if gate != nil {
+		select {
+		case <-gate:
+		case <-ctx.Done():
+			return share.Admission{}, ctx.Err()
+		}
+	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.knocks = append(a.knocks, knockResourceID)
@@ -83,6 +95,17 @@ func (a *fakeSharedAdmitter) counts() (admits, retired, healthy int) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return a.admits, len(a.retired), a.healthy
+}
+
+// holdAdmissions makes every later Admit wait until the returned release
+// function is called.
+func (a *fakeSharedAdmitter) holdAdmissions() (release func()) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	gate := make(chan struct{})
+	a.gate = gate
+	var once sync.Once
+	return func() { once.Do(func() { close(gate) }) }
 }
 
 func (a *fakeSharedAdmitter) knockResources() []string {
@@ -925,6 +948,69 @@ func TestSharedServiceKnockOverrideAppliesToEveryRoute(t *testing.T) {
 	}
 	if knocks := admitter.knockResources(); len(knocks) != 1 || knocks[0] != "q_override" {
 		t.Errorf("knocks = %v, want one knock of the override resource", knocks)
+	}
+}
+
+func TestSharedServiceRetiredRoutesStayRetiredAcrossReadmission(t *testing.T) {
+	logger := &captureAuditLogger{}
+	previous := audit.SetDefault(logger)
+	t.Cleanup(func() { audit.SetDefault(previous) })
+
+	h := startSharedServiceHarness(t, sharedServiceTestConfig("a", "b", "c"))
+	h.waitReadyBlock(t)
+	first := h.session(t, 1)
+
+	// c is revoked per proxy, then the session itself ends as resource-gone
+	// (a Login the tunnel server rejected): the primary a is retired and the
+	// rest re-admitted -- without c, which is already known dead.
+	first.failRoute("c", fmt.Errorf("%w: resource_not_found", share.ErrResourceGone))
+	waitFor(t, 2*time.Second, func() bool { return strings.Join(first.lastUpdate(), ",") == "a,b" }, "c withdrawn")
+	first.end(fmt.Errorf("%w: login rejected", share.ErrResourceGone))
+
+	second := h.session(t, 2)
+	waitFor(t, 2*time.Second, func() bool { return second.RouteStates()["b"].Phase == share.RouteServing }, "b serving on the re-admitted session")
+	if states := second.RouteStates(); len(states) != 1 {
+		t.Errorf("re-admitted session carries %d routes, want only b: %+v", len(states), states)
+	}
+	if second.admission.ResourceID != "resource-b" {
+		t.Errorf("re-admitted under %q, want resource-b", second.admission.ResourceID)
+	}
+	denies := logger.byEvent(audit.EventProxyDeny)
+	if len(denies) != 2 {
+		t.Fatalf("audit denies = %+v, want exactly one for c and one for a", denies)
+	}
+	if denies[0].RouteID != "c" || denies[0].Reason != "resource_not_found" || denies[1].RouteID != "a" || denies[1].Reason != "admission_resource_gone" {
+		t.Errorf("audit denies = %+v", denies)
+	}
+	h.requireStillRunning(t)
+}
+
+func TestSharedServiceFallbackIgnoresRoutesFromAnEndedSession(t *testing.T) {
+	previous := readyFallbackWait
+	readyFallbackWait = 60 * time.Millisecond
+	t.Cleanup(func() { readyFallbackWait = previous })
+
+	// d is held everywhere so the block is still waiting when session 1 is
+	// lost; re-admission is held back so the wait elapses with no session.
+	h := startSharedServiceHarness(t, sharedServiceTestConfig("a", "b", "c", "d"), "d")
+	first := h.session(t, 1)
+	waitFor(t, 2*time.Second, func() bool { return first.RouteStates()["c"].Phase == share.RouteServing }, "session 1 serving")
+	release := h.admitter.holdAdmissions()
+	t.Cleanup(release)
+	first.end(errors.New("control connection lost"))
+
+	time.Sleep(150 * time.Millisecond)
+	if out := h.out.String(); strings.Contains(out, "Connector is running") {
+		t.Fatalf("fallback block printed routes from the ended session while nothing served:\n%s", out)
+	}
+
+	release()
+	block := h.waitReadyBlock(t)
+	if !strings.Contains(block, "3 of 4 route(s) live") {
+		t.Errorf("fallback block should list the replacement session's routes; got:\n%s", block)
+	}
+	if got := readyBlockRoutes(block); strings.Join(got, ",") != "a,b,c" {
+		t.Errorf("fallback block rows = %v, want [a b c]", got)
 	}
 }
 
