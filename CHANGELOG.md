@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.11.1](https://github.com/layervai/qurl-connector/compare/v0.11.0...v0.11.1) (2026-09-03)
+
+
+### Bug Fixes
+
+* **frpc:** keep retired routes out of re-admission and probe liveness at the fallback ([#59](https://github.com/layervai/qurl-connector/issues/59)) ([9ae3422](https://github.com/layervai/qurl-connector/commit/9ae3422052711acc8576fe2c99ca8ab77b1db22b))
+
 ## [0.11.0](https://github.com/layervai/qurl-connector/compare/v0.10.0...v0.11.0) (2026-09-03)
 
 
