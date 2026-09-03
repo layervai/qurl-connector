@@ -82,6 +82,9 @@ var groupRegistrationWindow = 16
 // shrink the hold.
 const groupReleasedPendingFactor = 2
 
+// groupErroredHold is how long after a proxy's first refusal it keeps
+// counting against the released-pending ceiling; see
+// groupReleasedPendingFactor.
 var groupErroredHold = 60 * time.Second
 
 // ErrRouteNotServing reports a route that stayed configured but did not reach

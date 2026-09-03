@@ -194,9 +194,9 @@ var (
 
 // groupLeadMarginNum/Den is the safety margin applied to a measured
 // registration cost before it sizes the next lead: a replacement gets one and
-// a half times what the last full registration took, so ordinary variance on
-// the server's side does not leave the tail of the set unregistered at the
-// old admission's expiry.
+// a half times what the latest cycle's registration took, so ordinary
+// variance on the server's side does not leave the tail of the set
+// unregistered at the old admission's expiry.
 const (
 	groupLeadMarginNum = 3
 	groupLeadMarginDen = 2
@@ -207,9 +207,10 @@ const (
 // server: every NewProxy is one authorization round trip plus registration
 // after Login itself, so the needed lead grows with the route count. Its
 // per-route cost is the larger of a 50ms floor (the a-priori estimate; 50s
-// for 1000 routes) and measuredPerRoute, the margin-included cost the runner
-// measured on the last cycle that brought every route up — the server's real
-// rate is a property of the platform behind it, and a lead sized only from
+// for 1000 routes) and measuredPerRoute, the margin-included high-water
+// estimate the runner measured on the latest cycle (see observeRegistration)
+// — the server's real rate is a property of the platform behind it, and a
+// lead sized only from
 // the a-priori estimate would promote a replacement at the old admission's
 // expiry with the tail of the set still queued behind the server's serial
 // NewProxy path, dropping those routes until the queue reached them. A 30s
@@ -283,20 +284,25 @@ func (r *SessionGroupRunner) observeRegistration(cycle *groupCycle, states map[s
 		return
 	}
 	cycle.highWater = serving
-	// A single route has no spacing to measure, and a set that registered
-	// inside one observation measures below the a-priori estimate: both
-	// record zero, so the 50ms floor applies rather than a stale measurement
-	// from an earlier cycle.
+	if serving >= len(cycle.initial) {
+		cycle.measured = true
+	}
+	// A single route has no spacing to measure, so it leaves the estimate
+	// alone: a replacement promoted at the old admission's expiry with one
+	// route up must not discard the measurement that sized its lead. A set
+	// that registered inside one observation measures below the a-priori
+	// estimate and records zero, so the 50ms floor applies rather than a
+	// stale measurement from an earlier cycle.
+	if serving < 2 {
+		return
+	}
 	var perRoute time.Duration
-	if spacing := now.Sub(cycle.firstServingAt); serving >= 2 && spacing > 0 {
+	if spacing := now.Sub(cycle.firstServingAt); spacing > 0 {
 		perRoute = spacing * groupLeadMarginNum / groupLeadMarginDen / time.Duration(serving-1)
 	}
 	r.mu.Lock()
 	r.measuredPerRoute = perRoute
 	r.mu.Unlock()
-	if serving >= len(cycle.initial) {
-		cycle.measured = true
-	}
 }
 
 // Run serves until ctx ends. Admission and connection failures retry forever
