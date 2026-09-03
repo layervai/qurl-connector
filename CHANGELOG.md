@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.11.2](https://github.com/layervai/qurl-connector/compare/v0.11.1...v0.11.2) (2026-09-03)
+
+
+### Bug Fixes
+
+* **frpc:** own the retirement ledger in the runtime, not the ready block ([#62](https://github.com/layervai/qurl-connector/issues/62)) ([9d4bf32](https://github.com/layervai/qurl-connector/commit/9d4bf32910075d1d251fdbc5b829926d8fe55bc7))
+
 ## [0.11.1](https://github.com/layervai/qurl-connector/compare/v0.11.0...v0.11.1) (2026-09-03)
 
 
