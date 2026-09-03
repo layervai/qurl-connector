@@ -18,7 +18,7 @@ BLUE := \033[34m
 GREEN := \033[32m
 RESET := \033[0m
 
-.PHONY: all build frpc test test-race lint vet fmt clean verify-deps
+.PHONY: all build frpc test test-race lint vet fmt clean verify-deps proof-1000
 
 all: print-version env frpc
 
@@ -62,6 +62,20 @@ vet:
 	go vet ./...
 	GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go vet ./...
 
+# Scaling proof: N routes on one Connector admission and one FRP session,
+# measured in-process against the real FRP client and server (README,
+# "Scaling proof"). 1000 routes with the race detector off (it is too slow
+# at that size), then 200 with it on. JSON reports land in bin/ (ignored).
+PROOF_TEST := ^TestHermeticSessionGroupServes1000Routes$$
+proof-1000:
+	@mkdir -p bin
+	QURL_PROOF_ROUTES=1000 QURL_PROOF_REPORT=$(CURDIR)/bin/proof-1000.json CGO_ENABLED=0 \
+		go test -count=1 -v -timeout 20m -run '$(PROOF_TEST)' ./pkg/share
+	QURL_PROOF_ROUTES=200 QURL_PROOF_REPORT=$(CURDIR)/bin/proof-200-race.json CGO_ENABLED=1 \
+		go test -race -count=1 -v -timeout 20m -run '$(PROOF_TEST)' ./pkg/share
+	@printf "$(GREEN)[qURL Connector] proof reports -> bin/proof-1000.json bin/proof-200-race.json$(RESET)\n"
+
 clean:
 	rm -f ./bin/qurl-connector
+	rm -f ./bin/proof-*.json
 	rm -f coverage.out

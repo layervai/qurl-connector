@@ -24,6 +24,8 @@ type hermeticAdmitter struct {
 	mu         sync.Mutex
 	admissions []Admission
 	next       int
+	// admittedAt records when each scripted admission was handed out.
+	admittedAt []time.Time
 	retired    []Admission
 }
 
@@ -32,12 +34,27 @@ func (a *hermeticAdmitter) Admit(ctx context.Context, _, _ string) (Admission, e
 	if a.next < len(a.admissions) {
 		admission := a.admissions[a.next]
 		a.next++
+		a.admittedAt = append(a.admittedAt, time.Now())
 		a.mu.Unlock()
 		return admission, nil
 	}
 	a.mu.Unlock()
 	<-ctx.Done()
 	return Admission{}, ctx.Err()
+}
+
+// admissionCount is how many scripted admissions have been handed out.
+func (a *hermeticAdmitter) admissionCount() int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.next
+}
+
+// admittedAtIndex is when the i-th admission was handed out.
+func (a *hermeticAdmitter) admittedAtIndex(i int) time.Time {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.admittedAt[i]
 }
 
 func (a *hermeticAdmitter) Retire(_ context.Context, admission Admission) error {
@@ -57,6 +74,7 @@ type hermeticNewProxyObservation struct {
 	runID     string
 	proxyName string
 	rejected  bool
+	at        time.Time
 }
 
 type hermeticQRTSPlugin struct {
@@ -155,7 +173,7 @@ func (p *hermeticQRTSPlugin) handle(w http.ResponseWriter, r *http.Request) {
 			reason, rejected = hermeticOwnerMissing, true
 		}
 		p.observations = append(p.observations, hermeticNewProxyObservation{
-			runID: request.Content.User.RunID, proxyName: request.Content.ProxyName, rejected: rejected,
+			runID: request.Content.User.RunID, proxyName: request.Content.ProxyName, rejected: rejected, at: time.Now(),
 		})
 		p.mu.Unlock()
 		if rejected {
@@ -193,6 +211,38 @@ func (p *hermeticQRTSPlugin) admittedNewProxies() map[string]int {
 	return counts
 }
 
+// admittedTimes reports, per proxy name, when its latest NewProxy was admitted.
+func (p *hermeticQRTSPlugin) admittedTimes() map[string]time.Time {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	times := make(map[string]time.Time)
+	for _, observation := range p.observations {
+		if !observation.rejected && observation.at.After(times[observation.proxyName]) {
+			times[observation.proxyName] = observation.at
+		}
+	}
+	return times
+}
+
+// lastAdmittedAt reports when the latest NewProxy for the RunID was admitted
+// and how many were admitted in total for it.
+func (p *hermeticQRTSPlugin) lastAdmittedAt(runID string) (time.Time, int) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	var last time.Time
+	count := 0
+	for _, observation := range p.observations {
+		if observation.runID != runID || observation.rejected {
+			continue
+		}
+		count++
+		if observation.at.After(last) {
+			last = observation.at
+		}
+	}
+	return last, count
+}
+
 func (p *hermeticQRTSPlugin) snapshot() []hermeticNewProxyObservation {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -214,7 +264,14 @@ func reserveHermeticPort(t *testing.T) int {
 
 func startHermeticFRPS(t *testing.T, bindPort, vhostPort int, subdomainHost, pluginURL string) *frpserver.Service {
 	t.Helper()
-	cfg := &v1.ServerConfig{
+	return startHermeticFRPSFromConfig(t, hermeticFRPSConfig(bindPort, vhostPort, subdomainHost, pluginURL))
+}
+
+// hermeticFRPSConfig is the FRP server shape every hermetic test shares: one
+// loopback listener multiplexing control and vhost HTTP, the tunnel-auth
+// plugin on NewProxy, and routing by subdomain.
+func hermeticFRPSConfig(bindPort, vhostPort int, subdomainHost, pluginURL string) *v1.ServerConfig {
+	return &v1.ServerConfig{
 		BindAddr: "127.0.0.1", BindPort: bindPort,
 		ProxyBindAddr: "127.0.0.1", VhostHTTPPort: vhostPort,
 		SubDomainHost: subdomainHost,
@@ -222,6 +279,10 @@ func startHermeticFRPS(t *testing.T, bindPort, vhostPort int, subdomainHost, plu
 			Name: "qrts-sim", Addr: pluginURL, Path: "/", Ops: []string{"NewProxy"},
 		}},
 	}
+}
+
+func startHermeticFRPSFromConfig(t *testing.T, cfg *v1.ServerConfig) *frpserver.Service {
+	t.Helper()
 	if err := cfg.Complete(); err != nil {
 		t.Fatalf("complete FRPS config: %v", err)
 	}
