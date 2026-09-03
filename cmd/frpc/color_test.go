@@ -246,16 +246,15 @@ func TestReadyBlockHonorsColorGate(t *testing.T) {
 	// The readiness block is the print this gate exists for. It is designed to
 	// be read by non-interactive log consumers, so escapes in it land squarely
 	// in the stream least able to render them.
-	announcer := &readyAnnouncer{
-		routes: []readyRoute{
-			{routeID: "web", target: "127.0.0.1:8080"},
-			{routeID: "internal-api", target: "127.0.0.1:9000"},
-		},
+	live := []readyRoute{
+		{routeID: "web", target: "127.0.0.1:8080"},
+		{routeID: "internal-api", target: "127.0.0.1:9000"},
 	}
+	announcer := newReadyAnnouncer(live, nil, true)
 
 	withColorEnabled(t, true)
 	announcer.interactive = true
-	colored := announcer.render()
+	colored := announcer.render(live)
 	if !strings.Contains(colored, ansiGreen) || !strings.Contains(colored, ansiCyan) {
 		t.Fatalf("ready block lost its color with the gate on:\n%q", colored)
 	}
@@ -266,7 +265,7 @@ func TestReadyBlockHonorsColorGate(t *testing.T) {
 	setColorEnabled(false)
 	for _, interactive := range []bool{true, false} {
 		announcer.interactive = interactive
-		plain := announcer.render()
+		plain := announcer.render(live)
 		assertNoANSI(t, "readyAnnouncer.render", plain)
 		for _, want := range []string{"Connector is running", "2 route(s) live", "web", "internal-api", "127.0.0.1:9000"} {
 			if !strings.Contains(plain, want) {

@@ -1,0 +1,647 @@
+package main
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	v1 "github.com/fatedier/frp/pkg/config/v1"
+	qurl "github.com/layervai/qurl-go/qurl"
+
+	"github.com/layervai/qurl-connector/pkg/audit"
+	nhpconfig "github.com/layervai/qurl-connector/pkg/config"
+	"github.com/layervai/qurl-connector/pkg/share"
+)
+
+// The shared runtime is exercised the way pkg/share's own tests exercise the
+// group runner: a fake admitter that mints valid admissions and counts every
+// knock, and a fake session factory whose sessions the test can drive route
+// by route. Nothing here touches the network or FRP.
+
+// fakeSharedAdmitter mints one valid admission per Admit and counts every
+// call, so a test can prove how many knocks a route set costs.
+type fakeSharedAdmitter struct {
+	mu      sync.Mutex
+	admits  int
+	retired []uint64
+	healthy int
+}
+
+func (a *fakeSharedAdmitter) Admit(_ context.Context, knockResourceID, resourceID string) (share.Admission, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.admits++
+	sessionID := uint64(a.admits)
+	return share.Admission{
+		KnockResourceID: knockResourceID, ResourceID: resourceID,
+		RunID: "run", RunAttempt: 1, Token: "token", ResourceHost: "frp.example:7000",
+		SessionID: sessionID,
+		SessionReceipt: qurl.NativeSessionReceipt{
+			CellID: "cell0", SessionID: sessionID, SessionIssuedAtMillis: 1, RunID: "run", RunAttempt: 1,
+		},
+		OpenTime: time.Hour,
+	}, nil
+}
+
+func (a *fakeSharedAdmitter) Retire(_ context.Context, admission share.Admission) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.retired = append(a.retired, admission.SessionID)
+	return nil
+}
+
+func (a *fakeSharedAdmitter) MarkServingHealthy() error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.healthy++
+	return nil
+}
+
+func (a *fakeSharedAdmitter) counts() (admits, retired, healthy int) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.admits, len(a.retired), a.healthy
+}
+
+// fakeGroupFactory starts fake group sessions. Every route serves as soon as
+// it is installed unless it is held, in which case it stays pending until the
+// test serves or fails it.
+type fakeGroupFactory struct {
+	mu       sync.Mutex
+	hold     map[string]bool
+	sessions []*fakeGroupSession
+}
+
+func (f *fakeGroupFactory) Start(_ context.Context, admission share.Admission, routes []share.GroupRoute) (share.GroupServingSession, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	session := &fakeGroupSession{
+		admission: admission, hold: f.hold,
+		routes:  make(map[string]share.RouteState, len(routes)),
+		ready:   make(chan struct{}),
+		done:    make(chan struct{}),
+		changes: make(chan struct{}, 1),
+	}
+	session.install(routes)
+	f.sessions = append(f.sessions, session)
+	return session, nil
+}
+
+func (f *fakeGroupFactory) starts() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.sessions)
+}
+
+func (f *fakeGroupFactory) first() *fakeGroupSession {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.sessions) == 0 {
+		return nil
+	}
+	return f.sessions[0]
+}
+
+type fakeGroupSession struct {
+	admission share.Admission
+	hold      map[string]bool
+
+	mu      sync.Mutex
+	routes  map[string]share.RouteState
+	updates [][]share.GroupRoute
+	err     error
+	stopped bool
+
+	ready    chan struct{}
+	done     chan struct{}
+	changes  chan struct{}
+	stopOnce sync.Once
+}
+
+func fakeProxyName(route share.GroupRoute, sessionID uint64) string {
+	return fmt.Sprintf("%s-s%d-g%d", route.RouteID, sessionID, route.Generation)
+}
+
+func (s *fakeGroupSession) install(routes []share.GroupRoute) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	next := make(map[string]share.RouteState, len(routes))
+	for _, route := range routes {
+		name := fakeProxyName(route, s.admission.SessionID)
+		if current, ok := s.routes[route.RouteID]; ok && current.ProxyName == name && current.Route == route {
+			next[route.RouteID] = current
+			continue
+		}
+		phase := share.RouteServing
+		if s.hold[route.RouteID] {
+			phase = share.RoutePending
+		}
+		next[route.RouteID] = share.RouteState{Route: route, ProxyName: name, Phase: phase}
+	}
+	s.routes = next
+	s.notifyLocked()
+}
+
+func (s *fakeGroupSession) notifyLocked() {
+	select {
+	case s.changes <- struct{}{}:
+	default:
+	}
+}
+
+func (s *fakeGroupSession) serve(routeID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	state := s.routes[routeID]
+	state.Phase, state.Err = share.RouteServing, nil
+	s.routes[routeID] = state
+	s.notifyLocked()
+}
+
+func (s *fakeGroupSession) failRoute(routeID string, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	state := s.routes[routeID]
+	state.Phase, state.Err = share.RouteFailed, err
+	s.routes[routeID] = state
+	s.notifyLocked()
+}
+
+func (s *fakeGroupSession) Update(ctx context.Context, routes []share.GroupRoute) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	if s.stopped {
+		s.mu.Unlock()
+		return share.ErrSessionGroupEnded
+	}
+	s.updates = append(s.updates, append([]share.GroupRoute(nil), routes...))
+	s.mu.Unlock()
+	s.install(routes)
+	return nil
+}
+
+// lastUpdate returns the route IDs of the most recent proxy set pushed to
+// the session, or nil when nothing has been pushed since Start.
+func (s *fakeGroupSession) lastUpdate() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.updates) == 0 {
+		return nil
+	}
+	last := s.updates[len(s.updates)-1]
+	ids := make([]string, 0, len(last))
+	for _, route := range last {
+		ids = append(ids, route.RouteID)
+	}
+	return ids
+}
+
+func (s *fakeGroupSession) RouteStates() map[string]share.RouteState {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make(map[string]share.RouteState, len(s.routes))
+	for id, state := range s.routes {
+		out[id] = state
+	}
+	return out
+}
+
+func (s *fakeGroupSession) Changes() <-chan struct{} { return s.changes }
+func (s *fakeGroupSession) Ready() <-chan struct{}   { return s.ready }
+func (s *fakeGroupSession) Done() <-chan struct{}    { return s.done }
+func (s *fakeGroupSession) Err() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.err
+}
+
+func (s *fakeGroupSession) Stop(context.Context) error {
+	s.end(nil)
+	return nil
+}
+
+func (s *fakeGroupSession) Drain(context.Context) error {
+	s.end(nil)
+	return nil
+}
+
+func (s *fakeGroupSession) end(err error) {
+	s.stopOnce.Do(func() {
+		s.mu.Lock()
+		s.stopped = true
+		if s.err == nil {
+			s.err = err
+		}
+		for routeID, state := range s.routes {
+			if state.Phase == share.RouteServing {
+				state.Phase, state.Err = share.RoutePending, share.ErrSessionGroupEnded
+				s.routes[routeID] = state
+			}
+		}
+		s.notifyLocked()
+		s.mu.Unlock()
+		close(s.done)
+	})
+}
+
+// captureAuditLogger records every entry so a test can assert what the
+// runtime put on the audit stream.
+type captureAuditLogger struct {
+	mu      sync.Mutex
+	entries []audit.Entry
+}
+
+func (l *captureAuditLogger) Log(entry audit.Entry) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.entries = append(l.entries, entry)
+}
+
+func (l *captureAuditLogger) Close() error { return nil }
+
+func (l *captureAuditLogger) byEvent(event string) []audit.Entry {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	var out []audit.Entry
+	for _, entry := range l.entries {
+		if entry.Event == event {
+			out = append(out, entry)
+		}
+	}
+	return out
+}
+
+type lockedBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+// sharedServiceTestConfig is a resolved config: every route carries its own
+// public resource and routing identity, and every resource maps to the one
+// knock resource the Connector session is admitted through.
+func sharedServiceTestConfig(ids ...string) *nhpconfig.Config {
+	cfg := &nhpconfig.Config{}
+	for i, id := range ids {
+		cfg.Routes = append(cfg.Routes, nhpconfig.Route{
+			ID: id, Type: nhpconfig.RouteTypeHTTP, LocalIP: "127.0.0.1", LocalPort: 3000 + i,
+			ResourceID: "resource-" + id, ConnectorRoutingID: "routing-" + id,
+		})
+		cfg.SetKnockResourceID("resource-"+id, "q_knock")
+	}
+	return cfg
+}
+
+func waitFor(t *testing.T, timeout time.Duration, condition func() bool, what string) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for !condition() {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %s", what)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+type sharedServiceHarness struct {
+	admitter *fakeSharedAdmitter
+	factory  *fakeGroupFactory
+	out      *lockedBuffer
+	cancel   context.CancelFunc
+
+	done     chan error
+	mu       sync.Mutex
+	returned bool
+	err      error
+}
+
+func startSharedServiceHarness(t *testing.T, cfg *nhpconfig.Config, hold ...string) *sharedServiceHarness {
+	t.Helper()
+	t.Setenv(EnvKnockResourceID, "")
+	held := make(map[string]bool, len(hold))
+	for _, id := range hold {
+		held[id] = true
+	}
+	h := &sharedServiceHarness{
+		admitter: &fakeSharedAdmitter{},
+		factory:  &fakeGroupFactory{hold: held},
+		out:      &lockedBuffer{},
+		done:     make(chan error, 1),
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	h.cancel = cancel
+	announcer := newReadyAnnouncer(readyRoutes(cfg), h.out, false)
+	go func() { h.done <- runSharedService(ctx, cfg, h.admitter, h.factory, announcer) }()
+	t.Cleanup(func() {
+		cancel()
+		if _, returned := h.result(5 * time.Second); !returned {
+			t.Error("shared service did not stop")
+		}
+	})
+	return h
+}
+
+// result waits up to timeout for the runtime to return, caching the outcome
+// so every later call reports the same thing.
+func (h *sharedServiceHarness) result(timeout time.Duration) (err error, returned bool) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.returned {
+		return h.err, true
+	}
+	select {
+	case err := <-h.done:
+		h.returned, h.err = true, err
+		return err, true
+	case <-time.After(timeout):
+		return nil, false
+	}
+}
+
+func (h *sharedServiceHarness) session(t *testing.T) *fakeGroupSession {
+	t.Helper()
+	waitFor(t, 2*time.Second, func() bool { return h.factory.first() != nil }, "the first session")
+	return h.factory.first()
+}
+
+func (h *sharedServiceHarness) waitReadyBlock(t *testing.T) string {
+	t.Helper()
+	waitFor(t, 2*time.Second, func() bool { return strings.Contains(h.out.String(), "Connector is running") }, "the ready block")
+	return h.out.String()
+}
+
+func (h *sharedServiceHarness) requireStillRunning(t *testing.T) {
+	t.Helper()
+	if err, returned := h.result(100 * time.Millisecond); returned {
+		t.Fatalf("shared service returned %v; it should keep serving", err)
+	}
+}
+
+func (h *sharedServiceHarness) stop(t *testing.T) error {
+	t.Helper()
+	h.cancel()
+	err, returned := h.result(5 * time.Second)
+	if !returned {
+		t.Fatal("shared service did not stop")
+	}
+	return err
+}
+
+func TestSharedServiceAdmitsOnceForEveryRoute(t *testing.T) {
+	h := startSharedServiceHarness(t, sharedServiceTestConfig("a", "b", "c"))
+	block := h.waitReadyBlock(t)
+
+	// Three routes cost one knock, one Login, and one session: the
+	// per-route shape cost three of each, every rotation.
+	admits, retired, healthy := h.admitter.counts()
+	if admits != 1 || retired != 0 {
+		t.Fatalf("admits = %d, retired = %d; want one admission for the whole route set", admits, retired)
+	}
+	if healthy < 1 {
+		t.Fatal("MarkServingHealthy was not called after the group started serving")
+	}
+	if starts := h.factory.starts(); starts != 1 {
+		t.Fatalf("FRP sessions started = %d, want 1", starts)
+	}
+	states := h.session(t).RouteStates()
+	if len(states) != 3 {
+		t.Fatalf("session carries %d routes, want 3", len(states))
+	}
+	for id, state := range states {
+		if state.Phase != share.RouteServing {
+			t.Errorf("route %q phase = %s, want serving", id, state.Phase)
+		}
+		// Each proxy carries its own route's public resource identity; only
+		// the admission is shared.
+		if state.Route.ResourceID != "resource-"+id || state.Route.ConnectorRoutingID != "routing-"+id {
+			t.Errorf("route %q registered with identities %q/%q", id, state.Route.ResourceID, state.Route.ConnectorRoutingID)
+		}
+	}
+	if !strings.Contains(block, "3 route(s) live") {
+		t.Errorf("ready block should report every route live; got:\n%s", block)
+	}
+
+	if err := h.stop(t); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run returned %v after cancel, want context.Canceled", err)
+	}
+	if admits, retired, _ := h.admitter.counts(); admits != 1 || retired != 1 {
+		t.Fatalf("after stop: admits = %d, retired = %d; want the one admission retired", admits, retired)
+	}
+}
+
+func TestSharedServiceRetiresGoneRouteWithoutDisturbingSiblings(t *testing.T) {
+	logger := &captureAuditLogger{}
+	previous := audit.SetDefault(logger)
+	t.Cleanup(func() { audit.SetDefault(previous) })
+
+	h := startSharedServiceHarness(t, sharedServiceTestConfig("a", "b", "c"))
+	h.waitReadyBlock(t)
+	session := h.session(t)
+
+	// The platform revoked b: qRTS answers its NewProxy with
+	// resource_not_found, which the session reports as a failed route.
+	session.failRoute("b", fmt.Errorf("%w: resource_not_found", share.ErrResourceGone))
+
+	waitFor(t, 2*time.Second, func() bool { return len(logger.byEvent(audit.EventProxyDeny)) == 1 }, "the route retirement audit event")
+	waitFor(t, 2*time.Second, func() bool { return strings.Join(session.lastUpdate(), ",") == "a,c" }, "b withdrawn from the live session")
+
+	// Siblings keep serving on the same admission; nothing was re-knocked or
+	// retired, and the process is still running.
+	h.requireStillRunning(t)
+	states := session.RouteStates()
+	for _, id := range []string{"a", "c"} {
+		if states[id].Phase != share.RouteServing {
+			t.Errorf("route %q phase = %s after sibling b was revoked, want serving", id, states[id].Phase)
+		}
+	}
+	if _, present := states["b"]; present {
+		t.Error("route b is still registered on the session after it was retired")
+	}
+	if admits, retired, _ := h.admitter.counts(); admits != 1 || retired != 0 {
+		t.Fatalf("admits = %d, retired = %d; retiring one route must not touch the shared admission", admits, retired)
+	}
+	entry := logger.byEvent(audit.EventProxyDeny)[0]
+	if entry.Outcome != audit.OutcomeDeny || entry.Reason != "resource_not_found" || entry.RouteID != "b" || entry.ResourceID != "resource-b" {
+		t.Errorf("retirement audit entry = %+v", entry)
+	}
+
+	if err := h.stop(t); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run returned %v after cancel, want context.Canceled", err)
+	}
+}
+
+func TestSharedServiceReturnsOnlyWhenEveryRouteIsGone(t *testing.T) {
+	h := startSharedServiceHarness(t, sharedServiceTestConfig("a", "b"))
+	h.waitReadyBlock(t)
+	session := h.session(t)
+
+	session.failRoute("a", fmt.Errorf("%w: resource_not_found", share.ErrResourceGone))
+	waitFor(t, 2*time.Second, func() bool { return strings.Join(session.lastUpdate(), ",") == "b" }, "a withdrawn")
+	h.requireStillRunning(t)
+
+	session.failRoute("b", fmt.Errorf("%w: resource_not_found", share.ErrResourceGone))
+	err, returned := h.result(5 * time.Second)
+	if !returned {
+		t.Fatal("shared service kept running with no route left to serve")
+	}
+	if !errors.Is(err, share.ErrGroupEmpty) {
+		t.Fatalf("Run returned %v, want ErrGroupEmpty", err)
+	}
+	if !strings.Contains(err.Error(), "qurl-connector remove") {
+		t.Errorf("empty-group error should tell the operator how to recover; got %q", err)
+	}
+	if admits, retired, _ := h.admitter.counts(); admits != 1 || retired != 1 {
+		t.Fatalf("admits = %d, retired = %d; want the one admission retired on exit", admits, retired)
+	}
+}
+
+func TestSharedServiceReadyBlockWaitsForEveryRoute(t *testing.T) {
+	h := startSharedServiceHarness(t, sharedServiceTestConfig("a", "b", "c"), "c")
+	session := h.session(t)
+
+	// a and b are serving (the group promoted and MarkServingHealthy ran),
+	// but c is still pending: no block. This cannot race the wrong way,
+	// because nothing can print while c is held.
+	waitFor(t, 2*time.Second, func() bool { _, _, healthy := h.admitter.counts(); return healthy >= 1 }, "the group to serve")
+	if strings.Contains(h.out.String(), "Connector is running") {
+		t.Fatalf("ready block printed with route c still pending:\n%s", h.out.String())
+	}
+
+	session.serve("c")
+	block := h.waitReadyBlock(t)
+	if !strings.Contains(block, "3 route(s) live") {
+		t.Errorf("ready block should count every route; got:\n%s", block)
+	}
+	if got := readyBlockRoutes(block); strings.Join(got, ",") != "a,b,c" {
+		t.Errorf("ready block routes = %v, want [a b c]", got)
+	}
+	for _, want := range []string{"127.0.0.1:3000", "127.0.0.1:3001", "127.0.0.1:3002"} {
+		if !strings.Contains(block, want) {
+			t.Errorf("ready block missing local target %q:\n%s", want, block)
+		}
+	}
+}
+
+func TestSharedServiceReadyBlockNamesOnlyServingRoutes(t *testing.T) {
+	h := startSharedServiceHarness(t, sharedServiceTestConfig("a", "b", "c"), "c")
+	session := h.session(t)
+	waitFor(t, 2*time.Second, func() bool { _, _, healthy := h.admitter.counts(); return healthy >= 1 }, "the group to serve")
+
+	// c never comes up: the platform revoked it. The block must print for
+	// the routes that did, without listing c.
+	session.failRoute("c", fmt.Errorf("%w: resource_not_found", share.ErrResourceGone))
+	block := h.waitReadyBlock(t)
+	if !strings.Contains(block, "2 route(s) live") {
+		t.Errorf("ready block should count only the serving routes; got:\n%s", block)
+	}
+	if got := readyBlockRoutes(block); strings.Join(got, ",") != "a,b" {
+		t.Errorf("ready block routes = %v, want [a b]", got)
+	}
+	h.requireStillRunning(t)
+}
+
+func TestSharedServiceRendersOneAdminListenerForEveryRoute(t *testing.T) {
+	// The desktop's default config enables the admin API on 127.0.0.1:7400.
+	// FRP binds that listener inside NewService, at construction, from the
+	// session's WebServer config -- so the number of listeners is the number
+	// of sessions. One session for three routes renders one WebServer config
+	// and three proxies.
+	common := &v1.ClientCommonConfig{}
+	common.WebServer.Addr, common.WebServer.Port = "127.0.0.1", 7400
+	common.WebServer.User, common.WebServer.Password = "admin", "secret"
+	if err := common.Complete(); err != nil {
+		t.Fatal(err)
+	}
+	factory, err := newSharedServiceSessions(common, "qurl-proxy.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	admission, err := (&fakeSharedAdmitter{}).Admit(context.Background(), "q_knock", "resource-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := sharedServiceTestConfig("a", "b", "c")
+	routes := make([]share.GroupRoute, 0, len(cfg.Routes))
+	for _, route := range cfg.Routes {
+		routes = append(routes, share.GroupRoute{LocalHTTPRoute: share.LocalHTTPRoute{
+			RouteID: route.ID, LocalIP: route.LocalIP, LocalPort: route.LocalPort,
+			ResourceID: route.ResourceID, ConnectorRoutingID: route.ConnectorRoutingID,
+		}})
+	}
+	built, proxies, names, err := factory.BuildConfig(admission, routes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if built.WebServer.Addr != "127.0.0.1" || built.WebServer.Port != 7400 {
+		t.Fatalf("session WebServer = %s:%d, want the configured admin listener", built.WebServer.Addr, built.WebServer.Port)
+	}
+	if len(proxies) != 3 || len(names) != 3 {
+		t.Fatalf("session renders %d proxies / %d names, want 3 on the one Login", len(proxies), len(names))
+	}
+	seen := make(map[string]struct{}, len(names))
+	for _, name := range names {
+		if _, dup := seen[name]; dup {
+			t.Fatalf("proxy name %q rendered twice", name)
+		}
+		seen[name] = struct{}{}
+	}
+
+	// And the runtime starts exactly one session for that route set, so the
+	// listener is bound exactly once.
+	h := startSharedServiceHarness(t, cfg)
+	h.waitReadyBlock(t)
+	if starts := h.factory.starts(); starts != 1 {
+		t.Fatalf("sessions started for 3 routes = %d, want 1", starts)
+	}
+}
+
+func TestNewSharedServiceRunnerRejectsRoutesOnDifferentKnockResources(t *testing.T) {
+	t.Setenv(EnvKnockResourceID, "")
+	cfg := sharedServiceTestConfig("a", "b")
+	cfg.SetKnockResourceID("resource-b", "q_other")
+
+	_, err := newSharedServiceRunner(context.Background(), cfg, &fakeSharedAdmitter{}, &fakeGroupFactory{}, newReadyAnnouncer(nil, io.Discard, false))
+	if err == nil {
+		t.Fatal("routes on different NHP knock resources were accepted onto one session")
+	}
+	for _, want := range []string{`route "b"`, "q_other", "q_knock", "admission targets"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q should mention %q", err, want)
+		}
+	}
+}
+
+func TestNewSharedServiceRunnerRejectsConfigsWithNothingToAdmit(t *testing.T) {
+	t.Setenv(EnvKnockResourceID, "")
+	announcer := newReadyAnnouncer(nil, io.Discard, false)
+
+	if _, err := newSharedServiceRunner(context.Background(), &nhpconfig.Config{}, &fakeSharedAdmitter{}, &fakeGroupFactory{}, announcer); err == nil {
+		t.Error("an empty route set was accepted")
+	}
+
+	unknockable := sharedServiceTestConfig("a")
+	unknockable.Runtime.KnockResourceIDs = nil
+	_, err := newSharedServiceRunner(context.Background(), unknockable, &fakeSharedAdmitter{}, &fakeGroupFactory{}, announcer)
+	if err == nil || !strings.Contains(err.Error(), "missing NHP knock resource") {
+		t.Errorf("a route without a knock resource was accepted; err = %v", err)
+	}
+}

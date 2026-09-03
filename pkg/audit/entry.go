@@ -86,10 +86,11 @@ const (
 	EventLoginError   = "qurl.connector.login.error"
 
 	EventProxyAllow = "qurl.connector.proxy.allow"
-	// EventProxyDeny is reserved for taxonomy shape parity; the
-	// client-side emitter is pending FRP per-proxy hooks (LayerV FRP
-	// v0.70.0-layerv.5 does not expose a typed NewProxy reject signal
-	// at the runner boundary).
+	// EventProxyDeny records the tunnel server permanently refusing one
+	// route's NewProxy (Reason resource_not_found): the Connector retires
+	// that route in place and its siblings keep serving. Emitted by the
+	// standalone command from the session group's per-route failure
+	// signal; a transient NewProxy retry is not a deny.
 	EventProxyDeny = "qurl.connector.proxy.deny"
 	// EventProxyError is reserved for taxonomy shape parity; the
 	// client-side emitter is pending FRP per-proxy hooks (same
