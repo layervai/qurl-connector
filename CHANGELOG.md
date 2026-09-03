@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.11.0](https://github.com/layervai/qurl-connector/compare/v0.10.0...v0.11.0) (2026-09-03)
+
+
+### ⚠ BREAKING CHANGES
+
+* **frpc:** a revoked route no longer exits the process.
+
+### Bug Fixes
+
+* **frpc:** serve all routes on one Connector session ([#56](https://github.com/layervai/qurl-connector/issues/56)) ([221434c](https://github.com/layervai/qurl-connector/commit/221434c032d4a0489bb905a8091801796dd26743))
+
 ## [0.10.0](https://github.com/layervai/qurl-connector/compare/v0.9.0...v0.10.0) (2026-09-03)
 
 
