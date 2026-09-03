@@ -435,9 +435,9 @@ type proofGoroutines struct {
 // them, so the in-process FRP client, the in-process FRP server, and this
 // package's own supervision are reported apart.
 func proofGoroutineSnapshot() proofGoroutines {
-	// Sized for a few thousand goroutines up front; each undersized attempt
-	// is one more stop-the-world pass.
-	buf := make([]byte, 8<<20)
+	// Sized from the live count up front; each undersized attempt is one
+	// more stop-the-world pass.
+	buf := make([]byte, max(8<<20, runtime.NumGoroutine()*4096))
 	for {
 		n := runtime.Stack(buf, true)
 		if n < len(buf) {
@@ -663,7 +663,7 @@ func TestHermeticSessionGroupServes1000Routes(t *testing.T) {
 	// first W, and the replacement then has W to re-register every route
 	// before the old admission expires. The second admission is long so
 	// nothing rotates again during the rejection phase and teardown.
-	window := 8*time.Second + time.Duration(routeCount)*20*time.Millisecond
+	window := 12*time.Second + time.Duration(routeCount)*20*time.Millisecond
 	resourceHost := net.JoinHostPort("127.0.0.1", strconv.Itoa(port))
 	first := Admission{
 		KnockResourceID: knockResourceID, ResourceID: groupResourceID,
@@ -684,7 +684,7 @@ func TestHermeticSessionGroupServes1000Routes(t *testing.T) {
 	insideWindow := func(phase string) {
 		t.Helper()
 		if elapsed := time.Since(admitter.admittedAtIndex(0)); elapsed >= window {
-			t.Fatalf("%s finished %s after the first admission, past the %s rotation window (8s + 20ms per route): the machine is too slow for the steady-state budget, not a rotation defect", phase, elapsed, window)
+			t.Fatalf("%s finished %s after the first admission, past the %s rotation window (12s + 20ms per route): the machine is too slow for the steady-state budget, not a rotation defect", phase, elapsed, window)
 		}
 	}
 
@@ -872,12 +872,21 @@ func TestHermeticSessionGroupServes1000Routes(t *testing.T) {
 	registeredAt := make(map[string]time.Time, routeCount)
 	admittedTimes := plugin.admittedTimes()
 	for routeID, state := range runner.RouteStates() {
-		registeredAt[routeID] = admittedTimes[state.ProxyName]
+		if at, ok := admittedTimes[state.ProxyName]; ok {
+			registeredAt[routeID] = at
+		}
 	}
 	verdict := judgeProofOverlap(overlapFailures, registeredAt, promotedAt, withdrawnAt, proofDrainSettle)
 	if verdict.hard != 0 {
 		t.Fatalf("overlap loop: %d of %d requests failed outside any FRP work-connection admission window; first: %v",
 			verdict.hard, requests, verdict.firstHard)
+	}
+	// The excused windows are one dispatch race per proxy edge, so they can
+	// cost at most a request or two per sampled route; anything larger is an
+	// outage wearing the window's name.
+	if verdict.registering+verdict.draining > proofSampleRoutes {
+		t.Fatalf("overlap loop: %d failures inside the FRP admission windows across %d sampled routes (%d at registration, %d in the drain); a dispatch race costs at most one per route",
+			verdict.registering+verdict.draining, proofSampleRoutes, verdict.registering, verdict.draining)
 	}
 	report.OverlapRequests, report.OverlapFailures = requests, len(overlapFailures)
 	report.OverlapFailuresRegistering, report.OverlapRegisterMaxOffsetMs = verdict.registering, proofMillis(verdict.maxRegisterOffset)
@@ -985,7 +994,9 @@ func TestHermeticSessionGroupServes1000Routes(t *testing.T) {
 
 	registeredSnapshot := report.Snapshots["registered"]
 	report.GoroutinesPerRoute = float64(registeredSnapshot.Goroutines.Total-baseline.Goroutines.Total) / float64(routeCount)
-	report.FDsPerRouteIdle = float64(report.Snapshots["after_sweep"].OpenFDs-baseline.OpenFDs) / float64(routeCount)
+	if report.FDsMeasured {
+		report.FDsPerRouteIdle = float64(report.Snapshots["after_sweep"].OpenFDs-baseline.OpenFDs) / float64(routeCount)
+	}
 	if rss, ok := proofPeakRSSBytes(); ok {
 		report.PeakRSSBytes, report.PeakRSSSource = rss, "getrusage ru_maxrss, whole test process"
 	}

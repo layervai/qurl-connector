@@ -77,4 +77,5 @@ proof-1000:
 
 clean:
 	rm -f ./bin/qurl-connector
+	rm -f ./bin/proof-*.json
 	rm -f coverage.out
