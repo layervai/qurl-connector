@@ -17,8 +17,6 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"golang.org/x/sync/errgroup"
-
 	"github.com/denisbrodbeck/machineid"
 	frpconfig "github.com/fatedier/frp/pkg/config"
 	v1 "github.com/fatedier/frp/pkg/config/v1"
@@ -1011,6 +1009,15 @@ func startFRPFromConfig(ctx context.Context, cfgPath, machineID string, cfg *nhp
 	// FRP's HTTP admin API is opt-in. When disabled, leave
 	// common.WebServer at its zero value so FRP skips the listener entirely.
 	// Operators can opt in through YAML or QURL_ADMIN_ENABLED=true.
+	//
+	// FRP binds this listener inside frpclient.NewService, at construction,
+	// from a clone of common.WebServer -- one listener per FRP control
+	// session. startSharedService serves every route on ONE session, which
+	// is what makes this one admin listener per process: a session per
+	// route had the second route's NewService fail with address-in-use and
+	// retry forever. The make-before-break overlap at rotation, where the
+	// replacement session is constructed while the old one still holds the
+	// port, predates multi-route serving and is unchanged here.
 	if cfg.Server.EgressLocalIP != "" {
 		common.Transport.ConnectServerLocalIP = cfg.Server.EgressLocalIP
 	}
@@ -1021,6 +1028,8 @@ func startFRPFromConfig(ctx context.Context, cfgPath, machineID string, cfg *nhp
 		}
 		common.WebServer.Addr, common.WebServer.Port = cfg.Admin.Addr, cfg.Admin.Port
 		common.WebServer.User, common.WebServer.Password = "admin", password
+		slog.WarnContext(ctx, "admin API enabled: FRP binds its listener per control session, so each admission rotation replaces the session cold instead of make-before-break; expect a brief serving gap per admission window",
+			"addr", cfg.Admin.Addr, "port", cfg.Admin.Port)
 	}
 	applyLogPresentation(common, logLevel, colorEnabled)
 	if err := common.Complete(); err != nil {
@@ -1046,81 +1055,244 @@ func startFRPFromConfig(ctx context.Context, cfgPath, machineID string, cfg *nhp
 	return startSharedService(ctx, common, cfgPath, cfg, admitter)
 }
 
-// startSharedService serves every configured resource from this one process.
+// sharedServiceAdmitter is the admitter surface the shared runtime needs:
+// resource-bound admissions plus the post-serving assignment-refresh reset.
+// *share.NativeAdmitter is the production implementation; tests supply a fake.
+type sharedServiceAdmitter interface {
+	share.Admitter
+	MarkServingHealthy() error
+}
+
+// startSharedService serves every configured route on one NHP admission and
+// one FRP control session.
 //
-// One process per resource was the original shape, but it makes a
-// multi-resource client impossible without supervising a process per share --
-// qURL Desktop hit exactly that, crashlooping the moment a user shared a second
-// file. NativeAdmitter is already built for this: it locks per resource
-// (a.resources.lock), enumerates resources plurally during recovery, and guards
-// MarkServingHealthy with a mutex, so several runners can share one admitter.
+// One session per route was the previous shape: a share.ResourceRunner per
+// route under an errgroup. That had three defects, all removed here by
+// construction rather than patched:
 //
-// Each resource gets its own session factory and runner, all canceled together
-// so a terminal failure on one cannot leave the others half-serving.
-func startSharedService(ctx context.Context, common *v1.ClientCommonConfig, cfgPath string, qcfg *nhpconfig.Config, admitter *share.NativeAdmitter) error {
-	if len(qcfg.Routes) == 0 {
+//   - Sibling teardown. A route whose resource was revoked server-side
+//     returned ErrResourceGone from its runner, the errgroup canceled every
+//     healthy sibling, and the process exited 1 with the revoked route still
+//     in the config -- so the supervisor crashlooped and the good shares went
+//     down with the bad one. The session group retires a gone route in place
+//     (OnRouteFailed) and keeps serving the rest; Run returns only when ctx
+//     ends, when no route is left (share.ErrGroupEmpty), or when the group's
+//     own admission is terminally refused.
+//   - The ready block lied. It latched on the first route's OnServing and
+//     printed every configured route as live. It is now driven per route by
+//     OnRouteServing and waits for every route still configured (see
+//     readyAnnouncer).
+//   - Admin port collision. With admin.enabled, every per-route
+//     frpclient.NewService cloned common.WebServer and bound the admin
+//     listener at construction, so the second route's session failed with
+//     address-in-use and retried forever. One session is one listener; see
+//     the admin wiring in startFRPFromConfig.
+//
+// It is also the affordable shape. A session per route costs a knock, a
+// Login, a NewProxy authorization and a registration heartbeat stream each,
+// on every rotation; one session costs one knock and one Login for the whole
+// set, and only the per-proxy NewProxy authorizations scale with the route
+// count. A restart with N routes is one knock and one Login.
+func startSharedService(ctx context.Context, common *v1.ClientCommonConfig, cfgPath string, qcfg *nhpconfig.Config, admitter sharedServiceAdmitter) error {
+	sessions, err := newSharedServiceSessions(common, cfgPath)
+	if err != nil {
+		return err
+	}
+	announcer := newReadyAnnouncer(readyRoutes(qcfg), os.Stdout, stdoutIsTerminal())
+	return runSharedService(ctx, qcfg, admitter, sessions, announcer)
+}
+
+// newSharedServiceSessions builds the FRP session factory for the group. It
+// carries the same common config, client version and config path the
+// per-route factories did; the routes themselves belong to the group runner.
+func newSharedServiceSessions(common *v1.ClientCommonConfig, cfgPath string) (*share.FRPSessionGroupFactory, error) {
+	return share.NewFRPSessionGroupFactory(share.FRPGroupFactoryConfig{
+		Common: common, ClientVersion: clientVersionMeta(version.Version), ConfigPath: cfgPath,
+	})
+}
+
+// runSharedService runs the group until a terminal condition.
+//
+// A revocation can reach the process through the knock as well as through a
+// NewProxy: the admitted resource is the primary route's, and the SDK
+// authenticates it on every knock separately from the shared knock resource.
+// An admission refused with ErrResourceGone therefore retires the primary
+// route in place and re-admits the rest under the next route, so the healthy
+// siblings survive either path. If the refusal is really about the knock
+// resource every route shares, each successive admission is refused too; the
+// cost is one knock per remaining route before the process exits with the
+// same error, never a stuck loop.
+func runSharedService(ctx context.Context, qcfg *nhpconfig.Config, admitter sharedServiceAdmitter, sessions share.SessionGroupFactory, announcer *readyAnnouncer) error {
+	if qcfg == nil {
 		return errors.New("shared Connector runtime requires at least one resource")
 	}
-	announced := make([]readyRoute, 0, len(qcfg.Routes))
+	defer announcer.stop()
+	remaining := *qcfg
+	remaining.Routes = append([]nhpconfig.Route(nil), qcfg.Routes...)
+	for {
+		runner, err := newSharedServiceRunner(ctx, &remaining, admitter, sessions, announcer)
+		if err != nil {
+			return err
+		}
+		err = runner.Run(ctx)
+		if errors.Is(err, share.ErrGroupEmpty) {
+			return allRoutesRetiredError(err)
+		}
+		if !errors.Is(err, share.ErrResourceGone) || ctx.Err() != nil {
+			return err
+		}
+		primary, rest := splitPrimaryRoute(&remaining)
+		if primary == nil {
+			return err
+		}
+		retireSharedRoute(ctx, announcer, primary.ID, primary.ResourceID, "admission_resource_gone", err)
+		if len(rest) == 0 {
+			return allRoutesRetiredError(err)
+		}
+		remaining.Routes = rest
+	}
+}
+
+func allRoutesRetiredError(err error) error {
+	return fmt.Errorf("%w: every configured route was retired as permanently unavailable; remove them with 'qurl-connector remove' before restarting", err)
+}
+
+// splitPrimaryRoute separates the route whose resource the group admits from
+// the rest, or returns nil when no route carries a routing identity.
+func splitPrimaryRoute(qcfg *nhpconfig.Config) (*nhpconfig.Route, []nhpconfig.Route) {
+	primaryResourceID := qcfg.PrimaryResourceID()
+	if primaryResourceID == "" {
+		return nil, nil
+	}
+	for i := range qcfg.Routes {
+		if qcfg.Routes[i].ResourceID != primaryResourceID {
+			continue
+		}
+		primary := qcfg.Routes[i]
+		rest := make([]nhpconfig.Route, 0, len(qcfg.Routes)-1)
+		rest = append(rest, qcfg.Routes[:i]...)
+		rest = append(rest, qcfg.Routes[i+1:]...)
+		return &primary, rest
+	}
+	return nil, nil
+}
+
+// retireSharedRoute is the one place a route leaves the running set: it is
+// logged, put on the audit stream, and dropped from the ready block. The
+// process keeps serving; the route stays in the config until the operator
+// removes it. reason is the audit tag: resource_not_found when the tunnel
+// server refused the route's NewProxy, admission_resource_gone when the
+// knock for its admission was refused.
+func retireSharedRoute(ctx context.Context, announcer *readyAnnouncer, routeID, resourceID, reason string, err error) {
+	slog.WarnContext(ctx, "connector: route retired; its resource is permanently unavailable and the other routes keep serving",
+		"route", routeID, "resource_id", resourceID, "reason", reason, "err", err.Error())
+	audit.Default().Log(audit.Entry{
+		Event: audit.EventProxyDeny, Outcome: audit.OutcomeDeny, Reason: reason,
+		RouteID: routeID, ResourceID: resourceID, Error: err.Error(),
+	})
+	announcer.routeRetired(routeID)
+}
+
+// newSharedServiceRunner builds the one session group for qcfg's routes.
+//
+// Every managed route on a Connector is admitted through the same NHP knock
+// resource: resolveConnectorIdentitiesLocked refuses a route whose assigned
+// knock resource differs from its siblings' (FirstDifferentKnockResourceID)
+// before the runtime starts, because one FRP control session cannot span
+// admission targets. The group therefore knocks once, for the primary
+// resource, exactly as the single-route runtime did. The check below is the
+// runtime's own guard on that invariant, so a config that reached this point
+// by another path fails clearly instead of registering proxies under an
+// admission that does not cover them.
+//
+// The admitted resource is the primary route's (the first route carrying a
+// connector routing ID), so removing that route re-points the admission at
+// the next one on the following start. That is benign: the admitter's
+// per-resource state is the pending-operation journal and an in-memory
+// placement backoff, an absent journal is an empty one, and startup recovery
+// scans every resource's journal regardless of which one is admitted next.
+//
+// ctx scopes only the callbacks' log context; Run(ctx) is what scopes the
+// runner's lifetime.
+func newSharedServiceRunner(ctx context.Context, qcfg *nhpconfig.Config, admitter sharedServiceAdmitter, sessions share.SessionGroupFactory, announcer *readyAnnouncer) (*share.SessionGroupRunner, error) {
+	if qcfg == nil || len(qcfg.Routes) == 0 {
+		return nil, errors.New("shared Connector runtime requires at least one resource")
+	}
+	resourceID := qcfg.PrimaryResourceID()
+	if resourceID == "" {
+		return nil, errors.New("shared Connector runtime has no resolved primary resource")
+	}
+	knockResourceID := knockResourceIDOrEmpty(qcfg, resourceID)
+	if knockResourceID == "" {
+		return nil, fmt.Errorf("missing NHP knock resource for qURL Connector %q", resourceID)
+	}
+	routes := make([]share.LocalHTTPRoute, 0, len(qcfg.Routes))
+	resourceIDs := make(map[string]string, len(qcfg.Routes))
 	for _, route := range qcfg.Routes {
-		announced = append(announced, readyRoute{
+		// An empty knock resource is a route that was never hydrated, which is
+		// a different problem from two routes on different admission targets.
+		switch routeKnock := knockResourceIDOrEmpty(qcfg, route.ResourceID); {
+		case routeKnock == "":
+			return nil, fmt.Errorf("route %q: missing NHP knock resource for qURL Connector %q", route.ID, route.ResourceID)
+		case routeKnock != knockResourceID:
+			return nil, fmt.Errorf("route %q: NHP knock resource %q differs from the Connector session's %q (resource %q); one FRP control session cannot span NHP admission targets", route.ID, routeKnock, knockResourceID, resourceID)
+		}
+		routes = append(routes, share.LocalHTTPRoute{
+			RouteID: route.ID, LocalIP: route.LocalIP, LocalPort: route.LocalPort,
+			ResourceID: route.ResourceID, ConnectorRoutingID: route.ConnectorRoutingID,
+		})
+		resourceIDs[route.ID] = route.ResourceID
+	}
+	return share.NewSessionGroupRunner(share.SessionGroupConfig{
+		KnockResourceID: knockResourceID, ResourceID: resourceID, Routes: routes,
+		Admitter: admitter, Sessions: sessions,
+		OnServing: func(share.Admission) {
+			if err := admitter.MarkServingHealthy(); err != nil {
+				slog.WarnContext(ctx, "connector: failed to clear assignment-refresh state after serving", "err", err.Error())
+			}
+			announcer.sessionPromoted(readyFallbackWait)
+		},
+		OnRouteServing: func(routeID string, _ share.Admission) {
+			announcer.routeServing(routeID)
+		},
+		OnRouteFailed: func(routeID string, err error) {
+			if !errors.Is(err, share.ErrResourceGone) {
+				// ErrRouteNotServing: the route stays in the group and FRP's
+				// same-session retry keeps registering it.
+				slog.WarnContext(ctx, "connector: route did not come up on the replacement session; it stays configured and keeps retrying",
+					"route", routeID, "err", err.Error())
+				return
+			}
+			// Retired in place: the tunnel server permanently refused this
+			// route's proxy, so the group withdrew it and its siblings keep
+			// serving.
+			retireSharedRoute(ctx, announcer, routeID, resourceIDs[routeID], "resource_not_found", err)
+		},
+		OnRetry: func(err error, wait time.Duration) {
+			slog.WarnContext(ctx, "connector: NHP admission or FRP session attempt failed; retrying",
+				"wait", wait.String(), "err", err.Error())
+		},
+		OnRotationLeadCapped: func(routes int, need, lead time.Duration) {
+			slog.WarnContext(ctx, "connector: admission window is short for this route count; a rotation may promote before every route re-registers",
+				"routes", routes, "lead_needed", need.String(), "lead", lead.String())
+		},
+	})
+}
+
+// readyRoutes lists the configured routes for the ready block: what the
+// customer calls each route and where it points locally.
+func readyRoutes(qcfg *nhpconfig.Config) []readyRoute {
+	if qcfg == nil {
+		return nil
+	}
+	routes := make([]readyRoute, 0, len(qcfg.Routes))
+	for _, route := range qcfg.Routes {
+		routes = append(routes, readyRoute{
 			routeID: route.ID,
 			target:  net.JoinHostPort(route.LocalIP, strconv.Itoa(route.LocalPort)),
 		})
 	}
-	// One announcer for the process: it latches, so whichever resource serves
-	// first prints the block for all of them.
-	announcer := &readyAnnouncer{routes: announced, out: os.Stdout, interactive: stdoutIsTerminal()}
-
-	runners := make([]*share.ResourceRunner, 0, len(qcfg.Routes))
-	for _, route := range qcfg.Routes {
-		resourceID := route.ResourceID
-		knockResourceID := knockResourceIDOrEmpty(qcfg, resourceID)
-		factory, err := share.NewFRPSessionFactory(share.FRPFactoryConfig{
-			Common: common,
-			Route: share.LocalHTTPRoute{
-				RouteID: route.ID, LocalIP: route.LocalIP, LocalPort: route.LocalPort,
-				ResourceID: resourceID, ConnectorRoutingID: route.ConnectorRoutingID,
-			},
-			ClientVersion: clientVersionMeta(version.Version), ConfigPath: cfgPath,
-		})
-		if err != nil {
-			return fmt.Errorf("route %q: %w", route.ID, err)
-		}
-		runner, err := share.NewResourceRunner(share.ResourceConfig{
-			KnockResourceID: knockResourceID, ResourceID: resourceID,
-			Admitter: admitter, Sessions: factory,
-			OnServing: func(share.Admission) {
-				if err := admitter.MarkServingHealthy(); err != nil {
-					slog.WarnContext(ctx, "connector: failed to clear assignment-refresh state after serving", "err", err.Error())
-				}
-				announcer.announce()
-			},
-		})
-		if err != nil {
-			return fmt.Errorf("route %q: %w", route.ID, err)
-		}
-		runners = append(runners, runner)
-	}
-
-	if len(runners) == 1 {
-		return runners[0].Run(ctx)
-	}
-
-	// Cancel the siblings as soon as any runner returns: Run only returns on a
-	// terminal condition, so continuing to serve the rest would leave the
-	// process half-alive with no supervisor able to tell.
-	group, groupCtx := errgroup.WithContext(ctx)
-	for i, runner := range runners {
-		routeID := qcfg.Routes[i].ID
-		group.Go(func() error {
-			if err := runner.Run(groupCtx); err != nil {
-				return fmt.Errorf("route %q: %w", routeID, err)
-			}
-			return nil
-		})
-	}
-	return group.Wait()
+	return routes
 }
 
 // applyLogPresentation stamps the FRP client's log settings from this process's
