@@ -9,15 +9,15 @@ import (
 )
 
 // proofPeakRSSBytes reports the process's peak resident set size from
-// getrusage. ru_maxrss is bytes on Darwin and kilobytes on Linux (where it is
-// the same figure /proc/self/status reports as VmHWM).
+// getrusage. ru_maxrss is bytes on Darwin and kilobytes on Linux (the figure
+// /proc/self/status reports as VmHWM) and on the BSDs.
 func proofPeakRSSBytes() (uint64, bool) {
 	var usage syscall.Rusage
 	if err := syscall.Getrusage(syscall.RUSAGE_SELF, &usage); err != nil || usage.Maxrss < 0 {
 		return 0, false
 	}
 	rss := uint64(usage.Maxrss)
-	if runtime.GOOS == "linux" {
+	if runtime.GOOS != "darwin" {
 		rss *= 1024
 	}
 	return rss, true

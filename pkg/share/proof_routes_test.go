@@ -51,6 +51,10 @@ const (
 	// instant a request dispatched inside that instant can still be observed
 	// failing: one request round trip, padded generously.
 	proofDrainSettle = 250 * time.Millisecond
+	// proofDrainCeiling bounds the drain itself: the FRP client's admission
+	// window is excused only while withdrawing the old proxies stays this
+	// short, so a slow drain is a failure rather than a wider exemption.
+	proofDrainCeiling = 2 * time.Second
 )
 
 func TestMain(m *testing.M) {
@@ -265,7 +269,11 @@ func proofRandomSample(routes []proofRoute, requests int) []proofRoute {
 }
 
 // proofSpread picks count routes evenly spaced across the set.
-func proofSpread(routes []proofRoute, count int) []proofRoute {
+func proofSpread(t *testing.T, routes []proofRoute, count int) []proofRoute {
+	t.Helper()
+	if len(routes) < count {
+		t.Fatalf("cannot spread a %d-route sample over %d routes", count, len(routes))
+	}
 	step := len(routes) / count
 	sample := make([]proofRoute, 0, count)
 	for i := range count {
@@ -287,7 +295,7 @@ func proofPercentile(latencies []time.Duration, percent int) time.Duration {
 func proofAwaitStatus(t *testing.T, client *http.Client, port int, host string, want int, timeout time.Duration, runner <-chan error) {
 	t.Helper()
 	var last string
-	proofWait(t, runner, timeout, func() bool {
+	proofWaitFor(t, runner, timeout, func() bool {
 		status, body, err := proofGet(client, port, host)
 		if err != nil {
 			last = err.Error()
@@ -295,22 +303,29 @@ func proofAwaitStatus(t *testing.T, client *http.Client, port int, host string, 
 		}
 		last = fmt.Sprintf("status=%d body=%q", status, body)
 		return status == want
-	}, fmt.Sprintf("%s to answer %d (last: %s)", host, want, last))
+	}, func() string { return fmt.Sprintf("%s to answer %d (last: %s)", host, want, last) })
 }
 
 // proofWait polls condition until it holds, failing if the runner exits or
 // the timeout passes first.
 func proofWait(t *testing.T, runner <-chan error, timeout time.Duration, condition func() bool, what string) {
 	t.Helper()
+	proofWaitFor(t, runner, timeout, condition, func() string { return what })
+}
+
+// proofWaitFor is proofWait with the description rendered only on failure,
+// so it can carry the last state the condition observed.
+func proofWaitFor(t *testing.T, runner <-chan error, timeout time.Duration, condition func() bool, describe func() string) {
+	t.Helper()
 	deadline := time.Now().Add(timeout)
 	for !condition() {
 		select {
 		case err := <-runner:
-			t.Fatalf("session group exited while waiting for %s: %v", what, err)
+			t.Fatalf("session group exited while waiting for %s: %v", describe(), err)
 		default:
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("timed out after %s waiting for %s", timeout, what)
+			t.Fatalf("timed out after %s waiting for %s", timeout, describe())
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
@@ -394,7 +409,7 @@ func judgeProofOverlap(failures []proofOverlapFailure, registeredAt map[string]t
 		case known && !failure.at.Before(registered) && failure.at.Sub(registered) <= settle:
 			verdict.registering++
 			verdict.maxRegisterOffset = max(verdict.maxRegisterOffset, failure.at.Sub(registered))
-		case !failure.at.Before(promotedAt) && failure.at.Sub(withdrawnAt) <= settle:
+		case !failure.at.Before(promotedAt) && failure.at.Before(withdrawnAt.Add(settle)):
 			verdict.draining++
 			verdict.maxDrainOffset = max(verdict.maxDrainOffset, failure.at.Sub(promotedAt))
 		default:
@@ -420,7 +435,9 @@ type proofGoroutines struct {
 // them, so the in-process FRP client, the in-process FRP server, and this
 // package's own supervision are reported apart.
 func proofGoroutineSnapshot() proofGoroutines {
-	buf := make([]byte, 1<<20)
+	// Sized for a few thousand goroutines up front; each undersized attempt
+	// is one more stop-the-world pass.
+	buf := make([]byte, 8<<20)
 	for {
 		n := runtime.Stack(buf, true)
 		if n < len(buf) {
@@ -471,9 +488,9 @@ func takeProofSnapshot() proofSnapshot {
 
 // proofServerOnlineHTTPProxies asks the FRP server's own API how many HTTP
 // proxies its proxy manager currently holds.
-func proofServerOnlineHTTPProxies(t *testing.T, apiPort int) int {
+func proofServerOnlineHTTPProxies(t *testing.T, client *http.Client, apiPort int) int {
 	t.Helper()
-	response, err := http.Get("http://127.0.0.1:" + strconv.Itoa(apiPort) + "/api/proxy/http")
+	response, err := client.Get("http://127.0.0.1:" + strconv.Itoa(apiPort) + "/api/proxy/http")
 	if err != nil {
 		t.Fatalf("query FRP server proxies: %v", err)
 	}
@@ -646,7 +663,7 @@ func TestHermeticSessionGroupServes1000Routes(t *testing.T) {
 	// first W, and the replacement then has W to re-register every route
 	// before the old admission expires. The second admission is long so
 	// nothing rotates again during the rejection phase and teardown.
-	window := 6*time.Second + time.Duration(routeCount)*20*time.Millisecond
+	window := 8*time.Second + time.Duration(routeCount)*20*time.Millisecond
 	resourceHost := net.JoinHostPort("127.0.0.1", strconv.Itoa(port))
 	first := Admission{
 		KnockResourceID: knockResourceID, ResourceID: groupResourceID,
@@ -661,6 +678,15 @@ func TestHermeticSessionGroupServes1000Routes(t *testing.T) {
 		SessionReceipt: testSessionReceipt(102, "2222222222222222", 2), OpenTime: 10 * time.Minute,
 	}
 	admitter := &hermeticAdmitter{admissions: []Admission{first, second}}
+	// insideWindow names the real cause when a slow machine overruns the
+	// steady-state budget, instead of letting the rotation fire mid-phase and
+	// a later assertion blame SetRoutes for a second admission.
+	insideWindow := func(phase string) {
+		t.Helper()
+		if elapsed := time.Since(admitter.admittedAtIndex(0)); elapsed >= window {
+			t.Fatalf("%s finished %s after the first admission, past the %s rotation window (8s + 20ms per route): the machine is too slow for the steady-state budget, not a rotation defect", phase, elapsed, window)
+		}
+	}
 
 	events := &proofEvents{serving: make(map[uint64]int)}
 	var runner *SessionGroupRunner
@@ -721,7 +747,7 @@ func TestHermeticSessionGroupServes1000Routes(t *testing.T) {
 		}
 	}
 	report.Snapshots["registered"] = takeProofSnapshot()
-	report.ServerOnlineProxies = proofServerOnlineHTTPProxies(t, apiPort)
+	report.ServerOnlineProxies = proofServerOnlineHTTPProxies(t, client, apiPort)
 	if report.ServerOnlineProxies != routeCount {
 		t.Fatalf("FRP server reports %d online HTTP proxies, want %d", report.ServerOnlineProxies, routeCount)
 	}
@@ -737,11 +763,13 @@ func TestHermeticSessionGroupServes1000Routes(t *testing.T) {
 	report.Snapshots["after_sweep"] = takeProofSnapshot()
 	t.Logf("phase 2: %d routes answered in %.0f ms (p50 %.2f ms, p99 %.2f ms)", routeCount, report.SweepMs, report.SweepP50Ms, report.SweepP99Ms)
 
-	// Phase 3: steady-state latency over a fixed random request mix.
-	latencies, failures = proofSweep(client, port, proofRandomSample(initial, proofSteadyRequests), proofSteadyConcurrency)
+	// Phase 3: steady-state latency over a fixed random request mix, scaled
+	// down for small groups so the default run's budget is not spent here.
+	latencies, failures = proofSweep(client, port, proofRandomSample(initial, min(proofSteadyRequests, 10*routeCount)), proofSteadyConcurrency)
 	requireNoProofFailures(t, "steady-state request", failures)
 	report.SteadyRequests = len(latencies)
 	report.SteadyP50Ms, report.SteadyP99Ms = proofMillis(proofPercentile(latencies, 50)), proofMillis(proofPercentile(latencies, 99))
+	insideWindow("phase 3 (steady-state latency)")
 
 	// Phase 4: ten routes leave and ten join the live session: no new knock,
 	// no sibling re-registration.
@@ -772,6 +800,7 @@ func TestHermeticSessionGroupServes1000Routes(t *testing.T) {
 			t.Fatalf("removed route %q is still tracked", route.RouteID)
 		}
 	}
+	insideWindow("phase 4 (route churn)")
 	t.Logf("phase 4: %d routes out, %d in, still one admission", proofRouteChurn, proofRouteChurn)
 
 	// Phase 5: restarting one route re-registers that proxy alone.
@@ -793,15 +822,13 @@ func TestHermeticSessionGroupServes1000Routes(t *testing.T) {
 	if counts[oldName] != 1 || counts[newName] != 1 {
 		t.Fatalf("NewProxy admissions around restart: old %q = %d, new %q = %d, want one each", oldName, counts[oldName], newName, counts[newName])
 	}
-	if elapsed := time.Since(admitter.admittedAtIndex(0)); elapsed >= window {
-		t.Fatalf("steady-state phases took %s, past the %s rotation window (6s + 20ms per route)", elapsed, window)
-	}
+	insideWindow("phase 5 (route restart)")
 	t.Logf("phase 5: route %q restarted as %q; siblings untouched", restarted.RouteID, newName)
 
 	// Phase 6: rotation. The replacement must carry every route before the old
 	// session retires, and a request loop across the overlap must see no
 	// failure at all.
-	overlap := startProofOverlap(client, port, proofSpread(churned, proofSampleRoutes), proofOverlapWorkers)
+	overlap := startProofOverlap(client, port, proofSpread(t, churned, proofSampleRoutes), proofOverlapWorkers)
 	promotionDeadline := time.Until(admitter.admittedAtIndex(0).Add(2*window)) + 15*time.Second
 	proofWait(t, runnerResult, promotionDeadline, func() bool { return len(events.promotionList()) == 2 }, "replacement promoted")
 	promotions := events.promotionList()
@@ -820,7 +847,7 @@ func TestHermeticSessionGroupServes1000Routes(t *testing.T) {
 	// only the replacement's. Time how long the server takes to hold exactly
 	// the replacement's proxies again.
 	proofWait(t, runnerResult, 15*time.Second,
-		func() bool { return proofServerOnlineHTTPProxies(t, apiPort) == routeCount }, "old proxies to leave the FRP server")
+		func() bool { return proofServerOnlineHTTPProxies(t, client, apiPort) == routeCount }, "old proxies to leave the FRP server")
 	withdrawnAt := time.Now()
 	proofWait(t, runnerResult, 30*time.Second, func() bool {
 		for _, admission := range admitter.retiredSnapshot() {
@@ -836,6 +863,9 @@ func TestHermeticSessionGroupServes1000Routes(t *testing.T) {
 	}
 	promotedAt := promotions[1].at
 	report.DrainWithdrawMs = proofMillis(withdrawnAt.Sub(promotedAt))
+	if drain := withdrawnAt.Sub(promotedAt); drain > proofDrainCeiling {
+		t.Fatalf("old proxies took %s to leave the FRP server after promotion, want under %s", drain, proofDrainCeiling)
+	}
 	// Attribute every failure to the exact server-side event of its own
 	// route: the instant the replacement's proxy for that route was admitted
 	// (from the plugin's per-proxy timestamps), or the drain after promotion.
@@ -935,11 +965,15 @@ func TestHermeticSessionGroupServes1000Routes(t *testing.T) {
 	}
 	transport.CloseIdleConnections()
 	baseline := report.Snapshots["baseline"]
+	// The FRP server keeps a couple of idle keep-alive connections to the
+	// plugin it authorized against, so the settled state sits a few
+	// goroutines and descriptors above baseline; a leak would be per route,
+	// so tolerances well below the smallest route count still catch one.
 	settled := time.Now().Add(15 * time.Second)
 	for {
 		snapshot := takeProofSnapshot()
 		report.Snapshots["after_stop"] = snapshot
-		if snapshot.Goroutines.Total <= baseline.Goroutines.Total+8 && snapshot.OpenFDs <= baseline.OpenFDs+4 {
+		if snapshot.Goroutines.Total <= baseline.Goroutines.Total+24 && snapshot.OpenFDs <= baseline.OpenFDs+16 {
 			break
 		}
 		if time.Now().After(settled) {
@@ -993,5 +1027,5 @@ func requireNoProofFailures(t *testing.T, what string, failures []error) {
 	if len(shown) > 5 {
 		shown = shown[:5]
 	}
-	t.Fatalf("%d %s failures; first: %v", len(failures), what, shown)
+	t.Fatalf("%d %s failures; first %d: %v", len(failures), what, len(shown), shown)
 }

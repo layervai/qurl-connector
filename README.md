@@ -129,25 +129,25 @@ Measured on darwin/arm64 (Apple M5 Max, 18 cores, Go 1.27.1):
 
 | | 1000 routes, race off | 200 routes, race on |
 |---|---|---|
-| `Run()` to every route serving | 76 ms | 77 ms |
-| vhost sweep, every route once, 32-way | 77 ms (cold p50 2.1 ms, p99 6.8 ms) | 37 ms (cold p50 5.3 ms, p99 11.0 ms) |
-| steady-state latency, 2000 requests | p50 0.31 ms, p99 0.67 ms | p50 0.65 ms, p99 1.46 ms |
-| rotation: Admit to every route re-registered | 70 ms (promoted at 71 ms) | 90 ms (promoted at 92 ms) |
-| drain: promotion to old proxies withdrawn | 18 ms | 59 ms |
-| overlap requests / failures | 79,145 / 0 | 28,779 / 0 |
+| `Run()` to every route serving | 87 ms | 88 ms |
+| vhost sweep, every route once, 32-way | 81 ms (cold p50 2.3 ms, p99 6.6 ms) | 38 ms (cold p50 4.7 ms, p99 10.3 ms) |
+| steady-state latency, 2000 requests | p50 0.31 ms, p99 0.48 ms | p50 0.63 ms, p99 1.29 ms |
+| rotation: Admit to every route re-registered | 75 ms (promoted at 82 ms) | 86 ms (promoted at 92 ms) |
+| drain: promotion to old proxies withdrawn | 17 ms | 64 ms |
+| overlap requests / failures | 83,315 / 0 | 31,691 / 0 |
 | goroutines per route (the FRP client's status worker) | 1.02 | 1.10 |
 | open FDs at registration (baseline 15) | 19 | 19 |
 | open FDs after every route was hit once | 2,085 (2.07 per route, idle work connections) | 485 |
-| goroutines after that sweep | 7,172 (FRP client 2,002; 5,155 net/http and stream goroutines, mostly the in-process server's) | 1,769 |
-| Go `sys` at registration / after that sweep | 50 MiB / 207 MiB | 33 MiB / 69 MiB |
-| peak RSS, whole test process | 373 MiB | 933 MiB (race detector) |
+| goroutines after that sweep | 7,172 (FRP client 2,002; 5,155 net/http and stream goroutines, mostly the in-process server's) | 1,770 |
+| Go `sys` at registration / after that sweep | 53 MiB / 208 MiB | 48 MiB / 73 MiB |
+| peak RSS, whole test process | 395 MiB | 1,073 MiB (race detector) |
 | FRP server online HTTP proxies | 1000 | 200 |
 | `NewProxy` admitted / rejected | 2011 / 1 | 411 / 1 |
-| goroutines / FDs after stop (baseline 42 / 15) | 48 / 19 | 48 / 19 |
+| goroutines / FDs after stop (baseline 42 / 15) | 45 / 17 | 45 / 17 |
 
-Registration and rotation are linear and fast, about 70 µs per route on the
+Registration and rotation are linear and fast, about 75 µs per route on the
 server's serial `NewProxy` path, so the production rotation lead of 50 ms per
-route is roughly 700 times what this machine needs. The steady-state cost of
+route is roughly 650 times what this machine needs. The steady-state cost of
 a route is one goroutine and no file descriptor. Memory and descriptors scale
 with idle work connections, not routes: the FRP server keeps up to five idle
 work connections per Host for 60 s, so once every route has been hit the
