@@ -989,8 +989,11 @@ func TestFRPGroupSessionRegeneratedRouteTakesNextSlot(t *testing.T) {
 
 func TestFRPGroupSessionCeilingAgesOutDurableStartErrors(t *testing.T) {
 	withRegistrationWindow(t, 1)
+	// A quarter second keeps the "still held back" check below clear of a
+	// scheduling hiccup on a loaded race-detector runner while staying far
+	// inside waitForLastPush's deadline.
 	hold := groupErroredHold
-	groupErroredHold = 30 * time.Millisecond
+	groupErroredHold = 250 * time.Millisecond
 	t.Cleanup(func() { groupErroredHold = hold })
 	svc := &recordingGroupService{}
 	status := &lockedStatusMap{}
