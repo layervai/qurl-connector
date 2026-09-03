@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.10.0](https://github.com/layervai/qurl-connector/compare/v0.9.0...v0.10.0) (2026-09-03)
+
+
+### ⚠ BREAKING CHANGES
+
+* **frpc:** startSharedService no longer rejects configs with more than one route. Callers that relied on the one-resource guarantee must not assume a single ResourceRunner per process.
+
+### Features
+
+* **frpc:** serve every configured resource from one Connector process ([#54](https://github.com/layervai/qurl-connector/issues/54)) ([33b89f8](https://github.com/layervai/qurl-connector/commit/33b89f86435374f338a8df48f03f8fe5a2c0d79e))
+* **share:** session group runtime serving many routes on one admission ([#55](https://github.com/layervai/qurl-connector/issues/55)) ([f80e729](https://github.com/layervai/qurl-connector/commit/f80e7296f581159577ab9df151af5642d7116be6))
+
+
+### Continuous Integration
+
+* **deps:** bump age-check-actions reusable to v0.13.0 ([#49](https://github.com/layervai/qurl-connector/issues/49)) ([785c3fd](https://github.com/layervai/qurl-connector/commit/785c3fd5778ed265591bbe2b5bc3372f321695aa))
+* **deps:** bump remaining ops-routines-workflows shims to v0.13.0 ([#52](https://github.com/layervai/qurl-connector/issues/52)) ([8595dfe](https://github.com/layervai/qurl-connector/commit/8595dfe7fa0e6045e1b887487ac0049ea60d997f))
+
 ## [0.9.0](https://github.com/layervai/qurl-connector/compare/v0.8.13...v0.9.0) (2026-09-01)
 
 
