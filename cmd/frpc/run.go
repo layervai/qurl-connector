@@ -1205,19 +1205,26 @@ func splitPrimaryRoute(qcfg *nhpconfig.Config) (*nhpconfig.Route, []nhpconfig.Ro
 }
 
 // retireSharedRoute is the one place a route leaves the running set: it is
-// logged, put on the audit stream, and dropped from the ready block. The
-// process keeps serving; the route stays in the config until the operator
-// removes it. reason is the audit tag: resource_not_found when the tunnel
-// server refused the route's NewProxy, admission_resource_gone when the
-// knock for its admission was refused.
+// dropped from the ready block, logged, and put on the audit stream, once.
+// The process keeps serving; the route stays in the config until the
+// operator removes it. reason is the audit tag: resource_not_found when the
+// tunnel server refused the route's NewProxy, admission_resource_gone when
+// the knock for its admission was refused. A route can be refused at both
+// layers -- the primary route revoked per proxy still has the group's
+// admission bound to its resource until the next rotation refuses the knock
+// -- and the second refusal is not a second retirement.
 func retireSharedRoute(ctx context.Context, announcer *readyAnnouncer, routeID, resourceID, reason string, err error) {
+	if !announcer.routeRetired(routeID) {
+		slog.DebugContext(ctx, "connector: route already retired; admission-layer refusal for its resource is expected",
+			"route", routeID, "resource_id", resourceID, "reason", reason, "err", err.Error())
+		return
+	}
 	slog.WarnContext(ctx, "connector: route retired; its resource is permanently unavailable and the other routes keep serving",
 		"route", routeID, "resource_id", resourceID, "reason", reason, "err", err.Error())
 	audit.Default().Log(audit.Entry{
 		Event: audit.EventProxyDeny, Outcome: audit.OutcomeDeny, Reason: reason,
 		RouteID: routeID, ResourceID: resourceID, Error: err.Error(),
 	})
-	announcer.routeRetired(routeID)
 }
 
 // newSharedServiceRunner builds the one session group for qcfg's routes.

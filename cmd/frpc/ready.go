@@ -203,24 +203,29 @@ func (a *readyAnnouncer) routeServing(routeID string) {
 }
 
 // routeRetired drops a permanently unavailable route from the set the block
-// waits for. If every remaining route is already serving, the block prints
-// now, without the retired route.
-func (a *readyAnnouncer) routeRetired(routeID string) {
+// waits for and reports whether this call retired it: false for a route
+// that is not configured or was retired already. If every remaining route
+// is already serving, the block prints now, without the retired route.
+func (a *readyAnnouncer) routeRetired(routeID string) bool {
 	if a == nil {
-		return
+		return false
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if _, ok := a.index[routeID]; !ok {
-		return
+		return false
+	}
+	if _, gone := a.retired[routeID]; gone {
+		return false
 	}
 	a.retired[routeID] = struct{}{}
 	delete(a.serving, routeID)
 	if a.announced {
 		a.narrateLocked(routeID, false)
-		return
+		return true
 	}
 	a.announceIfCompleteLocked()
+	return true
 }
 
 // narrateLocked prints one follow-up line for a route the fallback block
@@ -279,6 +284,10 @@ func (a *readyAnnouncer) announceOutstanding() {
 	if a.live != nil {
 		// Rebuild the serving set from the runtime's view so a session that
 		// ended since the last promotion cannot lend its routes to the block.
+		// Lock order: this holds a.mu and the probe takes the runner's lock;
+		// every runner callback into this announcer runs with no runner lock
+		// held (SessionGroupConfig documents that), so the order never
+		// reverses.
 		clear(a.serving)
 		for _, routeID := range a.live() {
 			if _, ok := a.index[routeID]; !ok {

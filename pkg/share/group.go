@@ -17,6 +17,11 @@ var ErrGroupEmpty = errors.New("qURL share session group has no routes left")
 
 // SessionGroupConfig configures one SessionGroupRunner.
 //
+// Every callback below is invoked with no runner lock held, so a callback
+// may call back into the runner (RouteStates, SetRoutes, RestartRoute) or
+// hold a lock of its own that the runner is queried under. Callbacks run on
+// the runner's Run goroutine and must return promptly.
+//
 // KnockResourceID and ResourceID identify the single NHP admission the whole
 // group shares: every Connector route is protected by the same knock resource,
 // so one knock legitimately authorizes every proxy, and the durable

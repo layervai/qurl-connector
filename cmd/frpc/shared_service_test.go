@@ -39,13 +39,18 @@ type fakeSharedAdmitter struct {
 	deny map[string]error
 	// knocks records the knock resource of every Admit, in order.
 	knocks []string
-	// gate, when set, holds every Admit until it is closed (or ctx ends).
+	// gate, when set, holds every Admit until it is closed (or ctx ends);
+	// held counts the Admit calls that reached the gate.
 	gate chan struct{}
+	held int
 }
 
 func (a *fakeSharedAdmitter) Admit(ctx context.Context, knockResourceID, resourceID string) (share.Admission, error) {
 	a.mu.Lock()
 	gate := a.gate
+	if gate != nil {
+		a.held++
+	}
 	a.mu.Unlock()
 	if gate != nil {
 		select {
@@ -106,6 +111,12 @@ func (a *fakeSharedAdmitter) holdAdmissions() (release func()) {
 	a.gate = gate
 	var once sync.Once
 	return func() { once.Do(func() { close(gate) }) }
+}
+
+func (a *fakeSharedAdmitter) heldAdmits() int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.held
 }
 
 func (a *fakeSharedAdmitter) knockResources() []string {
@@ -416,10 +427,11 @@ func waitFor(t *testing.T, timeout time.Duration, condition func() bool, what st
 }
 
 type sharedServiceHarness struct {
-	admitter *fakeSharedAdmitter
-	factory  *fakeGroupFactory
-	out      *lockedBuffer
-	cancel   context.CancelFunc
+	admitter  *fakeSharedAdmitter
+	factory   *fakeGroupFactory
+	out       *lockedBuffer
+	announcer *readyAnnouncer
+	cancel    context.CancelFunc
 
 	done     chan error
 	mu       sync.Mutex
@@ -460,8 +472,8 @@ func startSharedServiceHarnessWith(t *testing.T, cfg *nhpconfig.Config, opts sha
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	h.cancel = cancel
-	announcer := newReadyAnnouncer(readyRoutes(cfg), h.out, false)
-	go func() { h.done <- runSharedService(ctx, cfg, h.admitter, h.factory, announcer) }()
+	h.announcer = newReadyAnnouncer(readyRoutes(cfg), h.out, false)
+	go func() { h.done <- runSharedService(ctx, cfg, h.admitter, h.factory, h.announcer) }()
 	t.Cleanup(func() {
 		cancel()
 		if _, returned := h.result(5 * time.Second); !returned {
@@ -985,6 +997,37 @@ func TestSharedServiceRetiredRoutesStayRetiredAcrossReadmission(t *testing.T) {
 	h.requireStillRunning(t)
 }
 
+func TestSharedServiceRetiresPrimaryRevokedPerProxyOnce(t *testing.T) {
+	logger := &captureAuditLogger{}
+	previous := audit.SetDefault(logger)
+	t.Cleanup(func() { audit.SetDefault(previous) })
+
+	h := startSharedServiceHarness(t, sharedServiceTestConfig("a", "b", "c"))
+	h.waitReadyBlock(t)
+	first := h.session(t, 1)
+
+	// The primary a is revoked per proxy; the group's admission is still
+	// bound to its resource, so the next admission attempt is refused too.
+	// That is one retirement, not two.
+	first.failRoute("a", fmt.Errorf("%w: resource_not_found", share.ErrResourceGone))
+	waitFor(t, 2*time.Second, func() bool { return strings.Join(first.lastUpdate(), ",") == "b,c" }, "a withdrawn")
+	first.end(fmt.Errorf("%w: login rejected", share.ErrResourceGone))
+
+	second := h.session(t, 2)
+	waitFor(t, 2*time.Second, func() bool { return second.RouteStates()["c"].Phase == share.RouteServing }, "siblings serving on the re-admitted session")
+	if second.admission.ResourceID != "resource-b" {
+		t.Errorf("re-admitted under %q, want resource-b", second.admission.ResourceID)
+	}
+	if states := second.RouteStates(); len(states) != 2 {
+		t.Errorf("re-admitted session carries %d routes, want b and c: %+v", len(states), states)
+	}
+	denies := logger.byEvent(audit.EventProxyDeny)
+	if len(denies) != 1 || denies[0].RouteID != "a" || denies[0].Reason != "resource_not_found" {
+		t.Errorf("audit denies = %+v, want exactly one for a as resource_not_found", denies)
+	}
+	h.requireStillRunning(t)
+}
+
 func TestSharedServiceFallbackIgnoresRoutesFromAnEndedSession(t *testing.T) {
 	previous := readyFallbackWait
 	readyFallbackWait = 60 * time.Millisecond
@@ -999,7 +1042,11 @@ func TestSharedServiceFallbackIgnoresRoutesFromAnEndedSession(t *testing.T) {
 	t.Cleanup(release)
 	first.end(errors.New("control connection lost"))
 
-	time.Sleep(150 * time.Millisecond)
+	// Once the re-admission is parked at the gate the runner has no active
+	// session; fire the wait directly rather than sleeping for it, so the
+	// assertion cannot pass merely because the timer had not gone off yet.
+	waitFor(t, 2*time.Second, func() bool { return h.admitter.heldAdmits() >= 1 }, "re-admission parked at the gate")
+	h.announcer.announceOutstanding()
 	if out := h.out.String(); strings.Contains(out, "Connector is running") {
 		t.Fatalf("fallback block printed routes from the ended session while nothing served:\n%s", out)
 	}
