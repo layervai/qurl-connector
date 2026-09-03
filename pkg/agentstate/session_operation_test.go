@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -361,6 +362,9 @@ func TestSessionOperationRecordRejectsNoncanonicalOrTamperedState(t *testing.T) 
 		"unknown":    append(bytes.TrimSuffix(bytes.Clone(raw), []byte("}")), []byte(`,"unknown":true}`)...),
 		"duplicate":  bytes.Replace(raw, []byte(`"status":"PREPARED"`), []byte(`"status":"PREPARED","status":"PREPARED"`), 1),
 		"operation":  bytes.Replace(raw, []byte(`"owner_id":"auth0|canary-owner"`), []byte(`"owner_id":"other"`), 1),
+		// An explicit zero is not the canonical omitted form.
+		"explicit_zero_post_expiry": bytes.Replace(raw, []byte(`"status":"PREPARED"`),
+			[]byte(`"status":"PREPARED","post_expiry_no_reply_attempts":0`), 1),
 	}
 	for name, mutation := range mutations {
 		t.Run(name, func(t *testing.T) {
@@ -422,5 +426,128 @@ func TestSessionOperationFileNameDoesNotExposeResource(t *testing.T) {
 	}
 	if len(name) != len("native_session_operation-")+64+len(".json") || bytes.Contains([]byte(name), []byte(testOperationProtectedResourceID)) {
 		t.Fatalf("unsafe operation filename %q", name)
+	}
+}
+
+// TestSDKStoreSessionOperationPersistsPostExpiryFailuresAndEndpointMoves pins
+// the two journal rules recovery relies on after a server cohort roll: exactly
+// one counter advances per transition together with a later deadline, and the
+// recovery endpoint may move only to another valid endpoint.
+func TestSDKStoreSessionOperationPersistsPostExpiryFailuresAndEndpointMoves(t *testing.T) {
+	store, err := NewSDKStore(filepath.Join(realSDKTempDir(t), "state"), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	prepared := testSessionOperationRecord(SessionOperationPrepared)
+	if err := store.CreateSessionOperation(context.Background(), prepared); err != nil {
+		t.Fatal(err)
+	}
+	dispatching := prepared
+	dispatching.Status = SessionOperationDispatching
+	if err := store.TransitionSessionOperation(context.Background(), prepared, dispatching); err != nil {
+		t.Fatal(err)
+	}
+	// A post-expiry failure cannot precede any counted attempt.
+	premature := dispatching
+	premature.PostExpiryNoReplyAttempts = 1
+	premature.RecoveryNotBeforeMilli = 1_800_000_010_100
+	if err := store.TransitionSessionOperation(context.Background(), dispatching, premature); !errors.Is(err, ErrSessionOperationConflict) {
+		t.Fatalf("post-expiry failure without an attempt = %v", err)
+	}
+	// uint32 wraparound must not add two steps up to one.
+	wrapped := dispatching
+	wrapped.RecoveryAttempt = math.MaxUint32
+	wrapped.PostExpiryNoReplyAttempts = 2
+	wrapped.RecoveryNotBeforeMilli = 1_800_000_010_100
+	if err := store.TransitionSessionOperation(context.Background(), dispatching, wrapped); !errors.Is(err, ErrSessionOperationConflict) {
+		t.Fatalf("wrapped counter step = %v", err)
+	}
+	attempt := dispatching
+	attempt.RecoveryAttempt = 1
+	attempt.RecoveryNotBeforeMilli = 1_800_000_010_100
+	if err := store.TransitionSessionOperation(context.Background(), dispatching, attempt); err != nil {
+		t.Fatal(err)
+	}
+
+	rejected := map[string]func(SessionOperationRecord) SessionOperationRecord{
+		"same deadline": func(r SessionOperationRecord) SessionOperationRecord {
+			r.PostExpiryNoReplyAttempts++
+			return r
+		},
+		"both counters at once": func(r SessionOperationRecord) SessionOperationRecord {
+			r.RecoveryAttempt++
+			r.PostExpiryNoReplyAttempts++
+			r.RecoveryNotBeforeMilli++
+			return r
+		},
+		"skipped failure": func(r SessionOperationRecord) SessionOperationRecord {
+			r.RecoveryAttempt++
+			r.RecoveryNotBeforeMilli++
+			r.PostExpiryNoReplyAttempts += 2
+			r.RecoveryAttempt++
+			return r
+		},
+		"more failures than attempts": func(r SessionOperationRecord) SessionOperationRecord {
+			r.PostExpiryNoReplyAttempts = r.RecoveryAttempt + 1
+			r.RecoveryNotBeforeMilli++
+			return r
+		},
+		"endpoint port": func(r SessionOperationRecord) SessionOperationRecord {
+			r.RecoveryEndpoint.Port = 444
+			return r
+		},
+		"endpoint host": func(r SessionOperationRecord) SessionOperationRecord {
+			r.RecoveryEndpoint.Host = "Cell1.Example.Test"
+			return r
+		},
+		"endpoint key": func(r SessionOperationRecord) SessionOperationRecord {
+			r.RecoveryEndpoint.ServerPublicKeyB64 = "short"
+			return r
+		},
+	}
+	for name, mutate := range rejected {
+		if err := store.TransitionSessionOperation(context.Background(), attempt, mutate(attempt)); !errors.Is(err, ErrSessionOperationConflict) {
+			t.Fatalf("%s = %v, want conflict", name, err)
+		}
+	}
+
+	failed := attempt
+	failed.PostExpiryNoReplyAttempts = 1
+	failed.RecoveryNotBeforeMilli += 4_000
+	if err := store.TransitionSessionOperation(context.Background(), attempt, failed); err != nil {
+		t.Fatalf("persist post-expiry failure: %v", err)
+	}
+	regressed := failed
+	regressed.PostExpiryNoReplyAttempts = 0
+	if err := store.TransitionSessionOperation(context.Background(), failed, regressed); !errors.Is(err, ErrSessionOperationConflict) {
+		t.Fatalf("regressed post-expiry counter = %v", err)
+	}
+	moved := failed
+	moved.RecoveryEndpoint = qurl.NHPUDPEndpoint{
+		Host: "cell0-blue.example.test", Port: 443,
+		ServerPublicKeyB64: base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{0x44}, 32)),
+	}
+	if err := store.TransitionSessionOperation(context.Background(), failed, moved); err != nil {
+		t.Fatalf("move recovery endpoint: %v", err)
+	}
+	loaded, err := store.LoadSessionOperations(context.Background(), moved.Operation.ProtectedResourceID)
+	if err != nil || len(loaded) != 1 || !sameSessionOperationRecord(loaded[0], moved) {
+		t.Fatalf("persisted post-expiry progress=%+v err=%v", loaded, err)
+	}
+	// The counter is written only when nonzero, so journals that predate it
+	// stay byte-identical and decode unchanged.
+	withCounter, _ := json.Marshal(moved)
+	if !bytes.Contains(withCounter, []byte(`"post_expiry_no_reply_attempts":1`)) {
+		t.Fatalf("post-expiry counter missing from %s", withCounter)
+	}
+	withoutCounter, _ := json.Marshal(attempt)
+	if bytes.Contains(withoutCounter, []byte("post_expiry")) {
+		t.Fatalf("zero post-expiry counter was serialized: %s", withoutCounter)
+	}
+	if !ValidSessionOperationRecoveryEndpoint(moved.RecoveryEndpoint) ||
+		ValidSessionOperationRecoveryEndpoint(qurl.NHPUDPEndpoint{}) {
+		t.Fatal("exported recovery endpoint validation disagrees with the journal rule")
 	}
 }

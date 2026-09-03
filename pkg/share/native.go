@@ -1231,9 +1231,11 @@ func (a *NativeAdmitter) admitOnce(ctx context.Context, knockResourceID,
 	}
 	generation := a.generation
 	if err := a.operations.RecoverPending(ctx, a.binding, a.privateKey, resourceID, a.liveOperationIDs(resourceID), a.udpOpts); err != nil {
-		// Recovery is source-fenced to the operation's persisted cell. Assignment
-		// refresh cannot change that endpoint, so this resource remains blocked by
-		// its durable record without changing the live-placement failure budget.
+		// Recovery is fenced to the operation's persisted cell. It already
+		// retries a silent pinned endpoint against the binding's current
+		// same-cell endpoint and retires a record that stays silent past its
+		// expiry, so this resource remains blocked by its durable record only for
+		// that bounded window, without changing the live-placement failure budget.
 		return Admission{}, fmt.Errorf("recover prior native session operation before replacement: %w", err), generation, false
 	}
 	if err := a.retirePendingForResource(ctx, resourceID); err != nil {
@@ -1599,7 +1601,9 @@ func (a *NativeAdmitter) resetPlacementFailures(resourceID string) {
 
 // Retire durably closes only the exact NHP session represented by admission.
 // A failed retirement remains pending and must succeed before the same
-// resource can obtain another admission.
+// resource can obtain another admission. Success is the server reporting the
+// operation terminal, or the bounded local abandonment of an operation that is
+// past its expiry after repeated post-expiry exchanges no cell endpoint answered.
 func (a *NativeAdmitter) Retire(ctx context.Context, admission Admission) error {
 	if ctx == nil {
 		return errors.New("retire native admission: context is nil")

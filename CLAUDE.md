@@ -47,7 +47,9 @@ endpoints, cloud account identifiers, customer data, or live rollout evidence.
   and `Umask` configure systemd and launchd; Windows does not use them. The
   executable and its ancestors must not be replaceable by an untrusted principal.
 - Persisted lifecycle updates are monotonic: serving epochs cannot regress and
-  immutable resource identities cannot change in place.
+  immutable resource identities cannot change in place. A durable session
+  operation's recovery endpoint is routing state, not identity: recovery may
+  move it to another endpoint of the operation's own cell.
 - Automatic assignment recovery uses bounded persisted backoff. Authenticated
   denials and malformed replies are not assignment-refresh signals.
 - Never log enrollment credentials, device keys, account bearers, NHP tokens,
