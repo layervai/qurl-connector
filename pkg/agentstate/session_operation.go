@@ -571,10 +571,11 @@ func validSessionOperationRecoveryProgress(previous, next SessionOperationRecord
 	}
 	attempts := next.RecoveryAttempt - previous.RecoveryAttempt
 	failures := next.PostExpiryNoReplyAttempts - previous.PostExpiryNoReplyAttempts
+	// Each step is tested on its own so uint32 wraparound cannot add up to one.
 	switch {
 	case attempts == 0 && failures == 0:
 		return next.RecoveryNotBeforeMilli == previous.RecoveryNotBeforeMilli
-	case attempts+failures == 1:
+	case attempts == 1 && failures == 0, attempts == 0 && failures == 1:
 		return next.RecoveryNotBeforeMilli > previous.RecoveryNotBeforeMilli
 	default:
 		return false

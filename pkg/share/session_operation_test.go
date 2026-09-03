@@ -1716,6 +1716,40 @@ func TestDurableNativeSessionRecoveryTypedDenyAfterExpiryIsNeverAbandoned(t *tes
 	}
 }
 
+// An authenticated deny from the re-fenced endpoint supersedes the pinned
+// silence: the endpoint moves, the deny is returned as today, and nothing is
+// ever counted toward abandonment, however many passes it repeats.
+func TestDurableNativeSessionRecoveryTypedDenyFromRefencedEndpointIsNeverCounted(t *testing.T) {
+	f := newRecoveryFixture(t, true)
+	f.now = f.pastAbandonMargin()
+	deny := &qurl.ServerDenyError{ErrCode: "52004"}
+	f.answer(t, func(endpoint qurl.NHPUDPEndpoint, _ int) (*qurl.NativeSessionOperationRecovery, error) {
+		if endpoint == f.pinned {
+			return nil, silentEndpoint(endpoint)
+		}
+		return nil, deny
+	})
+	const passes = nativeSessionRecoveryAbandonAttempts + 1
+	for pass := 1; pass <= passes; pass++ {
+		var got *qurl.ServerDenyError
+		if err := f.recover(context.Background()); !errors.As(err, &got) || got.ErrCode != deny.ErrCode ||
+			errors.Is(err, qurl.ErrEndpointNoReply) {
+			t.Fatalf("pass %d = %v, want the current endpoint's deny alone", pass, err)
+		}
+		records := f.records(t)
+		if len(records) != 1 || records[0].Status != agentstate.SessionOperationClosing ||
+			records[0].PostExpiryNoReplyAttempts != 0 || records[0].RecoveryEndpoint != f.current {
+			t.Fatalf("pass %d records = %+v, want CLOSING on the current endpoint with nothing counted", pass, records)
+		}
+		f.now = f.now.Add(time.Minute)
+	}
+	// The pinned endpoint is tried once; every later pass goes straight to the
+	// endpoint that answered.
+	if pinned, current := countEndpoints(f.exchanges, f.pinned), countEndpoints(f.exchanges, f.current); pinned != 1 || current != passes {
+		t.Fatalf("exchanges pinned=%d current=%d, want 1 and %d", pinned, current, passes)
+	}
+}
+
 func TestDurableNativeSessionRecoveryDefersInsideEscalatedPostExpiryBackoff(t *testing.T) {
 	f := newRecoveryFixture(t, true)
 	f.now = f.pastAbandonMargin()

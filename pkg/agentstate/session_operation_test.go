@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -454,6 +455,14 @@ func TestSDKStoreSessionOperationPersistsPostExpiryFailuresAndEndpointMoves(t *t
 	premature.RecoveryNotBeforeMilli = 1_800_000_010_100
 	if err := store.TransitionSessionOperation(context.Background(), dispatching, premature); !errors.Is(err, ErrSessionOperationConflict) {
 		t.Fatalf("post-expiry failure without an attempt = %v", err)
+	}
+	// uint32 wraparound must not add two steps up to one.
+	wrapped := dispatching
+	wrapped.RecoveryAttempt = math.MaxUint32
+	wrapped.PostExpiryNoReplyAttempts = 2
+	wrapped.RecoveryNotBeforeMilli = 1_800_000_010_100
+	if err := store.TransitionSessionOperation(context.Background(), dispatching, wrapped); !errors.Is(err, ErrSessionOperationConflict) {
+		t.Fatalf("wrapped counter step = %v", err)
 	}
 	attempt := dispatching
 	attempt.RecoveryAttempt = 1

@@ -343,6 +343,10 @@ func (d *durableNativeSessionOperations) RecoverOperation(ctx context.Context, b
 					}
 					record = moved
 					result, err = refenced, refenceErr
+					// The pinned silence is superseded: whatever the current endpoint
+					// answered is the outcome of this attempt, and an authenticated
+					// deny is never counted as silence.
+					countable = isNativeSessionCountableSilence(refenceErr)
 				case isNativeSessionNoReplyError(refenceErr) && ctx.Err() == nil:
 					countable = countable && isNativeSessionCountableSilence(refenceErr)
 				default:
