@@ -39,7 +39,8 @@ type SessionGroupConfig struct {
 	MinBackoff time.Duration
 	MaxBackoff time.Duration
 	// RotationLead is a floor on the replacement lead; see groupRotationLead
-	// for how the lead grows with the route count.
+	// for how the lead grows with the route count and with the registration
+	// rate the runner measures.
 	RotationLead time.Duration
 	StopTimeout  time.Duration
 
@@ -59,10 +60,11 @@ type SessionGroupConfig struct {
 	OnRouteFailed func(routeID string, err error)
 	// OnRetry has the same contract as ResourceConfig.OnRetry.
 	OnRetry func(error, time.Duration)
-	// OnRotationLeadCapped reports, once per route count per admission,
-	// that the admission window is too short for the lead the route count
-	// needs: the replacement gets only lead (half the window) instead of
-	// need, so a rotation may promote before every route re-registers.
+	// OnRotationLeadCapped reports, once per distinct route count and need
+	// per admission, that the admission window is too short for the lead
+	// the route count needs: the replacement gets only lead (half the
+	// window) instead of need, so a rotation may promote before every route
+	// re-registers.
 	OnRotationLeadCapped func(routes int, need, lead time.Duration)
 }
 
@@ -111,15 +113,28 @@ type SessionGroupRunner struct {
 	// reported maps route ID to the proxy name last reported serving on the
 	// active cycle, so a promotion or restart re-reports while flaps do not.
 	reported map[string]string
+	// measuredPerRoute is the per-route registration cost the last fully
+	// registered cycle measured, margin included; zero until a cycle has
+	// brought every route up. See groupRotationLead.
+	measuredPerRoute time.Duration
 }
 
 type groupCycle struct {
 	admission Admission
 	session   GroupServingSession
 	expiresAt time.Time
-	// capReported is the route count for which the lead cap was last
-	// reported on this cycle; it is touched only by the Run goroutine.
-	capReported int
+	// capReported and capReportedNeed are the route count and the need for
+	// which the lead cap was last reported on this cycle, so a cap that
+	// binds again after the measured cost moved the need is reported again;
+	// they are touched only by the Run goroutine.
+	capReported     int
+	capReportedNeed time.Duration
+	// firstServingAt is when the first route was observed serving on this
+	// cycle and fullAt when every desired route was (zero until then); the
+	// spacing between them is the server's registration cost for the set.
+	// Both are touched only by the Run goroutine.
+	firstServingAt time.Time
+	fullAt         time.Time
 }
 
 func NewSessionGroupRunner(cfg SessionGroupConfig) (*SessionGroupRunner, error) {
@@ -173,33 +188,93 @@ var (
 	groupLeadPerRoute = 50 * time.Millisecond
 )
 
+// groupLeadMarginNum/Den is the safety margin applied to a measured
+// registration cost before it sizes the next lead: a replacement gets one and
+// a half times what the last full registration took, so ordinary variance on
+// the server's side does not leave the tail of the set unregistered at the
+// old admission's expiry.
+const (
+	groupLeadMarginNum = 3
+	groupLeadMarginDen = 2
+)
+
 // groupRotationLead is how long before the admission expires the replacement
 // cycle starts. Registering N proxies on a fresh session is sequential on the
-// server: every NewProxy is one authorization round trip plus registration,
-// a few milliseconds each, after Login itself. The needed lead therefore
-// grows at 50ms per route (50s for 1000 routes) above a 30s floor that covers
-// the knock and Login; the configured lead is a floor, never a ceiling. The
-// result is clamped to [1s, openTime/2] (or exactly openTime/2 when that is
-// below 1s) so the old session still serves for at least half its lifetime.
-// need is returned unclamped so a caller can see when the cap binds.
-func groupRotationLead(openTime, configured time.Duration, routes int) (lead, need time.Duration) {
-	need = max(configured, groupLeadFloor, time.Duration(routes)*groupLeadPerRoute)
+// server: every NewProxy is one authorization round trip plus registration
+// after Login itself, so the needed lead grows with the route count. Its
+// per-route cost is the larger of a 50ms floor (the a-priori estimate; 50s
+// for 1000 routes) and measuredPerRoute, the margin-included cost the runner
+// measured on the last cycle that brought every route up — the server's real
+// rate is a property of the platform behind it, and a lead sized only from
+// the a-priori estimate would promote a replacement at the old admission's
+// expiry with the tail of the set still queued behind the server's serial
+// NewProxy path, dropping those routes until the queue reached them. A 30s
+// floor covers the knock and Login; the configured lead is a floor, never a
+// ceiling. The result is clamped to [1s, openTime/2] (or exactly openTime/2
+// when that is below 1s) so the old session still serves for at least half
+// its lifetime. need is returned unclamped so a caller can see when the cap
+// binds.
+func groupRotationLead(openTime, configured time.Duration, routes int, measuredPerRoute time.Duration) (lead, need time.Duration) {
+	perRoute := max(groupLeadPerRoute, measuredPerRoute)
+	need = max(configured, groupLeadFloor, time.Duration(routes)*perRoute)
 	upper := openTime / 2
 	lower := min(time.Second, upper)
 	return min(max(need, lower), upper), need
 }
 
-// rotateAt is computed from the current route count every time Run arms
-// its timer, so a group that grows inside an admission window rotates with
-// the lead the larger set needs rather than the lead it was admitted with.
+// rotateAt is computed from the current route count and the latest measured
+// registration cost every time Run arms its timer, so a group that grows
+// inside an admission window, or that registered slower than the a-priori
+// estimate, rotates with the lead it needs rather than the lead it was
+// admitted with.
 func (r *SessionGroupRunner) rotateAt(cycle *groupCycle) time.Time {
-	routes := r.desiredCount()
-	lead, need := groupRotationLead(cycle.admission.OpenTime, r.cfg.RotationLead, routes)
-	if lead < need && cycle.capReported != routes && r.cfg.OnRotationLeadCapped != nil {
-		cycle.capReported = routes
+	r.mu.Lock()
+	routes, measured := len(r.desired), r.measuredPerRoute
+	r.mu.Unlock()
+	lead, need := groupRotationLead(cycle.admission.OpenTime, r.cfg.RotationLead, routes, measured)
+	if lead < need && (cycle.capReported != routes || cycle.capReportedNeed != need) && r.cfg.OnRotationLeadCapped != nil {
+		cycle.capReported, cycle.capReportedNeed = routes, need
 		r.cfg.OnRotationLeadCapped(routes, need, lead)
 	}
 	return cycle.expiresAt.Add(-lead)
+}
+
+// observeRegistration tracks a cycle's registration progress from the Run
+// goroutine: the instant its first route served and, when full is set, the
+// instant every desired route did. The spacing between the two, spread over
+// the routes that registered after the first and widened by the safety
+// margin, is the per-route cost the next lead is sized with; the knock and
+// Login before the first route belong to the lead floor. The latest full
+// cycle wins, so a slow platform lengthens the next lead and a recovered one
+// shortens it again. A cycle promoted at the old admission's expiry with
+// routes still queued is measured once those routes come up, which is
+// exactly the cost the next lead must cover.
+func (r *SessionGroupRunner) observeRegistration(cycle *groupCycle, serving int, full bool, now time.Time) {
+	if serving <= 0 {
+		return
+	}
+	if cycle.firstServingAt.IsZero() {
+		cycle.firstServingAt = now
+	}
+	if !full || !cycle.fullAt.IsZero() {
+		return
+	}
+	cycle.fullAt = now
+	// A single route has no spacing to measure, and a set that registered
+	// inside one observation measures below the a-priori estimate: both
+	// record zero, so the 50ms floor applies again rather than a stale
+	// measurement from an earlier, larger cycle. The spacing is the spread
+	// between the first and the last route, so one route that lagged behind
+	// its siblings (a transient start error, say) lengthens the next lead
+	// for the whole set; that errs toward an earlier replacement, is clamped
+	// by the openTime/2 cap, and is replaced by the next full cycle.
+	var perRoute time.Duration
+	if spacing := now.Sub(cycle.firstServingAt); serving >= 2 && spacing > 0 {
+		perRoute = spacing * groupLeadMarginNum / groupLeadMarginDen / time.Duration(serving-1)
+	}
+	r.mu.Lock()
+	r.measuredPerRoute = perRoute
+	r.mu.Unlock()
 }
 
 // Run serves until ctx ends. Admission and connection failures retry forever
@@ -572,6 +647,7 @@ func (r *SessionGroupRunner) startCycleAttempt(ctx context.Context, old *groupCy
 		if r.desiredCount() == 0 {
 			return nil, r.failCycle(cycle, ErrGroupEmpty)
 		}
+		r.observeRegistration(cycle, countServing(states), false, time.Now())
 		if r.cycleServing(states, old) {
 			return cycle, nil
 		}
@@ -582,6 +658,7 @@ func (r *SessionGroupRunner) startCycleAttempt(ctx context.Context, old *groupCy
 			if r.desiredCount() == 0 {
 				return nil, r.failCycle(cycle, ErrGroupEmpty)
 			}
+			r.observeRegistration(cycle, countServing(states), false, time.Now())
 			if old != nil && anyRouteServing(states) {
 				// The old admission is expiring: promote what came up and
 				// report what the old session served that did not.
@@ -649,12 +726,17 @@ func (r *SessionGroupRunner) routesServedBy(cycle *groupCycle) map[string]struct
 }
 
 func anyRouteServing(states map[string]RouteState) bool {
+	return countServing(states) > 0
+}
+
+func countServing(states map[string]RouteState) int {
+	serving := 0
 	for _, state := range states {
 		if state.Phase == RouteServing {
-			return true
+			serving++
 		}
 	}
-	return false
+	return serving
 }
 
 func (r *SessionGroupRunner) reportNotServing(old *groupCycle, states map[string]RouteState) {
@@ -737,14 +819,23 @@ func (r *SessionGroupRunner) reportActive(ctx context.Context) {
 	states := active.session.RouteStates()
 	r.withdrawGone(ctx, states)
 	var serving []string
+	servingCount := 0
 	r.mu.Lock()
 	for routeID, state := range states {
-		if state.Phase == RouteServing && r.reported[routeID] != state.ProxyName {
+		if state.Phase != RouteServing {
+			continue
+		}
+		if _, desired := r.desired[routeID]; desired {
+			servingCount++
+		}
+		if r.reported[routeID] != state.ProxyName {
 			r.reported[routeID] = state.ProxyName
 			serving = append(serving, routeID)
 		}
 	}
+	full := servingCount == len(r.desired)
 	r.mu.Unlock()
+	r.observeRegistration(active, servingCount, full, time.Now())
 	if r.cfg.OnRouteServing == nil {
 		return
 	}

@@ -65,8 +65,10 @@ vet:
 # Scaling proof: N routes on one Connector admission and one FRP session,
 # measured in-process against the real FRP client and server (README,
 # "Scaling proof"). 1000 routes with the race detector off (it is too slow
-# at that size), then 200 with it on. JSON reports land in bin/ (ignored).
-PROOF_TEST := ^TestHermeticSessionGroupServes1000Routes$$
+# at that size), then 200 with it on. The same opt-in runs the platform-speed
+# rotation reproduction, which needs about a minute by construction. JSON
+# reports land in bin/ (ignored).
+PROOF_TEST := ^(TestHermeticSessionGroupServes1000Routes|TestHermeticSessionGroupRotationRegistersEveryRouteOnce)$$
 proof-1000:
 	@mkdir -p bin
 	QURL_PROOF_ROUTES=1000 QURL_PROOF_REPORT=$(CURDIR)/bin/proof-1000.json CGO_ENABLED=0 \

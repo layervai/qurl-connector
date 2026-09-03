@@ -764,3 +764,225 @@ func TestFRPGroupSessionTransientStartErrorStaysPending(t *testing.T) {
 	case <-time.After(10 * time.Millisecond):
 	}
 }
+
+func withRegistrationWindow(t *testing.T, window int) {
+	t.Helper()
+	previous := groupRegistrationWindow
+	groupRegistrationWindow = window
+	t.Cleanup(func() { groupRegistrationWindow = previous })
+}
+
+// liveProxyNames is the proxy set the session currently wants FRP to hold.
+func liveProxyNames(session *frpGroupSession) []string {
+	session.mu.Lock()
+	live := session.liveRoutesLocked()
+	session.mu.Unlock()
+	names := make([]string, 0, len(live))
+	for _, route := range live {
+		names = append(names, groupProxyName(route, session.sessionID))
+	}
+	return names
+}
+
+func waitForLastPush(t *testing.T, svc *recordingGroupService, want []string) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		updates := svc.updateNames()
+		if len(updates) > 0 && reflect.DeepEqual(updates[len(updates)-1], want) {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("FRP proxy set never became %q; pushes = %q", want, updates)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func TestFRPGroupSessionRegistersThroughWindow(t *testing.T) {
+	withRegistrationWindow(t, 2)
+	svc := &recordingGroupService{}
+	status := &lockedStatusMap{}
+	session := startTestGroupSession(t, svc, status, groupRoutesOf(groupTestRoutes("a", "b", "c", "d", "e")))
+
+	// The Login set is the first window; the rest are pending in the table
+	// and unknown to FRP, and no push is owed for them.
+	if got := liveProxyNames(session); !reflect.DeepEqual(got, []string{"a-nhp7", "b-nhp7"}) {
+		t.Fatalf("initial FRP proxy set = %q, want the first window", got)
+	}
+	states := session.RouteStates()
+	for _, routeID := range []string{"a", "b", "c", "d", "e"} {
+		if state := states[routeID]; state.Phase != RoutePending || state.Err != nil {
+			t.Fatalf("route %q before registration = %+v, want pending", routeID, state)
+		}
+	}
+	time.Sleep(10 * time.Millisecond)
+	if pushes := svc.updateNames(); len(pushes) != 0 {
+		t.Fatalf("session pushed %q while the first window was still registering", pushes)
+	}
+	select {
+	case <-session.Ready():
+		t.Fatal("session reported ready with routes waiting for the window")
+	default:
+	}
+
+	// Each registration frees a slot for the next route in ID order.
+	status.set("a-nhp7", frpproxy.ProxyPhaseRunning, "")
+	waitForLastPush(t, svc, []string{"a-nhp7", "b-nhp7", "c-nhp7"})
+	status.set("b-nhp7", frpproxy.ProxyPhaseRunning, "")
+	status.set("c-nhp7", frpproxy.ProxyPhaseRunning, "")
+	waitForLastPush(t, svc, []string{"a-nhp7", "b-nhp7", "c-nhp7", "d-nhp7", "e-nhp7"})
+	status.set("d-nhp7", frpproxy.ProxyPhaseRunning, "")
+	status.set("e-nhp7", frpproxy.ProxyPhaseRunning, "")
+	waitForRouteStates(t, session, func(s map[string]RouteState) bool {
+		for _, routeID := range []string{"a", "b", "c", "d", "e"} {
+			if phaseOf(s, routeID) != RouteServing {
+				return false
+			}
+		}
+		return true
+	})
+	select {
+	case <-session.Ready():
+	case <-time.After(time.Second):
+		t.Fatal("session with every route registered did not report ready")
+	}
+	for _, push := range svc.updateNames() {
+		if len(push) > 5 {
+			t.Fatalf("push %q carries more proxies than the group has", push)
+		}
+	}
+}
+
+func TestFRPGroupSessionWindowDoesNotWaitOnTransientStartErrors(t *testing.T) {
+	withRegistrationWindow(t, 1)
+	svc := &recordingGroupService{}
+	status := &lockedStatusMap{}
+	session := startTestGroupSession(t, svc, status, groupRoutesOf(groupTestRoutes("a", "b")))
+	if got := liveProxyNames(session); !reflect.DeepEqual(got, []string{"a-nhp7"}) {
+		t.Fatalf("initial FRP proxy set = %q, want only a", got)
+	}
+
+	// A proxy the server refused transiently waits out FRP's retry interval
+	// on the client; it is not in the server's queue and holds no slot.
+	status.set("a-nhp7", frpproxy.ProxyPhaseStartErr, "rate_limited: retry later")
+	waitForLastPush(t, svc, []string{"a-nhp7", "b-nhp7"})
+
+	// When FRP re-sends a's NewProxy the error clears and a is in flight
+	// again; with b also in flight the window is over-full, so a route added
+	// now waits until one of them registers.
+	status.set("a-nhp7", frpproxy.ProxyPhaseWaitStart, "")
+	waitForRouteStates(t, session, func(s map[string]RouteState) bool { return s["a"].Err == nil })
+	if err := session.Update(context.Background(), groupRoutesOf(groupTestRoutes("a", "b", "c"))); err != nil {
+		t.Fatal(err)
+	}
+	if got := liveProxyNames(session); !reflect.DeepEqual(got, []string{"a-nhp7", "b-nhp7"}) {
+		t.Fatalf("FRP proxy set after adding c to a full window = %q, want c held back", got)
+	}
+	if state := session.RouteStates()["c"]; state.Phase != RoutePending {
+		t.Fatalf("held-back route c = %+v, want pending", state)
+	}
+	// One registration leaves the window full with the other; c is released
+	// once both are running.
+	status.set("b-nhp7", frpproxy.ProxyPhaseRunning, "")
+	waitForRouteStates(t, session, func(s map[string]RouteState) bool { return phaseOf(s, "b") == RouteServing })
+	if got := liveProxyNames(session); !reflect.DeepEqual(got, []string{"a-nhp7", "b-nhp7"}) {
+		t.Fatalf("FRP proxy set with a still in flight = %q, want c still held back", got)
+	}
+	status.set("a-nhp7", frpproxy.ProxyPhaseRunning, "")
+	waitForLastPush(t, svc, []string{"a-nhp7", "b-nhp7", "c-nhp7"})
+}
+
+func TestFRPGroupSessionUpdateWithdrawsRoutesWaitingForWindow(t *testing.T) {
+	withRegistrationWindow(t, 1)
+	svc := &recordingGroupService{}
+	status := &lockedStatusMap{}
+	routes := groupRoutesOf(groupTestRoutes("a", "b", "c"))
+	session := startTestGroupSession(t, svc, status, routes)
+	if got := liveProxyNames(session); !reflect.DeepEqual(got, []string{"a-nhp7"}) {
+		t.Fatalf("initial FRP proxy set = %q, want only a", got)
+	}
+	// Withdrawing b, which FRP never saw, is a table change only; c keeps
+	// waiting behind a.
+	withoutB := []GroupRoute{routes[0], routes[2]}
+	if err := session.Update(context.Background(), withoutB); err != nil {
+		t.Fatal(err)
+	}
+	waitForLastPush(t, svc, []string{"a-nhp7"})
+	states := session.RouteStates()
+	if _, present := states["b"]; present {
+		t.Fatalf("withdrawn route b still tracked: %+v", states["b"])
+	}
+	if state := states["c"]; state.Phase != RoutePending {
+		t.Fatalf("waiting route c = %+v, want pending", state)
+	}
+	status.set("a-nhp7", frpproxy.ProxyPhaseRunning, "")
+	waitForLastPush(t, svc, []string{"a-nhp7", "c-nhp7"})
+	// A serving route never leaves the pushed set for the window's sake, and
+	// a restarted route re-enters the queue under its new name.
+	restarted := []GroupRoute{routes[0], routes[2]}
+	restarted[0].Generation = 1
+	if err := session.Update(context.Background(), restarted); err != nil {
+		t.Fatal(err)
+	}
+	if got := liveProxyNames(session); !reflect.DeepEqual(got, []string{"c-nhp7"}) {
+		t.Fatalf("FRP proxy set after restarting a behind in-flight c = %q, want a's new name held back", got)
+	}
+	status.set("c-nhp7", frpproxy.ProxyPhaseRunning, "")
+	waitForLastPush(t, svc, []string{"a-nhp7-r1", "c-nhp7"})
+}
+
+func TestFRPGroupSessionReleasedPendingCeilingHoldsErroredProxies(t *testing.T) {
+	withRegistrationWindow(t, 1)
+	svc := &recordingGroupService{}
+	status := &lockedStatusMap{}
+	session := startTestGroupSession(t, svc, status, groupRoutesOf(groupTestRoutes("a", "b", "c", "d")))
+	// An errored proxy frees its window slot but still counts against the
+	// released-pending ceiling (twice the window): a second transient error
+	// fills it, and no further route is released until one registers.
+	status.set("a-nhp7", frpproxy.ProxyPhaseStartErr, "rate_limited: retry later")
+	waitForLastPush(t, svc, []string{"a-nhp7", "b-nhp7"})
+	status.set("b-nhp7", frpproxy.ProxyPhaseStartErr, "rate_limited: retry later")
+	waitForRouteStates(t, session, func(s map[string]RouteState) bool { return s["b"].Err != nil })
+	time.Sleep(10 * time.Millisecond)
+	if got := liveProxyNames(session); !reflect.DeepEqual(got, []string{"a-nhp7", "b-nhp7"}) {
+		t.Fatalf("FRP proxy set with two errored proxies released = %q, want the ceiling to hold c back", got)
+	}
+	status.set("a-nhp7", frpproxy.ProxyPhaseRunning, "")
+	waitForLastPush(t, svc, []string{"a-nhp7", "b-nhp7", "c-nhp7"})
+}
+
+func TestFRPGroupSessionRegeneratedRouteTakesNextSlot(t *testing.T) {
+	withRegistrationWindow(t, 1)
+	svc := &recordingGroupService{}
+	status := &lockedStatusMap{}
+	routes := groupRoutesOf(groupTestRoutes("m", "n"))
+	session := startTestGroupSession(t, svc, status, routes)
+	status.set("m-nhp7", frpproxy.ProxyPhaseRunning, "")
+	waitForLastPush(t, svc, []string{"m-nhp7", "n-nhp7"})
+	// m serves, n is in flight, and a route added now waits; its ID sorts
+	// first among waiting routes.
+	added := groupRoutesOf(groupTestRoutes("m", "n", "a"))
+	if err := session.Update(context.Background(), added); err != nil {
+		t.Fatal(err)
+	}
+	if got := liveProxyNames(session); !reflect.DeepEqual(got, []string{"m-nhp7", "n-nhp7"}) {
+		t.Fatalf("FRP proxy set after adding a to a full window = %q, want a held back", got)
+	}
+	// Restarting m withdraws its serving proxy, and its new name goes ahead
+	// of a despite sorting after it: the route that was up is dark for one
+	// slot turnover, not for the backlog.
+	restarted := append([]GroupRoute(nil), added...)
+	restarted[0].Generation = 1
+	if err := session.Update(context.Background(), restarted); err != nil {
+		t.Fatal(err)
+	}
+	waitForLastPush(t, svc, []string{"n-nhp7"})
+	status.set("n-nhp7", frpproxy.ProxyPhaseRunning, "")
+	waitForLastPush(t, svc, []string{"m-nhp7-r1", "n-nhp7"})
+	if state := session.RouteStates()["a"]; state.Phase != RoutePending {
+		t.Fatalf("route a while the restarted route registers = %+v, want still waiting", state)
+	}
+	status.set("m-nhp7-r1", frpproxy.ProxyPhaseRunning, "")
+	waitForLastPush(t, svc, []string{"a-nhp7", "m-nhp7-r1", "n-nhp7"})
+}
