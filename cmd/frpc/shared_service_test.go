@@ -35,11 +35,19 @@ type fakeSharedAdmitter struct {
 	// openTime is the admission window; zero means an hour, long enough
 	// that no test rotates unless it asks to.
 	openTime time.Duration
+	// deny refuses admission for a protected resource ID with that error.
+	deny map[string]error
+	// knocks records the knock resource of every Admit, in order.
+	knocks []string
 }
 
 func (a *fakeSharedAdmitter) Admit(_ context.Context, knockResourceID, resourceID string) (share.Admission, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	a.knocks = append(a.knocks, knockResourceID)
+	if err := a.deny[resourceID]; err != nil {
+		return share.Admission{}, err
+	}
 	a.admits++
 	sessionID := uint64(a.admits)
 	openTime := a.openTime
@@ -75,6 +83,12 @@ func (a *fakeSharedAdmitter) counts() (admits, retired, healthy int) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return a.admits, len(a.retired), a.healthy
+}
+
+func (a *fakeSharedAdmitter) knockResources() []string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return append([]string(nil), a.knocks...)
 }
 
 // fakeGroupFactory starts fake group sessions. Every route serves as soon as
@@ -395,6 +409,8 @@ type sharedServiceHarnessOptions struct {
 	openTime time.Duration
 	// hold keeps a route pending on a given session until the test acts.
 	hold func(sessionIndex int, routeID string) bool
+	// deny refuses admission for a protected resource ID with that error.
+	deny map[string]error
 }
 
 // startSharedServiceHarness runs the shared runtime over cfg with every
@@ -414,7 +430,7 @@ func startSharedServiceHarnessWith(t *testing.T, cfg *nhpconfig.Config, opts sha
 	t.Helper()
 	t.Setenv(EnvKnockResourceID, "")
 	h := &sharedServiceHarness{
-		admitter: &fakeSharedAdmitter{openTime: opts.openTime},
+		admitter: &fakeSharedAdmitter{openTime: opts.openTime, deny: opts.deny},
 		factory:  &fakeGroupFactory{hold: opts.hold},
 		out:      &lockedBuffer{},
 		done:     make(chan error, 1),
@@ -788,6 +804,127 @@ func TestSharedServiceExitsWithoutReadyBlockWhenNoRouteEverServes(t *testing.T) 
 	}
 	if out := h.out.String(); strings.Contains(out, "Connector is running") {
 		t.Errorf("ready block printed for a Connector that never served:\n%s", out)
+	}
+}
+
+func TestSharedServiceForgetsRoutesServedByALostSession(t *testing.T) {
+	// Session 1 serves a, b, c (d held); it is lost and session 2 comes up
+	// with a, b, d serving and c held. The block must not print until c
+	// registers on the active session, however long a, b, c served before.
+	h := startSharedServiceHarnessWith(t, sharedServiceTestConfig("a", "b", "c", "d"), sharedServiceHarnessOptions{
+		hold: func(session int, routeID string) bool {
+			return (session == 1 && routeID == "d") || (session == 2 && routeID == "c")
+		},
+	})
+	first := h.session(t, 1)
+	waitFor(t, 2*time.Second, func() bool { _, _, healthy := h.admitter.counts(); return healthy >= 1 }, "session 1 promoted")
+	first.end(errors.New("control connection lost"))
+
+	second := h.session(t, 2)
+	waitFor(t, 2*time.Second, func() bool { _, _, healthy := h.admitter.counts(); return healthy >= 2 }, "session 2 promoted")
+	waitFor(t, 2*time.Second, func() bool { return second.RouteStates()["d"].Phase == share.RouteServing }, "d serving on session 2")
+	// The stale-serving bug printed synchronously inside the promotion; a
+	// short quiet window is ample to observe it.
+	time.Sleep(100 * time.Millisecond)
+	if out := h.out.String(); strings.Contains(out, "Connector is running") {
+		t.Fatalf("block printed with c not serving on the active session:\n%s", out)
+	}
+
+	second.serve("c")
+	block := h.waitReadyBlock(t)
+	if !strings.Contains(block, "4 route(s) live") {
+		t.Errorf("block should count every route once all serve on the active session; got:\n%s", block)
+	}
+	if got := readyBlockRoutes(block); strings.Join(got, ",") != "a,b,c,d" {
+		t.Errorf("block routes = %v, want [a b c d]", got)
+	}
+}
+
+func TestSharedServiceRetiresPrimaryRouteWhoseAdmissionIsGone(t *testing.T) {
+	logger := &captureAuditLogger{}
+	previous := audit.SetDefault(logger)
+	t.Cleanup(func() { audit.SetDefault(previous) })
+
+	// The knock authenticates the primary route's resource; the platform
+	// revoked it, so the admission itself is refused. The siblings must be
+	// re-admitted under the next route rather than exit with it.
+	h := startSharedServiceHarnessWith(t, sharedServiceTestConfig("a", "b", "c"), sharedServiceHarnessOptions{
+		deny: map[string]error{"resource-a": fmt.Errorf("%w: authenticated deny", share.ErrResourceGone)},
+	})
+	block := h.waitReadyBlock(t)
+	if !strings.Contains(block, "2 route(s) live") {
+		t.Errorf("block should count the two surviving routes; got:\n%s", block)
+	}
+	if got := readyBlockRoutes(block); strings.Join(got, ",") != "b,c" {
+		t.Errorf("block routes = %v, want [b c]", got)
+	}
+	denies := logger.byEvent(audit.EventProxyDeny)
+	if len(denies) != 1 || denies[0].RouteID != "a" || denies[0].ResourceID != "resource-a" || denies[0].Reason != "admission_resource_gone" {
+		t.Errorf("retirement audit entries = %+v", denies)
+	}
+	states := h.session(t, 1).RouteStates()
+	if len(states) != 2 || states["b"].Phase != share.RouteServing || states["c"].Phase != share.RouteServing {
+		t.Errorf("surviving session states = %+v", states)
+	}
+	if _, present := states["a"]; present {
+		t.Error("the retired primary route was registered on the surviving session")
+	}
+	// One refused admission for a, one granted for b: the group did not
+	// knock for c separately.
+	if admits, _, _ := h.admitter.counts(); admits != 1 {
+		t.Errorf("granted admissions = %d, want 1", admits)
+	}
+	if knocks := h.admitter.knockResources(); len(knocks) != 2 {
+		t.Errorf("knocks = %v, want one refused and one granted", knocks)
+	}
+	h.requireStillRunning(t)
+}
+
+func TestSharedServiceExitsWhenEveryAdmissionIsGone(t *testing.T) {
+	gone := fmt.Errorf("%w: authenticated deny", share.ErrResourceGone)
+	h := startSharedServiceHarnessWith(t, sharedServiceTestConfig("a", "b", "c"), sharedServiceHarnessOptions{
+		deny: map[string]error{"resource-a": gone, "resource-b": gone, "resource-c": gone},
+	})
+	err, returned := h.result(5 * time.Second)
+	if !returned {
+		t.Fatal("shared service kept knocking with every admission refused")
+	}
+	if !errors.Is(err, share.ErrResourceGone) || !strings.Contains(err.Error(), "qurl-connector remove") {
+		t.Fatalf("Run returned %v, want ErrResourceGone with the recovery hint", err)
+	}
+	// Bounded: one knock per route, then exit.
+	if knocks := h.admitter.knockResources(); len(knocks) != 3 {
+		t.Errorf("knocks = %v, want exactly one per route", knocks)
+	}
+	if out := h.out.String(); strings.Contains(out, "Connector is running") {
+		t.Errorf("ready block printed for a Connector that never served:\n%s", out)
+	}
+}
+
+func TestSharedServiceKnockOverrideAppliesToEveryRoute(t *testing.T) {
+	// The developer override replaces the knock operand for every route, so
+	// a config whose hydrated knock resources disagree is still one session
+	// knocking the override.
+	t.Setenv(EnvKnockResourceID, "q_override")
+	cfg := sharedServiceTestConfig("a", "b")
+	cfg.SetKnockResourceID("resource-b", "q_other")
+	admitter := &fakeSharedAdmitter{}
+	runner, err := newSharedServiceRunner(context.Background(), cfg, admitter, &fakeGroupFactory{}, newReadyAnnouncer(nil, io.Discard, false))
+	if err != nil {
+		t.Fatalf("override config rejected: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- runner.Run(ctx) }()
+	waitFor(t, 2*time.Second, func() bool { admits, _, _ := admitter.counts(); return admits >= 1 }, "the admission")
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("runner did not stop")
+	}
+	if knocks := admitter.knockResources(); len(knocks) != 1 || knocks[0] != "q_override" {
+		t.Errorf("knocks = %v, want one knock of the override resource", knocks)
 	}
 }
 

@@ -88,9 +88,12 @@ type readyAnnouncer struct {
 	// waiting is the set the fallback block named as still registering; each
 	// gets one follow-up line when it serves or is retired.
 	waiting map[string]struct{}
-	// fallback is the bounded wait, armed once by armFallback.
+	// fallback is the bounded wait, armed once by the first sessionPromoted.
+	// stopped ends it for good: a callback that had already fired when stop
+	// ran must not arm a successor.
 	fallback     *time.Timer
 	fallbackWait time.Duration
+	stopped      bool
 }
 
 func newReadyAnnouncer(routes []readyRoute, out io.Writer, interactive bool) *readyAnnouncer {
@@ -108,28 +111,36 @@ func newReadyAnnouncer(routes []readyRoute, out io.Writer, interactive bool) *re
 	return a
 }
 
-// armFallback starts the bounded wait, once, when the group first serves.
-// Later calls (every promotion re-reports OnServing) change nothing.
-func (a *readyAnnouncer) armFallback(wait time.Duration) {
+// sessionPromoted records that the group promoted a session (OnServing).
+//
+// Whatever served on the previous session is forgotten. The group re-reports
+// every route serving on the new session immediately afterwards, and a
+// whole-session loss is deliberately not reported per route, so without this
+// a reconnect inside the bounded wait would carry routes from the dead
+// session into the block as live. The first promotion also arms the bounded
+// wait; later ones leave it alone.
+func (a *readyAnnouncer) sessionPromoted(wait time.Duration) {
 	if a == nil {
 		return
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if a.announced || a.fallback != nil {
+	clear(a.serving)
+	if a.announced || a.stopped || a.fallback != nil {
 		return
 	}
 	a.fallbackWait = wait
 	a.fallback = time.AfterFunc(wait, a.announceOutstanding)
 }
 
-// stop releases the fallback timer. The block is not printed by stop.
+// stop ends the bounded wait for good. The block is not printed by stop.
 func (a *readyAnnouncer) stop() {
 	if a == nil {
 		return
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	a.stopped = true
 	if a.fallback != nil {
 		a.fallback.Stop()
 	}
@@ -230,7 +241,7 @@ func (a *readyAnnouncer) announceIfCompleteLocked() {
 func (a *readyAnnouncer) announceOutstanding() {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if a.announced {
+	if a.announced || a.stopped {
 		return
 	}
 	live, outstanding := a.partitionLocked()

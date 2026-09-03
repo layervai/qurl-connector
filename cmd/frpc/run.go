@@ -1028,6 +1028,8 @@ func startFRPFromConfig(ctx context.Context, cfgPath, machineID string, cfg *nhp
 		}
 		common.WebServer.Addr, common.WebServer.Port = cfg.Admin.Addr, cfg.Admin.Port
 		common.WebServer.User, common.WebServer.Password = "admin", password
+		slog.WarnContext(ctx, "admin API enabled: FRP binds its listener per control session, so each admission rotation replaces the session cold instead of make-before-break; expect a brief serving gap per admission window",
+			"addr", cfg.Admin.Addr, "port", cfg.Admin.Port)
 	}
 	applyLogPresentation(common, logLevel, colorEnabled)
 	if err := common.Complete(); err != nil {
@@ -1109,19 +1111,86 @@ func newSharedServiceSessions(common *v1.ClientCommonConfig, cfgPath string) (*s
 	})
 }
 
-// runSharedService runs the group until a terminal condition and translates
-// the only terminal condition an operator can act on locally.
+// runSharedService runs the group until a terminal condition.
+//
+// A revocation can reach the process through the knock as well as through a
+// NewProxy: the admitted resource is the primary route's, and the SDK
+// authenticates it on every knock separately from the shared knock resource.
+// An admission refused with ErrResourceGone therefore retires the primary
+// route in place and re-admits the rest under the next route, so the healthy
+// siblings survive either path. If the refusal is really about the knock
+// resource every route shares, each successive admission is refused too; the
+// cost is one knock per remaining route before the process exits with the
+// same error, never a stuck loop.
 func runSharedService(ctx context.Context, qcfg *nhpconfig.Config, admitter sharedServiceAdmitter, sessions share.SessionGroupFactory, announcer *readyAnnouncer) error {
-	runner, err := newSharedServiceRunner(ctx, qcfg, admitter, sessions, announcer)
-	if err != nil {
-		return err
+	if qcfg == nil {
+		return errors.New("shared Connector runtime requires at least one resource")
 	}
 	defer announcer.stop()
-	err = runner.Run(ctx)
-	if errors.Is(err, share.ErrGroupEmpty) {
-		return fmt.Errorf("%w: every configured route was retired as permanently unavailable; remove them with 'qurl-connector remove' before restarting", err)
+	remaining := *qcfg
+	remaining.Routes = append([]nhpconfig.Route(nil), qcfg.Routes...)
+	for {
+		runner, err := newSharedServiceRunner(ctx, &remaining, admitter, sessions, announcer)
+		if err != nil {
+			return err
+		}
+		err = runner.Run(ctx)
+		if errors.Is(err, share.ErrGroupEmpty) {
+			return allRoutesRetiredError(err)
+		}
+		if !errors.Is(err, share.ErrResourceGone) || ctx.Err() != nil {
+			return err
+		}
+		primary, rest := splitPrimaryRoute(&remaining)
+		if primary == nil {
+			return err
+		}
+		retireSharedRoute(ctx, announcer, primary.ID, primary.ResourceID, "admission_resource_gone", err)
+		if len(rest) == 0 {
+			return allRoutesRetiredError(err)
+		}
+		remaining.Routes = rest
 	}
-	return err
+}
+
+func allRoutesRetiredError(err error) error {
+	return fmt.Errorf("%w: every configured route was retired as permanently unavailable; remove them with 'qurl-connector remove' before restarting", err)
+}
+
+// splitPrimaryRoute separates the route whose resource the group admits from
+// the rest, or returns nil when no route carries a routing identity.
+func splitPrimaryRoute(qcfg *nhpconfig.Config) (*nhpconfig.Route, []nhpconfig.Route) {
+	primaryResourceID := qcfg.PrimaryResourceID()
+	if primaryResourceID == "" {
+		return nil, nil
+	}
+	for i := range qcfg.Routes {
+		if qcfg.Routes[i].ResourceID != primaryResourceID {
+			continue
+		}
+		primary := qcfg.Routes[i]
+		rest := make([]nhpconfig.Route, 0, len(qcfg.Routes)-1)
+		rest = append(rest, qcfg.Routes[:i]...)
+		rest = append(rest, qcfg.Routes[i+1:]...)
+		return &primary, rest
+	}
+	return nil, nil
+}
+
+// retireSharedRoute is the one place a route leaves the running set: it is
+// logged, put on the audit stream, and dropped from the ready block. The
+// process keeps serving; the route stays in the config until the operator
+// removes it. reason is the audit tag: resource_not_found when the tunnel
+// server refused the route's NewProxy, admission_resource_gone when the
+// knock for its admission was refused.
+func retireSharedRoute(ctx context.Context, announcer *readyAnnouncer, routeID, resourceID, reason string, err error) {
+	slog.WarnContext(ctx, "connector: route retired; its resource is permanently unavailable and the other routes keep serving",
+		"route", routeID, "resource_id", resourceID, "reason", reason, "err", err.Error())
+	audit.Default().Log(audit.Entry{
+		Event: audit.EventProxyDeny, Outcome: audit.OutcomeDeny, Reason: reason,
+		RouteID: routeID, ResourceID: resourceID, Error: err.Error(),
+	})
+	announcer.routeRetired(routeID)
 }
 
 // newSharedServiceRunner builds the one session group for qcfg's routes.
@@ -1135,6 +1204,13 @@ func runSharedService(ctx context.Context, qcfg *nhpconfig.Config, admitter shar
 // runtime's own guard on that invariant, so a config that reached this point
 // by another path fails clearly instead of registering proxies under an
 // admission that does not cover them.
+//
+// The admitted resource is the primary route's (the first route carrying a
+// connector routing ID), so removing that route re-points the admission at
+// the next one on the following start. That is benign: the admitter's
+// per-resource state is the pending-operation journal and an in-memory
+// placement backoff, an absent journal is an empty one, and startup recovery
+// scans every resource's journal regardless of which one is admitted next.
 //
 // ctx scopes only the callbacks' log context; Run(ctx) is what scopes the
 // runner's lifetime.
@@ -1174,7 +1250,7 @@ func newSharedServiceRunner(ctx context.Context, qcfg *nhpconfig.Config, admitte
 			if err := admitter.MarkServingHealthy(); err != nil {
 				slog.WarnContext(ctx, "connector: failed to clear assignment-refresh state after serving", "err", err.Error())
 			}
-			announcer.armFallback(readyFallbackWait)
+			announcer.sessionPromoted(readyFallbackWait)
 		},
 		OnRouteServing: func(routeID string, _ share.Admission) {
 			announcer.routeServing(routeID)
@@ -1187,17 +1263,10 @@ func newSharedServiceRunner(ctx context.Context, qcfg *nhpconfig.Config, admitte
 					"route", routeID, "err", err.Error())
 				return
 			}
-			// Retired in place: the platform permanently refused this route's
-			// proxy, so the group withdrew it and its siblings keep serving.
-			// The process does not exit; the route stays in the config until
-			// the operator removes it.
-			slog.WarnContext(ctx, "connector: route retired; its resource is permanently unavailable and the other routes keep serving",
-				"route", routeID, "resource_id", resourceIDs[routeID], "err", err.Error())
-			audit.Default().Log(audit.Entry{
-				Event: audit.EventProxyDeny, Outcome: audit.OutcomeDeny, Reason: "resource_not_found",
-				RouteID: routeID, ResourceID: resourceIDs[routeID], Error: err.Error(),
-			})
-			announcer.routeRetired(routeID)
+			// Retired in place: the tunnel server permanently refused this
+			// route's proxy, so the group withdrew it and its siblings keep
+			// serving.
+			retireSharedRoute(ctx, announcer, routeID, resourceIDs[routeID], "resource_not_found", err)
 		},
 		OnRetry: func(err error, wait time.Duration) {
 			slog.WarnContext(ctx, "connector: NHP admission or FRP session attempt failed; retrying",

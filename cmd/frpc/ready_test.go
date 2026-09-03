@@ -112,11 +112,9 @@ func TestReadyAnnouncerFallsBackAfterBoundedWaitAndNarratesTheRest(t *testing.T)
 	announcer := newReadyAnnouncer(readyTestRoutes("a", "b", "c", "d"), out, false)
 	t.Cleanup(announcer.stop)
 
+	announcer.sessionPromoted(10 * time.Millisecond)
 	announcer.routeServing("a")
 	announcer.routeServing("b")
-	announcer.armFallback(10 * time.Millisecond)
-	// Every promotion re-arms; only the first arming counts.
-	announcer.armFallback(time.Hour)
 	waitFor(t, 2*time.Second, func() bool { return strings.Contains(out.String(), "Connector is running") }, "the fallback block")
 
 	block := out.String()
@@ -159,8 +157,8 @@ func TestReadyAnnouncerFallbackDoesNotFireOnceComplete(t *testing.T) {
 	announcer := newReadyAnnouncer(readyTestRoutes("a", "b"), out, false)
 	t.Cleanup(announcer.stop)
 
+	announcer.sessionPromoted(10 * time.Millisecond)
 	announcer.routeServing("a")
-	announcer.armFallback(10 * time.Millisecond)
 	announcer.routeServing("b")
 	time.Sleep(40 * time.Millisecond)
 
@@ -181,13 +179,96 @@ func TestReadyAnnouncerFallbackWaitsForSomethingLive(t *testing.T) {
 	// The group promoted but every route flapped back to pending before the
 	// wait elapsed: announcing a running Connector with nothing live would
 	// be a lie, so the wait rolls over.
-	announcer.armFallback(5 * time.Millisecond)
+	announcer.sessionPromoted(5 * time.Millisecond)
 	time.Sleep(25 * time.Millisecond)
 	if out.String() != "" {
 		t.Fatalf("fallback block printed with nothing live:\n%s", out.String())
 	}
 	announcer.routeServing("a")
 	waitFor(t, 2*time.Second, func() bool { return strings.Contains(out.String(), "1 of 2 route(s) live") }, "the rolled-over fallback block")
+}
+
+func TestReadyAnnouncerForgetsRoutesServedByALostSession(t *testing.T) {
+	out := &lockedBuffer{}
+	announcer := newReadyAnnouncer(readyTestRoutes("a", "b", "c", "d"), out, false)
+	t.Cleanup(announcer.stop)
+
+	// Session 1 served a, b, c with d pending; it was lost, and the group
+	// promoted session 2 on which only a and b have registered so far.
+	announcer.sessionPromoted(time.Hour)
+	for _, id := range []string{"a", "b", "c"} {
+		announcer.routeServing(id)
+	}
+	announcer.sessionPromoted(time.Hour)
+	announcer.routeServing("a")
+	announcer.routeServing("b")
+	// A late promotion must not re-arm a shorter wait either; the first one
+	// owns the timer. (Both waits are an hour here; the block prints below
+	// only because the set completes.)
+	if out.String() != "" {
+		t.Fatalf("block printed with c and d not serving on the active session:\n%s", out.String())
+	}
+
+	// d never comes up and c comes back: the block must list exactly the
+	// routes serving on the active session.
+	announcer.routeRetired("d")
+	announcer.routeServing("c")
+	if !strings.Contains(out.String(), "3 route(s) live") {
+		t.Fatalf("block should count the routes serving on the active session; got:\n%s", out.String())
+	}
+	if got := readyBlockRoutes(out.String()); strings.Join(got, ",") != "a,b,c" {
+		t.Errorf("block routes = %v, want [a b c]", got)
+	}
+}
+
+func TestReadyAnnouncerFallbackListsOnlyTheActiveSessionsRoutes(t *testing.T) {
+	out := &lockedBuffer{}
+	announcer := newReadyAnnouncer(readyTestRoutes("a", "b", "c", "d"), out, false)
+	t.Cleanup(announcer.stop)
+
+	// d never registers, so the block is still waiting when session 1 is
+	// lost and replaced; c served on session 1 but has not re-registered.
+	announcer.sessionPromoted(time.Hour)
+	announcer.routeServing("a")
+	announcer.routeServing("b")
+	announcer.routeServing("c")
+	announcer.sessionPromoted(time.Hour)
+	announcer.routeServing("a")
+	announcer.routeServing("b")
+	// Force the bounded wait now rather than in an hour.
+	announcer.announceOutstanding()
+
+	block := out.String()
+	if !strings.Contains(block, "2 of 4 route(s) live") {
+		t.Errorf("fallback block counted a route from the lost session as live; got:\n%s", block)
+	}
+	if got := readyBlockRoutes(block); strings.Join(got, ",") != "a,b" {
+		t.Errorf("fallback block rows = %v, want [a b]", got)
+	}
+	if !strings.Contains(block, "Still registering:") || !strings.Contains(block, "c, d") {
+		t.Errorf("fallback block should name c and d as still registering; got:\n%s", block)
+	}
+}
+
+func TestReadyAnnouncerStopEndsTheFallbackForGood(t *testing.T) {
+	out := &lockedBuffer{}
+	announcer := newReadyAnnouncer(readyTestRoutes("a", "b"), out, false)
+
+	// Nothing live when the wait elapses, so the callback would re-arm;
+	// stop must win against that, whatever the interleaving.
+	announcer.sessionPromoted(5 * time.Millisecond)
+	time.Sleep(20 * time.Millisecond)
+	announcer.stop()
+	announcer.routeServing("a")
+	time.Sleep(30 * time.Millisecond)
+	if out.String() != "" {
+		t.Fatalf("a stopped announcer printed:\n%s", out.String())
+	}
+	announcer.sessionPromoted(time.Millisecond)
+	time.Sleep(20 * time.Millisecond)
+	if out.String() != "" {
+		t.Fatalf("a stopped announcer re-armed its wait:\n%s", out.String())
+	}
 }
 
 func TestReadyBlockOmitsCtrlCWhenNotInteractive(t *testing.T) {
