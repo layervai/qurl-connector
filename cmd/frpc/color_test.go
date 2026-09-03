@@ -254,7 +254,7 @@ func TestReadyBlockHonorsColorGate(t *testing.T) {
 
 	withColorEnabled(t, true)
 	announcer.interactive = true
-	colored := announcer.render(live)
+	colored := announcer.render(live, nil)
 	if !strings.Contains(colored, ansiGreen) || !strings.Contains(colored, ansiCyan) {
 		t.Fatalf("ready block lost its color with the gate on:\n%q", colored)
 	}
@@ -265,7 +265,7 @@ func TestReadyBlockHonorsColorGate(t *testing.T) {
 	setColorEnabled(false)
 	for _, interactive := range []bool{true, false} {
 		announcer.interactive = interactive
-		plain := announcer.render(live)
+		plain := announcer.render(live, nil)
 		assertNoANSI(t, "readyAnnouncer.render", plain)
 		for _, want := range []string{"Connector is running", "2 route(s) live", "web", "internal-api", "127.0.0.1:9000"} {
 			if !strings.Contains(plain, want) {

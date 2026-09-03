@@ -5,6 +5,7 @@ import (
 	"io"
 	"strings"
 	"sync"
+	"time"
 )
 
 // Foreground readiness announcement.
@@ -26,11 +27,20 @@ import (
 // to come up, and a route the platform has permanently revoked (OnRouteFailed
 // with ErrResourceGone) is dropped from the wait rather than listed as live.
 //
+// The wait is bounded. FRP keeps a proxy the server rejected for any reason
+// other than resource_not_found in a pending retry indefinitely, so a route
+// stuck on such a rejection would otherwise hold the block back forever while
+// its siblings serve — the frozen-terminal symptom again, on a Connector that
+// is genuinely running. readyFallbackWait after the group first serves, the
+// block prints the live routes, names the outstanding ones as still
+// registering, and then narrates each of those as it comes up or is retired.
+//
 // What this deliberately does NOT print is a public URL. Managed Connector
 // routes have no client-derivable public host — the qURL control plane discloses it only
 // after the qURL is resolved and the NHP grant is open (see routePublicLabel in
 // list.go). Printing a locally-assembled hostname here would invent a customer-
 // facing address the client is not entitled to compute.
+
 // readyRoute is one line of the ready block: what the customer calls the route
 // and where it points locally.
 type readyRoute struct {
@@ -38,8 +48,16 @@ type readyRoute struct {
 	target  string
 }
 
-// readyAnnouncer prints the foreground block once per process, the first
-// time every route still configured is serving.
+// readyFallbackWait bounds how long the block waits for the last route once
+// the group's first session serves. Registering a full set on a fresh session
+// is sequential and costs milliseconds per route, so anything still pending
+// this long after the first route came up is stuck in FRP's retry, not queued
+// behind its siblings. A variable so tests can shrink it.
+var readyFallbackWait = 30 * time.Second
+
+// readyAnnouncer prints the foreground block once per process: the first
+// time every route still configured is serving, or, failing that, once the
+// bounded wait after the first serving route elapses.
 //
 // Once, not once per supervised cycle: the block explains a startup surprise,
 // and a reconnect an hour later re-teaching the operator about Ctrl+C is noise.
@@ -62,25 +80,59 @@ type readyAnnouncer struct {
 	// routes is every configured route in config order; serving and retired
 	// are keyed by route ID and together decide when nothing is outstanding.
 	routes  []readyRoute
-	index   map[string]struct{}
+	index   map[string]readyRoute
 	serving map[string]struct{}
 	retired map[string]struct{}
 	// announced latches the single print, including across cycles.
 	announced bool
+	// waiting is the set the fallback block named as still registering; each
+	// gets one follow-up line when it serves or is retired.
+	waiting map[string]struct{}
+	// fallback is the bounded wait, armed once by armFallback.
+	fallback     *time.Timer
+	fallbackWait time.Duration
 }
 
 func newReadyAnnouncer(routes []readyRoute, out io.Writer, interactive bool) *readyAnnouncer {
 	a := &readyAnnouncer{
 		out: out, interactive: interactive,
 		routes:  append([]readyRoute(nil), routes...),
-		index:   make(map[string]struct{}, len(routes)),
+		index:   make(map[string]readyRoute, len(routes)),
 		serving: make(map[string]struct{}, len(routes)),
 		retired: make(map[string]struct{}),
+		waiting: make(map[string]struct{}),
 	}
 	for _, route := range routes {
-		a.index[route.routeID] = struct{}{}
+		a.index[route.routeID] = route
 	}
 	return a
+}
+
+// armFallback starts the bounded wait, once, when the group first serves.
+// Later calls (every promotion re-reports OnServing) change nothing.
+func (a *readyAnnouncer) armFallback(wait time.Duration) {
+	if a == nil {
+		return
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.announced || a.fallback != nil {
+		return
+	}
+	a.fallbackWait = wait
+	a.fallback = time.AfterFunc(wait, a.announceOutstanding)
+}
+
+// stop releases the fallback timer. The block is not printed by stop.
+func (a *readyAnnouncer) stop() {
+	if a == nil {
+		return
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.fallback != nil {
+		a.fallback.Stop()
+	}
 }
 
 // routeServing records that routeID reached FRP's running phase and prints
@@ -100,6 +152,10 @@ func (a *readyAnnouncer) routeServing(routeID string) {
 		return
 	}
 	a.serving[routeID] = struct{}{}
+	if a.announced {
+		a.narrateLocked(routeID, true)
+		return
+	}
 	a.announceIfCompleteLocked()
 }
 
@@ -117,38 +173,97 @@ func (a *readyAnnouncer) routeRetired(routeID string) {
 	}
 	a.retired[routeID] = struct{}{}
 	delete(a.serving, routeID)
+	if a.announced {
+		a.narrateLocked(routeID, false)
+		return
+	}
 	a.announceIfCompleteLocked()
 }
 
-// announceIfCompleteLocked writes the block at most once, when at least one
-// route serves and none is outstanding (neither serving nor retired).
-func (a *readyAnnouncer) announceIfCompleteLocked() {
-	if a.announced {
+// narrateLocked prints one follow-up line for a route the fallback block
+// named as still registering. Every other transition after the block is
+// the lifecycle engine's per-cycle story, told by FRP's own logs.
+func (a *readyAnnouncer) narrateLocked(routeID string, live bool) {
+	if _, ok := a.waiting[routeID]; !ok {
 		return
 	}
-	live := make([]readyRoute, 0, len(a.routes))
+	delete(a.waiting, routeID)
+	if live {
+		fmt.Fprintf(a.out, "  %s✓ %s is now live%s  →  %s\n", colorGreen, routeID, colorReset, a.index[routeID].target)
+		return
+	}
+	fmt.Fprintf(a.out, "  %s✗ %s retired%s — its resource is permanently unavailable\n", colorYellow, routeID, colorReset)
+}
+
+// partitionLocked splits the configured routes, in config order, into the
+// ones serving and the ones still outstanding (neither serving nor retired).
+func (a *readyAnnouncer) partitionLocked() (live, outstanding []readyRoute) {
 	for _, route := range a.routes {
 		if _, ok := a.serving[route.routeID]; ok {
 			live = append(live, route)
 			continue
 		}
 		if _, gone := a.retired[route.routeID]; !gone {
-			return
+			outstanding = append(outstanding, route)
 		}
 	}
-	if len(live) == 0 {
-		return
-	}
-	a.announced = true
-	fmt.Fprint(a.out, a.render(live))
+	return live, outstanding
 }
 
-// render builds the block for the live routes as a string so its exact shape
-// is testable without capturing os.Stdout.
-func (a *readyAnnouncer) render(live []readyRoute) string {
+// announceIfCompleteLocked writes the block at most once, when at least one
+// route serves and none is outstanding.
+func (a *readyAnnouncer) announceIfCompleteLocked() {
+	if a.announced {
+		return
+	}
+	live, outstanding := a.partitionLocked()
+	if len(live) == 0 || len(outstanding) > 0 {
+		return
+	}
+	a.printLocked(live, nil)
+}
+
+// announceOutstanding is the fallback: the bounded wait elapsed, so print
+// what serves and name what does not. Nothing live means the group lost its
+// session again after promoting; wait another round rather than announce a
+// Connector that serves nothing.
+func (a *readyAnnouncer) announceOutstanding() {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.announced {
+		return
+	}
+	live, outstanding := a.partitionLocked()
+	if len(live) == 0 {
+		a.fallback = time.AfterFunc(a.fallbackWait, a.announceOutstanding)
+		return
+	}
+	a.printLocked(live, outstanding)
+}
+
+func (a *readyAnnouncer) printLocked(live, outstanding []readyRoute) {
+	a.announced = true
+	if a.fallback != nil {
+		a.fallback.Stop()
+	}
+	for _, route := range outstanding {
+		a.waiting[route.routeID] = struct{}{}
+	}
+	fmt.Fprint(a.out, a.render(live, outstanding))
+}
+
+// render builds the block as a string so its exact shape is testable without
+// capturing os.Stdout. live is what the block lists; outstanding, when the
+// bounded wait forced the print, is named as still registering.
+func (a *readyAnnouncer) render(live, outstanding []readyRoute) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "\n  %s✓ Connector is running%s — %d route(s) live\n\n",
-		colorGreen, colorReset, len(live))
+	if len(outstanding) == 0 {
+		fmt.Fprintf(&b, "\n  %s✓ Connector is running%s — %d route(s) live\n\n",
+			colorGreen, colorReset, len(live))
+	} else {
+		fmt.Fprintf(&b, "\n  %s✓ Connector is running%s — %d of %d route(s) live\n\n",
+			colorGreen, colorReset, len(live), len(live)+len(outstanding))
+	}
 
 	width := 0
 	for _, r := range live {
@@ -163,6 +278,15 @@ func (a *readyAnnouncer) render(live []readyRoute) string {
 		// a run of colored trailing spaces.
 		fmt.Fprintf(&b, "    %s%s%s%s  →  %s\n",
 			colorCyan, r.routeID, colorReset, strings.Repeat(" ", width-len([]rune(r.routeID))), r.target)
+	}
+
+	if len(outstanding) > 0 {
+		ids := make([]string, 0, len(outstanding))
+		for _, r := range outstanding {
+			ids = append(ids, r.routeID)
+		}
+		fmt.Fprintf(&b, "\n  %sStill registering:%s %s — FRP keeps retrying; a line prints here when each comes up or is retired.\n",
+			colorYellow, colorReset, strings.Join(ids, ", "))
 	}
 
 	b.WriteString("\n")

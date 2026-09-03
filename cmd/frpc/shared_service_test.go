@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"strings"
 	"sync"
 	"testing"
@@ -31,6 +32,9 @@ type fakeSharedAdmitter struct {
 	admits  int
 	retired []uint64
 	healthy int
+	// openTime is the admission window; zero means an hour, long enough
+	// that no test rotates unless it asks to.
+	openTime time.Duration
 }
 
 func (a *fakeSharedAdmitter) Admit(_ context.Context, knockResourceID, resourceID string) (share.Admission, error) {
@@ -38,6 +42,10 @@ func (a *fakeSharedAdmitter) Admit(_ context.Context, knockResourceID, resourceI
 	defer a.mu.Unlock()
 	a.admits++
 	sessionID := uint64(a.admits)
+	openTime := a.openTime
+	if openTime == 0 {
+		openTime = time.Hour
+	}
 	return share.Admission{
 		KnockResourceID: knockResourceID, ResourceID: resourceID,
 		RunID: "run", RunAttempt: 1, Token: "token", ResourceHost: "frp.example:7000",
@@ -45,7 +53,7 @@ func (a *fakeSharedAdmitter) Admit(_ context.Context, knockResourceID, resourceI
 		SessionReceipt: qurl.NativeSessionReceipt{
 			CellID: "cell0", SessionID: sessionID, SessionIssuedAtMillis: 1, RunID: "run", RunAttempt: 1,
 		},
-		OpenTime: time.Hour,
+		OpenTime: openTime,
 	}, nil
 }
 
@@ -70,11 +78,11 @@ func (a *fakeSharedAdmitter) counts() (admits, retired, healthy int) {
 }
 
 // fakeGroupFactory starts fake group sessions. Every route serves as soon as
-// it is installed unless it is held, in which case it stays pending until the
-// test serves or fails it.
+// it is installed unless hold reports it held on that session (1-based
+// index), in which case it stays pending until the test serves or fails it.
 type fakeGroupFactory struct {
 	mu       sync.Mutex
-	hold     map[string]bool
+	hold     func(sessionIndex int, routeID string) bool
 	sessions []*fakeGroupSession
 }
 
@@ -82,7 +90,7 @@ func (f *fakeGroupFactory) Start(_ context.Context, admission share.Admission, r
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	session := &fakeGroupSession{
-		admission: admission, hold: f.hold,
+		index: len(f.sessions) + 1, admission: admission, hold: f.hold,
 		routes:  make(map[string]share.RouteState, len(routes)),
 		ready:   make(chan struct{}),
 		done:    make(chan struct{}),
@@ -99,18 +107,20 @@ func (f *fakeGroupFactory) starts() int {
 	return len(f.sessions)
 }
 
-func (f *fakeGroupFactory) first() *fakeGroupSession {
+// session returns the index-th (1-based) session started, or nil.
+func (f *fakeGroupFactory) session(index int) *fakeGroupSession {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if len(f.sessions) == 0 {
+	if index < 1 || index > len(f.sessions) {
 		return nil
 	}
-	return f.sessions[0]
+	return f.sessions[index-1]
 }
 
 type fakeGroupSession struct {
+	index     int
 	admission share.Admission
-	hold      map[string]bool
+	hold      func(int, string) bool
 
 	mu      sync.Mutex
 	routes  map[string]share.RouteState
@@ -139,7 +149,7 @@ func (s *fakeGroupSession) install(routes []share.GroupRoute) {
 			continue
 		}
 		phase := share.RouteServing
-		if s.hold[route.RouteID] {
+		if s.hold != nil && s.hold(s.index, route.RouteID) {
 			phase = share.RoutePending
 		}
 		next[route.RouteID] = share.RouteState{Route: route, ProxyName: name, Phase: phase}
@@ -279,6 +289,52 @@ func (l *captureAuditLogger) byEvent(event string) []audit.Entry {
 	return out
 }
 
+// captureLogHandler records every slog record so a test can assert on the
+// runtime's log lines without scraping stdout.
+type captureLogHandler struct {
+	mu      sync.Mutex
+	records []slog.Record
+}
+
+func (h *captureLogHandler) Enabled(context.Context, slog.Level) bool { return true }
+func (h *captureLogHandler) WithAttrs([]slog.Attr) slog.Handler       { return h }
+func (h *captureLogHandler) WithGroup(string) slog.Handler            { return h }
+func (h *captureLogHandler) Handle(_ context.Context, record slog.Record) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.records = append(h.records, record.Clone())
+	return nil
+}
+
+// matching returns the records whose message contains substr, each folded
+// to its attributes by key.
+func (h *captureLogHandler) matching(substr string) []map[string]string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	var out []map[string]string
+	for _, record := range h.records {
+		if !strings.Contains(record.Message, substr) {
+			continue
+		}
+		attrs := map[string]string{"msg": record.Message}
+		record.Attrs(func(attr slog.Attr) bool {
+			attrs[attr.Key] = attr.Value.String()
+			return true
+		})
+		out = append(out, attrs)
+	}
+	return out
+}
+
+func installCaptureLogger(t *testing.T) *captureLogHandler {
+	t.Helper()
+	handler := &captureLogHandler{}
+	previous := slog.Default()
+	slog.SetDefault(slog.New(handler))
+	t.Cleanup(func() { slog.SetDefault(previous) })
+	return handler
+}
+
 type lockedBuffer struct {
 	mu  sync.Mutex
 	buf bytes.Buffer
@@ -334,16 +390,32 @@ type sharedServiceHarness struct {
 	err      error
 }
 
+type sharedServiceHarnessOptions struct {
+	// openTime is the fake admission window; zero means an hour.
+	openTime time.Duration
+	// hold keeps a route pending on a given session until the test acts.
+	hold func(sessionIndex int, routeID string) bool
+}
+
+// startSharedServiceHarness runs the shared runtime over cfg with every
+// route in hold pending on every session until the test serves or fails it.
 func startSharedServiceHarness(t *testing.T, cfg *nhpconfig.Config, hold ...string) *sharedServiceHarness {
 	t.Helper()
-	t.Setenv(EnvKnockResourceID, "")
 	held := make(map[string]bool, len(hold))
 	for _, id := range hold {
 		held[id] = true
 	}
+	return startSharedServiceHarnessWith(t, cfg, sharedServiceHarnessOptions{
+		hold: func(_ int, routeID string) bool { return held[routeID] },
+	})
+}
+
+func startSharedServiceHarnessWith(t *testing.T, cfg *nhpconfig.Config, opts sharedServiceHarnessOptions) *sharedServiceHarness {
+	t.Helper()
+	t.Setenv(EnvKnockResourceID, "")
 	h := &sharedServiceHarness{
-		admitter: &fakeSharedAdmitter{},
-		factory:  &fakeGroupFactory{hold: held},
+		admitter: &fakeSharedAdmitter{openTime: opts.openTime},
+		factory:  &fakeGroupFactory{hold: opts.hold},
 		out:      &lockedBuffer{},
 		done:     make(chan error, 1),
 	}
@@ -377,10 +449,11 @@ func (h *sharedServiceHarness) result(timeout time.Duration) (err error, returne
 	}
 }
 
-func (h *sharedServiceHarness) session(t *testing.T) *fakeGroupSession {
+// session waits for the index-th (1-based) session to start and returns it.
+func (h *sharedServiceHarness) session(t *testing.T, index int) *fakeGroupSession {
 	t.Helper()
-	waitFor(t, 2*time.Second, func() bool { return h.factory.first() != nil }, "the first session")
-	return h.factory.first()
+	waitFor(t, 5*time.Second, func() bool { return h.factory.session(index) != nil }, fmt.Sprintf("session %d", index))
+	return h.factory.session(index)
 }
 
 func (h *sharedServiceHarness) waitReadyBlock(t *testing.T) string {
@@ -422,7 +495,7 @@ func TestSharedServiceAdmitsOnceForEveryRoute(t *testing.T) {
 	if starts := h.factory.starts(); starts != 1 {
 		t.Fatalf("FRP sessions started = %d, want 1", starts)
 	}
-	states := h.session(t).RouteStates()
+	states := h.session(t, 1).RouteStates()
 	if len(states) != 3 {
 		t.Fatalf("session carries %d routes, want 3", len(states))
 	}
@@ -455,7 +528,7 @@ func TestSharedServiceRetiresGoneRouteWithoutDisturbingSiblings(t *testing.T) {
 
 	h := startSharedServiceHarness(t, sharedServiceTestConfig("a", "b", "c"))
 	h.waitReadyBlock(t)
-	session := h.session(t)
+	session := h.session(t, 1)
 
 	// The platform revoked b: qRTS answers its NewProxy with
 	// resource_not_found, which the session reports as a failed route.
@@ -492,7 +565,7 @@ func TestSharedServiceRetiresGoneRouteWithoutDisturbingSiblings(t *testing.T) {
 func TestSharedServiceReturnsOnlyWhenEveryRouteIsGone(t *testing.T) {
 	h := startSharedServiceHarness(t, sharedServiceTestConfig("a", "b"))
 	h.waitReadyBlock(t)
-	session := h.session(t)
+	session := h.session(t, 1)
 
 	session.failRoute("a", fmt.Errorf("%w: resource_not_found", share.ErrResourceGone))
 	waitFor(t, 2*time.Second, func() bool { return strings.Join(session.lastUpdate(), ",") == "b" }, "a withdrawn")
@@ -516,7 +589,7 @@ func TestSharedServiceReturnsOnlyWhenEveryRouteIsGone(t *testing.T) {
 
 func TestSharedServiceReadyBlockWaitsForEveryRoute(t *testing.T) {
 	h := startSharedServiceHarness(t, sharedServiceTestConfig("a", "b", "c"), "c")
-	session := h.session(t)
+	session := h.session(t, 1)
 
 	// a and b are serving (the group promoted and MarkServingHealthy ran),
 	// but c is still pending: no block. This cannot race the wrong way,
@@ -543,7 +616,7 @@ func TestSharedServiceReadyBlockWaitsForEveryRoute(t *testing.T) {
 
 func TestSharedServiceReadyBlockNamesOnlyServingRoutes(t *testing.T) {
 	h := startSharedServiceHarness(t, sharedServiceTestConfig("a", "b", "c"), "c")
-	session := h.session(t)
+	session := h.session(t, 1)
 	waitFor(t, 2*time.Second, func() bool { _, _, healthy := h.admitter.counts(); return healthy >= 1 }, "the group to serve")
 
 	// c never comes up: the platform revoked it. The block must print for
@@ -644,4 +717,101 @@ func TestNewSharedServiceRunnerRejectsConfigsWithNothingToAdmit(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "missing NHP knock resource") {
 		t.Errorf("a route without a knock resource was accepted; err = %v", err)
 	}
+
+	// A route that was never hydrated is a missing knock resource, not a
+	// second admission target; the error must not send the operator looking
+	// for one.
+	partial := sharedServiceTestConfig("a", "b")
+	delete(partial.Runtime.KnockResourceIDs, "resource-b")
+	_, err = newSharedServiceRunner(context.Background(), partial, &fakeSharedAdmitter{}, &fakeGroupFactory{}, announcer)
+	if err == nil {
+		t.Fatal("a partially hydrated config was accepted")
+	}
+	for _, want := range []string{`route "b"`, "missing NHP knock resource", `"resource-b"`} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("partial-hydration error %q should mention %q", err, want)
+		}
+	}
+	if strings.Contains(err.Error(), "admission targets") {
+		t.Errorf("partial-hydration error %q misdiagnoses a missing knock resource as a second admission target", err)
+	}
+}
+
+func TestSharedServiceKeepsRouteThatMissesTheReplacementSession(t *testing.T) {
+	logs := installCaptureLogger(t)
+	logger := &captureAuditLogger{}
+	previous := audit.SetDefault(logger)
+	t.Cleanup(func() { audit.SetDefault(previous) })
+
+	// A short admission window forces a rotation; c serves on every session
+	// except the first replacement, so the old admission expires with c not
+	// yet registered on the new one.
+	h := startSharedServiceHarnessWith(t, sharedServiceTestConfig("a", "b", "c"), sharedServiceHarnessOptions{
+		openTime: 400 * time.Millisecond,
+		hold:     func(session int, routeID string) bool { return session == 2 && routeID == "c" },
+	})
+	h.waitReadyBlock(t)
+
+	waitFor(t, 5*time.Second, func() bool { return len(logs.matching("did not come up on the replacement session")) >= 1 }, "the not-serving report")
+	report := logs.matching("did not come up on the replacement session")[0]
+	if report["route"] != "c" || !strings.Contains(report["err"], "not serving") {
+		t.Errorf("not-serving report = %v", report)
+	}
+	// Not a retirement: no audit deny, and c stays in the group's set on the
+	// replacement session.
+	if denies := logger.byEvent(audit.EventProxyDeny); len(denies) != 0 {
+		t.Errorf("a route that merely missed a rotation was audited as denied: %+v", denies)
+	}
+	if states := h.session(t, 2).RouteStates(); states["c"].Phase == share.RouteFailed {
+		t.Errorf("route c was withdrawn from the replacement session: %+v", states["c"])
+	}
+	h.requireStillRunning(t)
+	// c registers on the next rotation, with nothing to do on our side.
+	waitFor(t, 5*time.Second, func() bool {
+		session := h.factory.session(3)
+		return session != nil && session.RouteStates()["c"].Phase == share.RouteServing
+	}, "route c serving on the following session")
+}
+
+func TestSharedServiceExitsWithoutReadyBlockWhenNoRouteEverServes(t *testing.T) {
+	h := startSharedServiceHarness(t, sharedServiceTestConfig("a", "b"), "a", "b")
+	session := h.session(t, 1)
+	session.failRoute("a", fmt.Errorf("%w: resource_not_found", share.ErrResourceGone))
+	session.failRoute("b", fmt.Errorf("%w: resource_not_found", share.ErrResourceGone))
+
+	err, returned := h.result(5 * time.Second)
+	if !returned {
+		t.Fatal("shared service kept running with every route revoked before serving")
+	}
+	if !errors.Is(err, share.ErrGroupEmpty) {
+		t.Fatalf("Run returned %v, want ErrGroupEmpty", err)
+	}
+	if out := h.out.String(); strings.Contains(out, "Connector is running") {
+		t.Errorf("ready block printed for a Connector that never served:\n%s", out)
+	}
+}
+
+func TestSharedServiceReadyBlockFallsBackWhenARouteStaysPending(t *testing.T) {
+	previous := readyFallbackWait
+	readyFallbackWait = 50 * time.Millisecond
+	t.Cleanup(func() { readyFallbackWait = previous })
+
+	h := startSharedServiceHarness(t, sharedServiceTestConfig("a", "b", "c"), "c")
+	block := h.waitReadyBlock(t)
+	if !strings.Contains(block, "2 of 3 route(s) live") {
+		t.Errorf("fallback block should count live routes against the configured set; got:\n%s", block)
+	}
+	if got := readyBlockRoutes(block); strings.Join(got, ",") != "a,b" {
+		t.Errorf("fallback block rows = %v, want [a b]", got)
+	}
+	if !strings.Contains(block, "Still registering:") || !strings.Contains(block, "c") {
+		t.Errorf("fallback block should name c as still registering; got:\n%s", block)
+	}
+
+	h.session(t, 1).serve("c")
+	waitFor(t, 2*time.Second, func() bool { return strings.Contains(h.out.String(), "c is now live") }, "route c narrated live")
+	if n := strings.Count(h.out.String(), "Connector is running"); n != 1 {
+		t.Errorf("block printed %d times, want exactly 1", n)
+	}
+	h.requireStillRunning(t)
 }

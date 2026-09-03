@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 )
 
 func readyTestRoutes(ids ...string) []readyRoute {
@@ -15,10 +16,14 @@ func readyTestRoutes(ids ...string) []readyRoute {
 	return routes
 }
 
-// readyBlockRoutes returns the route IDs a rendered block names, in order.
+// readyBlockRoutes returns the route IDs a rendered block lists as live, in
+// order. Follow-up "is now live" lines are not block rows.
 func readyBlockRoutes(block string) []string {
 	var ids []string
 	for _, line := range strings.Split(stripANSI(block), "\n") {
+		if !strings.HasPrefix(line, "    ") {
+			continue
+		}
 		if before, _, ok := strings.Cut(line, "→"); ok {
 			ids = append(ids, strings.TrimSpace(before))
 		}
@@ -102,13 +107,96 @@ func TestReadyAnnouncerIgnoresRoutesItWasNotConfiguredWith(t *testing.T) {
 	}
 }
 
+func TestReadyAnnouncerFallsBackAfterBoundedWaitAndNarratesTheRest(t *testing.T) {
+	out := &lockedBuffer{}
+	announcer := newReadyAnnouncer(readyTestRoutes("a", "b", "c", "d"), out, false)
+	t.Cleanup(announcer.stop)
+
+	announcer.routeServing("a")
+	announcer.routeServing("b")
+	announcer.armFallback(10 * time.Millisecond)
+	// Every promotion re-arms; only the first arming counts.
+	announcer.armFallback(time.Hour)
+	waitFor(t, 2*time.Second, func() bool { return strings.Contains(out.String(), "Connector is running") }, "the fallback block")
+
+	block := out.String()
+	if !strings.Contains(block, "2 of 4 route(s) live") {
+		t.Errorf("fallback block should say how many of the configured routes are live; got:\n%s", block)
+	}
+	if got := readyBlockRoutes(block); strings.Join(got, ",") != "a,b" {
+		t.Errorf("fallback block rows = %v, want only the live routes [a b]", got)
+	}
+	if !strings.Contains(block, "Still registering:") || !strings.Contains(block, "c, d") {
+		t.Errorf("fallback block should name the outstanding routes as still registering; got:\n%s", block)
+	}
+
+	// The outstanding routes are narrated as they resolve, once each.
+	announcer.routeServing("c")
+	announcer.routeServing("c")
+	announcer.routeRetired("d")
+	got := out.String()
+	if n := strings.Count(got, "c is now live"); n != 1 {
+		t.Errorf("route c narrated %d times, want 1:\n%s", n, got)
+	}
+	if !strings.Contains(got, "127.0.0.1:3002") {
+		t.Errorf("route c's follow-up should carry its local target:\n%s", got)
+	}
+	if !strings.Contains(got, "d retired") {
+		t.Errorf("route d's retirement should be narrated:\n%s", got)
+	}
+	if n := strings.Count(got, "Connector is running"); n != 1 {
+		t.Errorf("block printed %d times, want exactly 1", n)
+	}
+	// A route the block already listed as live is not news.
+	announcer.routeServing("a")
+	if strings.Contains(out.String(), "a is now live") {
+		t.Error("a route the block listed as live was narrated again")
+	}
+}
+
+func TestReadyAnnouncerFallbackDoesNotFireOnceComplete(t *testing.T) {
+	out := &lockedBuffer{}
+	announcer := newReadyAnnouncer(readyTestRoutes("a", "b"), out, false)
+	t.Cleanup(announcer.stop)
+
+	announcer.routeServing("a")
+	announcer.armFallback(10 * time.Millisecond)
+	announcer.routeServing("b")
+	time.Sleep(40 * time.Millisecond)
+
+	got := out.String()
+	if n := strings.Count(got, "Connector is running"); n != 1 {
+		t.Fatalf("block printed %d times, want exactly 1:\n%s", n, got)
+	}
+	if strings.Contains(got, " of ") || strings.Contains(got, "Still registering") {
+		t.Errorf("a complete block must not carry the fallback wording:\n%s", got)
+	}
+}
+
+func TestReadyAnnouncerFallbackWaitsForSomethingLive(t *testing.T) {
+	out := &lockedBuffer{}
+	announcer := newReadyAnnouncer(readyTestRoutes("a", "b"), out, false)
+	t.Cleanup(announcer.stop)
+
+	// The group promoted but every route flapped back to pending before the
+	// wait elapsed: announcing a running Connector with nothing live would
+	// be a lie, so the wait rolls over.
+	announcer.armFallback(5 * time.Millisecond)
+	time.Sleep(25 * time.Millisecond)
+	if out.String() != "" {
+		t.Fatalf("fallback block printed with nothing live:\n%s", out.String())
+	}
+	announcer.routeServing("a")
+	waitFor(t, 2*time.Second, func() bool { return strings.Contains(out.String(), "1 of 2 route(s) live") }, "the rolled-over fallback block")
+}
+
 func TestReadyBlockOmitsCtrlCWhenNotInteractive(t *testing.T) {
 	// Under systemd/launchd or a piped `docker run` the output is a log, and
 	// there is no terminal to press Ctrl+C in — but the facts still belong in
 	// the journal.
 	announcer := newReadyAnnouncer(nil, &bytes.Buffer{}, false)
 
-	got := announcer.render([]readyRoute{{routeID: "myapp", target: "127.0.0.1:8080"}})
+	got := announcer.render([]readyRoute{{routeID: "myapp", target: "127.0.0.1:8080"}}, nil)
 	if strings.Contains(got, "Ctrl+C") {
 		t.Errorf("non-interactive ready block should not tell the operator to press Ctrl+C; got:\n%s", got)
 	}
@@ -126,7 +214,7 @@ func TestReadyBlockAlignsRouteIDColumn(t *testing.T) {
 	block := announcer.render([]readyRoute{
 		{routeID: "a", target: "127.0.0.1:1"},
 		{routeID: "much-longer-id", target: "127.0.0.1:2"},
-	})
+	}, nil)
 	for _, line := range strings.Split(stripANSI(block), "\n") {
 		if idx := strings.Index(line, "→"); idx >= 0 {
 			arrowColumns = append(arrowColumns, len([]rune(line[:idx])))

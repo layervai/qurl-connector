@@ -1091,10 +1091,7 @@ type sharedServiceAdmitter interface {
 // on every rotation; one session costs one knock and one Login for the whole
 // set, and only the per-proxy NewProxy authorizations scale with the route
 // count. A restart with N routes is one knock and one Login.
-func startSharedService(ctx context.Context, common *v1.ClientCommonConfig, cfgPath string, qcfg *nhpconfig.Config, admitter *share.NativeAdmitter) error {
-	if admitter == nil {
-		return errors.New("Connector lifecycle implementation is unavailable")
-	}
+func startSharedService(ctx context.Context, common *v1.ClientCommonConfig, cfgPath string, qcfg *nhpconfig.Config, admitter sharedServiceAdmitter) error {
 	sessions, err := newSharedServiceSessions(common, cfgPath)
 	if err != nil {
 		return err
@@ -1119,6 +1116,7 @@ func runSharedService(ctx context.Context, qcfg *nhpconfig.Config, admitter shar
 	if err != nil {
 		return err
 	}
+	defer announcer.stop()
 	err = runner.Run(ctx)
 	if errors.Is(err, share.ErrGroupEmpty) {
 		return fmt.Errorf("%w: every configured route was retired as permanently unavailable; remove them with 'qurl-connector remove' before restarting", err)
@@ -1137,6 +1135,9 @@ func runSharedService(ctx context.Context, qcfg *nhpconfig.Config, admitter shar
 // runtime's own guard on that invariant, so a config that reached this point
 // by another path fails clearly instead of registering proxies under an
 // admission that does not cover them.
+//
+// ctx scopes only the callbacks' log context; Run(ctx) is what scopes the
+// runner's lifetime.
 func newSharedServiceRunner(ctx context.Context, qcfg *nhpconfig.Config, admitter sharedServiceAdmitter, sessions share.SessionGroupFactory, announcer *readyAnnouncer) (*share.SessionGroupRunner, error) {
 	if qcfg == nil || len(qcfg.Routes) == 0 {
 		return nil, errors.New("shared Connector runtime requires at least one resource")
@@ -1152,7 +1153,12 @@ func newSharedServiceRunner(ctx context.Context, qcfg *nhpconfig.Config, admitte
 	routes := make([]share.LocalHTTPRoute, 0, len(qcfg.Routes))
 	resourceIDs := make(map[string]string, len(qcfg.Routes))
 	for _, route := range qcfg.Routes {
-		if routeKnock := knockResourceIDOrEmpty(qcfg, route.ResourceID); routeKnock != knockResourceID {
+		// An empty knock resource is a route that was never hydrated, which is
+		// a different problem from two routes on different admission targets.
+		switch routeKnock := knockResourceIDOrEmpty(qcfg, route.ResourceID); {
+		case routeKnock == "":
+			return nil, fmt.Errorf("route %q: missing NHP knock resource for qURL Connector %q", route.ID, route.ResourceID)
+		case routeKnock != knockResourceID:
 			return nil, fmt.Errorf("route %q: NHP knock resource %q differs from the Connector session's %q (resource %q); one FRP control session cannot span NHP admission targets", route.ID, routeKnock, knockResourceID, resourceID)
 		}
 		routes = append(routes, share.LocalHTTPRoute{
@@ -1168,6 +1174,7 @@ func newSharedServiceRunner(ctx context.Context, qcfg *nhpconfig.Config, admitte
 			if err := admitter.MarkServingHealthy(); err != nil {
 				slog.WarnContext(ctx, "connector: failed to clear assignment-refresh state after serving", "err", err.Error())
 			}
+			announcer.armFallback(readyFallbackWait)
 		},
 		OnRouteServing: func(routeID string, _ share.Admission) {
 			announcer.routeServing(routeID)
