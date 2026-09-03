@@ -139,7 +139,10 @@ func (a *readyAnnouncer) sessionPromoted(wait time.Duration) {
 }
 
 // setLiveProbe installs the runtime's answer to "which routes serve on the
-// active session now", used by the bounded wait when it fires.
+// active session now", used by the bounded wait when it fires. A probe is
+// replaced only when its runner is; between one runner returning and the
+// next being built the old probe answers for a runner with no active
+// session, which is the conservative answer (nothing live, wait again).
 func (a *readyAnnouncer) setLiveProbe(live func() []string) {
 	if a == nil {
 		return
@@ -147,22 +150,6 @@ func (a *readyAnnouncer) setLiveProbe(live func() []string) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.live = live
-}
-
-// retiredRoutes lists the routes retired so far, in config order.
-func (a *readyAnnouncer) retiredRoutes() []string {
-	if a == nil {
-		return nil
-	}
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	var ids []string
-	for _, route := range a.routes {
-		if _, gone := a.retired[route.routeID]; gone {
-			ids = append(ids, route.routeID)
-		}
-	}
-	return ids
 }
 
 // stop ends the bounded wait for good. The block is not printed by stop.
