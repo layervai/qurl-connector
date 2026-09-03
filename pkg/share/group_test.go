@@ -759,6 +759,7 @@ func TestGroupRotationLeadScalesWithRouteCount(t *testing.T) {
 	tests := []struct {
 		openTime, configured time.Duration
 		routes               int
+		measured             time.Duration
 		want, need           time.Duration
 	}{
 		{openTime: 5 * time.Minute, routes: 1, want: 30 * time.Second, need: 30 * time.Second},
@@ -773,15 +774,74 @@ func TestGroupRotationLeadScalesWithRouteCount(t *testing.T) {
 		{openTime: 1500 * time.Millisecond, routes: 1, want: 750 * time.Millisecond, need: 30 * time.Second},
 		{openTime: time.Second, routes: 1, want: 500 * time.Millisecond, need: 30 * time.Second},
 		{openTime: 100 * time.Millisecond, routes: 1, want: 50 * time.Millisecond, need: 30 * time.Second},
+		// A measured per-route cost above the 50ms estimate replaces it: a
+		// platform that registers 600 routes at 125ms each (margin included)
+		// needs 75s, not the 30s floor, and 1000 routes need 125s.
+		{openTime: 5 * time.Minute, routes: 600, measured: 125 * time.Millisecond, want: 75 * time.Second, need: 75 * time.Second},
+		{openTime: 5 * time.Minute, routes: 1000, measured: 125 * time.Millisecond, want: 125 * time.Second, need: 125 * time.Second},
+		{openTime: 5 * time.Minute, routes: 2000, measured: 125 * time.Millisecond, want: 150 * time.Second, need: 250 * time.Second},
+		// A measured cost below the estimate does not shorten the lead.
+		{openTime: 5 * time.Minute, routes: 1000, measured: 10 * time.Millisecond, want: 50 * time.Second, need: 50 * time.Second},
+		{openTime: 5 * time.Minute, configured: 45 * time.Second, routes: 100, measured: 300 * time.Millisecond, want: 45 * time.Second, need: 45 * time.Second},
 	}
 	for _, test := range tests {
-		got, need := groupRotationLead(test.openTime, test.configured, test.routes)
+		got, need := groupRotationLead(test.openTime, test.configured, test.routes, test.measured)
 		if got != test.want || need != test.need {
-			t.Errorf("groupRotationLead(%s, %s, %d) = (%s, %s), want (%s, %s)", test.openTime, test.configured, test.routes, got, need, test.want, test.need)
+			t.Errorf("groupRotationLead(%s, %s, %d, %s) = (%s, %s), want (%s, %s)", test.openTime, test.configured, test.routes, test.measured, got, need, test.want, test.need)
 		}
 		if got > test.openTime/2 || got < min(time.Second, test.openTime/2) {
-			t.Errorf("groupRotationLead(%s, %s, %d) = %s is outside [min(1s, openTime/2), openTime/2]", test.openTime, test.configured, test.routes, got)
+			t.Errorf("groupRotationLead(%s, %s, %d, %s) = %s is outside [min(1s, openTime/2), openTime/2]", test.openTime, test.configured, test.routes, test.measured, got)
 		}
+	}
+}
+
+func TestSessionGroupRunnerRotationLeadFollowsMeasuredRegistration(t *testing.T) {
+	floor, perRoute := groupLeadFloor, groupLeadPerRoute
+	groupLeadFloor, groupLeadPerRoute = 100*time.Millisecond, time.Millisecond
+	t.Cleanup(func() { groupLeadFloor, groupLeadPerRoute = floor, perRoute })
+
+	// The first session registers a at once and b and c only `spacing`
+	// later, the way a slow server works down its NewProxy queue. The
+	// measured cost is spacing × 3/2 over the two routes that followed the
+	// first, 900ms per route, so three routes need 2.7s of lead: the
+	// replacement must start about 3.3s after admission, not the 5.9s the
+	// a-priori estimate would arm.
+	const (
+		openTime = 6 * time.Second
+		spacing  = 1200 * time.Millisecond
+	)
+	hold := func(sessionIndex int, routeID string) bool { return sessionIndex == 1 && routeID != "a" }
+	h := startGroupHarness(t, openTime, 0, hold, "a", "b", "c")
+	h.waitServing(t, 1, "a")
+	admittedAt := time.Now()
+	session := h.factory.session(1)
+	time.Sleep(spacing)
+	session.serve("b")
+	session.serve("c")
+	h.waitServing(t, 1, "b", "c")
+	waitUntil(t, openTime, func() bool { return h.factory.startCount() == 2 }, "replacement start")
+	elapsed := time.Since(admittedAt)
+	if elapsed < spacing+time.Second || elapsed > openTime-1500*time.Millisecond {
+		t.Fatalf("replacement started %s after admission, want about %s (6s window less the 2.7s the measured registration needs), not the %s the a-priori estimate arms",
+			elapsed, openTime-2700*time.Millisecond, openTime-100*time.Millisecond)
+	}
+	if caps := h.events.leadCaps(); len(caps) != 0 {
+		t.Fatalf("lead cap reports = %+v, want none for a 2.7s need inside a 3s cap", caps)
+	}
+	waitUntil(t, 3*time.Second, func() bool { return len(h.events.promotions()) == 2 }, "replacement promotion")
+	for _, routeID := range []string{"a", "b", "c"} {
+		if failed := h.events.failedFor(routeID); len(failed) != 0 {
+			t.Fatalf("route %q reported failed across the rotation: %v", routeID, failed)
+		}
+	}
+	// The replacement registered everything at once, which measures below
+	// the a-priori estimate: the next lead is the estimate's again, not the
+	// slow first cycle's.
+	h.runner.mu.Lock()
+	measured := h.runner.measuredPerRoute
+	h.runner.mu.Unlock()
+	if measured >= groupLeadPerRoute {
+		t.Fatalf("measured per-route cost after an instant replacement = %s, want below the %s estimate", measured, groupLeadPerRoute)
 	}
 }
 

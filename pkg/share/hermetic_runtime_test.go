@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -84,6 +85,17 @@ type hermeticQRTSPlugin struct {
 	stale         map[string]bool
 	rejectProxies map[string]string
 	observations  []hermeticNewProxyObservation
+	// latency, when set, is how long each NewProxy for the Login RunID takes
+	// to answer, modeling the platform's authorization round trip. The FRP
+	// server reads a control session's messages serially, so the delay is
+	// served in the order the client sent the NewProxy messages.
+	latency map[string]hermeticLatency
+	rng     *rand.Rand
+}
+
+// hermeticLatency is a uniform per-call delay range.
+type hermeticLatency struct {
+	min, max time.Duration
 }
 
 type hermeticTCPForwarder struct {
@@ -145,7 +157,11 @@ func (f *hermeticTCPForwarder) serve() {
 
 func newHermeticQRTSPlugin(t *testing.T) *hermeticQRTSPlugin {
 	t.Helper()
-	plugin := &hermeticQRTSPlugin{stale: make(map[string]bool), rejectProxies: make(map[string]string)}
+	plugin := &hermeticQRTSPlugin{
+		stale: make(map[string]bool), rejectProxies: make(map[string]string),
+		latency: make(map[string]hermeticLatency),
+		rng:     rand.New(rand.NewPCG(7, 7)), //nolint:gosec // deterministic jitter, not security-sensitive
+	}
 	plugin.server = httptest.NewServer(http.HandlerFunc(plugin.handle))
 	t.Cleanup(plugin.server.Close)
 	return plugin
@@ -175,13 +191,31 @@ func (p *hermeticQRTSPlugin) handle(w http.ResponseWriter, r *http.Request) {
 		p.observations = append(p.observations, hermeticNewProxyObservation{
 			runID: request.Content.User.RunID, proxyName: request.Content.ProxyName, rejected: rejected, at: time.Now(),
 		})
+		var delay time.Duration
+		if latency, ok := p.latency[request.Content.User.RunID]; ok {
+			delay = latency.min
+			if spread := latency.max - latency.min; spread > 0 {
+				delay += time.Duration(p.rng.Int64N(int64(spread)))
+			}
+		}
 		p.mu.Unlock()
+		if delay > 0 {
+			time.Sleep(delay)
+		}
 		if rejected {
 			response = map[string]any{"reject": true, "reject_reason": reason}
 		}
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(response)
+}
+
+// delayNewProxy makes every NewProxy authorization for the Login RunID take
+// a uniformly random time in [min, max], the way a platform round trip does.
+func (p *hermeticQRTSPlugin) delayNewProxy(runID string, min, max time.Duration) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.latency[runID] = hermeticLatency{min: min, max: max}
 }
 
 func (p *hermeticQRTSPlugin) markStale(runID string) {
