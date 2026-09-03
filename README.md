@@ -129,12 +129,12 @@ Measured on darwin/arm64 (Apple M5 Max, 18 cores, Go 1.27.1):
 
 | | 1000 routes, race off | 200 routes, race on |
 |---|---|---|
-| `Run()` to every route serving | 324 ms | 88 ms |
+| `Run()` to every route serving | 632 ms | 132 ms |
 | vhost sweep, every route once, 32-way | 79 ms (cold p50 2.2 ms, p99 5.9 ms) | 38 ms (cold p50 5.2 ms, p99 9.9 ms) |
 | steady-state latency, 2000 requests | p50 0.31 ms, p99 0.46 ms | p50 0.67 ms, p99 1.37 ms |
-| rotation: Admit to every route re-registered | 313 ms (promoted at 322 ms) | 89 ms (promoted at 93 ms) |
-| drain: promotion to old proxies withdrawn | 23 ms | 57 ms |
-| overlap requests / failures | 93,345 / 0 | 8,067 / 0 (drain only) |
+| rotation: Admit to every route re-registered | 625 ms (promoted at 633 ms) | 129 ms (promoted at 133 ms) |
+| drain: promotion to old proxies withdrawn | 22 ms | 59 ms |
+| overlap requests / failures | 96,203 / 0 | 8,810 / 0 (drain only) |
 | goroutines per route (the FRP client's status worker) | 1.02 | 1.10 |
 | open FDs at registration (baseline 15) | 19 | 19 |
 | open FDs after every route was hit once | 2,085 (2.07 per route, idle work connections) | 485 |
@@ -146,8 +146,8 @@ Measured on darwin/arm64 (Apple M5 Max, 18 cores, Go 1.27.1):
 | goroutines / FDs after stop (baseline 42 / 15) | 45 / 17 | 45 / 17 |
 
 Registration and rotation are linear and fast: about 80 µs per route on the
-server's serial `NewProxy` path, and about 0.3 ms per route end to end
-because proxies are handed to FRP through a 32-wide registration window
+server's serial `NewProxy` path, and about 0.6 ms per route end to end
+because proxies are handed to FRP through a 16-wide registration window
 that the session refills once per 10 ms status poll in the proof (100 ms in
 production). The production rotation lead's a-priori estimate of 50 ms per
 route is still well over a hundred times what this machine needs. A
@@ -155,15 +155,18 @@ platform behind the server is slower: its per-`NewProxy` authorization and
 registration round trips take hundreds of milliseconds, and because the
 server reads a session's messages serially, N proxies handed to FRP at once
 form an N-deep queue. Two mechanisms keep that queue from turning into
-churn. Proxies register through a window (32 in flight per session), so no
+churn. Proxies register through a window (16 in flight per session), so no
 proxy waits long enough for the pinned client's 20 s `NewProxy` re-send to
 fire and register twice; and the rotation lead follows the registration
 rate the runner measured on the last full cycle (with a 1.5× margin), so a
 replacement is started early enough to register every route before the old
-admission expires. Both are covered hermetically by
-`TestHermeticSessionGroupRotationRegistersEveryRouteOnce`, which answers
-`NewProxy` at platform speed for the replacement session, and by the
-runner's measured-lead tests. The steady-state cost of a route is one
+admission expires. The window is proven hermetically at platform speed by
+`TestHermeticSessionGroupRegistersEveryRouteOnceOnSlowServer` in the
+default lanes and by `TestHermeticSessionGroupRotationRegistersEveryRouteOnce`
+across a rotation under `make proof-1000`; the measured lead by the
+runner's tests. The window cannot bound what the pinned client re-sends on
+its own after a control loss, when its new control registers the whole
+pushed set at Login; that is a fork-side change. The steady-state cost of a route is one
 goroutine and no file descriptor. Memory and descriptors scale
 with idle work connections, not routes: the FRP server keeps up to five idle
 work connections per Host for 60 s, so once every route has been hit the
@@ -194,8 +197,8 @@ server's reverse proxy. Under a deliberately hostile overlap load (16 workers,
 no pause, about 36,000 requests per second across 20 routes) it shows as one
 to three such 404s per rotation in roughly half the runs, every one at its
 own route's re-registration instant; at the proof's background load it
-appears about once per few hundred thousand requests (0 in 93,345 in the
-published 1000-route run, 1 in 95,018 in the run before it, 1 in about
+appears about once per few hundred thousand requests (0 in 96,203 in the
+published 1000-route run, 1 in 95,018 in an earlier one, 1 in about
 500,000 across the 50-route runs). The
 proof attributes every overlap failure to that exact instant, bounds how
 many it will excuse, and fails on any failure outside it. The same

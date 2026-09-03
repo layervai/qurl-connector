@@ -63,6 +63,11 @@ func TestMain(m *testing.M) {
 		// prints several info lines per proxy, which would bury the summary.
 		frplog.InitLogger("console", "warn", 0, true)
 	}
+	// The FRP server's metrics registry is a process-wide global that
+	// EnableMem writes without synchronization against servers already
+	// running; a server from an earlier hermetic test that is still closing
+	// its proxies reads it concurrently. Enable it before any server exists.
+	proofEnableFRPMetrics()
 	os.Exit(m.Run())
 }
 
@@ -70,7 +75,8 @@ var proofFRPMetricsOnce sync.Once
 
 // proofEnableFRPMetrics turns on the FRP server's in-memory proxy statistics,
 // which its /api/proxy/{type} endpoint joins with the live proxy manager to
-// report each proxy as online or offline.
+// report each proxy as online or offline. TestMain calls it first; later
+// calls are no-ops.
 func proofEnableFRPMetrics() { proofFRPMetricsOnce.Do(frpmetrics.EnableMem) }
 
 // proofRoute is one route plus the exact vhost Host and backend echo that

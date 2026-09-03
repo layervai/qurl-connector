@@ -60,10 +60,11 @@ type SessionGroupConfig struct {
 	OnRouteFailed func(routeID string, err error)
 	// OnRetry has the same contract as ResourceConfig.OnRetry.
 	OnRetry func(error, time.Duration)
-	// OnRotationLeadCapped reports, once per route count per admission,
-	// that the admission window is too short for the lead the route count
-	// needs: the replacement gets only lead (half the window) instead of
-	// need, so a rotation may promote before every route re-registers.
+	// OnRotationLeadCapped reports, once per distinct route count and need
+	// per admission, that the admission window is too short for the lead
+	// the route count needs: the replacement gets only lead (half the
+	// window) instead of need, so a rotation may promote before every route
+	// re-registers.
 	OnRotationLeadCapped func(routes int, need, lead time.Duration)
 }
 
@@ -122,9 +123,12 @@ type groupCycle struct {
 	admission Admission
 	session   GroupServingSession
 	expiresAt time.Time
-	// capReported is the route count for which the lead cap was last
-	// reported on this cycle; it is touched only by the Run goroutine.
-	capReported int
+	// capReported and capReportedNeed are the route count and the need for
+	// which the lead cap was last reported on this cycle, so a cap that
+	// binds again after the measured cost moved the need is reported again;
+	// they are touched only by the Run goroutine.
+	capReported     int
+	capReportedNeed time.Duration
 	// firstServingAt is when the first route was observed serving on this
 	// cycle and fullAt when every desired route was (zero until then); the
 	// spacing between them is the server's registration cost for the set.
@@ -228,8 +232,8 @@ func (r *SessionGroupRunner) rotateAt(cycle *groupCycle) time.Time {
 	routes, measured := len(r.desired), r.measuredPerRoute
 	r.mu.Unlock()
 	lead, need := groupRotationLead(cycle.admission.OpenTime, r.cfg.RotationLead, routes, measured)
-	if lead < need && cycle.capReported != routes && r.cfg.OnRotationLeadCapped != nil {
-		cycle.capReported = routes
+	if lead < need && (cycle.capReported != routes || cycle.capReportedNeed != need) && r.cfg.OnRotationLeadCapped != nil {
+		cycle.capReported, cycle.capReportedNeed = routes, need
 		r.cfg.OnRotationLeadCapped(routes, need, lead)
 	}
 	return cycle.expiresAt.Add(-lead)
@@ -256,13 +260,16 @@ func (r *SessionGroupRunner) observeRegistration(cycle *groupCycle, serving int,
 		return
 	}
 	cycle.fullAt = now
-	if serving < 2 {
-		return
-	}
-	// A set that registered inside one observation measures below the
-	// a-priori estimate: zero, so the 50ms floor applies again.
+	// A single route has no spacing to measure, and a set that registered
+	// inside one observation measures below the a-priori estimate: both
+	// record zero, so the 50ms floor applies again rather than a stale
+	// measurement from an earlier, larger cycle. The spacing is the spread
+	// between the first and the last route, so one route that lagged behind
+	// its siblings (a transient start error, say) lengthens the next lead
+	// for the whole set; that errs toward an earlier replacement, is clamped
+	// by the openTime/2 cap, and is replaced by the next full cycle.
 	var perRoute time.Duration
-	if spacing := now.Sub(cycle.firstServingAt); spacing > 0 {
+	if spacing := now.Sub(cycle.firstServingAt); serving >= 2 && spacing > 0 {
 		perRoute = spacing * groupLeadMarginNum / groupLeadMarginDen / time.Duration(serving-1)
 	}
 	r.mu.Lock()

@@ -41,13 +41,36 @@ const MaxGroupRoutes = 2000
 // be refused as already registered, and its response arrives after the
 // original's, on a proxy that is already running, as FRP's "status not wait
 // start, ignore start message" warning. Registering through a window keeps
-// the queue at most window × service time deep — 32 × 300ms is under ten
-// seconds, half the re-send horizon at the slowest service time observed —
-// without lowering throughput, since the server never worked on more than
-// one proxy of a session at a time. Serving proxies never leave the pushed
-// set; only proxies that have not registered yet wait for a slot. A variable
-// so tests can shrink it.
-var groupRegistrationWindow = 32
+// the queue at most window × service time deep: 16 × 500ms is 8s, less than
+// half the re-send horizon at the slowest service time modeled, and the
+// window stays safe up to 1.25s per NewProxy. It costs no throughput, since
+// the server never worked on more than one proxy of a session at a time;
+// the session refills it once per status poll, 160 proxies per second at
+// the default 100ms poll against a platform that registers about a dozen.
+// Serving proxies never leave the pushed set and a regenerated route takes
+// the next slot ahead of routes that never registered; only proxies that
+// have not registered yet wait. A variable so tests can shrink it.
+//
+// The window bounds what this session hands to FRP; it cannot bound what
+// the fork re-sends on its own. After a control loss the fork's new control
+// registers the whole pushed set at Login, before the session can observe
+// the loss, so a session with N serving proxies re-registers N at once and
+// the ones past the re-send horizon register twice. Shrinking the set after
+// the fact would not shorten that queue (those NewProxy messages are already
+// on the wire) and would add a CloseProxy and a later re-registration per
+// withdrawn proxy, so the session leaves a re-Login backlog alone and only
+// pauses releases until it registers. Bounding the re-Login set is a
+// fork-side change.
+var groupRegistrationWindow = 16
+
+// groupReleasedPendingFactor caps, as a multiple of the window, how many
+// released proxies may be pending at once, in flight or waiting out a
+// transient start error on the client. Errored proxies hold no window slot,
+// but FRP re-sends every one of them after its 30s start-error interval, so
+// without a ceiling a wave of transient refusals would release as many new
+// routes as it errored and the re-sent batch would land on top of a full
+// window.
+const groupReleasedPendingFactor = 2
 
 // ErrRouteNotServing reports a route that stayed configured but did not reach
 // FRP's running phase on a replacement session before the prior admission
@@ -355,6 +378,11 @@ type groupRouteEntry struct {
 	// entry that is not released is waiting for a registration-window slot;
 	// it is pending, and FRP does not know it yet.
 	released bool
+	// replaces marks a regenerated route whose previous proxy was already
+	// released: the old proxy leaves the pushed set with this entry's first
+	// push, so the entry takes the next slot ahead of routes that never
+	// registered and the route is dark for at most one slot turnover.
+	replaces bool
 }
 
 type frpGroupSession struct {
@@ -411,31 +439,36 @@ func newFRPGroupSession(svc frpGroupService, status frpclient.StatusExporter, co
 	return session
 }
 
-// inflightLocked counts proxies FRP holds that have not registered: released,
-// pending, and without a start error. A proxy the server refused with a
-// transient error is waiting out FRP's own retry interval on the client, not
-// in the server's queue, so it does not hold a window slot; it re-enters the
-// count when FRP re-sends its NewProxy and the error clears.
-func (s *frpGroupSession) inflightLocked() int {
-	inflight := 0
+// windowLoadLocked counts the released proxies that have not registered:
+// inflight are the ones FRP is waiting on (pending, no start error) and
+// pending is every released pending proxy, errored ones included. A proxy
+// the server refused with a transient error is waiting out FRP's own retry
+// interval on the client, not in the server's queue, so it holds no window
+// slot; it re-enters inflight when FRP re-sends its NewProxy and the error
+// clears, and it always counts against the released-pending ceiling.
+func (s *frpGroupSession) windowLoadLocked() (inflight, pending int) {
 	for _, entry := range s.routes {
-		if entry.released && entry.phase == RoutePending && entry.err == nil {
+		if !entry.released || entry.phase != RoutePending {
+			continue
+		}
+		pending++
+		if entry.err == nil {
 			inflight++
 		}
 	}
-	return inflight
+	return inflight, pending
 }
 
-// releaseWindowLocked hands unreleased pending routes to FRP, in route ID
-// order, while the number of proxies awaiting registration is below the
-// window. It reports whether any route was released; the caller owes FRP a
-// push when it was. The window cannot shrink a set FRP already holds: after
-// a control loss the client re-registers every pushed proxy at once, and
-// withdrawing the excess would only add a CloseProxy and a second NewProxy
-// per proxy, so releases simply pause until that backlog registers.
+// releaseWindowLocked hands unreleased pending routes to FRP while the
+// number of proxies awaiting registration is below the window and the
+// released pending set is below its ceiling: regenerated routes first, then
+// in route ID order. It reports whether any route was released; the caller
+// owes FRP a push when it was.
 func (s *frpGroupSession) releaseWindowLocked() bool {
-	inflight := s.inflightLocked()
-	if inflight >= groupRegistrationWindow {
+	window := max(1, groupRegistrationWindow)
+	ceiling := groupReleasedPendingFactor * window
+	inflight, pending := s.windowLoadLocked()
+	if inflight >= window || pending >= ceiling {
 		return false
 	}
 	var waiting []string
@@ -447,14 +480,21 @@ func (s *frpGroupSession) releaseWindowLocked() bool {
 	if len(waiting) == 0 {
 		return false
 	}
-	sort.Strings(waiting)
+	sort.Slice(waiting, func(i, j int) bool {
+		a, b := s.routes[waiting[i]], s.routes[waiting[j]]
+		if a.replaces != b.replaces {
+			return a.replaces
+		}
+		return waiting[i] < waiting[j]
+	})
 	released := false
 	for _, routeID := range waiting {
-		if inflight >= groupRegistrationWindow {
+		if inflight >= window || pending >= ceiling {
 			break
 		}
 		s.routes[routeID].released = true
 		inflight++
+		pending++
 		released = true
 	}
 	return released
@@ -666,7 +706,11 @@ func (s *frpGroupSession) Update(ctx context.Context, routes []GroupRoute) error
 			next[route.RouteID] = current
 			continue
 		}
-		next[route.RouteID] = &groupRouteEntry{route: route, name: name, phase: RoutePending}
+		entry := &groupRouteEntry{route: route, name: name, phase: RoutePending}
+		if current, ok := s.routes[route.RouteID]; ok && current.released {
+			entry.replaces = true
+		}
+		next[route.RouteID] = entry
 	}
 	s.routes = next
 	s.releaseWindowLocked()

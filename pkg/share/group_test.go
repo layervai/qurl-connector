@@ -796,18 +796,21 @@ func TestGroupRotationLeadScalesWithRouteCount(t *testing.T) {
 }
 
 func TestSessionGroupRunnerRotationLeadFollowsMeasuredRegistration(t *testing.T) {
+	// A 20ms a-priori estimate keeps the 100ms floor binding for three
+	// routes (60ms) while leaving an instant replacement's measured cost,
+	// the gap between two Run-goroutine observations, well below it.
 	floor, perRoute := groupLeadFloor, groupLeadPerRoute
-	groupLeadFloor, groupLeadPerRoute = 100*time.Millisecond, time.Millisecond
+	groupLeadFloor, groupLeadPerRoute = 100*time.Millisecond, 20*time.Millisecond
 	t.Cleanup(func() { groupLeadFloor, groupLeadPerRoute = floor, perRoute })
 
 	// The first session registers a at once and b and c only `spacing`
 	// later, the way a slow server works down its NewProxy queue. The
 	// measured cost is spacing × 3/2 over the two routes that followed the
-	// first, 900ms per route, so three routes need 2.7s of lead: the
-	// replacement must start about 3.3s after admission, not the 5.9s the
-	// a-priori estimate would arm.
+	// first, 900ms per route, so three routes need 2.7s of lead inside a 4s
+	// cap: the replacement must start about 5.3s after admission, not the
+	// 7.9s the a-priori estimate would arm.
 	const (
-		openTime = 6 * time.Second
+		openTime = 8 * time.Second
 		spacing  = 1200 * time.Millisecond
 	)
 	hold := func(sessionIndex int, routeID string) bool { return sessionIndex == 1 && routeID != "a" }
@@ -822,11 +825,11 @@ func TestSessionGroupRunnerRotationLeadFollowsMeasuredRegistration(t *testing.T)
 	waitUntil(t, openTime, func() bool { return h.factory.startCount() == 2 }, "replacement start")
 	elapsed := time.Since(admittedAt)
 	if elapsed < spacing+time.Second || elapsed > openTime-1500*time.Millisecond {
-		t.Fatalf("replacement started %s after admission, want about %s (6s window less the 2.7s the measured registration needs), not the %s the a-priori estimate arms",
+		t.Fatalf("replacement started %s after admission, want about %s (8s window less the 2.7s the measured registration needs), not the %s the a-priori estimate arms",
 			elapsed, openTime-2700*time.Millisecond, openTime-100*time.Millisecond)
 	}
 	if caps := h.events.leadCaps(); len(caps) != 0 {
-		t.Fatalf("lead cap reports = %+v, want none for a 2.7s need inside a 3s cap", caps)
+		t.Fatalf("lead cap reports = %+v, want none for a 2.7s need inside a 4s cap", caps)
 	}
 	waitUntil(t, 3*time.Second, func() bool { return len(h.events.promotions()) == 2 }, "replacement promotion")
 	for _, routeID := range []string{"a", "b", "c"} {
