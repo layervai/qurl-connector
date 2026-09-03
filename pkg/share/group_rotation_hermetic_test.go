@@ -178,6 +178,9 @@ func (h *slowServerHarness) stop(t *testing.T) {
 // once. It is the same Login-then-register path a rotation replacement
 // takes, at about a third of the rotation reproduction's wall time.
 func TestHermeticSessionGroupRegistersEveryRouteOnceOnSlowServer(t *testing.T) {
+	if testing.Short() {
+		t.Skip("the platform-speed registration takes about half a minute by construction")
+	}
 	first := Admission{
 		RunID: "1111111111111111", RunAttempt: 1, Token: "token-one", SessionID: 101,
 		SessionReceipt: testSessionReceipt(101, "1111111111111111", 1), OpenTime: 10 * time.Minute,

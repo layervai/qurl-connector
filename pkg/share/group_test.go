@@ -1011,3 +1011,40 @@ func TestSessionGroupRunnerRefusesConcurrentRun(t *testing.T) {
 		t.Fatalf("second Run() = %v, want refusal", err)
 	}
 }
+
+func TestSessionGroupRunnerRotationLeadMeasuresWithoutEveryRouteServing(t *testing.T) {
+	floor, perRoute := groupLeadFloor, groupLeadPerRoute
+	groupLeadFloor, groupLeadPerRoute = 100*time.Millisecond, 20*time.Millisecond
+	t.Cleanup(func() { groupLeadFloor, groupLeadPerRoute = floor, perRoute })
+
+	// Route c never registers on the first session, the way a route the
+	// server keeps refusing never does. The measurement must still follow
+	// the routes that did: b served `spacing` after a, 1.8s per route with
+	// the margin, so three routes need 5.4s, which the 4s cap binds. The
+	// replacement therefore starts at the cap, about 4s after admission,
+	// not the 7.9s the a-priori estimate would arm, and the cap is reported.
+	const (
+		openTime = 8 * time.Second
+		spacing  = 1200 * time.Millisecond
+	)
+	hold := func(sessionIndex int, routeID string) bool { return sessionIndex == 1 && routeID != "a" }
+	h := startGroupHarness(t, openTime, 0, hold, "a", "b", "c")
+	h.waitServing(t, 1, "a")
+	admittedAt := time.Now()
+	session := h.factory.session(1)
+	time.Sleep(spacing)
+	session.serve("b")
+	h.waitServing(t, 1, "b")
+	waitUntil(t, openTime, func() bool { return h.factory.startCount() == 2 }, "replacement start")
+	elapsed := time.Since(admittedAt)
+	if elapsed < openTime/2-500*time.Millisecond || elapsed > openTime-1500*time.Millisecond {
+		t.Fatalf("replacement started %s after admission, want about %s (the cap), not the %s the a-priori estimate arms",
+			elapsed, openTime/2, openTime-100*time.Millisecond)
+	}
+	caps := h.events.leadCaps()
+	if len(caps) == 0 || caps[0].routes != 3 || caps[0].lead != openTime/2 || caps[0].need < 5*time.Second {
+		t.Fatalf("lead cap reports = %+v, want three routes needing about 5.4s and getting 4s", caps)
+	}
+	waitUntil(t, 3*time.Second, func() bool { return len(h.events.promotions()) == 2 }, "replacement promotion")
+	h.waitServing(t, 2, "a", "b", "c")
+}

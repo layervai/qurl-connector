@@ -113,9 +113,9 @@ type SessionGroupRunner struct {
 	// reported maps route ID to the proxy name last reported serving on the
 	// active cycle, so a promotion or restart re-reports while flaps do not.
 	reported map[string]string
-	// measuredPerRoute is the per-route registration cost the last fully
-	// registered cycle measured, margin included; zero until a cycle has
-	// brought every route up. See groupRotationLead.
+	// measuredPerRoute is the per-route registration cost measured on the
+	// latest cycle, margin included; zero until a cycle has registered at
+	// least two routes. See groupRotationLead and observeRegistration.
 	measuredPerRoute time.Duration
 }
 
@@ -129,12 +129,15 @@ type groupCycle struct {
 	// they are touched only by the Run goroutine.
 	capReported     int
 	capReportedNeed time.Duration
-	// firstServingAt is when the first route was observed serving on this
-	// cycle and fullAt when every desired route was (zero until then); the
-	// spacing between them is the server's registration cost for the set.
-	// Both are touched only by the Run goroutine.
+	// initial is the route count the cycle was started with. firstServingAt
+	// is when its first route was observed serving, highWater the most
+	// routes observed serving at once, and measured reports that the cycle
+	// has registered its initial set and its measurement is final. All are
+	// touched only by the Run goroutine.
+	initial        int
 	firstServingAt time.Time
-	fullAt         time.Time
+	highWater      int
+	measured       bool
 }
 
 func NewSessionGroupRunner(cfg SessionGroupConfig) (*SessionGroupRunner, error) {
@@ -240,34 +243,38 @@ func (r *SessionGroupRunner) rotateAt(cycle *groupCycle) time.Time {
 }
 
 // observeRegistration tracks a cycle's registration progress from the Run
-// goroutine: the instant its first route served and, when full is set, the
-// instant every desired route did. The spacing between the two, spread over
-// the routes that registered after the first and widened by the safety
-// margin, is the per-route cost the next lead is sized with; the knock and
-// Login before the first route belong to the lead floor. The latest full
-// cycle wins, so a slow platform lengthens the next lead and a recovered one
+// goroutine and keeps the runner's per-route estimate current. It measures
+// the spacing from the instant the cycle's first route served to the latest
+// instant its serving count grew, spread over the routes that registered
+// after the first and widened by the safety margin; the knock and Login
+// before the first route belong to the lead floor. The estimate is updated
+// on every growth of the count, so it is defined from the second route on
+// and a route the server keeps refusing does not leave the lead sized from
+// the a-priori guess, and it is frozen once the cycle has registered the
+// set it started with, so routes added later do not stretch it. The latest
+// cycle wins: a slow platform lengthens the next lead and a recovered one
 // shortens it again. A cycle promoted at the old admission's expiry with
-// routes still queued is measured once those routes come up, which is
-// exactly the cost the next lead must cover.
-func (r *SessionGroupRunner) observeRegistration(cycle *groupCycle, serving int, full bool, now time.Time) {
-	if serving <= 0 {
+// routes still queued keeps measuring as they come up, which is exactly
+// the cost the next lead must cover. The spacing is the spread between the
+// first and the latest route, so one route that lagged behind its siblings
+// lengthens the next lead for the whole set; that errs toward an earlier
+// replacement, is clamped by the openTime/2 cap, and is replaced by the
+// next cycle.
+func (r *SessionGroupRunner) observeRegistration(cycle *groupCycle, serving int, now time.Time) {
+	if serving <= 0 || cycle.measured {
 		return
 	}
 	if cycle.firstServingAt.IsZero() {
 		cycle.firstServingAt = now
 	}
-	if !full || !cycle.fullAt.IsZero() {
+	if serving <= cycle.highWater {
 		return
 	}
-	cycle.fullAt = now
+	cycle.highWater = serving
 	// A single route has no spacing to measure, and a set that registered
 	// inside one observation measures below the a-priori estimate: both
-	// record zero, so the 50ms floor applies again rather than a stale
-	// measurement from an earlier, larger cycle. The spacing is the spread
-	// between the first and the last route, so one route that lagged behind
-	// its siblings (a transient start error, say) lengthens the next lead
-	// for the whole set; that errs toward an earlier replacement, is clamped
-	// by the openTime/2 cap, and is replaced by the next full cycle.
+	// record zero, so the 50ms floor applies rather than a stale measurement
+	// from an earlier cycle.
 	var perRoute time.Duration
 	if spacing := now.Sub(cycle.firstServingAt); serving >= 2 && spacing > 0 {
 		perRoute = spacing * groupLeadMarginNum / groupLeadMarginDen / time.Duration(serving-1)
@@ -275,6 +282,9 @@ func (r *SessionGroupRunner) observeRegistration(cycle *groupCycle, serving int,
 	r.mu.Lock()
 	r.measuredPerRoute = perRoute
 	r.mu.Unlock()
+	if serving >= cycle.initial {
+		cycle.measured = true
+	}
 }
 
 // Run serves until ctx ends. Admission and connection failures retry forever
@@ -626,7 +636,7 @@ func (r *SessionGroupRunner) startCycleAttempt(ctx context.Context, old *groupCy
 	if err != nil {
 		return nil, errors.Join(err, r.retireAdmission(admission))
 	}
-	cycle := &groupCycle{admission: admission, session: session, expiresAt: expiresAt, capReported: -1}
+	cycle := &groupCycle{admission: admission, session: session, expiresAt: expiresAt, capReported: -1, initial: len(routes)}
 	r.setPending(cycle)
 	// Route changes that raced with Start land on the new session now; a
 	// session that already ended is caught below.
@@ -647,7 +657,7 @@ func (r *SessionGroupRunner) startCycleAttempt(ctx context.Context, old *groupCy
 		if r.desiredCount() == 0 {
 			return nil, r.failCycle(cycle, ErrGroupEmpty)
 		}
-		r.observeRegistration(cycle, countServing(states), false, time.Now())
+		r.observeRegistration(cycle, countServing(states), time.Now())
 		if r.cycleServing(states, old) {
 			return cycle, nil
 		}
@@ -658,7 +668,7 @@ func (r *SessionGroupRunner) startCycleAttempt(ctx context.Context, old *groupCy
 			if r.desiredCount() == 0 {
 				return nil, r.failCycle(cycle, ErrGroupEmpty)
 			}
-			r.observeRegistration(cycle, countServing(states), false, time.Now())
+			r.observeRegistration(cycle, countServing(states), time.Now())
 			if old != nil && anyRouteServing(states) {
 				// The old admission is expiring: promote what came up and
 				// report what the old session served that did not.
@@ -833,9 +843,8 @@ func (r *SessionGroupRunner) reportActive(ctx context.Context) {
 			serving = append(serving, routeID)
 		}
 	}
-	full := servingCount == len(r.desired)
 	r.mu.Unlock()
-	r.observeRegistration(active, servingCount, full, time.Now())
+	r.observeRegistration(active, servingCount, time.Now())
 	if r.cfg.OnRouteServing == nil {
 		return
 	}

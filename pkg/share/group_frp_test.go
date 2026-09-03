@@ -986,3 +986,33 @@ func TestFRPGroupSessionRegeneratedRouteTakesNextSlot(t *testing.T) {
 	status.set("m-nhp7-r1", frpproxy.ProxyPhaseRunning, "")
 	waitForLastPush(t, svc, []string{"a-nhp7", "m-nhp7-r1", "n-nhp7"})
 }
+
+func TestFRPGroupSessionCeilingAgesOutDurableStartErrors(t *testing.T) {
+	withRegistrationWindow(t, 1)
+	hold := groupErroredHold
+	groupErroredHold = 30 * time.Millisecond
+	t.Cleanup(func() { groupErroredHold = hold })
+	svc := &recordingGroupService{}
+	status := &lockedStatusMap{}
+	session := startTestGroupSession(t, svc, status, groupRoutesOf(groupTestRoutes("a", "b", "c", "d")))
+	// Two refusals fill the ceiling; while they are recent, c waits.
+	status.set("a-nhp7", frpproxy.ProxyPhaseStartErr, "subdomain_conflict: taken")
+	waitForLastPush(t, svc, []string{"a-nhp7", "b-nhp7"})
+	status.set("b-nhp7", frpproxy.ProxyPhaseStartErr, "subdomain_conflict: taken")
+	waitForRouteStates(t, session, func(s map[string]RouteState) bool { return s["b"].Err != nil })
+	if got := liveProxyNames(session); !reflect.DeepEqual(got, []string{"a-nhp7", "b-nhp7"}) {
+		t.Fatalf("FRP proxy set with two fresh refusals = %q, want c held back", got)
+	}
+	// A refusal the server keeps repeating is those routes' own problem:
+	// once it is older than the hold, their siblings register through the
+	// window as if the errored routes were not there.
+	waitForLastPush(t, svc, []string{"a-nhp7", "b-nhp7", "c-nhp7"})
+	states := session.RouteStates()
+	for _, routeID := range []string{"a", "b"} {
+		if state := states[routeID]; state.Phase != RoutePending || state.Err == nil {
+			t.Fatalf("durably refused route %q = %+v, want still pending with its error", routeID, state)
+		}
+	}
+	status.set("c-nhp7", frpproxy.ProxyPhaseRunning, "")
+	waitForLastPush(t, svc, []string{"a-nhp7", "b-nhp7", "c-nhp7", "d-nhp7"})
+}
