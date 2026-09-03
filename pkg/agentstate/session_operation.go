@@ -84,6 +84,9 @@ type SessionOperationRecord struct {
 	// one per failed post-expiry exchange, never by wall-clock movement, so a
 	// clock correction alone can never retire a session the server still holds.
 	// Zero is omitted so journals written before this field decode unchanged.
+	// Downgrade is not supported once it is nonzero: the closed decoder makes a
+	// binary that predates this field report the whole journal corrupt, which
+	// is the fail-closed, operator-attention path for that resource.
 	PostExpiryNoReplyAttempts uint32 `json:"post_expiry_no_reply_attempts,omitempty"`
 }
 

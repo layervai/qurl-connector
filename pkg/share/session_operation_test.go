@@ -1773,14 +1773,22 @@ func TestNativeSessionRecoveryAbandonMarginCoversServerRecoveryMargin(t *testing
 }
 
 func TestNativeSessionNoReplyClassification(t *testing.T) {
-	silence := []error{
+	// Unanswered datagrams: re-fence and count.
+	countable := []error{
 		qurl.ErrEndpointNoReply, silentEndpoint(testDurableRecoveryEndpoint()),
-		nativeudp.ErrNoReply, nativeudp.ErrTransport, nativeudp.ErrResolve, nativeudp.ErrServerUnauthenticated,
+		nativeudp.ErrNoReply, nativeudp.ErrServerUnauthenticated,
 		context.DeadlineExceeded, fmt.Errorf("recover: %w", context.DeadlineExceeded),
 	}
-	for _, err := range silence {
-		if !isNativeSessionNoReplyError(err) {
-			t.Errorf("%v should count as silence", err)
+	for _, err := range countable {
+		if !isNativeSessionNoReplyError(err) || !isNativeSessionCountableSilence(err) {
+			t.Errorf("%v should re-fence and count as silence", err)
+		}
+	}
+	// The packet never left this host: re-fence, but never count.
+	offline := []error{nativeudp.ErrTransport, nativeudp.ErrResolve, fmt.Errorf("recover: %w", nativeudp.ErrResolve)}
+	for _, err := range offline {
+		if !isNativeSessionNoReplyError(err) || isNativeSessionCountableSilence(err) {
+			t.Errorf("%v should re-fence but must not count as silence", err)
 		}
 	}
 	decisions := []error{
@@ -1791,9 +1799,234 @@ func TestNativeSessionNoReplyClassification(t *testing.T) {
 		errors.New("recovery reply lost"),
 	}
 	for _, err := range decisions {
-		if isNativeSessionNoReplyError(err) {
+		if isNativeSessionNoReplyError(err) || isNativeSessionCountableSilence(err) {
 			t.Errorf("%v must not count as silence", err)
 		}
+	}
+	answers := map[string]struct {
+		result *qurl.NativeSessionOperationRecovery
+		err    error
+	}{
+		"complete":             {result: &qurl.NativeSessionOperationRecovery{Complete: true}},
+		"still revoking":       {result: &qurl.NativeSessionOperationRecovery{}},
+		"typed deny":           {err: &qurl.ServerDenyError{ErrCode: "52004"}},
+		"unexpected admission": {err: &qurl.NativeSessionOperationUnexpectedAdmissionError{}},
+	}
+	for name, answer := range answers {
+		if !nativeSessionEndpointAnswered(answer.result, answer.err) {
+			t.Errorf("%s must count as an authenticated answer", name)
+		}
+	}
+	notAnswers := map[string]error{
+		"canceled":         fmt.Errorf("%w: %w", qurl.ErrEndpointNoReply, context.Canceled),
+		"silent":           silentEndpoint(testDurableRecoveryEndpoint()),
+		"local validation": qurl.ErrInvalidNativeSessionOperation,
+		"malformed":        qurl.ErrMalformedReply,
+	}
+	for name, err := range notAnswers {
+		if nativeSessionEndpointAnswered(nil, err) || nativeSessionEndpointAnswered(nil, nil) {
+			t.Errorf("%s must not count as an answer", name)
+		}
+	}
+}
+
+// Offline is not silence. A resolver or socket failure means no datagram left
+// this host, so past expiry the record is still re-fenced but never counted:
+// the connector keeps its handle on a session the server may still hold.
+func TestDurableNativeSessionRecoveryOfflineFailuresNeverCountTowardAbandonment(t *testing.T) {
+	for name, offline := range map[string]error{"resolver": nativeudp.ErrResolve, "socket": nativeudp.ErrTransport} {
+		t.Run(name, func(t *testing.T) {
+			f := newRecoveryFixture(t, true)
+			f.now = f.pastAbandonMargin()
+			f.answer(t, func(endpoint qurl.NHPUDPEndpoint, _ int) (*qurl.NativeSessionOperationRecovery, error) {
+				if endpoint == f.pinned {
+					// The pinned datagram did leave; only the re-fence leg is offline.
+					return nil, silentEndpoint(endpoint)
+				}
+				return nil, fmt.Errorf("recover: %w", offline)
+			})
+			const passes = nativeSessionRecoveryAbandonAttempts * 2
+			for pass := 1; pass <= passes; pass++ {
+				if err := f.recover(context.Background()); !errors.Is(err, qurl.ErrEndpointNoReply) {
+					t.Fatalf("pass %d = %v", pass, err)
+				}
+				f.now = f.now.Add(time.Minute)
+			}
+			records := f.records(t)
+			if len(records) != 1 || records[0].PostExpiryNoReplyAttempts != 0 || records[0].RecoveryEndpoint != f.pinned {
+				t.Fatalf("records after %d offline passes = %+v, want the pinned CLOSING record with no counted failures", passes, records)
+			}
+			if pinned, current := countEndpoints(f.exchanges, f.pinned), countEndpoints(f.exchanges, f.current); pinned != passes || current != passes {
+				t.Fatalf("exchanges pinned=%d current=%d, want the re-fence still attempted every pass", pinned, current)
+			}
+		})
+	}
+	t.Run("pinned offline", func(t *testing.T) {
+		f := newRecoveryFixture(t, true)
+		f.now = f.pastAbandonMargin()
+		f.answer(t, func(endpoint qurl.NHPUDPEndpoint, _ int) (*qurl.NativeSessionOperationRecovery, error) {
+			if endpoint == f.pinned {
+				return nil, fmt.Errorf("recover: %w", nativeudp.ErrResolve)
+			}
+			return nil, silentEndpoint(endpoint)
+		})
+		for pass := 1; pass <= nativeSessionRecoveryAbandonAttempts*2; pass++ {
+			if err := f.recover(context.Background()); !errors.Is(err, nativeudp.ErrResolve) {
+				t.Fatalf("pass %d = %v", pass, err)
+			}
+			f.now = f.now.Add(time.Minute)
+		}
+		if records := f.records(t); len(records) != 1 || records[0].PostExpiryNoReplyAttempts != 0 {
+			t.Fatalf("records = %+v, want no counted failures while the pinned leg is offline", records)
+		}
+	})
+}
+
+// A canceled caller or a local failure during the re-fence exchange is not an
+// answer: the endpoint is not moved, nothing is counted, and both causes reach
+// the caller.
+func TestDurableNativeSessionRecoveryRefenceWithoutEvidenceMovesNothing(t *testing.T) {
+	for name, refenceErr := range map[string]error{
+		"caller canceled mid-exchange": fmt.Errorf("%w: %w", qurl.ErrEndpointNoReply, context.Canceled),
+		"local validation failure":     qurl.ErrInvalidNativeSessionOperation,
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := newRecoveryFixture(t, true)
+			f.now = f.pastAbandonMargin()
+			f.answer(t, func(endpoint qurl.NHPUDPEndpoint, _ int) (*qurl.NativeSessionOperationRecovery, error) {
+				if endpoint == f.pinned {
+					return nil, silentEndpoint(endpoint)
+				}
+				return nil, refenceErr
+			})
+			err := f.recover(context.Background())
+			if !errors.Is(err, qurl.ErrEndpointNoReply) || !errors.Is(err, refenceErr) {
+				t.Fatalf("recovery = %v, want both the pinned silence and the re-fence cause", err)
+			}
+			records := f.records(t)
+			if len(records) != 1 || records[0].RecoveryEndpoint != f.pinned || records[0].PostExpiryNoReplyAttempts != 0 ||
+				records[0].RecoveryAttempt != 1 {
+				t.Fatalf("records = %+v, want the pinned endpoint kept and nothing counted", records)
+			}
+			for _, record := range f.store.committed() {
+				if record.RecoveryEndpoint != f.pinned {
+					t.Fatalf("the endpoint was moved on no evidence: %+v", record)
+				}
+			}
+		})
+	}
+	t.Run("caller context ended before the move", func(t *testing.T) {
+		f := newRecoveryFixture(t, true)
+		ctx, cancel := context.WithCancel(context.Background())
+		f.answer(t, func(endpoint qurl.NHPUDPEndpoint, _ int) (*qurl.NativeSessionOperationRecovery, error) {
+			if endpoint == f.pinned {
+				return nil, silentEndpoint(endpoint)
+			}
+			// The reply is authenticated, but the caller is gone before it can be
+			// acted on; no durable write may follow.
+			cancel()
+			return &qurl.NativeSessionOperationRecovery{Complete: true}, nil
+		})
+		if err := f.recover(ctx); !errors.Is(err, context.Canceled) {
+			t.Fatalf("recovery = %v, want cancellation", err)
+		}
+		if records := f.records(t); len(records) != 1 || records[0].RecoveryEndpoint != f.pinned {
+			t.Fatalf("records = %+v, want the pinned record untouched", records)
+		}
+	})
+}
+
+// concurrentAdvanceStore simulates another process winning the race on the
+// endpoint move: right before the move is written, the record it targets has
+// already taken a legal recovery step, so the move loses its compare-and-swap.
+type concurrentAdvanceStore struct {
+	*transitionRecordingStore
+	current   qurl.NHPUDPEndpoint
+	preempted int
+}
+
+func (s *concurrentAdvanceStore) TransitionSessionOperation(ctx context.Context, previous, next agentstate.SessionOperationRecord) error {
+	if next.RecoveryEndpoint == s.current && previous.RecoveryEndpoint != s.current && s.preempted == 0 {
+		s.preempted++
+		advanced := previous
+		advanced.RecoveryAttempt++
+		advanced.RecoveryNotBeforeMilli++
+		if err := s.transitionRecordingStore.TransitionSessionOperation(ctx, previous, advanced); err != nil {
+			return err
+		}
+	}
+	return s.transitionRecordingStore.TransitionSessionOperation(ctx, previous, next)
+}
+
+func TestDurableNativeSessionRecoveryReconcilesLostEndpointMoveAndRetries(t *testing.T) {
+	f := newRecoveryFixture(t, true)
+	store := &concurrentAdvanceStore{transitionRecordingStore: f.store, current: f.current}
+	f.controller.store = store
+	f.answer(t, func(endpoint qurl.NHPUDPEndpoint, _ int) (*qurl.NativeSessionOperationRecovery, error) {
+		if endpoint == f.pinned {
+			return nil, silentEndpoint(endpoint)
+		}
+		return &qurl.NativeSessionOperationRecovery{Complete: true}, nil
+	})
+	if err := f.recover(context.Background()); err != nil {
+		t.Fatalf("recovery after a lost endpoint move = %v", err)
+	}
+	if store.preempted != 1 {
+		t.Fatalf("preempted=%d, want the first move to lose its compare-and-swap", store.preempted)
+	}
+	// The lost move reloads and retries the whole attempt: pinned again, then
+	// the current endpoint again, and only then the terminal write.
+	want := []qurl.NHPUDPEndpoint{f.pinned, f.current, f.pinned, f.current}
+	if len(f.exchanges) != len(want) {
+		t.Fatalf("exchanges = %+v, want %+v", f.exchanges, want)
+	}
+	for index := range want {
+		if f.exchanges[index] != want[index] {
+			t.Fatalf("exchange %d = %+v, want %+v", index, f.exchanges[index], want[index])
+		}
+	}
+	if records := f.records(t); len(records) != 0 {
+		t.Fatalf("records = %+v, want deletion after the retried move", records)
+	}
+	moves := 0
+	for _, record := range f.store.committed() {
+		if record.RecoveryEndpoint == f.current && record.Status == agentstate.SessionOperationClosing {
+			moves++
+		}
+	}
+	if moves != 1 {
+		t.Fatalf("committed endpoint moves = %d, want exactly one", moves)
+	}
+}
+
+func TestDurableNativeSessionRecoveryFailsClosedWhenRefencedAdmissionCannotBePersisted(t *testing.T) {
+	f := newRecoveryFixture(t, false)
+	store := &concurrentAdvanceStore{transitionRecordingStore: f.store, current: f.current}
+	f.controller.store = store
+	receipt := qurl.NativeSessionReceipt{
+		CellID: f.operation.CellID, SessionID: 93, SessionIssuedAtMillis: 1_800_000_012_000,
+		RunID: f.operation.RunID, RunAttempt: f.operation.RunAttempt,
+	}
+	f.answer(t, func(endpoint qurl.NHPUDPEndpoint, _ int) (*qurl.NativeSessionOperationRecovery, error) {
+		if endpoint == f.pinned {
+			return nil, silentEndpoint(endpoint)
+		}
+		admitted := receipt
+		return &qurl.NativeSessionOperationRecovery{UnexpectedAdmission: &admitted},
+			&qurl.NativeSessionOperationUnexpectedAdmissionError{SessionReceipt: receipt}
+	})
+	err := f.recover(context.Background())
+	if err == nil || !errors.Is(err, agentstate.ErrSessionOperationCASLost) ||
+		!strings.Contains(err.Error(), "persist re-fenced recovery endpoint") {
+		t.Fatalf("recovery = %v, want fail-closed on the lost endpoint move while holding an admission", err)
+	}
+	if len(f.exchanges) != 2 {
+		t.Fatalf("exchanges = %d, want no further packet after the ambiguity", len(f.exchanges))
+	}
+	records := f.records(t)
+	if len(records) != 1 || records[0].Status != agentstate.SessionOperationDispatching ||
+		records[0].Admission != nil || records[0].RecoveryEndpoint != f.pinned {
+		t.Fatalf("records = %+v, want the pinned DISPATCHING record preserved for the next pass", records)
 	}
 }
 

@@ -302,15 +302,24 @@ func (d *durableNativeSessionOperations) RecoverOperation(ctx context.Context, b
 		}
 		record = attempt
 		result, err := recoverNativeSessionOperation(ctx, binding, privateKey, record.Operation, record.RecoveryEndpoint, udpOptions...)
+		// countable stays true only while every endpoint this attempt reached
+		// left a datagram unanswered; a re-fence leg that never got its chance
+		// (resolver or socket failure) withdraws the pinned silence as evidence.
+		countable := isNativeSessionCountableSilence(err)
 		if err != nil && isNativeSessionNoReplyError(err) && ctx.Err() == nil {
 			// The pinned endpoint stayed silent. After a server cohort roll the
 			// cell's live endpoint moves to another host or server key while the
 			// durable operation store stays shared within the cell, so give this
 			// same attempt one more exchange against the current same-cell
-			// endpoint before counting it as a failure.
+			// endpoint before counting it as a failure. RecoverPending shares one
+			// cleanup budget across a resource's records, so this second exchange
+			// halves the per-pass recovery rate of a multi-record journal during a
+			// roll; a starved sibling fails with the caller's deadline, which the
+			// ctx.Err() guards keep out of the post-expiry count.
 			if current, ok := nativeSessionRefenceEndpoint(binding, record); ok {
 				refenced, refenceErr := recoverNativeSessionOperation(ctx, binding, privateKey, record.Operation, current, udpOptions...)
-				if refenceErr == nil || !isNativeSessionNoReplyError(refenceErr) {
+				switch {
+				case nativeSessionEndpointAnswered(refenced, refenceErr) && ctx.Err() == nil:
 					// The current endpoint answered. Pin it durably so the next pass
 					// goes straight there; the pinned endpoint stays untouched until
 					// then, exactly as if this exchange had never happened.
@@ -334,13 +343,21 @@ func (d *durableNativeSessionOperations) RecoverOperation(ctx context.Context, b
 					}
 					record = moved
 					result, err = refenced, refenceErr
+				case isNativeSessionNoReplyError(refenceErr) && ctx.Err() == nil:
+					countable = countable && isNativeSessionCountableSilence(refenceErr)
+				default:
+					// Neither silence nor an answer the caller can still act on: the
+					// caller went away or the exchange failed locally. That is no
+					// evidence about either endpoint, so nothing is moved and nothing
+					// is counted; every cause, including the caller's, is reported.
+					return fmt.Errorf("recover native session operation: %w", errors.Join(err, refenceErr, ctx.Err()))
 				}
 			}
 		}
 		if err != nil {
 			var unexpected *qurl.NativeSessionOperationUnexpectedAdmissionError
 			if !errors.As(err, &unexpected) {
-				if !isNativeSessionNoReplyError(err) || ctx.Err() != nil {
+				if !countable || ctx.Err() != nil {
 					return fmt.Errorf("recover native session operation: %w", err)
 				}
 				counted, disposition, countErr := d.countPostExpiryNoReply(ctx, protectedResourceID, record)
@@ -528,9 +545,10 @@ func nativeSessionRefenceEndpoint(binding *qurl.AgentRuntimeBinding, record agen
 // authenticated server decision: nothing answered, the transport or resolver
 // failed, the caller's deadline passed while waiting, or a datagram arrived
 // that the pinned server key cannot authenticate (the signature of a rolled
-// server key). A typed deny, an unexpected admission, or a malformed
-// authenticated reply is a decision and is never treated as silence. Caller
-// cancellation is not evidence about the endpoint.
+// server key). It gates the re-fence: trying the cell's other endpoint is
+// harmless on any of these. A typed deny, an unexpected admission, or a
+// malformed authenticated reply is a decision and is never treated as silence.
+// Caller cancellation is not evidence about the endpoint.
 func isNativeSessionNoReplyError(err error) bool {
 	if err == nil || errors.Is(err, context.Canceled) {
 		return false
@@ -543,6 +561,32 @@ func isNativeSessionNoReplyError(err error) bool {
 	return errors.Is(err, qurl.ErrEndpointNoReply) || errors.Is(err, nativeudp.ErrNoReply) ||
 		errors.Is(err, nativeudp.ErrTransport) || errors.Is(err, nativeudp.ErrResolve) ||
 		errors.Is(err, nativeudp.ErrServerUnauthenticated) || errors.Is(err, context.DeadlineExceeded)
+}
+
+// isNativeSessionCountableSilence is the narrower class that may count toward
+// abandonment: the datagram left this host and nothing authenticated came
+// back. A resolver or socket failure means the packet was never sent, so an
+// offline connector accrues no post-expiry failures and keeps its handle on a
+// session the server may still hold.
+func isNativeSessionCountableSilence(err error) bool {
+	if !isNativeSessionNoReplyError(err) {
+		return false
+	}
+	return errors.Is(err, qurl.ErrEndpointNoReply) || errors.Is(err, nativeudp.ErrNoReply) ||
+		errors.Is(err, nativeudp.ErrServerUnauthenticated) || errors.Is(err, context.DeadlineExceeded)
+}
+
+// nativeSessionEndpointAnswered reports positive evidence that an endpoint
+// authenticated a reply: a recovery result, a typed deny, or an unexpected
+// admission. The mere absence of silence is not an answer; a canceled caller
+// or a local validation failure proves nothing about the endpoint.
+func nativeSessionEndpointAnswered(result *qurl.NativeSessionOperationRecovery, err error) bool {
+	if err == nil {
+		return result != nil
+	}
+	var deny *qurl.ServerDenyError
+	var unexpected *qurl.NativeSessionOperationUnexpectedAdmissionError
+	return errors.As(err, &deny) || errors.As(err, &unexpected)
 }
 
 // nativeSessionRecoveryNoReplyBackoff escalates from twice the ordinary
