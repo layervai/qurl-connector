@@ -743,7 +743,7 @@ func TestNewSharedServiceRunnerRejectsRoutesOnDifferentKnockResources(t *testing
 	cfg := sharedServiceTestConfig("a", "b")
 	cfg.SetKnockResourceID("resource-b", "q_other")
 
-	_, err := newSharedServiceRunner(context.Background(), cfg, &fakeSharedAdmitter{}, &fakeGroupFactory{}, newReadyAnnouncer(nil, io.Discard, false))
+	_, err := newSharedServiceRunner(context.Background(), cfg, &fakeSharedAdmitter{}, &fakeGroupFactory{}, newReadyAnnouncer(nil, io.Discard, false), &sharedRouteLedger{})
 	if err == nil {
 		t.Fatal("routes on different NHP knock resources were accepted onto one session")
 	}
@@ -758,13 +758,13 @@ func TestNewSharedServiceRunnerRejectsConfigsWithNothingToAdmit(t *testing.T) {
 	t.Setenv(EnvKnockResourceID, "")
 	announcer := newReadyAnnouncer(nil, io.Discard, false)
 
-	if _, err := newSharedServiceRunner(context.Background(), &nhpconfig.Config{}, &fakeSharedAdmitter{}, &fakeGroupFactory{}, announcer); err == nil {
+	if _, err := newSharedServiceRunner(context.Background(), &nhpconfig.Config{}, &fakeSharedAdmitter{}, &fakeGroupFactory{}, announcer, &sharedRouteLedger{}); err == nil {
 		t.Error("an empty route set was accepted")
 	}
 
 	unknockable := sharedServiceTestConfig("a")
 	unknockable.Runtime.KnockResourceIDs = nil
-	_, err := newSharedServiceRunner(context.Background(), unknockable, &fakeSharedAdmitter{}, &fakeGroupFactory{}, announcer)
+	_, err := newSharedServiceRunner(context.Background(), unknockable, &fakeSharedAdmitter{}, &fakeGroupFactory{}, announcer, &sharedRouteLedger{})
 	if err == nil || !strings.Contains(err.Error(), "missing NHP knock resource") {
 		t.Errorf("a route without a knock resource was accepted; err = %v", err)
 	}
@@ -774,7 +774,7 @@ func TestNewSharedServiceRunnerRejectsConfigsWithNothingToAdmit(t *testing.T) {
 	// for one.
 	partial := sharedServiceTestConfig("a", "b")
 	delete(partial.Runtime.KnockResourceIDs, "resource-b")
-	_, err = newSharedServiceRunner(context.Background(), partial, &fakeSharedAdmitter{}, &fakeGroupFactory{}, announcer)
+	_, err = newSharedServiceRunner(context.Background(), partial, &fakeSharedAdmitter{}, &fakeGroupFactory{}, announcer, &sharedRouteLedger{})
 	if err == nil {
 		t.Fatal("a partially hydrated config was accepted")
 	}
@@ -944,7 +944,7 @@ func TestSharedServiceKnockOverrideAppliesToEveryRoute(t *testing.T) {
 	cfg := sharedServiceTestConfig("a", "b")
 	cfg.SetKnockResourceID("resource-b", "q_other")
 	admitter := &fakeSharedAdmitter{}
-	runner, err := newSharedServiceRunner(context.Background(), cfg, admitter, &fakeGroupFactory{}, newReadyAnnouncer(nil, io.Discard, false))
+	runner, err := newSharedServiceRunner(context.Background(), cfg, admitter, &fakeGroupFactory{}, newReadyAnnouncer(nil, io.Discard, false), &sharedRouteLedger{})
 	if err != nil {
 		t.Fatalf("override config rejected: %v", err)
 	}
@@ -968,7 +968,7 @@ func TestSharedServiceRetiredRoutesStayRetiredAcrossReadmission(t *testing.T) {
 	previous := audit.SetDefault(logger)
 	t.Cleanup(func() { audit.SetDefault(previous) })
 
-	h := startSharedServiceHarness(t, sharedServiceTestConfig("a", "b", "c"))
+	h := startSharedServiceHarness(t, sharedServiceTestConfig("a", "b", "c", "d", "e"))
 	h.waitReadyBlock(t)
 	first := h.session(t, 1)
 
@@ -976,25 +976,65 @@ func TestSharedServiceRetiredRoutesStayRetiredAcrossReadmission(t *testing.T) {
 	// (a Login the tunnel server rejected): the primary a is retired and the
 	// rest re-admitted -- without c, which is already known dead.
 	first.failRoute("c", fmt.Errorf("%w: resource_not_found", share.ErrResourceGone))
-	waitFor(t, 2*time.Second, func() bool { return strings.Join(first.lastUpdate(), ",") == "a,b" }, "c withdrawn")
+	waitFor(t, 2*time.Second, func() bool { return strings.Join(first.lastUpdate(), ",") == "a,b,d,e" }, "c withdrawn")
 	first.end(fmt.Errorf("%w: login rejected", share.ErrResourceGone))
 
 	second := h.session(t, 2)
-	waitFor(t, 2*time.Second, func() bool { return second.RouteStates()["b"].Phase == share.RouteServing }, "b serving on the re-admitted session")
-	if states := second.RouteStates(); len(states) != 1 {
-		t.Errorf("re-admitted session carries %d routes, want only b: %+v", len(states), states)
+	waitFor(t, 2*time.Second, func() bool { return second.RouteStates()["e"].Phase == share.RouteServing }, "the second admission serving")
+	if states := second.RouteStates(); len(states) != 3 {
+		t.Errorf("second admission carries %d routes, want b, d, e: %+v", len(states), states)
 	}
 	if second.admission.ResourceID != "resource-b" {
-		t.Errorf("re-admitted under %q, want resource-b", second.admission.ResourceID)
+		t.Errorf("second admission under %q, want resource-b", second.admission.ResourceID)
+	}
+
+	// The same again one admission later: d goes per proxy, then b's
+	// admission is refused. Neither c nor d may come back on the third.
+	second.failRoute("d", fmt.Errorf("%w: resource_not_found", share.ErrResourceGone))
+	waitFor(t, 2*time.Second, func() bool { return strings.Join(second.lastUpdate(), ",") == "b,e" }, "d withdrawn")
+	second.end(fmt.Errorf("%w: login rejected", share.ErrResourceGone))
+
+	third := h.session(t, 3)
+	waitFor(t, 2*time.Second, func() bool { return third.RouteStates()["e"].Phase == share.RouteServing }, "the third admission serving")
+	if states := third.RouteStates(); len(states) != 1 {
+		t.Errorf("third admission carries %d routes, want only e: %+v", len(states), states)
+	}
+	if third.admission.ResourceID != "resource-e" {
+		t.Errorf("third admission under %q, want resource-e", third.admission.ResourceID)
 	}
 	denies := logger.byEvent(audit.EventProxyDeny)
-	if len(denies) != 2 {
-		t.Fatalf("audit denies = %+v, want exactly one for c and one for a", denies)
+	var got []string
+	for _, deny := range denies {
+		got = append(got, deny.RouteID+":"+deny.Reason)
 	}
-	if denies[0].RouteID != "c" || denies[0].Reason != "resource_not_found" || denies[1].RouteID != "a" || denies[1].Reason != "admission_resource_gone" {
-		t.Errorf("audit denies = %+v", denies)
+	want := "c:resource_not_found,a:admission_resource_gone,d:resource_not_found,b:admission_resource_gone"
+	if strings.Join(got, ",") != want {
+		t.Errorf("audit denies = %v, want %s", got, want)
 	}
 	h.requireStillRunning(t)
+}
+
+func TestRetireSharedRouteAuditsOnceAndDoesNotNeedTheAnnouncer(t *testing.T) {
+	logger := &captureAuditLogger{}
+	previous := audit.SetDefault(logger)
+	t.Cleanup(func() { audit.SetDefault(previous) })
+
+	// The announcer knows nothing about this route; the ledger, not the
+	// display helper, decides that the first refusal is audited and the
+	// second is not.
+	ledger := &sharedRouteLedger{}
+	announcer := newReadyAnnouncer(nil, io.Discard, false)
+	gone := fmt.Errorf("%w: resource_not_found", share.ErrResourceGone)
+	retireSharedRoute(context.Background(), ledger, announcer, "ghost", "resource-ghost", "resource_not_found", gone)
+	retireSharedRoute(context.Background(), ledger, announcer, "ghost", "resource-ghost", "admission_resource_gone", gone)
+
+	denies := logger.byEvent(audit.EventProxyDeny)
+	if len(denies) != 1 || denies[0].RouteID != "ghost" || denies[0].Reason != "resource_not_found" {
+		t.Errorf("audit denies = %+v, want exactly one for ghost", denies)
+	}
+	if got := ledger.retiredRoutes(); strings.Join(got, ",") != "ghost" {
+		t.Errorf("ledger = %v, want [ghost]", got)
+	}
 }
 
 func TestSharedServiceRetiresPrimaryRevokedPerProxyOnce(t *testing.T) {
@@ -1029,8 +1069,10 @@ func TestSharedServiceRetiresPrimaryRevokedPerProxyOnce(t *testing.T) {
 }
 
 func TestSharedServiceFallbackIgnoresRoutesFromAnEndedSession(t *testing.T) {
+	// The bounded wait is parked for an hour and driven by hand at the two
+	// moments under test, so neither assertion races the timer.
 	previous := readyFallbackWait
-	readyFallbackWait = 60 * time.Millisecond
+	readyFallbackWait = time.Hour
 	t.Cleanup(func() { readyFallbackWait = previous })
 
 	// d is held everywhere so the block is still waiting when session 1 is
@@ -1052,6 +1094,10 @@ func TestSharedServiceFallbackIgnoresRoutesFromAnEndedSession(t *testing.T) {
 	}
 
 	release()
+	second := h.session(t, 2)
+	waitFor(t, 2*time.Second, func() bool { return second.RouteStates()["c"].Phase == share.RouteServing }, "the replacement session serving")
+	waitFor(t, 2*time.Second, func() bool { _, _, healthy := h.admitter.counts(); return healthy >= 2 }, "the replacement promoted")
+	h.announcer.announceOutstanding()
 	block := h.waitReadyBlock(t)
 	if !strings.Contains(block, "3 of 4 route(s) live") {
 		t.Errorf("fallback block should list the replacement session's routes; got:\n%s", block)

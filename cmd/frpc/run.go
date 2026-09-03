@@ -1129,10 +1129,11 @@ func runSharedService(ctx context.Context, qcfg *nhpconfig.Config, admitter shar
 		return errors.New("shared Connector runtime requires at least one resource")
 	}
 	defer announcer.stop()
+	ledger := &sharedRouteLedger{}
 	remaining := *qcfg
 	remaining.Routes = append([]nhpconfig.Route(nil), qcfg.Routes...)
 	for {
-		runner, err := newSharedServiceRunner(ctx, &remaining, admitter, sessions, announcer)
+		runner, err := newSharedServiceRunner(ctx, &remaining, admitter, sessions, announcer, ledger)
 		if err != nil {
 			return err
 		}
@@ -1156,8 +1157,8 @@ func runSharedService(ctx context.Context, qcfg *nhpconfig.Config, admitter shar
 		if primary == nil {
 			return err
 		}
-		retireSharedRoute(ctx, announcer, primary.ID, primary.ResourceID, "admission_resource_gone", err)
-		rest = withoutRoutes(rest, announcer.retiredRoutes())
+		retireSharedRoute(ctx, ledger, announcer, primary.ID, primary.ResourceID, "admission_resource_gone", err)
+		rest = withoutRoutes(rest, ledger.retiredRoutes())
 		if len(rest) == 0 {
 			return allRoutesRetiredError(err)
 		}
@@ -1204,17 +1205,51 @@ func splitPrimaryRoute(qcfg *nhpconfig.Config) (*nhpconfig.Route, []nhpconfig.Ro
 	return nil, nil
 }
 
+// sharedRouteLedger records which routes the runtime has retired. It is the
+// runtime's own source of truth for two decisions: which routes never enter
+// a re-admission again, and which refusals are a route's first (and only
+// audited) retirement. The ready block is told about retirements; it is
+// never asked. The zero value is ready to use.
+type sharedRouteLedger struct {
+	mu      sync.Mutex
+	retired map[string]struct{}
+	order   []string
+}
+
+// retire records routeID and reports whether this call retired it.
+func (l *sharedRouteLedger) retire(routeID string) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if _, gone := l.retired[routeID]; gone {
+		return false
+	}
+	if l.retired == nil {
+		l.retired = make(map[string]struct{})
+	}
+	l.retired[routeID] = struct{}{}
+	l.order = append(l.order, routeID)
+	return true
+}
+
+// retiredRoutes lists every retired route in retirement order.
+func (l *sharedRouteLedger) retiredRoutes() []string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return append([]string(nil), l.order...)
+}
+
 // retireSharedRoute is the one place a route leaves the running set: it is
-// dropped from the ready block, logged, and put on the audit stream, once.
-// The process keeps serving; the route stays in the config until the
-// operator removes it. reason is the audit tag: resource_not_found when the
-// tunnel server refused the route's NewProxy, admission_resource_gone when
-// the knock for its admission was refused. A route can be refused at both
-// layers -- the primary route revoked per proxy still has the group's
-// admission bound to its resource until the next rotation refuses the knock
-// -- and the second refusal is not a second retirement.
-func retireSharedRoute(ctx context.Context, announcer *readyAnnouncer, routeID, resourceID, reason string, err error) {
-	if !announcer.routeRetired(routeID) {
+// recorded in the ledger, logged, put on the audit stream, and dropped from
+// the ready block -- once. The process keeps serving; the route stays in the
+// config until the operator removes it. reason is the audit tag:
+// resource_not_found when the tunnel server refused the route's NewProxy,
+// admission_resource_gone when the knock for its admission was refused. A
+// route can be refused at both layers -- the primary route revoked per proxy
+// still has the group's admission bound to its resource until the next
+// rotation refuses the knock -- and the second refusal is not a second
+// retirement.
+func retireSharedRoute(ctx context.Context, ledger *sharedRouteLedger, announcer *readyAnnouncer, routeID, resourceID, reason string, err error) {
+	if !ledger.retire(routeID) {
 		slog.DebugContext(ctx, "connector: route already retired; admission-layer refusal for its resource is expected",
 			"route", routeID, "resource_id", resourceID, "reason", reason, "err", err.Error())
 		return
@@ -1225,6 +1260,7 @@ func retireSharedRoute(ctx context.Context, announcer *readyAnnouncer, routeID, 
 		Event: audit.EventProxyDeny, Outcome: audit.OutcomeDeny, Reason: reason,
 		RouteID: routeID, ResourceID: resourceID, Error: err.Error(),
 	})
+	announcer.routeRetired(routeID)
 }
 
 // newSharedServiceRunner builds the one session group for qcfg's routes.
@@ -1248,7 +1284,7 @@ func retireSharedRoute(ctx context.Context, announcer *readyAnnouncer, routeID, 
 //
 // ctx scopes only the callbacks' log context; Run(ctx) is what scopes the
 // runner's lifetime.
-func newSharedServiceRunner(ctx context.Context, qcfg *nhpconfig.Config, admitter sharedServiceAdmitter, sessions share.SessionGroupFactory, announcer *readyAnnouncer) (*share.SessionGroupRunner, error) {
+func newSharedServiceRunner(ctx context.Context, qcfg *nhpconfig.Config, admitter sharedServiceAdmitter, sessions share.SessionGroupFactory, announcer *readyAnnouncer, ledger *sharedRouteLedger) (*share.SessionGroupRunner, error) {
 	if qcfg == nil || len(qcfg.Routes) == 0 {
 		return nil, errors.New("shared Connector runtime requires at least one resource")
 	}
@@ -1300,7 +1336,7 @@ func newSharedServiceRunner(ctx context.Context, qcfg *nhpconfig.Config, admitte
 			// Retired in place: the tunnel server permanently refused this
 			// route's proxy, so the group withdrew it and its siblings keep
 			// serving.
-			retireSharedRoute(ctx, announcer, routeID, resourceIDs[routeID], "resource_not_found", err)
+			retireSharedRoute(ctx, ledger, announcer, routeID, resourceIDs[routeID], "resource_not_found", err)
 		},
 		OnRetry: func(err error, wait time.Duration) {
 			slog.WarnContext(ctx, "connector: NHP admission or FRP session attempt failed; retrying",

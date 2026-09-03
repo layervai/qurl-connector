@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -261,8 +262,9 @@ func TestReadyAnnouncerFallbackAsksTheRuntimeWhatIsLive(t *testing.T) {
 	for _, id := range []string{"a", "b", "c"} {
 		announcer.routeServing(id)
 	}
-	live := []string{}
-	announcer.setLiveProbe(func() []string { return live })
+	var live atomic.Pointer[[]string]
+	live.Store(&[]string{})
+	announcer.setLiveProbe(func() []string { return *live.Load() })
 	announcer.announceOutstanding()
 	if out.String() != "" {
 		t.Fatalf("fallback block printed routes from an ended session:\n%s", out.String())
@@ -270,7 +272,7 @@ func TestReadyAnnouncerFallbackAsksTheRuntimeWhatIsLive(t *testing.T) {
 
 	// The replacement has a alone so far, plus a stranger the block must
 	// ignore; d was retired meanwhile.
-	live = []string{"a", "stranger"}
+	live.Store(&[]string{"a", "stranger"})
 	announcer.routeRetired("d")
 	announcer.announceOutstanding()
 	block := out.String()
@@ -282,9 +284,6 @@ func TestReadyAnnouncerFallbackAsksTheRuntimeWhatIsLive(t *testing.T) {
 	}
 	if !strings.Contains(block, "Still registering: b, c ") || strings.Contains(block, "b, c, d") {
 		t.Errorf("fallback block should name b and c as still registering and not the retired d; got:\n%s", block)
-	}
-	if got := announcer.retiredRoutes(); strings.Join(got, ",") != "d" {
-		t.Errorf("retiredRoutes = %v, want [d]", got)
 	}
 }
 
