@@ -306,7 +306,11 @@ func (r *SessionGroupRunner) Run(ctx context.Context) (retErr error) {
 // apply to the live session immediately (no new admission); a replacement
 // that is still being built receives the new set as well, and the rotation
 // timer is re-armed for the new route count. A route that was removed and
-// later re-added registers under a fresh proxy name. A session that ends
+// later re-added, or whose local target changed, registers under a fresh
+// proxy name so the server sees a new NewProxy rather than the stale one; a
+// route's public resource ID and connector routing ID are immutable
+// identities and may not change in place (remove the route and add it
+// again). A session that ends
 // while the set is being applied is not an error: the desired set is
 // authoritative and the next cycle starts from it, and if applying fails for
 // any other reason (a canceled caller context, for instance) the error is
@@ -324,9 +328,21 @@ func (r *SessionGroupRunner) SetRoutes(ctx context.Context, routes []LocalHTTPRo
 	next := make(map[string]LocalHTTPRoute, len(routes))
 	for _, route := range routes {
 		next[route.RouteID] = route
+		current, exists := r.desired[route.RouteID]
+		if !exists || current == route {
+			continue
+		}
+		if current.ResourceID != route.ResourceID || current.ConnectorRoutingID != route.ConnectorRoutingID {
+			r.mu.Unlock()
+			return fmt.Errorf("set session group routes: route %q changes its resource identity in place (resource %q to %q, routing %q to %q); remove the route and add it again",
+				route.RouteID, current.ResourceID, route.ResourceID, current.ConnectorRoutingID, route.ConnectorRoutingID)
+		}
 	}
-	for routeID := range r.desired {
-		if _, keep := next[routeID]; !keep {
+	for routeID, current := range r.desired {
+		route, keep := next[routeID]
+		if !keep || current != route {
+			// Removed, or its local target changed: the next registration of
+			// this route ID must not reuse a name the server still holds.
 			r.restarts[routeID]++
 		}
 	}

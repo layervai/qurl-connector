@@ -448,6 +448,13 @@ func (s *frpGroupSession) observe() error {
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	// run demotes every serving route once the session ends; a scan that was
+	// already past its snapshot must not write a phantom serving phase back
+	// onto a dead session, or a replacement would wait on routes nobody
+	// serves.
+	if s.stopped {
+		return nil
+	}
 	changed := false
 	for _, observed := range observations {
 		entry, ok := s.routes[observed.routeID]
@@ -519,6 +526,9 @@ func errText(err error) string {
 
 // Update replaces the session's route set. Entries whose route and proxy name
 // are unchanged keep their observed state; everything else registers afresh.
+// A route whose target or identity changed must arrive under a new
+// Generation: its old registration is still running on the server under the
+// old name, so reusing that name would report the stale proxy as serving.
 // The route table is authoritative from the moment Update returns: if the
 // push to FRP fails, the error is returned and the session keeps retrying the
 // push on every poll until FRP accepts it, so RouteStates never reports a
@@ -554,7 +564,11 @@ func (s *frpGroupSession) Update(ctx context.Context, routes []GroupRoute) error
 	next := make(map[string]*groupRouteEntry, len(routes))
 	for _, route := range routes {
 		name := groupProxyName(route, s.sessionID)
-		if current, ok := s.routes[route.RouteID]; ok && current.name == name && current.route == route {
+		if current, ok := s.routes[route.RouteID]; ok && current.name == name {
+			if current.route != route {
+				s.mu.Unlock()
+				return fmt.Errorf("update FRP session group: route %q changed in place under proxy name %q; a changed route needs a new generation", route.RouteID, name)
+			}
 			next[route.RouteID] = current
 			continue
 		}

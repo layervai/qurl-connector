@@ -507,6 +507,99 @@ func TestFRPGroupSessionUpdatedProxiesMatchServiceCompletedConfigs(t *testing.T)
 	}
 }
 
+func TestFRPGroupSessionUpdateRefusesInPlaceRouteChange(t *testing.T) {
+	svc := &recordingGroupService{}
+	status := &lockedStatusMap{}
+	session := startTestGroupSession(t, svc, status, groupRoutesOf(groupTestRoutes("a")))
+	status.set("a-nhp7", frpproxy.ProxyPhaseRunning, "")
+	waitForRouteStates(t, session, func(s map[string]RouteState) bool { return phaseOf(s, "a") == RouteServing })
+
+	moved := groupRoutesOf(groupTestRoutes("a"))
+	moved[0].LocalPort = 4000
+	err := session.Update(context.Background(), moved)
+	if err == nil || !strings.Contains(err.Error(), "changed in place") {
+		t.Fatalf("Update with a changed target under the same name = %v, want a refusal", err)
+	}
+	if state := session.RouteStates()["a"]; state.Phase != RouteServing || state.Route.LocalPort != 3000 {
+		t.Fatalf("refused update altered the table: %+v", state)
+	}
+	if len(svc.updateNames()) != 0 {
+		t.Fatalf("refused update reached FRP: %q", svc.updateNames())
+	}
+	moved[0].Generation = 1
+	if err := session.Update(context.Background(), moved); err != nil {
+		t.Fatal(err)
+	}
+	if state := session.RouteStates()["a"]; state.ProxyName != "a-nhp7-r1" || state.Phase != RoutePending {
+		t.Fatalf("regenerated route a = %+v, want a fresh pending registration", state)
+	}
+}
+
+// gatedStatus blocks status reads on demand so a test can end the session
+// while observe is between its snapshot and its write-back.
+type gatedStatus struct {
+	inner   *lockedStatusMap
+	mu      sync.Mutex
+	gate    chan struct{}
+	entered chan struct{}
+	once    sync.Once
+}
+
+func (g *gatedStatus) GetProxyStatus(name string) (*frpproxy.WorkingStatus, bool) {
+	g.mu.Lock()
+	gate := g.gate
+	g.mu.Unlock()
+	if gate != nil {
+		g.once.Do(func() { close(g.entered) })
+		<-gate
+	}
+	return g.inner.GetProxyStatus(name)
+}
+
+func (g *gatedStatus) arm() chan struct{} {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.gate = make(chan struct{})
+	return g.gate
+}
+
+func TestFRPGroupSessionDoesNotResurrectServingAfterEnd(t *testing.T) {
+	inner := &lockedStatusMap{}
+	status := &gatedStatus{inner: inner, entered: make(chan struct{})}
+	ctx, cancel := context.WithCancel(context.Background())
+	session := newFRPGroupSession(&recordingGroupService{}, status, &v1.ClientCommonConfig{}, 7, time.Millisecond, groupRoutesOf(groupTestRoutes("a")))
+	session.cancel = cancel
+	go session.run(ctx)
+	inner.set("a-nhp7", frpproxy.ProxyPhaseRunning, "")
+	waitForRouteStates(t, session, func(s map[string]RouteState) bool { return phaseOf(s, "a") == RouteServing })
+
+	// Park the scan after its snapshot, end the session (which demotes a),
+	// then let the scan finish: it must not write "serving" back.
+	gate := status.arm()
+	select {
+	case <-status.entered:
+	case <-time.After(time.Second):
+		t.Fatal("observe never entered the gated status scan")
+	}
+	if err := session.Stop(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if state := session.RouteStates()["a"]; state.Phase != RoutePending {
+		t.Fatalf("route a after the session ended = %+v, want demoted", state)
+	}
+	close(gate)
+	deadline := time.Now().Add(100 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if state := session.RouteStates()["a"]; state.Phase == RouteServing {
+			t.Fatalf("a scan that outlived the session resurrected route a: %+v", state)
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	if len(session.ServingRouteIDs()) != 0 {
+		t.Fatal("dead session still lists serving routes")
+	}
+}
+
 func TestFRPGroupSessionStaleAdmissionEndsWholeSession(t *testing.T) {
 	svc := &recordingGroupService{}
 	status := &lockedStatusMap{}

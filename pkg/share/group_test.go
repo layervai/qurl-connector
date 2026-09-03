@@ -427,7 +427,8 @@ func TestSessionGroupRunnerSetRoutesChangesProxiesWithoutReadmission(t *testing.
 	h.waitServing(t, 1, "a", "b", "c")
 	session := h.factory.session(1)
 
-	if err := h.runner.SetRoutes(context.Background(), groupTestRoutes("a", "b", "c", "d")); err != nil {
+	four := groupTestRoutes("a", "b", "c", "d")
+	if err := h.runner.SetRoutes(context.Background(), four); err != nil {
 		t.Fatal(err)
 	}
 	h.waitServing(t, 1, "d")
@@ -447,7 +448,9 @@ func TestSessionGroupRunnerSetRoutesChangesProxiesWithoutReadmission(t *testing.
 		}
 	}
 
-	if err := h.runner.SetRoutes(context.Background(), groupTestRoutes("a", "c", "d")); err != nil {
+	// Remove b with every other route's target unchanged; a changed target
+	// would (correctly) regenerate that route.
+	if err := h.runner.SetRoutes(context.Background(), []LocalHTTPRoute{four[0], four[2], four[3]}); err != nil {
 		t.Fatal(err)
 	}
 	waitUntil(t, time.Second, func() bool { _, present := session.RouteStates()["b"]; return !present }, "route b withdrawn")
@@ -491,6 +494,48 @@ func TestSessionGroupRunnerRestartRouteRenamesOnlyThatProxy(t *testing.T) {
 	}
 	if err := h.runner.RestartRoute(context.Background(), "zzz"); err == nil {
 		t.Fatal("RestartRoute accepted a route outside the group")
+	}
+}
+
+func TestSessionGroupRunnerRegeneratesChangedTargetAndRejectsIdentityChange(t *testing.T) {
+	h := startGroupHarness(t, time.Hour, 0, nil, "a", "b")
+	h.waitServing(t, 1, "a", "b")
+	session := h.factory.session(1)
+
+	// A changed local target registers under a fresh name: the server still
+	// holds the old registration, so the same name would report it serving.
+	moved := groupTestRoutes("a", "b")
+	moved[0].LocalPort = 4000
+	if err := h.runner.SetRoutes(context.Background(), moved); err != nil {
+		t.Fatal(err)
+	}
+	waitUntil(t, time.Second, func() bool { return h.events.servingCount("a", 1) == 2 }, "moved route a serving under its new registration")
+	states := session.RouteStates()
+	if states["a"].ProxyName != "a-nhp1-r1" || states["a"].Route.LocalPort != 4000 {
+		t.Fatalf("moved route a = %+v, want a fresh generation carrying the new target", states["a"])
+	}
+	if states["b"].ProxyName != "b-nhp1" || h.events.servingCount("b", 1) != 1 {
+		t.Fatalf("sibling b after a's target change = %+v (serving reports %d), want untouched", states["b"], h.events.servingCount("b", 1))
+	}
+	if got := h.admissions(); got != 1 {
+		t.Fatalf("admissions = %d, want no knock for a target change", got)
+	}
+
+	// Resource identities are immutable in place.
+	for name, mutate := range map[string]func(*LocalHTTPRoute){
+		"resource ID": func(r *LocalHTTPRoute) { r.ResourceID = "resource-other" },
+		"routing ID":  func(r *LocalHTTPRoute) { r.ConnectorRoutingID = "routing-other" },
+	} {
+		changed := groupTestRoutes("a", "b")
+		changed[0].LocalPort = 4000
+		mutate(&changed[1])
+		err := h.runner.SetRoutes(context.Background(), changed)
+		if err == nil || !strings.Contains(err.Error(), "resource identity in place") {
+			t.Fatalf("SetRoutes changing b's %s in place = %v, want a refusal", name, err)
+		}
+	}
+	if after := session.RouteStates(); after["b"].ProxyName != "b-nhp1" || after["b"].Route.LocalHTTPRoute != groupTestRoutes("a", "b")[1] {
+		t.Fatalf("refused identity change still reached the session: %+v", after["b"])
 	}
 }
 
@@ -661,7 +706,8 @@ func TestSessionGroupRunnerAddsDuringRotationOnlyToReplacement(t *testing.T) {
 	waitUntil(t, 2*time.Second, func() bool { return h.factory.startCount() == 2 }, "replacement session start")
 	second := h.factory.session(2)
 
-	if err := h.runner.SetRoutes(context.Background(), groupTestRoutes("a", "b", "c", "d")); err != nil {
+	four := groupTestRoutes("a", "b", "c", "d")
+	if err := h.runner.SetRoutes(context.Background(), four); err != nil {
 		t.Fatal(err)
 	}
 	if _, present := second.RouteStates()["d"]; !present {
@@ -670,7 +716,7 @@ func TestSessionGroupRunnerAddsDuringRotationOnlyToReplacement(t *testing.T) {
 	if _, present := first.RouteStates()["d"]; present {
 		t.Fatal("route added during rotation was registered on the expiring session")
 	}
-	if err := h.runner.SetRoutes(context.Background(), groupTestRoutes("a", "c", "d")); err != nil {
+	if err := h.runner.SetRoutes(context.Background(), []LocalHTTPRoute{four[0], four[2], four[3]}); err != nil {
 		t.Fatal(err)
 	}
 	if _, present := first.RouteStates()["b"]; present {
