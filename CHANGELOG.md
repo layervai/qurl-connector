@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.11.3](https://github.com/layervai/qurl-connector/compare/v0.11.2...v0.11.3) (2026-09-03)
+
+
+### Bug Fixes
+
+* **share:** re-fence native session recovery to the current endpoint ([#64](https://github.com/layervai/qurl-connector/issues/64)) ([e7d1c80](https://github.com/layervai/qurl-connector/commit/e7d1c8086c3a10126c630481b2f1d4052be9bb6f))
+
 ## [0.11.2](https://github.com/layervai/qurl-connector/compare/v0.11.1...v0.11.2) (2026-09-03)
 
 
