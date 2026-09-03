@@ -480,6 +480,9 @@ type proofSnapshot struct {
 }
 
 func takeProofSnapshot() proofSnapshot {
+	// Collect first so HeapInuse is live memory rather than garbage from the
+	// previous snapshot's goroutine dump; Sys stays the high-water mark.
+	runtime.GC()
 	var stats runtime.MemStats
 	runtime.ReadMemStats(&stats)
 	fds, _ := proofOpenFDs()
@@ -537,6 +540,7 @@ type proofReport struct {
 	RotationReregisterMs          float64 `json:"rotation_reregister_ms"`
 	RotationPromoteMs             float64 `json:"rotation_promote_ms"`
 	DrainWithdrawMs               float64 `json:"drain_withdraw_ms"`
+	OverlapCoverage               string  `json:"overlap_coverage"`
 	OverlapRequests               int64   `json:"overlap_requests"`
 	OverlapFailures               int     `json:"overlap_failures"`
 	OverlapFailuresRegistering    int     `json:"overlap_failures_at_route_registration"`
@@ -579,7 +583,7 @@ scaling proof: %d routes on one Connector admission and one FRP session (%s/%s, 
   steady-state latency, %d requests       warm p50 %.2f ms  p99 %.2f ms
   rotation: Admit -> all re-registered    %8.0f ms   Admit -> promoted %.0f ms   (window %.0f s; production lead need %.0f s)
   drain: promoted -> old proxies gone     %8.0f ms
-  overlap requests / failures             %d / %d   (%d at a route's own re-registration instant, max +%.1f ms; %d in the drain window, max +%.1f ms; 0 elsewhere)
+  overlap requests / failures             %d / %d   (%d at a route's own re-registration instant, max +%.1f ms; %d in the drain window, max +%.1f ms; 0 elsewhere; loop covered %s)
   goroutines  baseline %d  registered %d (%.2f/route: frp client %d, frp server %d, share %d, other %d)  after rotation %d  after stop %d
   open FDs    %s
   peak RSS    %s   Go sys %.1f MiB registered / %.1f MiB after sweep / %.1f MiB after rotation
@@ -592,7 +596,7 @@ scaling proof: %d routes on one Connector admission and one FRP session (%s/%s, 
 		r.SteadyRequests, r.SteadyP50Ms, r.SteadyP99Ms,
 		r.RotationReregisterMs, r.RotationPromoteMs, r.RotationWindowMs/1000, r.RotationLeadNeedMs/1000,
 		r.DrainWithdrawMs,
-		r.OverlapRequests, r.OverlapFailures, r.OverlapFailuresRegistering, r.OverlapRegisterMaxOffsetMs, r.OverlapFailuresDraining, r.OverlapDrainMaxOffsetMs,
+		r.OverlapRequests, r.OverlapFailures, r.OverlapFailuresRegistering, r.OverlapRegisterMaxOffsetMs, r.OverlapFailuresDraining, r.OverlapDrainMaxOffsetMs, r.OverlapCoverage,
 		base.Goroutines.Total, registered.Goroutines.Total, r.GoroutinesPerRoute,
 		registered.Goroutines.Client, registered.Goroutines.Server, registered.Goroutines.Share, registered.Goroutines.Other,
 		afterRotation.Goroutines.Total, afterStop.Goroutines.Total,
@@ -684,7 +688,16 @@ func TestHermeticSessionGroupServes1000Routes(t *testing.T) {
 	insideWindow := func(phase string) {
 		t.Helper()
 		if elapsed := time.Since(admitter.admittedAtIndex(0)); elapsed >= window {
-			t.Fatalf("%s finished %s after the first admission, past the %s rotation window (12s + 20ms per route): the machine is too slow for the steady-state budget, not a rotation defect", phase, elapsed, window)
+			t.Fatalf("%s reached %s after the first admission, past the %s rotation window (12s + 20ms per route): the machine is too slow for the steady-state budget, not a rotation defect", phase, elapsed, window)
+		}
+	}
+	// budgeted wraps a steady-state wait condition so the budget is checked
+	// on every poll: a rotation that fires mid-wait would otherwise surface as
+	// the wait's own timeout.
+	budgeted := func(phase string, condition func() bool) func() bool {
+		return func() bool {
+			insideWindow(phase)
+			return condition()
 		}
 	}
 
@@ -732,8 +745,11 @@ func TestHermeticSessionGroupServes1000Routes(t *testing.T) {
 
 	// Phase 1: every route registers on one admission and one session.
 	proofWait(t, runnerResult, 60*time.Second+time.Duration(routeCount)*50*time.Millisecond,
-		func() bool { return events.servingCount(first.SessionID) == routeCount }, "every route serving on the first session")
+		func() bool { return events.servingCount(first.SessionID) >= routeCount }, "every route serving on the first session")
 	report.StartToAllServingMs = proofMillis(time.Since(runStarted))
+	if got := events.servingCount(first.SessionID); got != routeCount {
+		t.Fatalf("route serving reports = %d, want exactly one per route (%d)", got, routeCount)
+	}
 	if got := admitter.admissionCount(); got != 1 {
 		t.Fatalf("admissions = %d, want one knock for %d routes", got, routeCount)
 	}
@@ -778,13 +794,17 @@ func TestHermeticSessionGroupServes1000Routes(t *testing.T) {
 		t.Fatal(err)
 	}
 	proofWait(t, runnerResult, 15*time.Second,
-		func() bool { return events.servingCount(first.SessionID) == routeCount+proofRouteChurn }, "added routes serving")
+		budgeted("phase 4 (route churn)", func() bool { return events.servingCount(first.SessionID) >= routeCount+proofRouteChurn }), "added routes serving")
+	if got := events.servingCount(first.SessionID); got != routeCount+proofRouteChurn {
+		t.Fatalf("route serving reports after SetRoutes = %d, want %d", got, routeCount+proofRouteChurn)
+	}
 	for _, route := range churnIn {
 		if err := proofCheck(client, port, route); err != nil {
 			t.Fatalf("added route did not answer: %v", err)
 		}
 	}
 	for _, route := range initial[:proofRouteChurn] {
+		insideWindow("phase 4 (route churn)")
 		proofAwaitStatus(t, client, port, route.host, http.StatusNotFound, 15*time.Second, runnerResult)
 	}
 	if got := admitter.admissionCount(); got != 1 {
@@ -810,7 +830,10 @@ func TestHermeticSessionGroupServes1000Routes(t *testing.T) {
 		t.Fatal(err)
 	}
 	proofWait(t, runnerResult, 15*time.Second,
-		func() bool { return events.servingCount(first.SessionID) == routeCount+proofRouteChurn+1 }, "restarted route serving again")
+		budgeted("phase 5 (route restart)", func() bool { return events.servingCount(first.SessionID) >= routeCount+proofRouteChurn+1 }), "restarted route serving again")
+	if got := events.servingCount(first.SessionID); got != routeCount+proofRouteChurn+1 {
+		t.Fatalf("route serving reports after RestartRoute = %d, want %d", got, routeCount+proofRouteChurn+1)
+	}
 	newName := runner.RouteStates()[restarted.RouteID].ProxyName
 	if newName == oldName || !strings.HasSuffix(newName, "-r1") {
 		t.Fatalf("restarted route proxy name = %q (was %q), want a fresh restart generation", newName, oldName)
@@ -828,10 +851,27 @@ func TestHermeticSessionGroupServes1000Routes(t *testing.T) {
 	// Phase 6: rotation. The replacement must carry every route before the old
 	// session retires, and a request loop across the overlap must see no
 	// failure at all.
-	overlap := startProofOverlap(client, port, proofSpread(t, churned, proofSampleRoutes), proofOverlapWorkers)
+	// Under the race detector the loop starts only once the old proxies have
+	// left the server. The pinned FRP client reads a proxy's phase in
+	// Wrapper.InWorkConn after releasing its lock, so a work connection the
+	// server dispatches to a proxy at its registration instant is not only
+	// refused (the window measured below) but is also reported by the
+	// detector as a data race in the fork, which would fail this lane on the
+	// fork's behalf. After withdrawal every proxy the loop can reach is
+	// already running, so every such read is ordered after its write. The
+	// non-race lanes and the opt-in run cover the whole rotation.
+	sample := proofSpread(t, churned, proofSampleRoutes)
+	var overlap *proofOverlap
+	report.OverlapCoverage = "the whole rotation"
+	if !proofRaceDetector {
+		overlap = startProofOverlap(client, port, sample, proofOverlapWorkers)
+	}
 	promotionDeadline := time.Until(admitter.admittedAtIndex(0).Add(2*window)) + 15*time.Second
-	proofWait(t, runnerResult, promotionDeadline, func() bool { return len(events.promotionList()) == 2 }, "replacement promoted")
+	proofWait(t, runnerResult, promotionDeadline, func() bool { return len(events.promotionList()) >= 2 }, "replacement promoted")
 	promotions := events.promotionList()
+	if len(promotions) != 2 {
+		t.Fatalf("promotions = %d, want exactly the first cycle and one replacement", len(promotions))
+	}
 	report.RoutesServingAtFirstPromotion = promotions[0].serving
 	if promotions[1].sessionID != second.SessionID {
 		t.Fatalf("second promotion is session %d, want %d", promotions[1].sessionID, second.SessionID)
@@ -849,6 +889,10 @@ func TestHermeticSessionGroupServes1000Routes(t *testing.T) {
 	proofWait(t, runnerResult, 15*time.Second,
 		func() bool { return proofServerOnlineHTTPProxies(t, client, apiPort) == routeCount }, "old proxies to leave the FRP server")
 	withdrawnAt := time.Now()
+	if overlap == nil {
+		report.OverlapCoverage = "the drain after the old proxies were withdrawn (race detector)"
+		overlap = startProofOverlap(client, port, sample, proofOverlapWorkers)
+	}
 	proofWait(t, runnerResult, 30*time.Second, func() bool {
 		for _, admission := range admitter.retiredSnapshot() {
 			if admission.SessionID == first.SessionID {
