@@ -172,7 +172,7 @@ func (r *ResourceRunner) Run(ctx context.Context) (retErr error) {
 		return errors.New("run resource session: context is nil")
 	}
 	var active *resourceCycle
-	drains := cycleDrainSet{cycles: make(map[*resourceCycle]cycleDrain)}
+	var drains cycleDrainSet
 	backoff := r.cfg.MinBackoff
 	defer drains.stopAndWait(r.cfg.StopTimeout)
 	defer func() { retErr = errors.Join(retErr, r.stopCycle(active)) }()
@@ -240,14 +240,17 @@ func (r *ResourceRunner) Run(ctx context.Context) (retErr error) {
 			if r.cfg.OnServing != nil {
 				r.cfg.OnServing(active.admission)
 			}
-			drains.start(r, old)
+			drains.start(old.session, r.cfg.StopTimeout, func() { _ = r.retireAdmission(old.admission) })
 		}
 	}
 }
 
+// cycleDrainSet tracks retired cycles that are still draining. It is shared
+// by ResourceRunner and SessionGroupRunner; a drain retires the cycle's
+// admission only after the session itself exits or the cleanup budget ends.
 type cycleDrainSet struct {
 	mu     sync.Mutex
-	cycles map[*resourceCycle]cycleDrain
+	cycles map[*cycleDrain]struct{}
 }
 
 type cycleDrain struct {
@@ -255,15 +258,19 @@ type cycleDrain struct {
 	cancel context.CancelFunc
 }
 
-func (d *cycleDrainSet) start(r *ResourceRunner, cycle *resourceCycle) {
-	if cycle == nil {
+func (d *cycleDrainSet) start(session ServingSession, stopTimeout time.Duration, retire func()) {
+	if session == nil {
 		return
 	}
 	done := make(chan struct{})
-	cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), r.cfg.StopTimeout)
+	cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), stopTimeout)
 	drainCtx, cancelDrain := context.WithCancel(cleanupCtx)
+	drain := &cycleDrain{done: done, cancel: cancelDrain}
 	d.mu.Lock()
-	d.cycles[cycle] = cycleDrain{done: done, cancel: cancelDrain}
+	if d.cycles == nil {
+		d.cycles = make(map[*cycleDrain]struct{})
+	}
+	d.cycles[drain] = struct{}{}
 	d.mu.Unlock()
 	go func() {
 		defer func() {
@@ -271,30 +278,32 @@ func (d *cycleDrainSet) start(r *ResourceRunner, cycle *resourceCycle) {
 			cleanupCancel()
 			close(done)
 			d.mu.Lock()
-			delete(d.cycles, cycle)
+			delete(d.cycles, drain)
 			d.mu.Unlock()
 		}()
-		if session, ok := cycle.session.(drainingSession); ok {
-			_ = session.Drain(drainCtx)
+		if draining, ok := session.(drainingSession); ok {
+			_ = draining.Drain(drainCtx)
 		} else {
-			_ = cycle.session.Stop(drainCtx)
+			_ = session.Stop(drainCtx)
 		}
 		// Drain may return as soon as its context is canceled while the
 		// underlying FRP control is still completing its bounded grace period.
 		// Keep the cycle tracked until the session itself exits or the cleanup
 		// budget is exhausted.
 		select {
-		case <-cycle.session.Done():
+		case <-session.Done():
 		case <-cleanupCtx.Done():
 		}
-		_ = r.retireAdmission(cycle.admission)
+		if retire != nil {
+			retire()
+		}
 	}()
 }
 
 func (d *cycleDrainSet) stopAndWait(timeout time.Duration) {
 	d.mu.Lock()
-	drains := make([]cycleDrain, 0, len(d.cycles))
-	for _, drain := range d.cycles {
+	drains := make([]*cycleDrain, 0, len(d.cycles))
+	for drain := range d.cycles {
 		drains = append(drains, drain)
 	}
 	d.mu.Unlock()
@@ -348,20 +357,23 @@ func (r *ResourceRunner) startReadyCycle(ctx context.Context, old *resourceCycle
 }
 
 func (r *ResourceRunner) waitToRetry(ctx context.Context, attemptErr error, wait time.Duration) error {
+	return retryAfter(ctx, r.cfg.OnRetry, attemptErr, wait)
+}
+
+// retryAfter reports one failed attempt and sleeps the bounded delay. Time the
+// callback consumes counts against the delay, and a canceled attempt is never
+// reported as a retry.
+func retryAfter(ctx context.Context, onRetry func(error, time.Duration), attemptErr error, wait time.Duration) error {
 	retryAt := time.Now().Add(wait)
-	r.reportRetry(ctx, attemptErr, wait)
+	if ctx.Err() == nil && attemptErr != nil && onRetry != nil {
+		onRetry(attemptErr, wait)
+	}
 	remaining := time.Until(retryAt)
 	if remaining <= 0 {
 		// The callback consumed the delay, so the next attempt can start now.
 		return ctx.Err()
 	}
 	return sleepWithContext(ctx, remaining)
-}
-
-func (r *ResourceRunner) reportRetry(ctx context.Context, err error, wait time.Duration) {
-	if ctx.Err() == nil && err != nil && r.cfg.OnRetry != nil {
-		r.cfg.OnRetry(err, wait)
-	}
 }
 
 func (r *ResourceRunner) startCycleAttempt(ctx context.Context, old *resourceCycle) (*resourceCycle, error) {
@@ -497,16 +509,24 @@ func (r *ResourceRunner) stopCycle(cycle *resourceCycle) error {
 }
 
 func (r *ResourceRunner) retireAdmission(admission Admission) error {
-	ctx, cancel := context.WithTimeout(context.Background(), r.cfg.StopTimeout)
-	defer cancel()
-	return r.cfg.Admitter.Retire(ctx, admission)
+	return retireAdmission(r.cfg.Admitter, admission, r.cfg.StopTimeout)
 }
 
 func (r *ResourceRunner) stopSession(session ServingSession) {
+	stopServingSession(session, r.cfg.StopTimeout)
+}
+
+func retireAdmission(admitter Admitter, admission Admission, timeout time.Duration) error {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	return admitter.Retire(ctx, admission)
+}
+
+func stopServingSession(session ServingSession, timeout time.Duration) {
 	if session == nil {
 		return
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), r.cfg.StopTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	_ = session.Stop(ctx)
 }
