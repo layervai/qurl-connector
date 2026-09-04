@@ -1055,6 +1055,32 @@ func startFRPFromConfig(ctx context.Context, cfgPath, machineID string, cfg *nhp
 	return startSharedService(ctx, common, cfgPath, cfg, admitter)
 }
 
+// retryReporter surfaces admission and connection retries.
+//
+// ResourceConfig.OnRetry has always existed and no caller ever set it, so a
+// Connector that could not be admitted retried forever in complete silence:
+// no log line, no admin API, no exit. From the outside that is indistinguishable
+// from a hang, and it is exactly what made a qURL Desktop startup failure
+// undiagnosable -- the process was alive and healthy-looking while every attempt
+// failed unseen.
+//
+// The error is reported at two levels on purpose. OnRetry's contract warns the
+// error "is not guaranteed to be safe for persistent logs", so the default level
+// records only that an attempt failed and how long until the next one, which is
+// enough to tell a hang apart from a retry loop. The text itself is debug-only,
+// where an operator has explicitly asked for detail.
+func retryReporter(ctx context.Context) func(error, time.Duration) {
+	return func(err error, wait time.Duration) {
+		if err == nil {
+			return
+		}
+		slog.InfoContext(ctx, "connector: resource admission attempt failed; retrying",
+			"retry_in", wait.String())
+		slog.DebugContext(ctx, "connector: resource admission attempt failed; retrying",
+			"retry_in", wait.String(), "err", err.Error())
+	}
+}
+
 // sharedServiceAdmitter is the admitter surface the shared runtime needs:
 // resource-bound admissions plus the post-serving assignment-refresh reset.
 // *share.NativeAdmitter is the production implementation; tests supply a fake.
@@ -1338,14 +1364,11 @@ func newSharedServiceRunner(ctx context.Context, qcfg *nhpconfig.Config, admitte
 			// serving.
 			retireSharedRoute(ctx, ledger, announcer, routeID, resourceIDs[routeID], "resource_not_found", err)
 		},
-		OnRetry: func(err error, wait time.Duration) {
-			slog.WarnContext(ctx, "connector: NHP admission or FRP session attempt failed; retrying",
-				"wait", wait.String(), "err", err.Error())
-		},
 		OnRotationLeadCapped: func(routes int, need, lead time.Duration) {
 			slog.WarnContext(ctx, "connector: admission window is short for this route count; a rotation may promote before every route re-registers",
 				"routes", routes, "lead_needed", need.String(), "lead", lead.String())
 		},
+		OnRetry: retryReporter(ctx),
 	})
 }
 
