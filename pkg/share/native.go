@@ -34,8 +34,12 @@ type NativeRuntimeConfig struct {
 	// retained after OpenNativeRuntime returns.
 	RecoveryCredentialProvider func(context.Context) (string, error)
 	RefreshMode                string
-	UDPOptions                 []qurl.AgentRuntimeUDPOption
-	SessionOperations          NativeSessionOperationAuthority
+	// UDPOptions configure native UDP lifecycle, discovery, registered-session
+	// admission, and durable recovery/close. They are retained for assignment
+	// refresh and therefore must not close over enrollment credentials or account
+	// bearer tokens.
+	UDPOptions        []qurl.AgentRuntimeUDPOption
+	SessionOperations NativeSessionOperationAuthority
 }
 
 // nativeRefreshConfig is the credential-free subset retained after opening
@@ -55,10 +59,13 @@ type nativeRefreshConfig struct {
 // Client and Binding for native resource discovery before transferring the
 // runtime into NewNativeAdmitter.
 type NativeRuntime struct {
-	Client            *qurl.Client
-	Binding           *qurl.AgentRuntimeBinding
-	AgentID           string
-	Hub               qurl.HubBootstrap
+	Client  *qurl.Client
+	Binding *qurl.AgentRuntimeBinding
+	AgentID string
+	Hub     qurl.HubBootstrap
+	// UDPOptions configure direct qurl-go UDP calls, including registered-session
+	// admission and durable recovery/close. NewNativeAdmitter transfers and then
+	// clears them from this runtime.
 	UDPOptions        []qurl.AgentRuntimeUDPOption
 	OpenKind          NativeOpenKind
 	SessionOperations NativeSessionOperationAuthority
@@ -104,7 +111,6 @@ var (
 	recoverNativeRuntime = qurl.RecoverAgentRuntimeWithCredentialProvider
 	waitNativeRefresh    = sleepWithContext
 	knockNativeRuntime   = qurl.KnockRegisteredAgent
-	retireNativeSession  = qurl.RetireRegisteredAgentSession
 	takeNativeKey        = func(binding *qurl.AgentRuntimeBinding) []byte { return binding.TakeDeviceStaticPrivateKey() }
 )
 
@@ -517,10 +523,12 @@ func assembleNativeRuntime(client *qurl.Client, binding *qurl.AgentRuntimeBindin
 		binding.Destroy()
 		return nil, err
 	}
+	retained := cfg
+	retained.UDPOptions = append([]qurl.AgentRuntimeUDPOption(nil), cfg.UDPOptions...)
 	return &NativeRuntime{
 		Client: client, Binding: binding, AgentID: binding.AgentID, Hub: cfg.Hub, OpenKind: kind,
 		store: store, UDPOptions: append([]qurl.AgentRuntimeUDPOption(nil), cfg.UDPOptions...),
-		refreshCfg: cfg, SessionOperations: cfg.SessionOperations,
+		refreshCfg: retained, SessionOperations: cfg.SessionOperations,
 	}, nil
 }
 
@@ -667,6 +675,7 @@ func (r *NativeRuntime) Close() error {
 	}
 	r.Client = nil
 	r.UDPOptions = nil
+	r.refreshCfg = nativeRefreshConfig{}
 	r.SessionOperations = NativeSessionOperationAuthority{}
 	return err
 }
@@ -1222,9 +1231,11 @@ func (a *NativeAdmitter) admitOnce(ctx context.Context, knockResourceID,
 	}
 	generation := a.generation
 	if err := a.operations.RecoverPending(ctx, a.binding, a.privateKey, resourceID, a.liveOperationIDs(resourceID), a.udpOpts); err != nil {
-		// Recovery is source-fenced to the operation's persisted cell. Assignment
-		// refresh cannot change that endpoint, so this resource remains blocked by
-		// its durable record without changing the live-placement failure budget.
+		// Recovery is fenced to the operation's persisted cell. It already
+		// retries a silent pinned endpoint against the binding's current
+		// same-cell endpoint and retires a record that stays silent past its
+		// expiry, so this resource remains blocked by its durable record only for
+		// that bounded window, without changing the live-placement failure budget.
 		return Admission{}, fmt.Errorf("recover prior native session operation before replacement: %w", err), generation, false
 	}
 	if err := a.retirePendingForResource(ctx, resourceID); err != nil {
@@ -1401,7 +1412,7 @@ func (a *NativeAdmitter) refresh(ctx context.Context, failedGeneration uint64, r
 	oldKey := a.privateKey
 	a.binding = runtime.Binding
 	a.privateKey = key
-	a.udpOpts = append(a.udpOpts[:0], runtime.UDPOptions...)
+	a.udpOpts = append([]qurl.AgentRuntimeUDPOption(nil), runtime.UDPOptions...)
 	runtime.Binding = nil
 	runtime.store = nil
 	a.generation++
@@ -1590,7 +1601,9 @@ func (a *NativeAdmitter) resetPlacementFailures(resourceID string) {
 
 // Retire durably closes only the exact NHP session represented by admission.
 // A failed retirement remains pending and must succeed before the same
-// resource can obtain another admission.
+// resource can obtain another admission. Success is the server reporting the
+// operation terminal, or the bounded local abandonment of an operation that is
+// past its expiry after repeated post-expiry exchanges no cell endpoint answered.
 func (a *NativeAdmitter) Retire(ctx context.Context, admission Admission) error {
 	if ctx == nil {
 		return errors.New("retire native admission: context is nil")

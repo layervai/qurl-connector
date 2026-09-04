@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -24,6 +25,8 @@ type hermeticAdmitter struct {
 	mu         sync.Mutex
 	admissions []Admission
 	next       int
+	// admittedAt records when each scripted admission was handed out.
+	admittedAt []time.Time
 	retired    []Admission
 }
 
@@ -32,12 +35,27 @@ func (a *hermeticAdmitter) Admit(ctx context.Context, _, _ string) (Admission, e
 	if a.next < len(a.admissions) {
 		admission := a.admissions[a.next]
 		a.next++
+		a.admittedAt = append(a.admittedAt, time.Now())
 		a.mu.Unlock()
 		return admission, nil
 	}
 	a.mu.Unlock()
 	<-ctx.Done()
 	return Admission{}, ctx.Err()
+}
+
+// admissionCount is how many scripted admissions have been handed out.
+func (a *hermeticAdmitter) admissionCount() int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.next
+}
+
+// admittedAtIndex is when the i-th admission was handed out.
+func (a *hermeticAdmitter) admittedAtIndex(i int) time.Time {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.admittedAt[i]
 }
 
 func (a *hermeticAdmitter) Retire(_ context.Context, admission Admission) error {
@@ -54,16 +72,30 @@ func (a *hermeticAdmitter) retiredSnapshot() []Admission {
 }
 
 type hermeticNewProxyObservation struct {
-	runID    string
-	rejected bool
+	runID     string
+	proxyName string
+	rejected  bool
+	at        time.Time
 }
 
 type hermeticQRTSPlugin struct {
 	server *httptest.Server
 
-	mu           sync.Mutex
-	stale        map[string]bool
-	observations []hermeticNewProxyObservation
+	mu            sync.Mutex
+	stale         map[string]bool
+	rejectProxies map[string]string
+	observations  []hermeticNewProxyObservation
+	// latency, when set, is how long each NewProxy for the Login RunID takes
+	// to answer, modeling the platform's authorization round trip. The FRP
+	// server reads a control session's messages serially, so the delay is
+	// served in the order the client sent the NewProxy messages.
+	latency map[string]hermeticLatency
+	rng     *rand.Rand
+}
+
+// hermeticLatency is a uniform per-call delay range.
+type hermeticLatency struct {
+	low, high time.Duration
 }
 
 type hermeticTCPForwarder struct {
@@ -125,7 +157,11 @@ func (f *hermeticTCPForwarder) serve() {
 
 func newHermeticQRTSPlugin(t *testing.T) *hermeticQRTSPlugin {
 	t.Helper()
-	plugin := &hermeticQRTSPlugin{stale: make(map[string]bool)}
+	plugin := &hermeticQRTSPlugin{
+		stale: make(map[string]bool), rejectProxies: make(map[string]string),
+		latency: make(map[string]hermeticLatency),
+		rng:     rand.New(rand.NewPCG(7, 7)), //nolint:gosec // deterministic jitter, not security-sensitive
+	}
 	plugin.server = httptest.NewServer(http.HandlerFunc(plugin.handle))
 	t.Cleanup(plugin.server.Close)
 	return plugin
@@ -138,6 +174,7 @@ func (p *hermeticQRTSPlugin) handle(w http.ResponseWriter, r *http.Request) {
 			User struct {
 				RunID string `json:"run_id"`
 			} `json:"user"`
+			ProxyName string `json:"proxy_name"`
 		} `json:"content"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
@@ -147,23 +184,97 @@ func (p *hermeticQRTSPlugin) handle(w http.ResponseWriter, r *http.Request) {
 	response := map[string]any{"reject": false, "unchange": true}
 	if request.Op == "NewProxy" {
 		p.mu.Lock()
-		rejected := p.stale[request.Content.User.RunID]
+		reason, rejected := p.rejectProxies[request.Content.ProxyName]
+		if !rejected && p.stale[request.Content.User.RunID] {
+			reason, rejected = hermeticOwnerMissing, true
+		}
 		p.observations = append(p.observations, hermeticNewProxyObservation{
-			runID: request.Content.User.RunID, rejected: rejected,
+			runID: request.Content.User.RunID, proxyName: request.Content.ProxyName, rejected: rejected, at: time.Now(),
 		})
+		var delay time.Duration
+		if latency, ok := p.latency[request.Content.User.RunID]; ok {
+			delay = latency.low
+			if spread := latency.high - latency.low; spread > 0 {
+				delay += time.Duration(p.rng.Int64N(int64(spread)))
+			}
+		}
 		p.mu.Unlock()
+		if delay > 0 {
+			time.Sleep(delay)
+		}
 		if rejected {
-			response = map[string]any{"reject": true, "reject_reason": hermeticOwnerMissing}
+			response = map[string]any{"reject": true, "reject_reason": reason}
 		}
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(response)
 }
 
+// delayNewProxy makes every NewProxy authorization for the Login RunID take
+// a uniformly random time in [low, high], the way a platform round trip does.
+func (p *hermeticQRTSPlugin) delayNewProxy(runID string, low, high time.Duration) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.latency[runID] = hermeticLatency{low: low, high: high}
+}
+
 func (p *hermeticQRTSPlugin) markStale(runID string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.stale[runID] = true
+}
+
+// rejectProxy makes every NewProxy for the exact proxy name fail with the
+// given wire text, independent of the Login RunID.
+func (p *hermeticQRTSPlugin) rejectProxy(proxyName, reason string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.rejectProxies[proxyName] = reason
+}
+
+// admittedNewProxies counts admitted NewProxy calls per proxy name.
+func (p *hermeticQRTSPlugin) admittedNewProxies() map[string]int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	counts := make(map[string]int)
+	for _, observation := range p.observations {
+		if !observation.rejected {
+			counts[observation.proxyName]++
+		}
+	}
+	return counts
+}
+
+// admittedTimes reports, per proxy name, when its latest NewProxy was admitted.
+func (p *hermeticQRTSPlugin) admittedTimes() map[string]time.Time {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	times := make(map[string]time.Time)
+	for _, observation := range p.observations {
+		if !observation.rejected && observation.at.After(times[observation.proxyName]) {
+			times[observation.proxyName] = observation.at
+		}
+	}
+	return times
+}
+
+// lastAdmittedAt reports when the latest NewProxy for the RunID was admitted
+// and how many were admitted in total for it.
+func (p *hermeticQRTSPlugin) lastAdmittedAt(runID string) (time.Time, int) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	var last time.Time
+	count := 0
+	for _, observation := range p.observations {
+		if observation.runID != runID || observation.rejected {
+			continue
+		}
+		count++
+		if observation.at.After(last) {
+			last = observation.at
+		}
+	}
+	return last, count
 }
 
 func (p *hermeticQRTSPlugin) snapshot() []hermeticNewProxyObservation {
@@ -187,7 +298,14 @@ func reserveHermeticPort(t *testing.T) int {
 
 func startHermeticFRPS(t *testing.T, bindPort, vhostPort int, subdomainHost, pluginURL string) *frpserver.Service {
 	t.Helper()
-	cfg := &v1.ServerConfig{
+	return startHermeticFRPSFromConfig(t, hermeticFRPSConfig(bindPort, vhostPort, subdomainHost, pluginURL))
+}
+
+// hermeticFRPSConfig is the FRP server shape every hermetic test shares: one
+// loopback listener multiplexing control and vhost HTTP, the tunnel-auth
+// plugin on NewProxy, and routing by subdomain.
+func hermeticFRPSConfig(bindPort, vhostPort int, subdomainHost, pluginURL string) *v1.ServerConfig {
+	return &v1.ServerConfig{
 		BindAddr: "127.0.0.1", BindPort: bindPort,
 		ProxyBindAddr: "127.0.0.1", VhostHTTPPort: vhostPort,
 		SubDomainHost: subdomainHost,
@@ -195,6 +313,10 @@ func startHermeticFRPS(t *testing.T, bindPort, vhostPort int, subdomainHost, plu
 			Name: "qrts-sim", Addr: pluginURL, Path: "/", Ops: []string{"NewProxy"},
 		}},
 	}
+}
+
+func startHermeticFRPSFromConfig(t *testing.T, cfg *v1.ServerConfig) *frpserver.Service {
+	t.Helper()
 	if err := cfg.Complete(); err != nil {
 		t.Fatalf("complete FRPS config: %v", err)
 	}
@@ -207,6 +329,13 @@ func startHermeticFRPS(t *testing.T, bindPort, vhostPort int, subdomainHost, plu
 }
 
 func pollHermeticHTTP(t *testing.T, port int, host, want string, runner <-chan error) {
+	t.Helper()
+	pollHermeticRoute(t, port, "hermetic."+host, want, runner)
+}
+
+// pollHermeticRoute sends vhost requests for one exact Host until the expected
+// body traverses the admitted route.
+func pollHermeticRoute(t *testing.T, port int, hostHeader, want string, runner <-chan error) {
 	t.Helper()
 	client := &http.Client{Timeout: 500 * time.Millisecond}
 	deadline := time.Now().Add(15 * time.Second)
@@ -221,7 +350,7 @@ func pollHermeticHTTP(t *testing.T, port int, host, want string, runner <-chan e
 		if err != nil {
 			t.Fatal(err)
 		}
-		request.Host = "hermetic." + host
+		request.Host = hostHeader
 		response, err := client.Do(request)
 		if err != nil {
 			lastErr = err

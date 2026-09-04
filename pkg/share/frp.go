@@ -47,11 +47,8 @@ func NewFRPSessionFactory(cfg FRPFactoryConfig) (*FRPSessionFactory, error) {
 	if cfg.Common == nil {
 		return nil, errors.New("build FRP session factory: common config is nil")
 	}
-	if cfg.Route.RouteID == "" || cfg.Route.ResourceID == "" || cfg.Route.ConnectorRoutingID == "" {
-		return nil, errors.New("build FRP session factory: route identities are incomplete")
-	}
-	if cfg.Route.LocalIP == "" || cfg.Route.LocalPort < 1 || cfg.Route.LocalPort > 65535 {
-		return nil, errors.New("build FRP session factory: local target is invalid")
+	if err := validateLocalHTTPRoute(cfg.Route); err != nil {
+		return nil, fmt.Errorf("build FRP session factory: %w", err)
 	}
 	if cfg.ReadyPoll <= 0 {
 		cfg.ReadyPoll = 100 * time.Millisecond
@@ -66,13 +63,36 @@ func (f *FRPSessionFactory) BuildConfig(admission Admission) (*v1.ClientCommonCo
 	if err := validateAdmission(admission, admission.KnockResourceID, f.cfg.Route.ResourceID); err != nil {
 		return nil, nil, nil, err
 	}
-	common := cloneCommon(f.cfg.Common)
+	common, err := buildAdmittedCommon(f.cfg.Common, admission, f.cfg.ClientVersion)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	proxyName := nhpconfig.FRPProxyName(f.cfg.Route.RouteID, sessionProxyDiscriminator(admission.SessionID))
+	proxy := buildRouteProxy(f.cfg.Route, proxyName)
+	return common, []v1.ProxyConfigurer{proxy}, []string{proxyName}, nil
+}
+
+func validateLocalHTTPRoute(route LocalHTTPRoute) error {
+	if route.RouteID == "" || route.ResourceID == "" || route.ConnectorRoutingID == "" {
+		return errors.New("route identities are incomplete")
+	}
+	if route.LocalIP == "" || route.LocalPort < 1 || route.LocalPort > 65535 {
+		return errors.New("local target is invalid")
+	}
+	return nil
+}
+
+// buildAdmittedCommon renders the Login half of one admission: the admitted
+// server endpoint, the bearer knock token, and fail-fast login. The caller's
+// base config is never mutated.
+func buildAdmittedCommon(base *v1.ClientCommonConfig, admission Admission, clientVersion string) (*v1.ClientCommonConfig, error) {
+	common := cloneCommon(base)
 	host, port, err := parseAdmittedResourceHost(admission.ResourceHost)
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("parse admitted FRP host: %w", err)
+		return nil, fmt.Errorf("parse admitted FRP host: %w", err)
 	}
 	if tlsEnabled(common) && common.Transport.TLS.ServerName == "" && ipLiteralHost(host) {
-		return nil, nil, nil, errors.New("parse admitted FRP host: IP-literal target requires an explicit TLS server name")
+		return nil, errors.New("parse admitted FRP host: IP-literal target requires an explicit TLS server name")
 	}
 	common.ServerAddr = host
 	common.ServerPort = port
@@ -80,23 +100,34 @@ func (f *FRPSessionFactory) BuildConfig(admission Admission) (*v1.ClientCommonCo
 		common.Metadatas = map[string]string{}
 	}
 	common.Metadatas[nhpconfig.MetaQURLKnockToken] = admission.Token
-	if f.cfg.ClientVersion != "" {
-		common.Metadatas[nhpconfig.MetaClientVersion] = f.cfg.ClientVersion
+	if clientVersion != "" {
+		common.Metadatas[nhpconfig.MetaClientVersion] = clientVersion
 	}
 	failFast := true
 	common.LoginFailExit = &failFast
+	return common, nil
+}
 
-	proxyName := nhpconfig.FRPProxyName(f.cfg.Route.RouteID, "nhp"+strconv.FormatUint(admission.SessionID, 36))
+// sessionProxyDiscriminator is the per-admission replica discriminator folded
+// into every proxy name so overlapping cycles never collide on the server.
+func sessionProxyDiscriminator(sessionID uint64) string {
+	return "nhp" + strconv.FormatUint(sessionID, 36)
+}
+
+// buildRouteProxy renders one HTTP proxy. Group, group key, subdomain, public
+// resource metadata, and the local target are the route's stable identity;
+// only the name changes between cycles.
+func buildRouteProxy(route LocalHTTPRoute, proxyName string) *v1.HTTPProxyConfig {
 	proxy := &v1.HTTPProxyConfig{}
 	proxy.Name = proxyName
 	proxy.Type = string(v1.ProxyTypeHTTP)
-	proxy.LocalIP = f.cfg.Route.LocalIP
-	proxy.LocalPort = f.cfg.Route.LocalPort
-	proxy.SubDomain = f.cfg.Route.ConnectorRoutingID
-	proxy.LoadBalancer.Group = f.cfg.Route.ConnectorRoutingID
-	proxy.LoadBalancer.GroupKey = f.cfg.Route.ConnectorRoutingID
-	proxy.Metadatas = map[string]string{nhpconfig.MetaResourceID: f.cfg.Route.ResourceID}
-	return common, []v1.ProxyConfigurer{proxy}, []string{proxyName}, nil
+	proxy.LocalIP = route.LocalIP
+	proxy.LocalPort = route.LocalPort
+	proxy.SubDomain = route.ConnectorRoutingID
+	proxy.LoadBalancer.Group = route.ConnectorRoutingID
+	proxy.LoadBalancer.GroupKey = route.ConnectorRoutingID
+	proxy.Metadatas = map[string]string{nhpconfig.MetaResourceID: route.ResourceID}
+	return proxy
 }
 
 func (f *FRPSessionFactory) Start(ctx context.Context, admission Admission) (ServingSession, error) {

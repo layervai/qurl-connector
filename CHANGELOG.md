@@ -1,5 +1,101 @@
 # Changelog
 
+## [0.11.5](https://github.com/layervai/qurl-connector/compare/v0.11.4...v0.11.5) (2026-09-03)
+
+
+### Bug Fixes
+
+* **share:** age refused proxies out of the ceiling; measure the lead from the second route ([#69](https://github.com/layervai/qurl-connector/issues/69)) ([a6423c0](https://github.com/layervai/qurl-connector/commit/a6423c086589ed0c3d201ee7204e676761761200))
+
+## [0.11.4](https://github.com/layervai/qurl-connector/compare/v0.11.3...v0.11.4) (2026-09-03)
+
+
+### Bug Fixes
+
+* **share:** window NewProxy registration; lead follows measured rate ([#67](https://github.com/layervai/qurl-connector/issues/67)) ([a1ee171](https://github.com/layervai/qurl-connector/commit/a1ee171876bcd861e335b13c08ea5e9da25c76c8))
+
+## [0.11.3](https://github.com/layervai/qurl-connector/compare/v0.11.2...v0.11.3) (2026-09-03)
+
+
+### Bug Fixes
+
+* **share:** re-fence native session recovery to the current endpoint ([#64](https://github.com/layervai/qurl-connector/issues/64)) ([e7d1c80](https://github.com/layervai/qurl-connector/commit/e7d1c8086c3a10126c630481b2f1d4052be9bb6f))
+
+## [0.11.2](https://github.com/layervai/qurl-connector/compare/v0.11.1...v0.11.2) (2026-09-03)
+
+
+### Bug Fixes
+
+* **frpc:** own the retirement ledger in the runtime, not the ready block ([#62](https://github.com/layervai/qurl-connector/issues/62)) ([9d4bf32](https://github.com/layervai/qurl-connector/commit/9d4bf32910075d1d251fdbc5b829926d8fe55bc7))
+
+## [0.11.1](https://github.com/layervai/qurl-connector/compare/v0.11.0...v0.11.1) (2026-09-03)
+
+
+### Bug Fixes
+
+* **frpc:** keep retired routes out of re-admission and probe liveness at the fallback ([#59](https://github.com/layervai/qurl-connector/issues/59)) ([9ae3422](https://github.com/layervai/qurl-connector/commit/9ae3422052711acc8576fe2c99ca8ab77b1db22b))
+
+## [0.11.0](https://github.com/layervai/qurl-connector/compare/v0.10.0...v0.11.0) (2026-09-03)
+
+
+### ⚠ BREAKING CHANGES
+
+* **frpc:** a revoked route no longer exits the process.
+
+### Bug Fixes
+
+* **frpc:** serve all routes on one Connector session ([#56](https://github.com/layervai/qurl-connector/issues/56)) ([221434c](https://github.com/layervai/qurl-connector/commit/221434c032d4a0489bb905a8091801796dd26743))
+
+## [0.10.0](https://github.com/layervai/qurl-connector/compare/v0.9.0...v0.10.0) (2026-09-03)
+
+
+### ⚠ BREAKING CHANGES
+
+* **frpc:** startSharedService no longer rejects configs with more than one route. Callers that relied on the one-resource guarantee must not assume a single ResourceRunner per process.
+
+### Features
+
+* **frpc:** serve every configured resource from one Connector process ([#54](https://github.com/layervai/qurl-connector/issues/54)) ([33b89f8](https://github.com/layervai/qurl-connector/commit/33b89f86435374f338a8df48f03f8fe5a2c0d79e))
+* **share:** session group runtime serving many routes on one admission ([#55](https://github.com/layervai/qurl-connector/issues/55)) ([f80e729](https://github.com/layervai/qurl-connector/commit/f80e7296f581159577ab9df151af5642d7116be6))
+
+
+### Continuous Integration
+
+* **deps:** bump age-check-actions reusable to v0.13.0 ([#49](https://github.com/layervai/qurl-connector/issues/49)) ([785c3fd](https://github.com/layervai/qurl-connector/commit/785c3fd5778ed265591bbe2b5bc3372f321695aa))
+* **deps:** bump remaining ops-routines-workflows shims to v0.13.0 ([#52](https://github.com/layervai/qurl-connector/issues/52)) ([8595dfe](https://github.com/layervai/qurl-connector/commit/8595dfe7fa0e6045e1b887487ac0049ea60d997f))
+
+## [0.9.0](https://github.com/layervai/qurl-connector/compare/v0.8.13...v0.9.0) (2026-09-01)
+
+
+### ⚠ BREAKING CHANGES
+
+* **share:** NativeRuntimeConfig and NativeRuntime no longer expose SessionOptions. No separate session-only option channel remains. Configure credential-free UDPOptions for registered-session operations; these retained options also apply to native lifecycle, discovery, assignment refresh, and the account-credential-authenticated device-authorization recovery client.
+
+### Bug Fixes
+
+* **share:** keep registered sessions on native UDP ([#44](https://github.com/layervai/qurl-connector/issues/44)) ([e99252b](https://github.com/layervai/qurl-connector/commit/e99252bbcb74a5cde88e17cef42429d8858f9d75))
+
+## [0.8.13](https://github.com/layervai/qurl-connector/compare/v0.8.12...v0.8.13) (2026-09-01)
+
+
+### Bug Fixes
+
+* **service:** settle rapid launchd label reuse ([#41](https://github.com/layervai/qurl-connector/issues/41)) ([9fcd76c](https://github.com/layervai/qurl-connector/commit/9fcd76c5fa59a9bfdfee9563b34a02a9f68f6b16))
+
+## [0.8.12](https://github.com/layervai/qurl-connector/compare/v0.8.11...v0.8.12) (2026-09-01)
+
+
+### Features
+
+* **agent:** relay registered session operations ([#39](https://github.com/layervai/qurl-connector/issues/39)) ([fe8436d](https://github.com/layervai/qurl-connector/commit/fe8436d6c9a00a5530f5ee2fe10ca75af986e6f2))
+
+## [0.8.11](https://github.com/layervai/qurl-connector/compare/v0.8.10...v0.8.11) (2026-09-01)
+
+
+### Bug Fixes
+
+* resume terminal session retirement ([#37](https://github.com/layervai/qurl-connector/issues/37)) ([df1e388](https://github.com/layervai/qurl-connector/commit/df1e388419b14c412d69469c47b2c4e696b5c1b1))
+
 ## [0.8.10](https://github.com/layervai/qurl-connector/compare/v0.8.9...v0.8.10) (2026-08-31)
 
 

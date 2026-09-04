@@ -1,17 +1,22 @@
 package share
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	qurl "github.com/layervai/qurl-go/qurl"
+	"github.com/layervai/qurl-go/relayknock/nativeudp"
 
 	"github.com/layervai/qurl-connector/pkg/agentstate"
 )
@@ -163,16 +168,18 @@ func TestDurableNativeSessionOperationPersistsEveryNetworkBoundary(t *testing.T)
 
 	recoverCalls := 0
 	recoverNativeSessionOperation = func(_ context.Context, _ *qurl.AgentRuntimeBinding, _ []byte,
-		got qurl.NativeSessionOperation, _ qurl.NHPUDPEndpoint, _ ...qurl.AgentRuntimeUDPOption,
+		got qurl.NativeSessionOperation, _ qurl.NHPUDPEndpoint, options ...qurl.AgentRuntimeUDPOption,
 	) (*qurl.NativeSessionOperationRecovery, error) {
 		recoverCalls++
 		current := store.operations[protected][0]
-		if current.Status != agentstate.SessionOperationClosing || got != *operation {
+		if current.Status != agentstate.SessionOperationClosing || got != *operation ||
+			len(options) != 1 || options[0] == nil {
 			t.Fatalf("recovery boundary record=%+v operation=%+v", current, got)
 		}
 		return &qurl.NativeSessionOperationRecovery{Complete: true}, nil
 	}
-	if err := controller.Retire(context.Background(), binding, make([]byte, 32), protected, operation.OperationID, receipt, nil); err != nil {
+	if err := controller.Retire(context.Background(), binding, make([]byte, 32), protected, operation.OperationID,
+		receipt, testAgentRuntimeUDPOptions()); err != nil {
 		t.Fatal(err)
 	}
 	if recoverCalls != 1 {
@@ -231,15 +238,16 @@ func TestDurableNativeSessionOperationSurvivesSDKStoreRestart(t *testing.T) {
 	}
 	recovery.clock = controller.clock
 	recoverNativeSessionOperation = func(_ context.Context, _ *qurl.AgentRuntimeBinding, _ []byte,
-		got qurl.NativeSessionOperation, _ qurl.NHPUDPEndpoint, _ ...qurl.AgentRuntimeUDPOption,
+		got qurl.NativeSessionOperation, _ qurl.NHPUDPEndpoint, options ...qurl.AgentRuntimeUDPOption,
 	) (*qurl.NativeSessionOperationRecovery, error) {
-		if got != *operation {
+		if got != *operation || len(options) != 1 || options[0] == nil {
 			t.Fatalf("restarted operation = %+v, want %+v", got, *operation)
 		}
 		return &qurl.NativeSessionOperationRecovery{Complete: true}, nil
 	}
 	if err := recovery.RecoverPending(context.Background(), &qurl.AgentRuntimeBinding{AgentID: "agent-one"},
-		make([]byte, 32), testProtectedResourceID, nil, nil); err != nil {
+		make([]byte, 32), testProtectedResourceID, nil,
+		testAgentRuntimeUDPOptions()); err != nil {
 		t.Fatal(err)
 	}
 	if records, err := reopened.LoadSessionOperations(context.Background(), testProtectedResourceID); err != nil || len(records) != 0 {
@@ -675,6 +683,360 @@ func TestDurableNativeSessionRetirementResumesClosingWithPersistedBackoff(t *tes
 	}
 }
 
+type failFirstSessionOperationDeleteStore struct {
+	*memoryNativeStore
+	err     error
+	deletes int
+}
+
+func (s *failFirstSessionOperationDeleteStore) DeleteSessionOperation(ctx context.Context,
+	terminal agentstate.SessionOperationRecord,
+) error {
+	s.deletes++
+	if s.deletes == 1 {
+		return s.err
+	}
+	return s.memoryNativeStore.DeleteSessionOperation(ctx, terminal)
+}
+
+func TestDurableNativeSessionRetirementResumesCommittedClosedTombstone(t *testing.T) {
+	oldRecover := recoverNativeSessionOperation
+	t.Cleanup(func() { recoverNativeSessionOperation = oldRecover })
+	want := errors.New("delete terminal tombstone interrupted")
+	store := &failFirstSessionOperationDeleteStore{memoryNativeStore: &memoryNativeStore{}, err: want}
+	mapped, receipt := seedMappedDurableRecord(t, store.memoryNativeStore)
+	controller, err := newDurableNativeSessionOperations(store, testNativeSessionAuthority())
+	if err != nil {
+		t.Fatal(err)
+	}
+	controller.clock = func() time.Time { return time.UnixMilli(1_800_000_011_000).UTC() }
+	recoverCalls := 0
+	recoverNativeSessionOperation = func(context.Context, *qurl.AgentRuntimeBinding, []byte,
+		qurl.NativeSessionOperation, qurl.NHPUDPEndpoint, ...qurl.AgentRuntimeUDPOption,
+	) (*qurl.NativeSessionOperationRecovery, error) {
+		recoverCalls++
+		return &qurl.NativeSessionOperationRecovery{Complete: true}, nil
+	}
+	binding := &qurl.AgentRuntimeBinding{AgentID: mapped.Operation.AgentID}
+	err = controller.Retire(context.Background(), binding, make([]byte, 32), testProtectedResourceID,
+		mapped.Operation.OperationID, receipt, nil)
+	if !errors.Is(err, want) {
+		t.Fatalf("first Retire() = %v, want interrupted terminal deletion", err)
+	}
+	records, loadErr := store.LoadSessionOperations(context.Background(), testProtectedResourceID)
+	if loadErr != nil || len(records) != 1 || records[0].Status != agentstate.SessionOperationClosed {
+		t.Fatalf("committed terminal record = %+v, %v; want one CLOSED tombstone", records, loadErr)
+	}
+	if err := controller.Retire(context.Background(), binding, make([]byte, 32), testProtectedResourceID,
+		mapped.Operation.OperationID, receipt, nil); err != nil {
+		t.Fatalf("resume Retire() = %v, want terminal tombstone deletion", err)
+	}
+	if recoverCalls != 1 || store.deletes != 2 {
+		t.Fatalf("resume network calls=%d deletes=%d, want 1/2", recoverCalls, store.deletes)
+	}
+	if records, loadErr := store.LoadSessionOperations(context.Background(), testProtectedResourceID); loadErr != nil || len(records) != 0 {
+		t.Fatalf("resumed terminal records=%+v err=%v", records, loadErr)
+	}
+}
+
+func TestDurableNativeSessionRetirementRejectsMismatchedClosedTombstone(t *testing.T) {
+	oldRecover := recoverNativeSessionOperation
+	t.Cleanup(func() { recoverNativeSessionOperation = oldRecover })
+	store := &memoryNativeStore{}
+	mapped, receipt := seedMappedDurableRecord(t, store)
+	closing := mapped
+	closing.Status = agentstate.SessionOperationClosing
+	if err := store.TransitionSessionOperation(context.Background(), mapped, closing); err != nil {
+		t.Fatal(err)
+	}
+	closed := closing
+	closed.Status = agentstate.SessionOperationClosed
+	if err := store.TransitionSessionOperation(context.Background(), closing, closed); err != nil {
+		t.Fatal(err)
+	}
+	recoverCalls := 0
+	recoverNativeSessionOperation = func(context.Context, *qurl.AgentRuntimeBinding, []byte,
+		qurl.NativeSessionOperation, qurl.NHPUDPEndpoint, ...qurl.AgentRuntimeUDPOption,
+	) (*qurl.NativeSessionOperationRecovery, error) {
+		recoverCalls++
+		return &qurl.NativeSessionOperationRecovery{Complete: true}, nil
+	}
+	controller, err := newDurableNativeSessionOperations(store, testNativeSessionAuthority())
+	if err != nil {
+		t.Fatal(err)
+	}
+	receipt.SessionID++
+	err = controller.Retire(context.Background(), &qurl.AgentRuntimeBinding{AgentID: mapped.Operation.AgentID},
+		make([]byte, 32), testProtectedResourceID, mapped.Operation.OperationID, receipt, nil)
+	if !errors.Is(err, agentstate.ErrSessionOperationConflict) || recoverCalls != 0 {
+		t.Fatalf("mismatched CLOSED retirement = err %v, calls %d; want conflict without exchange", err, recoverCalls)
+	}
+	records, loadErr := store.LoadSessionOperations(context.Background(), testProtectedResourceID)
+	if loadErr != nil || len(records) != 1 || records[0] != closed {
+		t.Fatalf("mismatched CLOSED tombstone changed: records=%+v err=%v", records, loadErr)
+	}
+}
+
+type concurrentSessionOperationRecoveryStore struct {
+	*memoryNativeStore
+	mu              sync.Mutex
+	attempts        int
+	firstArrived    chan struct{}
+	secondCommitted chan struct{}
+	staleReturned   chan struct{}
+}
+
+func (s *concurrentSessionOperationRecoveryStore) TransitionSessionOperation(ctx context.Context,
+	previous, next agentstate.SessionOperationRecord,
+) error {
+	if previous.Status != agentstate.SessionOperationClosing || next.Status != agentstate.SessionOperationClosing ||
+		next.RecoveryAttempt != 1 {
+		return s.memoryNativeStore.TransitionSessionOperation(ctx, previous, next)
+	}
+	s.mu.Lock()
+	s.attempts++
+	attempt := s.attempts
+	s.mu.Unlock()
+	switch attempt {
+	case 1:
+		close(s.firstArrived)
+		<-s.secondCommitted
+		err := s.memoryNativeStore.TransitionSessionOperation(ctx, previous, next)
+		close(s.staleReturned)
+		return err
+	case 2:
+		<-s.firstArrived
+		err := s.memoryNativeStore.TransitionSessionOperation(ctx, previous, next)
+		close(s.secondCommitted)
+		<-s.staleReturned
+		return err
+	default:
+		return s.memoryNativeStore.TransitionSessionOperation(ctx, previous, next)
+	}
+}
+
+func TestDurableNativeSessionRecoveryReconcilesConcurrentMonotonicCASLoss(t *testing.T) {
+	oldRecover := recoverNativeSessionOperation
+	oldWait := waitNativeSessionRecovery
+	t.Cleanup(func() {
+		recoverNativeSessionOperation = oldRecover
+		waitNativeSessionRecovery = oldWait
+	})
+	memory := &memoryNativeStore{}
+	mapped, _ := seedMappedDurableRecord(t, memory)
+	closing := mapped
+	closing.Status = agentstate.SessionOperationClosing
+	if err := memory.TransitionSessionOperation(context.Background(), mapped, closing); err != nil {
+		t.Fatal(err)
+	}
+	store := &concurrentSessionOperationRecoveryStore{
+		memoryNativeStore: memory,
+		firstArrived:      make(chan struct{}), secondCommitted: make(chan struct{}), staleReturned: make(chan struct{}),
+	}
+	first, err := newDurableNativeSessionOperations(store, testNativeSessionAuthority())
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := newDurableNativeSessionOperations(store, testNativeSessionAuthority())
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.UnixMilli(1_800_000_011_000).UTC()
+	first.clock = func() time.Time { return now }
+	second.clock = func() time.Time { return now }
+	waitNativeSessionRecovery = func(context.Context, time.Duration) error { return nil }
+	var recoverMu sync.Mutex
+	recoverCalls := 0
+	recoverNativeSessionOperation = func(context.Context, *qurl.AgentRuntimeBinding, []byte,
+		qurl.NativeSessionOperation, qurl.NHPUDPEndpoint, ...qurl.AgentRuntimeUDPOption,
+	) (*qurl.NativeSessionOperationRecovery, error) {
+		recoverMu.Lock()
+		recoverCalls++
+		recoverMu.Unlock()
+		return &qurl.NativeSessionOperationRecovery{Complete: true}, nil
+	}
+	binding := &qurl.AgentRuntimeBinding{AgentID: mapped.Operation.AgentID}
+	errs := make(chan error, 2)
+	for _, controller := range []*durableNativeSessionOperations{first, second} {
+		go func() {
+			errs <- controller.RecoverOperation(context.Background(), binding, make([]byte, 32),
+				testProtectedResourceID, mapped.Operation.OperationID, nil)
+		}()
+	}
+	for range 2 {
+		if err := <-errs; err != nil {
+			t.Fatalf("concurrent RecoverOperation() = %v, want reconciled completion", err)
+		}
+	}
+	store.mu.Lock()
+	attempts := store.attempts
+	store.mu.Unlock()
+	recoverMu.Lock()
+	calls := recoverCalls
+	recoverMu.Unlock()
+	if attempts != 2 || calls == 0 {
+		t.Fatalf("concurrent CAS attempts=%d network calls=%d, want 2 and at least 1", attempts, calls)
+	}
+	if records, loadErr := store.LoadSessionOperations(context.Background(), testProtectedResourceID); loadErr != nil || len(records) != 0 {
+		t.Fatalf("concurrent terminal records=%+v err=%v", records, loadErr)
+	}
+}
+
+func TestDurableNativeSessionRecoveryRejectsDivergentConflictReload(t *testing.T) {
+	store := &memoryNativeStore{}
+	previous := testPreparedDurableRecord(t)
+	previous.Status = agentstate.SessionOperationDispatching
+	current := previous
+	current.Operation.OwnerID = "different-owner"
+	store.operations = map[string][]agentstate.SessionOperationRecord{
+		testProtectedResourceID: {current},
+	}
+	controller, err := newDurableNativeSessionOperations(store, testNativeSessionAuthority())
+	if err != nil {
+		t.Fatal(err)
+	}
+	complete, err := controller.reconcileRecoveryConflict(
+		context.Background(), testProtectedResourceID, previous, agentstate.ErrSessionOperationCASLost,
+	)
+	if complete || !errors.Is(err, agentstate.ErrSessionOperationConflict) {
+		t.Fatalf("divergent conflict reload = (%t, %v), want fail-closed conflict", complete, err)
+	}
+}
+
+func TestDurableNativeSessionRecoveryRejectsConcurrentPreparedAdmission(t *testing.T) {
+	store := &memoryNativeStore{}
+	previous := testPreparedDurableRecord(t)
+	current := previous
+	current.Status = agentstate.SessionOperationMapped
+	current.Admission = &agentstate.SessionOperationAdmission{
+		CellID: current.Operation.CellID, SessionID: 91,
+		SessionIssuedAtMillis: 1_800_000_011_000,
+		RunID:                 current.Operation.RunID, RunAttempt: current.Operation.RunAttempt,
+	}
+	store.operations = map[string][]agentstate.SessionOperationRecord{
+		testProtectedResourceID: {current},
+	}
+	controller, err := newDurableNativeSessionOperations(store, testNativeSessionAuthority())
+	if err != nil {
+		t.Fatal(err)
+	}
+	complete, err := controller.reconcileRecoveryConflict(
+		context.Background(), testProtectedResourceID, previous, agentstate.ErrSessionOperationCASLost,
+	)
+	if complete || !errors.Is(err, agentstate.ErrSessionOperationConflict) {
+		t.Fatalf("concurrent PREPARED admission = (%t, %v), want fail-closed conflict", complete, err)
+	}
+}
+
+func TestDurableNativeSessionRecoveryDoesNotReconcileValidationConflict(t *testing.T) {
+	store := &memoryNativeStore{}
+	previous := testPreparedDurableRecord(t)
+	store.operations = map[string][]agentstate.SessionOperationRecord{}
+	controller, err := newDurableNativeSessionOperations(store, testNativeSessionAuthority())
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := fmt.Errorf("%w: invalid transition", agentstate.ErrSessionOperationConflict)
+	complete, err := controller.reconcileRecoveryConflict(
+		context.Background(), testProtectedResourceID, previous, want,
+	)
+	if complete || !errors.Is(err, want) {
+		t.Fatalf("validation conflict reconciliation = (%t, %v), want original failure", complete, err)
+	}
+}
+
+func TestDurableNativeSessionRecoveryDoesNotDropJoinedLockReleaseError(t *testing.T) {
+	store := &memoryNativeStore{}
+	previous := testPreparedDurableRecord(t)
+	controller, err := newDurableNativeSessionOperations(store, testNativeSessionAuthority())
+	if err != nil {
+		t.Fatal(err)
+	}
+	lockErr := errors.New("release operation lock")
+	want := errors.Join(fmt.Errorf("write operation: %w", agentstate.ErrSessionOperationCASLost), lockErr)
+	complete, err := controller.reconcileRecoveryConflict(
+		context.Background(), testProtectedResourceID, previous, want,
+	)
+	if complete || !errors.Is(err, agentstate.ErrSessionOperationCASLost) || !errors.Is(err, lockErr) {
+		t.Fatalf("joined lock release reconciliation = (%t, %v), want both failures", complete, err)
+	}
+}
+
+func TestDurableNativeSessionRecoveryAcceptsPureWrappedCASLoss(t *testing.T) {
+	store := &memoryNativeStore{}
+	previous := testPreparedDurableRecord(t)
+	controller, err := newDurableNativeSessionOperations(store, testNativeSessionAuthority())
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := errors.Join(fmt.Errorf("write operation: %w", agentstate.ErrSessionOperationCASLost))
+	complete, err := controller.reconcileRecoveryConflict(
+		context.Background(), testProtectedResourceID, previous, want,
+	)
+	if !complete || err != nil {
+		t.Fatalf("pure wrapped CAS reconciliation = (%t, %v), want completed deletion", complete, err)
+	}
+}
+
+type removeUnexpectedAdmissionStore struct {
+	*memoryNativeStore
+	removed bool
+}
+
+func (s *removeUnexpectedAdmissionStore) TransitionSessionOperation(ctx context.Context,
+	previous, next agentstate.SessionOperationRecord,
+) error {
+	if !s.removed && previous.Status == agentstate.SessionOperationDispatching &&
+		next.Status == agentstate.SessionOperationMapped && next.Admission != nil {
+		s.removed = true
+		if err := s.memoryNativeStore.DeleteSessionOperation(ctx, previous); err != nil {
+			return err
+		}
+		return agentstate.ErrSessionOperationCASLost
+	}
+	return s.memoryNativeStore.TransitionSessionOperation(ctx, previous, next)
+}
+
+func TestDurableNativeSessionRecoveryFailsClosedWhenUnexpectedAdmissionJournalDisappears(t *testing.T) {
+	oldRecover := recoverNativeSessionOperation
+	t.Cleanup(func() { recoverNativeSessionOperation = oldRecover })
+	memory := &memoryNativeStore{}
+	prepared := testPreparedDurableRecord(t)
+	if err := memory.CreateSessionOperation(context.Background(), prepared); err != nil {
+		t.Fatal(err)
+	}
+	dispatching := prepared
+	dispatching.Status = agentstate.SessionOperationDispatching
+	if err := memory.TransitionSessionOperation(context.Background(), prepared, dispatching); err != nil {
+		t.Fatal(err)
+	}
+	store := &removeUnexpectedAdmissionStore{memoryNativeStore: memory}
+	controller, err := newDurableNativeSessionOperations(store, testNativeSessionAuthority())
+	if err != nil {
+		t.Fatal(err)
+	}
+	controller.clock = func() time.Time { return time.UnixMilli(1_800_000_011_000).UTC() }
+	receipt := qurl.NativeSessionReceipt{
+		CellID: dispatching.Operation.CellID, SessionID: 91,
+		SessionIssuedAtMillis: 1_800_000_011_000,
+		RunID:                 dispatching.Operation.RunID, RunAttempt: dispatching.Operation.RunAttempt,
+	}
+	recoverCalls := 0
+	recoverNativeSessionOperation = func(context.Context, *qurl.AgentRuntimeBinding, []byte,
+		qurl.NativeSessionOperation, qurl.NHPUDPEndpoint, ...qurl.AgentRuntimeUDPOption,
+	) (*qurl.NativeSessionOperationRecovery, error) {
+		recoverCalls++
+		return &qurl.NativeSessionOperationRecovery{UnexpectedAdmission: &receipt},
+			&qurl.NativeSessionOperationUnexpectedAdmissionError{SessionReceipt: receipt}
+	}
+	err = controller.RecoverOperation(context.Background(), &qurl.AgentRuntimeBinding{AgentID: "agent-one"},
+		make([]byte, 32), testProtectedResourceID, dispatching.Operation.OperationID, nil)
+	if !errors.Is(err, agentstate.ErrSessionOperationConflict) || recoverCalls != 1 || !store.removed {
+		t.Fatalf("disappeared unexpected admission = err %v, calls %d, removed %t; want fail closed after one exchange",
+			err, recoverCalls, store.removed)
+	}
+}
+
 func TestDurableNativeSessionRecoveryRejectsNilResult(t *testing.T) {
 	oldRecover := recoverNativeSessionOperation
 	t.Cleanup(func() { recoverNativeSessionOperation = oldRecover })
@@ -896,5 +1258,857 @@ func TestNativeSessionOperationAuthorityFailsClosed(t *testing.T) {
 		if _, err := newDurableNativeSessionOperations(&memoryNativeStore{}, authority); err == nil {
 			t.Fatalf("invalid authority accepted: %+v", authority)
 		}
+	}
+}
+
+// transitionRecordingStore wraps the production store so a test can assert
+// which durable states a recovery committed, not only what remains afterwards.
+type transitionRecordingStore struct {
+	nativeStateStore
+	mu          sync.Mutex
+	transitions []agentstate.SessionOperationRecord
+}
+
+func (s *transitionRecordingStore) TransitionSessionOperation(ctx context.Context, previous, next agentstate.SessionOperationRecord) error {
+	err := s.nativeStateStore.TransitionSessionOperation(ctx, previous, next)
+	if err == nil {
+		s.mu.Lock()
+		s.transitions = append(s.transitions, next)
+		s.mu.Unlock()
+	}
+	return err
+}
+
+func (s *transitionRecordingStore) committed() []agentstate.SessionOperationRecord {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]agentstate.SessionOperationRecord(nil), s.transitions...)
+}
+
+// recoveryFixture drives the real agentstate.SDKStore so every journal rule
+// (legal transitions, admission/terminal pairing, monotonic counters) applies
+// exactly as in production. A permissive double would let an illegal terminal
+// pass, which is the defect the first abandonment attempt shipped with.
+type recoveryFixture struct {
+	controller *durableNativeSessionOperations
+	store      *transitionRecordingStore
+	binding    *qurl.AgentRuntimeBinding
+	operation  qurl.NativeSessionOperation
+	pinned     qurl.NHPUDPEndpoint
+	// current is a same-cell endpoint with a different server key, the shape a
+	// blue/green cohort switch leaves behind.
+	current   qurl.NHPUDPEndpoint
+	now       time.Time
+	exchanges []qurl.NHPUDPEndpoint
+	waits     []time.Duration
+}
+
+func silentEndpoint(endpoint qurl.NHPUDPEndpoint) error {
+	return &qurl.EndpointNoReplyError{Endpoint: fmt.Sprintf("%s:%d", endpoint.Host, endpoint.Port),
+		Attempts: 3, Elapsed: 9 * time.Second, Last: nativeudp.ErrNoReply}
+}
+
+// newRecoveryFixture leaves one durable record in the journal: DISPATCHING
+// when admitted is false, MAPPED (which recovery promotes to CLOSING) with a
+// real admission otherwise. The current assignment is the pinned cell on a
+// different server key unless a test replaces it.
+func newRecoveryFixture(t *testing.T, admitted bool) *recoveryFixture {
+	t.Helper()
+	oldPrepare := prepareLiveNativeSessionOperation
+	oldRecover := recoverNativeSessionOperation
+	oldWait := waitNativeSessionRecovery
+	oldAssignment := currentNativeAssignment
+	t.Cleanup(func() {
+		prepareLiveNativeSessionOperation = oldPrepare
+		recoverNativeSessionOperation = oldRecover
+		waitNativeSessionRecovery = oldWait
+		currentNativeAssignment = oldAssignment
+	})
+	t.Setenv(agentstate.EnvKeyProvider, agentstate.KeyProviderFile)
+	parent, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	sdkStore, err := agentstate.NewSDKStore(filepath.Join(parent, "state"), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = sdkStore.Close() })
+	store := &transitionRecordingStore{nativeStateStore: sdkStore}
+	controller, err := newDurableNativeSessionOperations(store, testNativeSessionAuthority())
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := &recoveryFixture{
+		controller: controller, store: store,
+		binding: &qurl.AgentRuntimeBinding{AgentID: "agent-one"},
+		pinned:  testDurableRecoveryEndpoint(),
+		now:     time.UnixMilli(1_800_000_009_000).UTC(),
+	}
+	f.current = f.pinned
+	f.current.ServerPublicKeyB64 = base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{0x11}, 32))
+	controller.clock = func() time.Time { return f.now }
+	prepareLiveNativeSessionOperation = func(context.Context, *qurl.AgentRuntimeBinding, []byte,
+		qurl.NativeSessionOperationInput,
+	) (*qurl.NativeSessionOperation, qurl.NHPUDPEndpoint, error) {
+		operation := testDurableOperation()
+		return &operation, testDurableRecoveryEndpoint(), nil
+	}
+	operation, err := controller.PrepareDispatch(context.Background(), f.binding, make([]byte, 32),
+		"resource-a", testProtectedResourceID, "0123456789abcdef", 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.operation = *operation
+	if admitted {
+		receipt := qurl.NativeSessionReceipt{
+			CellID: operation.CellID, SessionID: 91, SessionIssuedAtMillis: 1_800_000_010_000,
+			RunID: operation.RunID, RunAttempt: operation.RunAttempt,
+		}
+		if err := controller.RecordMapped(context.Background(), testProtectedResourceID, *operation, receipt); err != nil {
+			t.Fatal(err)
+		}
+	}
+	store.mu.Lock()
+	store.transitions = nil
+	store.mu.Unlock()
+	currentNativeAssignment = func(*qurl.AgentRuntimeBinding) qurl.AgentAssignment {
+		return qurl.AgentAssignment{CellID: operation.CellID, Endpoint: f.current}
+	}
+	waitNativeSessionRecovery = func(_ context.Context, delay time.Duration) error {
+		f.waits = append(f.waits, delay)
+		f.now = f.now.Add(delay)
+		return nil
+	}
+	return f
+}
+
+// answer installs the server stub: reply returns what each endpoint answers.
+func (f *recoveryFixture) answer(t *testing.T, reply func(endpoint qurl.NHPUDPEndpoint, exchange int) (*qurl.NativeSessionOperationRecovery, error)) {
+	t.Helper()
+	recoverNativeSessionOperation = func(_ context.Context, _ *qurl.AgentRuntimeBinding, _ []byte,
+		got qurl.NativeSessionOperation, endpoint qurl.NHPUDPEndpoint, _ ...qurl.AgentRuntimeUDPOption,
+	) (*qurl.NativeSessionOperationRecovery, error) {
+		if got != f.operation {
+			t.Fatalf("recovery exchanged a different operation: %+v", got)
+		}
+		f.exchanges = append(f.exchanges, endpoint)
+		return reply(endpoint, len(f.exchanges))
+	}
+}
+
+func (f *recoveryFixture) recover(ctx context.Context) error {
+	return f.controller.RecoverOperation(ctx, f.binding, make([]byte, 32), testProtectedResourceID,
+		f.operation.OperationID, nil)
+}
+
+func (f *recoveryFixture) records(t *testing.T) []agentstate.SessionOperationRecord {
+	t.Helper()
+	records, err := f.store.LoadSessionOperations(context.Background(), testProtectedResourceID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return records
+}
+
+func (f *recoveryFixture) pastAbandonMargin() time.Time {
+	return time.UnixMilli(f.operation.ExpiresAtMillis).Add(nativeSessionRecoveryAbandonMargin + time.Second).UTC()
+}
+
+func countEndpoints(exchanges []qurl.NHPUDPEndpoint, endpoint qurl.NHPUDPEndpoint) int {
+	count := 0
+	for _, exchanged := range exchanges {
+		if exchanged == endpoint {
+			count++
+		}
+	}
+	return count
+}
+
+func TestDurableNativeSessionRecoveryRefencesSilentPinnedEndpointToCurrentCellEndpoint(t *testing.T) {
+	f := newRecoveryFixture(t, true)
+	f.answer(t, func(endpoint qurl.NHPUDPEndpoint, _ int) (*qurl.NativeSessionOperationRecovery, error) {
+		if endpoint == f.pinned {
+			return nil, silentEndpoint(endpoint)
+		}
+		return &qurl.NativeSessionOperationRecovery{Complete: true}, nil
+	})
+	if err := f.recover(context.Background()); err != nil {
+		t.Fatalf("re-fenced recovery = %v", err)
+	}
+	if len(f.exchanges) != 2 || f.exchanges[0] != f.pinned || f.exchanges[1] != f.current {
+		t.Fatalf("exchanges = %+v, want pinned then current", f.exchanges)
+	}
+	if records := f.records(t); len(records) != 0 {
+		t.Fatalf("52030 from the current endpoint must delete the row: %+v", records)
+	}
+	committed := f.store.committed()
+	var moved, terminal *agentstate.SessionOperationRecord
+	for index := range committed {
+		record := &committed[index]
+		if record.RecoveryEndpoint == f.current && moved == nil {
+			moved = record
+		}
+		if record.Status == agentstate.SessionOperationClosed {
+			terminal = record
+		}
+	}
+	if moved == nil || moved.Status != agentstate.SessionOperationClosing || moved.PostExpiryNoReplyAttempts != 0 {
+		t.Fatalf("the answering endpoint was not pinned durably before the terminal write: %+v", committed)
+	}
+	if terminal == nil || terminal.RecoveryEndpoint != f.current || terminal.Admission == nil {
+		t.Fatalf("terminal record = %+v, want CLOSED on the current endpoint with its admission", terminal)
+	}
+}
+
+func TestDurableNativeSessionRecoveryGoesStraightToTheAnsweringEndpointNextPass(t *testing.T) {
+	f := newRecoveryFixture(t, true)
+	f.answer(t, func(endpoint qurl.NHPUDPEndpoint, exchange int) (*qurl.NativeSessionOperationRecovery, error) {
+		if endpoint == f.pinned {
+			return nil, silentEndpoint(endpoint)
+		}
+		// 52029: still revoking. The loop polls again from the persisted record.
+		return &qurl.NativeSessionOperationRecovery{Complete: exchange >= 3}, nil
+	})
+	if err := f.recover(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	want := []qurl.NHPUDPEndpoint{f.pinned, f.current, f.current}
+	if len(f.exchanges) != len(want) {
+		t.Fatalf("exchanges = %+v, want %+v", f.exchanges, want)
+	}
+	for index := range want {
+		if f.exchanges[index] != want[index] {
+			t.Fatalf("exchange %d = %+v, want %+v", index, f.exchanges[index], want[index])
+		}
+	}
+	if records := f.records(t); len(records) != 0 {
+		t.Fatalf("records after terminal 52030 = %+v", records)
+	}
+}
+
+func TestDurableNativeSessionRecoveryNeverRefencesAcrossCellsOrToTheSameEndpoint(t *testing.T) {
+	for name, assignment := range map[string]func(*recoveryFixture) qurl.AgentAssignment{
+		"other cell": func(f *recoveryFixture) qurl.AgentAssignment {
+			return qurl.AgentAssignment{CellID: "cell-02", Endpoint: f.current}
+		},
+		"identical endpoint": func(f *recoveryFixture) qurl.AgentAssignment {
+			return qurl.AgentAssignment{CellID: f.operation.CellID, Endpoint: f.pinned}
+		},
+		"malformed endpoint": func(f *recoveryFixture) qurl.AgentAssignment {
+			return qurl.AgentAssignment{CellID: f.operation.CellID}
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := newRecoveryFixture(t, true)
+			live := assignment(f)
+			currentNativeAssignment = func(*qurl.AgentRuntimeBinding) qurl.AgentAssignment { return live }
+			f.answer(t, func(endpoint qurl.NHPUDPEndpoint, _ int) (*qurl.NativeSessionOperationRecovery, error) {
+				if endpoint != f.pinned {
+					t.Fatalf("recovery left the pinned endpoint for %+v", endpoint)
+				}
+				return nil, silentEndpoint(endpoint)
+			})
+			err := f.recover(context.Background())
+			if !errors.Is(err, qurl.ErrEndpointNoReply) || len(f.exchanges) != 1 {
+				t.Fatalf("recovery = %v exchanges=%d, want one silent pinned exchange", err, len(f.exchanges))
+			}
+			records := f.records(t)
+			if len(records) != 1 || records[0].RecoveryEndpoint != f.pinned || records[0].Status != agentstate.SessionOperationClosing {
+				t.Fatalf("records = %+v, want the pinned CLOSING record untouched", records)
+			}
+		})
+	}
+}
+
+// Silence alone never retires a record while the operation is live, and the
+// abandon margin past expiry is part of "live": until then every failure keeps
+// today's behavior and the post-expiry counter stays at zero.
+func TestDurableNativeSessionRecoveryKeepsRetryingSilentEndpointsInsideExpiryAndMargin(t *testing.T) {
+	for name, at := range map[string]func(*recoveryFixture) time.Time{
+		"before expiry": func(f *recoveryFixture) time.Time {
+			return time.UnixMilli(f.operation.ExpiresAtMillis).Add(-time.Minute).UTC()
+		},
+		"past expiry inside the margin": func(f *recoveryFixture) time.Time {
+			// The fake wait advances the clock by each bounded delay, so start
+			// far enough inside the margin that every pass stays inside it.
+			return time.UnixMilli(f.operation.ExpiresAtMillis).Add(nativeSessionRecoveryAbandonMargin - time.Minute).UTC()
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := newRecoveryFixture(t, true)
+			f.now = at(f)
+			f.answer(t, func(endpoint qurl.NHPUDPEndpoint, _ int) (*qurl.NativeSessionOperationRecovery, error) {
+				return nil, silentEndpoint(endpoint)
+			})
+			const passes = nativeSessionRecoveryAbandonAttempts * 3
+			for pass := 1; pass <= passes; pass++ {
+				if err := f.recover(context.Background()); !errors.Is(err, qurl.ErrEndpointNoReply) {
+					t.Fatalf("pass %d = %v, want the silent-endpoint error", pass, err)
+				}
+				records := f.records(t)
+				if len(records) != 1 || records[0].Status != agentstate.SessionOperationClosing ||
+					records[0].RecoveryAttempt != uint32(pass) || records[0].PostExpiryNoReplyAttempts != 0 ||
+					records[0].RecoveryEndpoint != f.pinned {
+					t.Fatalf("pass %d records = %+v, want CLOSING, attempt %d, no post-expiry failures", pass, records, pass)
+				}
+			}
+			if pinned, current := countEndpoints(f.exchanges, f.pinned), countEndpoints(f.exchanges, f.current); pinned != passes || current != passes {
+				t.Fatalf("exchanges pinned=%d current=%d, want %d each", pinned, current, passes)
+			}
+		})
+	}
+}
+
+func TestDurableNativeSessionRecoveryAbandonsClosingRecordAfterPostExpirySilenceOnBothEndpoints(t *testing.T) {
+	f := newRecoveryFixture(t, true)
+	f.now = f.pastAbandonMargin()
+	f.answer(t, func(endpoint qurl.NHPUDPEndpoint, _ int) (*qurl.NativeSessionOperationRecovery, error) {
+		return nil, silentEndpoint(endpoint)
+	})
+	for pass := 1; pass < nativeSessionRecoveryAbandonAttempts; pass++ {
+		if err := f.recover(context.Background()); !errors.Is(err, qurl.ErrEndpointNoReply) {
+			t.Fatalf("pass %d = %v, want the silent-endpoint error", pass, err)
+		}
+		records := f.records(t)
+		if len(records) != 1 || records[0].Status != agentstate.SessionOperationClosing ||
+			records[0].PostExpiryNoReplyAttempts != uint32(pass) || records[0].RecoveryAttempt != uint32(pass) {
+			t.Fatalf("pass %d records = %+v, want CLOSING with %d counted post-expiry failures", pass, records, pass)
+		}
+		// Step past the escalated persisted backoff the failure committed.
+		f.now = f.now.Add(time.Minute)
+	}
+	if err := f.recover(context.Background()); err != nil {
+		t.Fatalf("abandoning pass = %v, want success", err)
+	}
+	if records := f.records(t); len(records) != 0 {
+		t.Fatalf("records after abandonment = %+v", records)
+	}
+	committed := f.store.committed()
+	terminal := committed[len(committed)-1]
+	if terminal.Status != agentstate.SessionOperationClosed || terminal.Admission == nil ||
+		terminal.PostExpiryNoReplyAttempts != nativeSessionRecoveryAbandonAttempts ||
+		terminal.RecoveryAttempt != nativeSessionRecoveryAbandonAttempts {
+		t.Fatalf("terminal = %+v, want CLOSED with its admission after exactly %d post-expiry failures",
+			terminal, nativeSessionRecoveryAbandonAttempts)
+	}
+	for _, record := range committed[:len(committed)-1] {
+		if record.Status != agentstate.SessionOperationClosing {
+			t.Fatalf("non-terminal transition left CLOSING: %+v", record)
+		}
+	}
+	pinned, current := countEndpoints(f.exchanges, f.pinned), countEndpoints(f.exchanges, f.current)
+	if pinned != nativeSessionRecoveryAbandonAttempts || current != nativeSessionRecoveryAbandonAttempts {
+		t.Fatalf("exchanges pinned=%d current=%d, want %d each before abandonment",
+			pinned, current, nativeSessionRecoveryAbandonAttempts)
+	}
+}
+
+// The bound stands on its own when the pinned endpoint already is the current
+// assignment: nothing can be re-fenced, every silent exchange still counts, and
+// a DISPATCHING record (no admission) ends as CANCELED.
+func TestDurableNativeSessionRecoveryAbandonsDispatchingRecordWhenThePinnedEndpointIsCurrent(t *testing.T) {
+	f := newRecoveryFixture(t, false)
+	f.now = f.pastAbandonMargin()
+	currentNativeAssignment = func(*qurl.AgentRuntimeBinding) qurl.AgentAssignment {
+		return qurl.AgentAssignment{CellID: f.operation.CellID, Endpoint: f.pinned}
+	}
+	f.answer(t, func(endpoint qurl.NHPUDPEndpoint, _ int) (*qurl.NativeSessionOperationRecovery, error) {
+		if endpoint != f.pinned {
+			t.Fatalf("unexpected exchange with %+v", endpoint)
+		}
+		return nil, fmt.Errorf("recover: %w", context.DeadlineExceeded)
+	})
+	for pass := 1; pass < nativeSessionRecoveryAbandonAttempts; pass++ {
+		if err := f.recover(context.Background()); !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("pass %d = %v, want deadline", pass, err)
+		}
+		f.now = f.now.Add(time.Minute)
+	}
+	if err := f.recover(context.Background()); err != nil {
+		t.Fatalf("abandoning pass = %v", err)
+	}
+	if records := f.records(t); len(records) != 0 {
+		t.Fatalf("records after abandonment = %+v", records)
+	}
+	committed := f.store.committed()
+	terminal := committed[len(committed)-1]
+	if terminal.Status != agentstate.SessionOperationCanceled || terminal.Admission != nil ||
+		terminal.PostExpiryNoReplyAttempts != nativeSessionRecoveryAbandonAttempts {
+		t.Fatalf("terminal = %+v, want CANCELED without admission", terminal)
+	}
+	if len(f.exchanges) != nativeSessionRecoveryAbandonAttempts {
+		t.Fatalf("exchanges = %d, want %d pinned-only", len(f.exchanges), nativeSessionRecoveryAbandonAttempts)
+	}
+}
+
+// A clock that steps forward past expiry manufactures no post-expiry
+// exchanges, however many lifetime attempts the record already carries. The
+// first pass after the step still asks the server, which stays the authority.
+func TestDurableNativeSessionRecoveryClockStepPastExpiryDoesNotAbandon(t *testing.T) {
+	for name, answers := range map[string]bool{"server answers": true, "server stays silent": false} {
+		t.Run(name, func(t *testing.T) {
+			f := newRecoveryFixture(t, true)
+			f.now = time.UnixMilli(f.operation.PreparedAtMillis).Add(time.Minute).UTC()
+			silent := true
+			f.answer(t, func(endpoint qurl.NHPUDPEndpoint, _ int) (*qurl.NativeSessionOperationRecovery, error) {
+				if silent {
+					return nil, silentEndpoint(endpoint)
+				}
+				return &qurl.NativeSessionOperationRecovery{Complete: true}, nil
+			})
+			const lifetime = nativeSessionRecoveryAbandonAttempts * 2
+			for pass := 1; pass <= lifetime; pass++ {
+				if err := f.recover(context.Background()); !errors.Is(err, qurl.ErrEndpointNoReply) {
+					t.Fatalf("pass %d = %v", pass, err)
+				}
+			}
+			before := f.records(t)
+			if len(before) != 1 || before[0].RecoveryAttempt != lifetime || before[0].PostExpiryNoReplyAttempts != 0 {
+				t.Fatalf("records before the clock step = %+v", before)
+			}
+			f.now = f.pastAbandonMargin().Add(24 * time.Hour)
+			silent = !answers
+			exchangesBefore := len(f.exchanges)
+			err := f.recover(context.Background())
+			if len(f.exchanges) == exchangesBefore {
+				t.Fatal("the pass after the clock step sent nothing; the server must be asked")
+			}
+			records := f.records(t)
+			if answers {
+				if err != nil || len(records) != 0 {
+					t.Fatalf("server-completed retirement = %v records=%+v", err, records)
+				}
+				return
+			}
+			if !errors.Is(err, qurl.ErrEndpointNoReply) || len(records) != 1 ||
+				records[0].Status != agentstate.SessionOperationClosing || records[0].PostExpiryNoReplyAttempts != 1 {
+				t.Fatalf("first silent post-expiry pass = %v records=%+v, want one counted failure and no abandonment", err, records)
+			}
+		})
+	}
+}
+
+func TestDurableNativeSessionRecoveryTypedDenyAfterExpiryIsNeverAbandoned(t *testing.T) {
+	f := newRecoveryFixture(t, true)
+	f.now = f.pastAbandonMargin()
+	const polls = nativeSessionRecoveryAbandonAttempts + 2
+	f.answer(t, func(endpoint qurl.NHPUDPEndpoint, exchange int) (*qurl.NativeSessionOperationRecovery, error) {
+		if endpoint != f.pinned {
+			t.Fatalf("an answering pinned endpoint must not be re-fenced: %+v", endpoint)
+		}
+		// 52029 until the server finishes revoking, then 52030.
+		return &qurl.NativeSessionOperationRecovery{Complete: exchange > polls}, nil
+	})
+	if err := f.recover(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(f.exchanges) != polls+1 {
+		t.Fatalf("exchanges = %d, want %d", len(f.exchanges), polls+1)
+	}
+	if records := f.records(t); len(records) != 0 {
+		t.Fatalf("records after the server's 52030 = %+v", records)
+	}
+	for _, record := range f.store.committed() {
+		if record.PostExpiryNoReplyAttempts != 0 {
+			t.Fatalf("a typed deny was counted as silence: %+v", record)
+		}
+	}
+}
+
+// An authenticated deny from the re-fenced endpoint supersedes the pinned
+// silence: the endpoint moves, the deny is returned as today, and nothing is
+// ever counted toward abandonment, however many passes it repeats.
+func TestDurableNativeSessionRecoveryTypedDenyFromRefencedEndpointIsNeverCounted(t *testing.T) {
+	f := newRecoveryFixture(t, true)
+	f.now = f.pastAbandonMargin()
+	deny := &qurl.ServerDenyError{ErrCode: "52004"}
+	f.answer(t, func(endpoint qurl.NHPUDPEndpoint, _ int) (*qurl.NativeSessionOperationRecovery, error) {
+		if endpoint == f.pinned {
+			return nil, silentEndpoint(endpoint)
+		}
+		return nil, deny
+	})
+	const passes = nativeSessionRecoveryAbandonAttempts + 1
+	for pass := 1; pass <= passes; pass++ {
+		var got *qurl.ServerDenyError
+		if err := f.recover(context.Background()); !errors.As(err, &got) || got.ErrCode != deny.ErrCode ||
+			errors.Is(err, qurl.ErrEndpointNoReply) {
+			t.Fatalf("pass %d = %v, want the current endpoint's deny alone", pass, err)
+		}
+		records := f.records(t)
+		if len(records) != 1 || records[0].Status != agentstate.SessionOperationClosing ||
+			records[0].PostExpiryNoReplyAttempts != 0 || records[0].RecoveryEndpoint != f.current {
+			t.Fatalf("pass %d records = %+v, want CLOSING on the current endpoint with nothing counted", pass, records)
+		}
+		f.now = f.now.Add(time.Minute)
+	}
+	// The pinned endpoint is tried once; every later pass goes straight to the
+	// endpoint that answered.
+	if pinned, current := countEndpoints(f.exchanges, f.pinned), countEndpoints(f.exchanges, f.current); pinned != 1 || current != passes {
+		t.Fatalf("exchanges pinned=%d current=%d, want 1 and %d", pinned, current, passes)
+	}
+}
+
+func TestDurableNativeSessionRecoveryDefersInsideEscalatedPostExpiryBackoff(t *testing.T) {
+	f := newRecoveryFixture(t, true)
+	f.now = f.pastAbandonMargin()
+	f.answer(t, func(endpoint qurl.NHPUDPEndpoint, _ int) (*qurl.NativeSessionOperationRecovery, error) {
+		return nil, silentEndpoint(endpoint)
+	})
+	if err := f.recover(context.Background()); !errors.Is(err, qurl.ErrEndpointNoReply) {
+		t.Fatal(err)
+	}
+	records := f.records(t)
+	if len(records) != 1 || records[0].PostExpiryNoReplyAttempts != 1 {
+		t.Fatalf("records = %+v", records)
+	}
+	backoff := time.UnixMilli(records[0].RecoveryNotBeforeMilli).Sub(f.now)
+	if backoff != nativeSessionRecoveryNoReplyBackoff(1) || backoff <= nativeSessionRecoveryMaxDelay {
+		t.Fatalf("persisted post-expiry backoff = %s, want %s", backoff, nativeSessionRecoveryNoReplyBackoff(1))
+	}
+	sent := len(f.exchanges)
+	f.now = f.now.Add(time.Second)
+	if err := f.recover(context.Background()); !errors.Is(err, errNativeSessionRecoveryDeferred) ||
+		len(f.exchanges) != sent || len(f.waits) != 0 {
+		t.Fatalf("pass inside the backoff = %v exchanges=%d waits=%v, want deferred without a packet or a sleep",
+			err, len(f.exchanges), f.waits)
+	}
+	f.now = f.now.Add(backoff)
+	if err := f.recover(context.Background()); !errors.Is(err, qurl.ErrEndpointNoReply) || len(f.exchanges) != sent+2 {
+		t.Fatalf("pass after the backoff = %v exchanges=%d, want a fresh silent exchange on both endpoints", err, len(f.exchanges))
+	}
+	// A persisted deadline further away than the escalation ceiling can only
+	// come from a clock correction; keep the one bounded wait, then proceed.
+	f.now = f.now.Add(-2 * nativeSessionRecoveryNoReplyMaxDelay)
+	sent = len(f.exchanges)
+	if err := f.recover(context.Background()); !errors.Is(err, qurl.ErrEndpointNoReply) ||
+		len(f.exchanges) != sent+2 || len(f.waits) != 1 || f.waits[0] != nativeSessionRecoveryMaxDelay {
+		t.Fatalf("clock-regressed pass = %v exchanges=%d waits=%v, want one %s wait then an exchange",
+			err, len(f.exchanges), f.waits, nativeSessionRecoveryMaxDelay)
+	}
+}
+
+func TestNativeSessionRecoveryAbandonMarginCoversServerRecoveryMargin(t *testing.T) {
+	const skew = 30 * time.Second
+	if nativeSessionRecoveryAbandonMargin < qurl.NativeSessionOperationJournalMargin+nativeSessionCleanupBudget+skew {
+		t.Fatalf("abandon margin %s must cover the SDK absent-recovery margin %s plus one cleanup budget %s and clock skew %s",
+			nativeSessionRecoveryAbandonMargin, qurl.NativeSessionOperationJournalMargin, nativeSessionCleanupBudget, skew)
+	}
+	if nativeSessionRecoveryAbandonMargin < 5*time.Minute || nativeSessionRecoveryAbandonAttempts < 2 {
+		t.Fatalf("abandonment bound margin=%s attempts=%d is too aggressive", nativeSessionRecoveryAbandonMargin, nativeSessionRecoveryAbandonAttempts)
+	}
+	for failures, want := range map[uint32]time.Duration{0: 2 * time.Second, 1: 4 * time.Second, 2: 8 * time.Second,
+		3: 16 * time.Second, 4: nativeSessionRecoveryNoReplyMaxDelay, 40: nativeSessionRecoveryNoReplyMaxDelay} {
+		if got := nativeSessionRecoveryNoReplyBackoff(failures); got != want {
+			t.Fatalf("no-reply backoff(%d) = %s, want %s", failures, got, want)
+		}
+	}
+}
+
+func TestNativeSessionNoReplyClassification(t *testing.T) {
+	// Unanswered datagrams: re-fence and count.
+	countable := []error{
+		qurl.ErrEndpointNoReply, silentEndpoint(testDurableRecoveryEndpoint()),
+		nativeudp.ErrNoReply, nativeudp.ErrServerUnauthenticated,
+		context.DeadlineExceeded, fmt.Errorf("recover: %w", context.DeadlineExceeded),
+	}
+	for _, err := range countable {
+		if !isNativeSessionNoReplyError(err) || !isNativeSessionCountableSilence(err) {
+			t.Errorf("%v should re-fence and count as silence", err)
+		}
+	}
+	// The packet never left this host: re-fence, but never count.
+	offline := []error{nativeudp.ErrTransport, nativeudp.ErrResolve, fmt.Errorf("recover: %w", nativeudp.ErrResolve)}
+	for _, err := range offline {
+		if !isNativeSessionNoReplyError(err) || isNativeSessionCountableSilence(err) {
+			t.Errorf("%v should re-fence but must not count as silence", err)
+		}
+	}
+	decisions := []error{
+		nil, context.Canceled, fmt.Errorf("%w: %w", qurl.ErrEndpointNoReply, context.Canceled),
+		&qurl.ServerDenyError{ErrCode: "52029"}, &qurl.ServerDenyError{ErrCode: "52004"},
+		&qurl.NativeSessionOperationUnexpectedAdmissionError{},
+		qurl.ErrMalformedReply, qurl.ErrInvalidNativeSessionOperation, agentstate.ErrSessionOperationConflict,
+		errors.New("recovery reply lost"),
+	}
+	for _, err := range decisions {
+		if isNativeSessionNoReplyError(err) || isNativeSessionCountableSilence(err) {
+			t.Errorf("%v must not count as silence", err)
+		}
+	}
+	answers := map[string]struct {
+		result *qurl.NativeSessionOperationRecovery
+		err    error
+	}{
+		"complete":             {result: &qurl.NativeSessionOperationRecovery{Complete: true}},
+		"still revoking":       {result: &qurl.NativeSessionOperationRecovery{}},
+		"typed deny":           {err: &qurl.ServerDenyError{ErrCode: "52004"}},
+		"unexpected admission": {err: &qurl.NativeSessionOperationUnexpectedAdmissionError{}},
+	}
+	for name, answer := range answers {
+		if !nativeSessionEndpointAnswered(answer.result, answer.err) {
+			t.Errorf("%s must count as an authenticated answer", name)
+		}
+	}
+	notAnswers := map[string]error{
+		"canceled":         fmt.Errorf("%w: %w", qurl.ErrEndpointNoReply, context.Canceled),
+		"silent":           silentEndpoint(testDurableRecoveryEndpoint()),
+		"local validation": qurl.ErrInvalidNativeSessionOperation,
+		"malformed":        qurl.ErrMalformedReply,
+	}
+	for name, err := range notAnswers {
+		if nativeSessionEndpointAnswered(nil, err) || nativeSessionEndpointAnswered(nil, nil) {
+			t.Errorf("%s must not count as an answer", name)
+		}
+	}
+}
+
+// Offline is not silence. A resolver or socket failure means no datagram left
+// this host, so past expiry the record is still re-fenced but never counted:
+// the connector keeps its handle on a session the server may still hold.
+func TestDurableNativeSessionRecoveryOfflineFailuresNeverCountTowardAbandonment(t *testing.T) {
+	for name, offline := range map[string]error{"resolver": nativeudp.ErrResolve, "socket": nativeudp.ErrTransport} {
+		t.Run(name, func(t *testing.T) {
+			f := newRecoveryFixture(t, true)
+			f.now = f.pastAbandonMargin()
+			f.answer(t, func(endpoint qurl.NHPUDPEndpoint, _ int) (*qurl.NativeSessionOperationRecovery, error) {
+				if endpoint == f.pinned {
+					// The pinned datagram did leave; only the re-fence leg is offline.
+					return nil, silentEndpoint(endpoint)
+				}
+				return nil, fmt.Errorf("recover: %w", offline)
+			})
+			const passes = nativeSessionRecoveryAbandonAttempts * 2
+			for pass := 1; pass <= passes; pass++ {
+				if err := f.recover(context.Background()); !errors.Is(err, qurl.ErrEndpointNoReply) {
+					t.Fatalf("pass %d = %v", pass, err)
+				}
+				f.now = f.now.Add(time.Minute)
+			}
+			records := f.records(t)
+			if len(records) != 1 || records[0].PostExpiryNoReplyAttempts != 0 || records[0].RecoveryEndpoint != f.pinned {
+				t.Fatalf("records after %d offline passes = %+v, want the pinned CLOSING record with no counted failures", passes, records)
+			}
+			if pinned, current := countEndpoints(f.exchanges, f.pinned), countEndpoints(f.exchanges, f.current); pinned != passes || current != passes {
+				t.Fatalf("exchanges pinned=%d current=%d, want the re-fence still attempted every pass", pinned, current)
+			}
+		})
+	}
+	t.Run("pinned offline", func(t *testing.T) {
+		f := newRecoveryFixture(t, true)
+		f.now = f.pastAbandonMargin()
+		f.answer(t, func(endpoint qurl.NHPUDPEndpoint, _ int) (*qurl.NativeSessionOperationRecovery, error) {
+			if endpoint == f.pinned {
+				return nil, fmt.Errorf("recover: %w", nativeudp.ErrResolve)
+			}
+			return nil, silentEndpoint(endpoint)
+		})
+		for pass := 1; pass <= nativeSessionRecoveryAbandonAttempts*2; pass++ {
+			if err := f.recover(context.Background()); !errors.Is(err, nativeudp.ErrResolve) {
+				t.Fatalf("pass %d = %v", pass, err)
+			}
+			f.now = f.now.Add(time.Minute)
+		}
+		if records := f.records(t); len(records) != 1 || records[0].PostExpiryNoReplyAttempts != 0 {
+			t.Fatalf("records = %+v, want no counted failures while the pinned leg is offline", records)
+		}
+	})
+}
+
+// A canceled caller or a local failure during the re-fence exchange is not an
+// answer: the endpoint is not moved, nothing is counted, and both causes reach
+// the caller.
+func TestDurableNativeSessionRecoveryRefenceWithoutEvidenceMovesNothing(t *testing.T) {
+	for name, refenceErr := range map[string]error{
+		"caller canceled mid-exchange": fmt.Errorf("%w: %w", qurl.ErrEndpointNoReply, context.Canceled),
+		"local validation failure":     qurl.ErrInvalidNativeSessionOperation,
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := newRecoveryFixture(t, true)
+			f.now = f.pastAbandonMargin()
+			f.answer(t, func(endpoint qurl.NHPUDPEndpoint, _ int) (*qurl.NativeSessionOperationRecovery, error) {
+				if endpoint == f.pinned {
+					return nil, silentEndpoint(endpoint)
+				}
+				return nil, refenceErr
+			})
+			err := f.recover(context.Background())
+			if !errors.Is(err, qurl.ErrEndpointNoReply) || !errors.Is(err, refenceErr) {
+				t.Fatalf("recovery = %v, want both the pinned silence and the re-fence cause", err)
+			}
+			records := f.records(t)
+			if len(records) != 1 || records[0].RecoveryEndpoint != f.pinned || records[0].PostExpiryNoReplyAttempts != 0 ||
+				records[0].RecoveryAttempt != 1 {
+				t.Fatalf("records = %+v, want the pinned endpoint kept and nothing counted", records)
+			}
+			for _, record := range f.store.committed() {
+				if record.RecoveryEndpoint != f.pinned {
+					t.Fatalf("the endpoint was moved on no evidence: %+v", record)
+				}
+			}
+		})
+	}
+	t.Run("caller context ended before the move", func(t *testing.T) {
+		f := newRecoveryFixture(t, true)
+		ctx, cancel := context.WithCancel(context.Background())
+		f.answer(t, func(endpoint qurl.NHPUDPEndpoint, _ int) (*qurl.NativeSessionOperationRecovery, error) {
+			if endpoint == f.pinned {
+				return nil, silentEndpoint(endpoint)
+			}
+			// The reply is authenticated, but the caller is gone before it can be
+			// acted on; no durable write may follow.
+			cancel()
+			return &qurl.NativeSessionOperationRecovery{Complete: true}, nil
+		})
+		if err := f.recover(ctx); !errors.Is(err, context.Canceled) {
+			t.Fatalf("recovery = %v, want cancellation", err)
+		}
+		if records := f.records(t); len(records) != 1 || records[0].RecoveryEndpoint != f.pinned {
+			t.Fatalf("records = %+v, want the pinned record untouched", records)
+		}
+	})
+}
+
+// concurrentAdvanceStore simulates another process winning the race on the
+// endpoint move: right before the move is written, the record it targets has
+// already taken a legal recovery step, so the move loses its compare-and-swap.
+type concurrentAdvanceStore struct {
+	*transitionRecordingStore
+	current   qurl.NHPUDPEndpoint
+	preempted int
+}
+
+func (s *concurrentAdvanceStore) TransitionSessionOperation(ctx context.Context, previous, next agentstate.SessionOperationRecord) error {
+	if next.RecoveryEndpoint == s.current && previous.RecoveryEndpoint != s.current && s.preempted == 0 {
+		s.preempted++
+		advanced := previous
+		advanced.RecoveryAttempt++
+		advanced.RecoveryNotBeforeMilli++
+		if err := s.transitionRecordingStore.TransitionSessionOperation(ctx, previous, advanced); err != nil {
+			return err
+		}
+	}
+	return s.transitionRecordingStore.TransitionSessionOperation(ctx, previous, next)
+}
+
+func TestDurableNativeSessionRecoveryReconcilesLostEndpointMoveAndRetries(t *testing.T) {
+	f := newRecoveryFixture(t, true)
+	store := &concurrentAdvanceStore{transitionRecordingStore: f.store, current: f.current}
+	f.controller.store = store
+	f.answer(t, func(endpoint qurl.NHPUDPEndpoint, _ int) (*qurl.NativeSessionOperationRecovery, error) {
+		if endpoint == f.pinned {
+			return nil, silentEndpoint(endpoint)
+		}
+		return &qurl.NativeSessionOperationRecovery{Complete: true}, nil
+	})
+	if err := f.recover(context.Background()); err != nil {
+		t.Fatalf("recovery after a lost endpoint move = %v", err)
+	}
+	if store.preempted != 1 {
+		t.Fatalf("preempted=%d, want the first move to lose its compare-and-swap", store.preempted)
+	}
+	// The lost move reloads and retries the whole attempt: pinned again, then
+	// the current endpoint again, and only then the terminal write.
+	want := []qurl.NHPUDPEndpoint{f.pinned, f.current, f.pinned, f.current}
+	if len(f.exchanges) != len(want) {
+		t.Fatalf("exchanges = %+v, want %+v", f.exchanges, want)
+	}
+	for index := range want {
+		if f.exchanges[index] != want[index] {
+			t.Fatalf("exchange %d = %+v, want %+v", index, f.exchanges[index], want[index])
+		}
+	}
+	if records := f.records(t); len(records) != 0 {
+		t.Fatalf("records = %+v, want deletion after the retried move", records)
+	}
+	moves := 0
+	for _, record := range f.store.committed() {
+		if record.RecoveryEndpoint == f.current && record.Status == agentstate.SessionOperationClosing {
+			moves++
+		}
+	}
+	if moves != 1 {
+		t.Fatalf("committed endpoint moves = %d, want exactly one", moves)
+	}
+}
+
+func TestDurableNativeSessionRecoveryFailsClosedWhenRefencedAdmissionCannotBePersisted(t *testing.T) {
+	f := newRecoveryFixture(t, false)
+	store := &concurrentAdvanceStore{transitionRecordingStore: f.store, current: f.current}
+	f.controller.store = store
+	receipt := qurl.NativeSessionReceipt{
+		CellID: f.operation.CellID, SessionID: 93, SessionIssuedAtMillis: 1_800_000_012_000,
+		RunID: f.operation.RunID, RunAttempt: f.operation.RunAttempt,
+	}
+	f.answer(t, func(endpoint qurl.NHPUDPEndpoint, _ int) (*qurl.NativeSessionOperationRecovery, error) {
+		if endpoint == f.pinned {
+			return nil, silentEndpoint(endpoint)
+		}
+		admitted := receipt
+		return &qurl.NativeSessionOperationRecovery{UnexpectedAdmission: &admitted},
+			&qurl.NativeSessionOperationUnexpectedAdmissionError{SessionReceipt: receipt}
+	})
+	err := f.recover(context.Background())
+	if err == nil || !errors.Is(err, agentstate.ErrSessionOperationCASLost) ||
+		!strings.Contains(err.Error(), "persist re-fenced recovery endpoint") {
+		t.Fatalf("recovery = %v, want fail-closed on the lost endpoint move while holding an admission", err)
+	}
+	if len(f.exchanges) != 2 {
+		t.Fatalf("exchanges = %d, want no further packet after the ambiguity", len(f.exchanges))
+	}
+	records := f.records(t)
+	if len(records) != 1 || records[0].Status != agentstate.SessionOperationDispatching ||
+		records[0].Admission != nil || records[0].RecoveryEndpoint != f.pinned {
+		t.Fatalf("records = %+v, want the pinned DISPATCHING record preserved for the next pass", records)
+	}
+}
+
+// The admission gate clears on the same pass that abandons the record: the
+// resource is dark for the bounded window and then admits without any manual
+// journal surgery.
+func TestNativeAdmitterAdmitsOnceASilentExpiredRecoveryIsAbandoned(t *testing.T) {
+	oldKnock := knockNativeRuntime
+	t.Cleanup(func() { knockNativeRuntime = oldKnock })
+	f := newRecoveryFixture(t, true)
+	f.now = f.pastAbandonMargin()
+	currentNativeAssignment = func(*qurl.AgentRuntimeBinding) qurl.AgentAssignment {
+		return qurl.AgentAssignment{CellID: f.operation.CellID, Endpoint: f.pinned}
+	}
+	f.answer(t, func(endpoint qurl.NHPUDPEndpoint, _ int) (*qurl.NativeSessionOperationRecovery, error) {
+		return nil, silentEndpoint(endpoint)
+	})
+	knocks := 0
+	knockNativeRuntime = func(_ context.Context, _ *qurl.AgentRuntimeBinding, _ []byte, _ string,
+		opts qurl.NativeKnockOptions, _ ...qurl.AgentRuntimeUDPOption,
+	) (*qurl.NativeKnockResult, error) {
+		knocks++
+		if records := f.records(t); len(records) != 0 {
+			t.Fatalf("a replacement knock left while the journal still held %+v", records)
+		}
+		receipt := testSessionReceipt(92, opts.RunID, opts.RunAttempt)
+		return &qurl.NativeKnockResult{
+			ACToken: "token", ResourceHost: "127.0.0.1:7000", SessionID: receipt.SessionID,
+			OpenTime: 3600, SessionReceipt: receipt,
+		}, nil
+	}
+	admitter := &NativeAdmitter{
+		binding: f.binding, privateKey: make([]byte, 32),
+		operations: &durableRetirementFenceOperations{controller: f.controller}, store: f.store,
+	}
+	for pass := 1; pass < nativeSessionRecoveryAbandonAttempts; pass++ {
+		_, err := admitter.Admit(context.Background(), "resource-a", testProtectedResourceID)
+		if err == nil || !errors.Is(err, qurl.ErrEndpointNoReply) ||
+			!strings.Contains(err.Error(), "recover prior native session operation before replacement") {
+			t.Fatalf("pass %d admission = %v, want the recovery gate", pass, err)
+		}
+		if knocks != 0 {
+			t.Fatalf("pass %d knocked while the record was still pending", pass)
+		}
+		f.now = f.now.Add(time.Minute)
+	}
+	admission, err := admitter.Admit(context.Background(), "resource-a", testProtectedResourceID)
+	if err != nil || admission.SessionID != 92 || knocks != 1 {
+		t.Fatalf("admission after abandonment = %+v, %v, knocks=%d", admission, err, knocks)
 	}
 }

@@ -42,6 +42,10 @@ const (
 
 var (
 	ErrSessionOperationConflict = errors.New("native session operation state conflict")
+	// ErrSessionOperationCASLost means another writer changed or removed the
+	// exact durable record before this writer committed. It remains a state
+	// conflict for callers that do not need to distinguish safe CAS recovery.
+	ErrSessionOperationCASLost = fmt.Errorf("%w: compare-and-swap lost", ErrSessionOperationConflict)
 	// ErrSessionOperationJournalCorrupt means durable ambiguity cannot be
 	// resolved safely. Callers must not delete the journal or open a replacement
 	// session because the prior admission may still be live.
@@ -63,13 +67,27 @@ type SessionOperationAdmission struct {
 // A restarted process therefore recovers this operation instead of guessing
 // whether the prior UDP exchange crossed the server boundary.
 type SessionOperationRecord struct {
-	Schema                 int                         `json:"schema"`
-	Operation              qurl.NativeSessionOperation `json:"operation"`
-	RecoveryEndpoint       qurl.NHPUDPEndpoint         `json:"recovery_endpoint"`
-	Status                 string                      `json:"status"`
-	Admission              *SessionOperationAdmission  `json:"admission,omitempty"`
-	RecoveryAttempt        uint32                      `json:"recovery_attempt,omitempty"`
-	RecoveryNotBeforeMilli int64                       `json:"recovery_not_before_ms,omitempty"`
+	Schema    int                         `json:"schema"`
+	Operation qurl.NativeSessionOperation `json:"operation"`
+	// RecoveryEndpoint is the cell endpoint recovery contacts first. It is
+	// routing state rather than identity: a transition may move it to another
+	// endpoint of the same cell after that endpoint authenticated a reply, so a
+	// server cohort roll does not strand the record on a retired host or key.
+	RecoveryEndpoint       qurl.NHPUDPEndpoint        `json:"recovery_endpoint"`
+	Status                 string                     `json:"status"`
+	Admission              *SessionOperationAdmission `json:"admission,omitempty"`
+	RecoveryAttempt        uint32                     `json:"recovery_attempt,omitempty"`
+	RecoveryNotBeforeMilli int64                      `json:"recovery_not_before_ms,omitempty"`
+	// PostExpiryNoReplyAttempts counts recovery exchanges that ended without any
+	// authenticated server reply after the operation was already past its own
+	// expiry. It is the only evidence local abandonment may rely on: it grows by
+	// one per failed post-expiry exchange, never by wall-clock movement, so a
+	// clock correction alone can never retire a session the server still holds.
+	// Zero is omitted so journals written before this field decode unchanged.
+	// Downgrade is not supported once it is nonzero: the closed decoder makes a
+	// binary that predates this field report the whole journal corrupt, which
+	// is the fail-closed, operator-attention path for that resource.
+	PostExpiryNoReplyAttempts uint32 `json:"post_expiry_no_reply_attempts,omitempty"`
 }
 
 // NewSessionOperationRecord builds the only valid initial durable record. The
@@ -243,7 +261,7 @@ func (s *SDKStore) TransitionSessionOperation(ctx context.Context, previous, nex
 		}
 		index := findSessionOperationRecord(journal.Records, previous)
 		if !present || journal.ProtectedResourceID != previous.Operation.ProtectedResourceID || index < 0 {
-			return fmt.Errorf("%w: prior record changed", ErrSessionOperationConflict)
+			return fmt.Errorf("%w: prior record changed", ErrSessionOperationCASLost)
 		}
 		journal.Records[index] = next
 		return writeSessionOperationJournal(namespace, name, journal)
@@ -253,8 +271,9 @@ func (s *SDKStore) TransitionSessionOperation(ctx context.Context, previous, nex
 // DeleteSessionOperation removes one exact terminal record. Keeping the
 // compare-and-swap guard prevents cleanup from deleting a replacement.
 func (s *SDKStore) DeleteSessionOperation(ctx context.Context, terminal SessionOperationRecord) error {
-	if terminal.Status != SessionOperationCanceled && terminal.Status != SessionOperationClosed {
-		return fmt.Errorf("%w: record is not terminal", ErrSessionOperationConflict)
+	if (terminal.Status != SessionOperationCanceled && terminal.Status != SessionOperationClosed) ||
+		!validSessionOperationRecord(terminal) {
+		return fmt.Errorf("%w: record is not a valid terminal", ErrSessionOperationConflict)
 	}
 	return s.withSessionOperationLock(ctx, terminal.Operation.ProtectedResourceID, func(namespace *pinnedfs.Directory, name string) error {
 		journal, present, err := loadSessionOperationJournal(namespace, name)
@@ -263,7 +282,7 @@ func (s *SDKStore) DeleteSessionOperation(ctx context.Context, terminal SessionO
 		}
 		index := findSessionOperationRecord(journal.Records, terminal)
 		if !present || journal.ProtectedResourceID != terminal.Operation.ProtectedResourceID || index < 0 {
-			return fmt.Errorf("%w: terminal record changed", ErrSessionOperationConflict)
+			return fmt.Errorf("%w: terminal record changed", ErrSessionOperationCASLost)
 		}
 		journal.Records = append(journal.Records[:index], journal.Records[index+1:]...)
 		if len(journal.Records) > 0 {
@@ -439,7 +458,9 @@ func validSessionOperationRecord(record SessionOperationRecord) bool {
 	if record.Schema != sessionOperationRecordSchema || !validOperation(record.Operation) ||
 		!validRecoveryEndpoint(record.RecoveryEndpoint) ||
 		(record.RecoveryAttempt == 0) != (record.RecoveryNotBeforeMilli == 0) ||
-		record.RecoveryNotBeforeMilli < 0 {
+		record.RecoveryNotBeforeMilli < 0 ||
+		// Every post-expiry failure follows a durably counted attempt.
+		record.PostExpiryNoReplyAttempts > record.RecoveryAttempt {
 		return false
 	}
 	switch record.Status {
@@ -464,6 +485,15 @@ func validOperation(operation qurl.NativeSessionOperation) bool {
 	}
 	var checked qurl.NativeSessionOperation
 	return json.Unmarshal(raw, &checked) == nil && checked == operation
+}
+
+// ValidSessionOperationRecoveryEndpoint reports whether endpoint has the exact
+// shape a durable record may pin for recovery. Callers use it before offering a
+// live assignment endpoint as a same-cell recovery alternative, so a malformed
+// assignment is skipped instead of being classified as a permanent operation
+// failure by the SDK.
+func ValidSessionOperationRecoveryEndpoint(endpoint qurl.NHPUDPEndpoint) bool {
+	return validRecoveryEndpoint(endpoint)
 }
 
 func validRecoveryEndpoint(endpoint qurl.NHPUDPEndpoint) bool {
@@ -500,8 +530,11 @@ func validSessionOperationAdmission(admission *SessionOperationAdmission, operat
 }
 
 func validSessionOperationTransition(previous, next SessionOperationRecord) bool {
+	// RecoveryEndpoint is deliberately absent from the immutable set: recovery
+	// may move it within the operation's cell. validSessionOperationRecord has
+	// already held the replacement to the exact endpoint shape.
 	if !validSessionOperationRecord(previous) || !validSessionOperationRecord(next) ||
-		previous.Schema != next.Schema || previous.Operation != next.Operation || previous.RecoveryEndpoint != next.RecoveryEndpoint {
+		previous.Schema != next.Schema || previous.Operation != next.Operation {
 		return false
 	}
 	if previous.Admission != nil && (next.Admission == nil || *previous.Admission != *next.Admission) {
@@ -525,16 +558,28 @@ func validSessionOperationTransition(previous, next SessionOperationRecord) bool
 	}
 }
 
+// validSessionOperationRecoveryProgress allows exactly one counter to advance
+// per transition, by exactly one, and only together with a strictly later
+// recovery deadline. An attempt is counted before its packet leaves; a
+// post-expiry no-reply failure is counted after the exchange ended without an
+// authenticated reply. Neither counter ever regresses.
 func validSessionOperationRecoveryProgress(previous, next SessionOperationRecord) bool {
 	if next.RecoveryAttempt < previous.RecoveryAttempt ||
-		next.RecoveryNotBeforeMilli < previous.RecoveryNotBeforeMilli {
+		next.RecoveryNotBeforeMilli < previous.RecoveryNotBeforeMilli ||
+		next.PostExpiryNoReplyAttempts < previous.PostExpiryNoReplyAttempts {
 		return false
 	}
-	if next.RecoveryAttempt == previous.RecoveryAttempt {
+	attempts := next.RecoveryAttempt - previous.RecoveryAttempt
+	failures := next.PostExpiryNoReplyAttempts - previous.PostExpiryNoReplyAttempts
+	// Each step is tested on its own so uint32 wraparound cannot add up to one.
+	switch {
+	case attempts == 0 && failures == 0:
 		return next.RecoveryNotBeforeMilli == previous.RecoveryNotBeforeMilli
+	case attempts == 1 && failures == 0, attempts == 0 && failures == 1:
+		return next.RecoveryNotBeforeMilli > previous.RecoveryNotBeforeMilli
+	default:
+		return false
 	}
-	return next.RecoveryAttempt == previous.RecoveryAttempt+1 &&
-		next.RecoveryNotBeforeMilli > previous.RecoveryNotBeforeMilli
 }
 
 func sameSessionOperationRecord(left, right SessionOperationRecord) bool {

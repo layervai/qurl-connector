@@ -92,9 +92,125 @@ The reusable production runtime lives under `pkg/share`. It owns native
 assignment recovery, resource-bound NHP admission, FRP session readiness,
 make-before-break renewal, and per-resource failure isolation. Command code
 must use that implementation rather than introducing another knock/session
-supervisor.
+supervisor. `ResourceRunner` serves one route per admission;
+`SessionGroupRunner` serves many routes (up to `MaxGroupRoutes`) on one
+admission and one FRP session, with live route add/remove/restart and
+per-route failure reporting.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for change and validation expectations.
+
+## Scaling proof
+
+`TestHermeticSessionGroupServes1000Routes` in `pkg/share` proves that one
+Connector process serves many routes on one NHP admission and one FRP control
+session, and measures what that costs. It runs in-process against the real
+FRP client and the real FRP server from the pinned fork; the knock is a
+scripted admitter and the tunnel-auth plugin is a hermetic HTTP plugin that
+answers `NewProxy` the way the platform does. Everything between them is
+production code on loopback.
+
+The normal suite runs it at 50 routes. The opt-in run is:
+
+```bash
+make proof-1000   # 1000 routes with the race detector off, then 200 with it on
+```
+
+`QURL_PROOF_ROUTES` sets the route count and `QURL_PROOF_REPORT` writes the
+measurements as JSON (`make proof-1000` leaves them in `bin/`). One run
+asserts, in order: every route registers on the single admission and answers
+through the vhost; ten routes leave and ten join with no second knock and no
+sibling re-registration; one route restarts under a fresh proxy name alone;
+the admission rotates and the replacement carries every route before the old
+session retires, with a background request loop running across the overlap;
+and one route the server rejects as `resource_not_found` is withdrawn while
+every sibling keeps answering.
+
+Measured on darwin/arm64 (Apple M5 Max, 18 cores, Go 1.27.1):
+
+| | 1000 routes, race off | 200 routes, race on |
+|---|---|---|
+| `Run()` to every route serving | 632 ms | 132 ms |
+| vhost sweep, every route once, 32-way | 79 ms (cold p50 2.2 ms, p99 5.9 ms) | 38 ms (cold p50 5.2 ms, p99 9.9 ms) |
+| steady-state latency, 2000 requests | p50 0.31 ms, p99 0.46 ms | p50 0.67 ms, p99 1.37 ms |
+| rotation: Admit to every route re-registered | 625 ms (promoted at 633 ms) | 129 ms (promoted at 133 ms) |
+| drain: promotion to old proxies withdrawn | 22 ms | 59 ms |
+| overlap requests / failures | 96,203 / 0 | 8,810 / 0 (drain only) |
+| goroutines per route (the FRP client's status worker) | 1.02 | 1.10 |
+| open FDs at registration (baseline 15) | 19 | 19 |
+| open FDs after every route was hit once | 2,085 (2.07 per route, idle work connections) | 485 |
+| goroutines after that sweep | 7,172 (FRP client 2,002; 5,155 net/http and stream goroutines, mostly the in-process server's) | 1,778 |
+| Go `sys` at registration / after that sweep | 53 MiB / 203 MiB | 45 MiB / 69 MiB |
+| peak RSS, whole test process | 393 MiB | 875 MiB (race detector) |
+| FRP server online HTTP proxies | 1000 | 200 |
+| `NewProxy` admitted / rejected | 2011 / 1 | 411 / 1 |
+| goroutines / FDs after stop (baseline 42 / 15) | 45 / 17 | 45 / 17 |
+
+Registration and rotation are linear and fast: about 80 µs per route on the
+server's serial `NewProxy` path, and about 0.6 ms per route end to end
+because proxies are handed to FRP through a 16-wide registration window
+that the session refills once per status poll: 10 ms in the proof, 100 ms in
+production, where the refill alone therefore bounds a 1000-route
+registration at about 6 s and a 2000-route one at about 13 s, inside the
+30 s lead floor. The production rotation lead's a-priori estimate of 50 ms per
+route is still well over a hundred times what this machine needs. A
+platform behind the server is slower: its per-`NewProxy` authorization and
+registration round trips take hundreds of milliseconds, and because the
+server reads a session's messages serially, N proxies handed to FRP at once
+form an N-deep queue. Two mechanisms keep that queue from turning into
+churn. Proxies register through a window (16 in flight per session), so no
+proxy waits long enough for the pinned client's 20 s `NewProxy` re-send to
+fire and register twice; and the rotation lead follows the registration
+rate the runner measured on the last full cycle (with a 1.5× margin), so a
+replacement is started early enough to register every route before the old
+admission expires. The window is proven hermetically at platform speed by
+`TestHermeticSessionGroupRegistersEveryRouteOnceOnSlowServer` in the
+default lanes and by `TestHermeticSessionGroupRotationRegistersEveryRouteOnce`
+across a rotation under `make proof-1000`; the measured lead by the
+runner's tests. The window cannot bound what the pinned client re-sends on
+its own after a control loss, when its new control registers the whole
+pushed set at Login; that is a fork-side change. The steady-state cost of a route is one
+goroutine and no file descriptor. Memory and descriptors scale
+with idle work connections, not routes: the FRP server keeps up to five idle
+work connections per Host for 60 s, so once every route has been hit the
+process holds about two descriptors per route (client and server ends,
+in-process), roughly five goroutines per connection, and roughly 75 KiB of
+stream buffers per connection. Goroutines and descriptors return to baseline
+after stop; Go's `sys` is not handed back to the OS promptly, as usual.
+
+Caveats: hermetic knock, hermetic tunnel-auth plugin, one machine, loopback,
+in-process server (goroutine and descriptor counts include the server's
+share; the breakdown is printed). Peak RSS covers the whole test process, and
+the race-on figure is dominated by the detector's shadow memory; Go `sys` is
+the runtime's high-water mark and includes the proof's own goroutine-dump
+buffers. Peak RSS and descriptor counts are not measured on Windows. Under
+the race detector the overlap loop starts only after the old proxies have
+left the server (see the gap below), so the race-on overlap column covers the
+drain, not the whole rotation. Server-side budgets are proven separately by
+the platform.
+
+One gap was found, and it is not in this repository. The pinned FRP client
+admits a work connection only while its proxy is in the running phase, and
+that phase lags the server on both edges of a proxy's life: the server adds a
+new proxy to its load-balancer group inside `RegisterProxy` and only then
+sends `NewProxyResp`, and `Wrapper.Stop` marks a proxy closed in the same
+instant it sends `CloseProxy`. A request the server dispatches to the proxy
+inside either window is refused by the client and answered 404 by the
+server's reverse proxy. Under a deliberately hostile overlap load (16 workers,
+no pause, about 36,000 requests per second across 20 routes) it shows as one
+to three such 404s per rotation in roughly half the runs, every one at its
+own route's re-registration instant; at the proof's background load it
+appears about once per few hundred thousand requests (0 in 96,203 in the
+published 1000-route run, 1 in 95,018 in an earlier one, 1 in about
+500,000 across the 50-route runs). The
+proof attributes every overlap failure to that exact instant, bounds how
+many it will excuse, and fails on any failure outside it. The same
+site is also a data race: `Wrapper.InWorkConn` reads the proxy phase after
+releasing the wrapper's lock, so the race detector reports the dispatch
+whenever it happens under `-race`, which is why the race lane starts its
+overlap loop after withdrawal. The fix belongs in the FRP fork's client:
+read the phase under the lock, accept work connections while a proxy awaits
+its `NewProxyResp`, and keep accepting through the drain grace after
+`CloseProxy` is sent.
 
 ## Developer command configuration
 
