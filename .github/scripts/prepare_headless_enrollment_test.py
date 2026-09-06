@@ -98,6 +98,7 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
         self.assertIn('.branch_policies[0].name == "main"', workflow)
         self.assertIn('.branch_policies[0].type == "branch"', workflow)
         self.assertIn('.type == "required_reviewers"', workflow)
+        self.assertIn(".prevent_self_review == true", workflow)
         for name in (
             "QURL_SANDBOX_API_KEY",
             "QURL_SANDBOX_API_ENDPOINT",
@@ -119,6 +120,8 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
             SCRIPT.parent.parent / "workflows" / "validate-workflows.yml"
         ).read_text()
         self.assertIn("pip install --require-hashes", validation_workflow)
+        self.assertIn("ruff check --no-cache", validation_workflow)
+        self.assertIn("ruff format --check --no-cache", validation_workflow)
         requirements = (SCRIPT.parent / "requirements-lint.txt").read_text()
         self.assertRegex(
             requirements, r"ruff==0\.15\.8.*\\\n\s+--hash=sha256:[0-9a-f]{64}"
@@ -1015,6 +1018,40 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
                 now=FIXED_NOW,
             )
         put.assert_called_once()
+
+    def test_lost_put_and_poll_responses_warn_that_sharing_may_be_on(self) -> None:
+        responses = [
+            [
+                {
+                    "slug": "detect-sandbox",
+                    "type": "tunnel",
+                    "status": "active",
+                    "resource_id": "MFkw-resource",
+                }
+            ],
+            {"desired_state": "off", "serving_epoch": 0},
+            MODULE.APIRequestOutcomeUnknown("qURL API PUT request failed"),
+            *[MODULE.EnrollmentError("temporary status failure")]
+            * MODULE.SHARING_POLL_ATTEMPTS,
+        ]
+        with (
+            mock.patch.object(MODULE, "api_request", side_effect=responses),
+            mock.patch.object(MODULE, "put_parameter") as put,
+            mock.patch.object(MODULE.time, "sleep"),
+        ):
+            with self.assertRaisesRegex(
+                MODULE.EnrollmentError,
+                "sharing may have been applied before the response was lost and may have been left on",
+            ):
+                MODULE.prepare_enrollment(
+                    "https://api.example.com",
+                    "lv_live_account-key",
+                    "detect-nhp-replica-a",
+                    "attempt-1",
+                    "us-east-2",
+                    now=FIXED_NOW,
+                )
+        put.assert_not_called()
 
     def test_transient_poll_failure_uses_remaining_attempts(self) -> None:
         responses = [

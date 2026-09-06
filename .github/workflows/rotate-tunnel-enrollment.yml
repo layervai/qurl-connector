@@ -58,12 +58,12 @@ jobs:
               [
                 (.deployment_branch_policy.protected_branches == false),
                 (.deployment_branch_policy.custom_branch_policies == true),
-                (any(.protection_rules[]?; .type == "required_reviewers" and (.reviewers | length) > 0))
+                (any(.protection_rules[]?; .type == "required_reviewers" and (.reviewers | length) > 0 and .prevent_self_review == true))
               ] | map(tostring) | join(" ")
             '
           )
           if [ "$policy" != "true true true" ]; then
-            echo "::error::sandbox environment must use an exact custom branch policy and require at least one reviewer"
+            echo "::error::sandbox environment must use an exact custom branch policy and prevent self-review by the dispatcher"
             exit 1
           fi
           branches=$(gh api --paginate "repos/${GITHUB_REPOSITORY}/environments/sandbox/deployment-branch-policies?per_page=100")

@@ -488,7 +488,7 @@ def prepare_enrollment(
         else:
             if put_failure is not None:
                 raise EnrollmentError(
-                    "sharing did not reach the required serving epoch after its update failed"
+                    "sharing did not reach the required serving epoch after its update failed; sharing may have been applied before the response was lost and may have been left on"
                 ) from put_failure
             if last_poll_failure is not None:
                 message = "sharing did not reach the required serving epoch because status checks failed"
