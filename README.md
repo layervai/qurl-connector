@@ -260,22 +260,24 @@ QURL_CONNECTOR_HEALTH_ADDR=127.0.0.1:7401 qurl-connector status --ready
 `status --ready` does not load the Connector config or call the FRP admin API.
 The loopback listener exposes no origin address and cannot forward application
 traffic. A probe reads only in-process route state; it does not enroll, knock,
-or fetch or mint an authentication token. Its local request is capped at 750
-ms, so an ECS health-check timeout of 2 s or more leaves adequate process
-overhead. The process claims the listener before config load, agent enrollment,
-or resource-identity resolution and returns 503 until every active route
-serves. Set the ECS health-check `startPeriod` to cover normal setup. A lost
-control session also returns 503 until re-admission, retry backoff, Login, and
-route registration finish. Set `interval` and `unhealthyThreshold` so that this
-transient recovery window does not cause a restart loop. Those settings do not
-bound a permanent retryable registration failure: the route stays desired, the
-whole group stays at 503, and an ECS container health check restarts healthy
-siblings with it. Do not enable that restart path unless the task has one route
-or the group is the intended replacement unit, and deployment tests prove that
-restarts do not mint Auth0 M2M tokens or other startup credentials per attempt.
-An embedded caller that changes or restarts routes during rotation must allow up
-to one rotation lead of 503 responses; this diagnostic command does not change
-its route set while it runs.
+or fetch or mint an authentication token. Its fixed local request deadline is
+750 ms; the ECS timeout does not extend it. Use an ECS health-check timeout of 2
+s or more for process overhead, and set `unhealthyThreshold` to absorb an
+occasional local timeout if the task is CPU-starved. The process claims the
+listener before config load, agent enrollment, or resource-identity resolution
+and returns 503 until every active route serves. Set the ECS health-check
+`startPeriod` to cover normal setup. A lost control session also returns 503
+until re-admission, retry backoff, Login, and route registration finish. Set
+`interval` and `unhealthyThreshold` so that this transient recovery window does
+not cause a restart loop. Those settings do not bound a permanent retryable
+registration failure: the route stays desired, the whole group stays at 503,
+and an ECS container health check restarts healthy siblings with it. Do not
+enable that restart path unless the task has one route or the group is the
+intended replacement unit, and deployment tests prove that restarts do not mint
+Auth0 M2M tokens or other startup credentials per attempt. An embedded caller
+that changes or restarts routes during rotation must allow up to one rotation
+lead of 503 responses; this diagnostic command does not change its route set
+while it runs.
 
 The address is disabled when the environment variable is absent and rejects
 non-loopback hosts. The response marker detects accidental port collisions; it

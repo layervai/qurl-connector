@@ -365,20 +365,20 @@ func TestRunStatusReadyUsesRuntimeOwnedHealth(t *testing.T) {
 
 func TestRunStatusReadyRejectsConfigFlag(t *testing.T) {
 	previous := statusReady
-	statusReady = true
 	t.Cleanup(func() { statusReady = previous })
 
-	cmd := &cobra.Command{}
-	cmd.Flags().String("config", "", "")
-	if err := cmd.Flags().Set("config", "/etc/qurl/site-b.yaml"); err != nil {
-		t.Fatal(err)
-	}
-	err := runStatus(cmd, nil)
+	root := &cobra.Command{Use: "qurl-connector"}
+	root.PersistentFlags().StringP("config", "c", "", "path to config file")
+	cmd := &cobra.Command{Use: "status", RunE: runStatus}
+	cmd.Flags().BoolVar(&statusReady, "ready", false, "check route readiness")
+	root.AddCommand(cmd)
+	root.SetArgs([]string{"status", "--ready", "-c", "/etc/qurl/site-b.yaml"})
+	err := root.Execute()
 	if err == nil || !strings.Contains(err.Error(), "cannot be scoped by --config") {
-		t.Fatalf("runStatus --ready --config error = %v, want rejected combination", err)
+		t.Fatalf("status --ready -c error = %v, want rejected inherited config flag", err)
 	}
 	if cmd.SilenceUsage || cmd.SilenceErrors {
-		t.Fatal("--ready --config misuse suppressed Cobra usage or error output")
+		t.Fatal("--ready -c misuse suppressed Cobra usage or error output")
 	}
 }
 
