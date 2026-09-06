@@ -48,6 +48,9 @@ func TestAdminAuthPassword(t *testing.T) {
 }
 
 func TestAdminAPIWorksWithoutDashboardAssets(t *testing.T) {
+	if assets.FileSystem != nil {
+		t.Fatal("connector binary registered FRP dashboard assets; the embedded web UI must stay unlinked")
+	}
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -57,8 +60,6 @@ func TestAdminAPIWorksWithoutDashboardAssets(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	previousAssets := assets.FileSystem
-	t.Cleanup(func() { assets.FileSystem = previousAssets })
 	loginFailExit := false
 	common := &v1.ClientCommonConfig{ServerAddr: "127.0.0.1", ServerPort: 1, LoginFailExit: &loginFailExit}
 	common.Log.Level = "error"
