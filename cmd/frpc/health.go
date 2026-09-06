@@ -112,6 +112,9 @@ func runWithConnectorHealth(ctx context.Context, ready func() bool, run func(con
 	if !configured {
 		return run(ctx)
 	}
+	if ready == nil {
+		return errors.New("Connector health readiness callback is nil")
+	}
 
 	listener, err := listenConnectorHealth("tcp", addr)
 	if err != nil {
@@ -151,8 +154,9 @@ func runWithConnectorHealth(ctx context.Context, ready func() bool, run func(con
 	}
 	// Shutdown can race Serve before Serve records the listener, and a
 	// connection can outlive the graceful-drain deadline. Close covers both:
-	// it closes the listener and every remaining connection, so the server
-	// goroutine always returns and nothing outlives this call.
+	// it closes the listener and every remaining connection, so Serve returns.
+	// The production readiness callback only locks and copies local state; an
+	// arbitrary callback that blocks forever is outside this helper's contract.
 	_ = server.Close()
 	serverErr := <-serveErr
 	if serverErr != nil && errors.Is(context.Cause(runCtx), serverErr) && joinedCancellationOnly(runErr) {

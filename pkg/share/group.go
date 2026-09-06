@@ -97,9 +97,11 @@ type SessionGroupRunner struct {
 
 	mu      sync.Mutex
 	desired map[string]LocalHTTPRoute
-	// divergent records that a caller's apply failed before every live
-	// session confirmed the desired set; Run re-applies under its own context.
-	divergent bool
+	// activeDivergent and pendingDivergent identify the exact live cycles whose
+	// last route-set apply failed. Readiness uses only activeDivergent; a
+	// replacement failure must not hide a converged active session.
+	activeDivergent  *groupCycle
+	pendingDivergent *groupCycle
 	// restarts holds each route's generation for the runner's lifetime,
 	// including routes that have left the group: a route that comes back
 	// must register under a fresh proxy name, never the one a lingering
@@ -504,16 +506,13 @@ func (r *SessionGroupRunner) RestartRoute(ctx context.Context, routeID string) e
 	return r.applyAndWake(ctx)
 }
 
-// applyAndWake pushes the desired set from a caller, records a failure for
-// Run to heal, and wakes Run so the rotation timer follows the route count.
+// applyAndWake pushes the desired set from a caller, records each live cycle's
+// result for Run to heal, and wakes Run so the rotation timer follows the route
+// count.
 func (r *SessionGroupRunner) applyAndWake(ctx context.Context) error {
 	r.applyMu.Lock()
-	err := r.applyLocked(ctx)
-	if err != nil {
-		r.mu.Lock()
-		r.divergent = true
-		r.mu.Unlock()
-	}
+	result := r.applyLocked(ctx)
+	err := r.recordApplyResult(result)
 	r.applyMu.Unlock()
 	r.signalWake()
 	return err
@@ -524,18 +523,14 @@ func (r *SessionGroupRunner) applyAndWake(ctx context.Context) error {
 // bounded backoff instead of waiting for a session change or rotation.
 func (r *SessionGroupRunner) healDivergence(ctx context.Context) error {
 	r.mu.Lock()
-	divergent := r.divergent
+	divergent := r.activeDivergent != nil || r.pendingDivergent != nil
 	r.mu.Unlock()
 	if !divergent {
 		return nil
 	}
 	r.applyMu.Lock()
-	err := r.applyLocked(ctx)
-	if err == nil {
-		r.mu.Lock()
-		r.divergent = false
-		r.mu.Unlock()
-	}
+	result := r.applyLocked(ctx)
+	err := r.recordApplyResult(result)
 	r.applyMu.Unlock()
 	return err
 }
@@ -559,9 +554,11 @@ func (r *SessionGroupRunner) RouteStates() map[string]RouteState {
 
 // RoutesReady reports whether the active session has exactly the route set the
 // runner currently desires, every route is serving at its desired generation,
-// and no failed apply remains to be healed. A replacement session does not
-// affect the result until promotion, so make-before-break rotation keeps
-// reporting the still-serving active session. Routes withdrawn after an
+// and no failed apply to that active cycle remains to be healed. A replacement
+// session does not affect the result until promotion, so a replacement-only
+// apply failure cannot hide the still-serving active session. If that cycle is
+// promoted while still divergent, the failure becomes active and readiness
+// fails closed until healing succeeds. Routes withdrawn after an
 // authenticated ErrResourceGone refusal are no longer desired and therefore
 // do not make healthy siblings fail readiness once their withdrawal converges.
 // Readiness is a whole-group bit: one retryably failed desired route or failed
@@ -584,7 +581,7 @@ func (r *SessionGroupRunner) RoutesReady() bool {
 	ended := sessionEnded(active.session)
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if r.active != active || len(r.desired) == 0 || r.divergent || ended {
+	if r.active != active || len(r.desired) == 0 || r.activeDivergent == active || ended {
 		return false
 	}
 	if len(states) != len(r.desired) {
@@ -607,21 +604,26 @@ func (r *SessionGroupRunner) RoutesReady() bool {
 func (r *SessionGroupRunner) apply(ctx context.Context) error {
 	r.applyMu.Lock()
 	defer r.applyMu.Unlock()
-	return r.applyLocked(ctx)
+	return r.recordApplyResult(r.applyLocked(ctx))
+}
+
+type groupApplyResult struct {
+	active, pending       *groupCycle
+	activeErr, pendingErr error
 }
 
 // applyLocked pushes the current desired set while applyMu serializes it with
 // caller changes and divergence healing.
-func (r *SessionGroupRunner) applyLocked(ctx context.Context) error {
+func (r *SessionGroupRunner) applyLocked(ctx context.Context) groupApplyResult {
 	r.mu.Lock()
 	desired := r.desiredRoutesLocked()
 	active, pending, rotating := r.active, r.pending, r.rotating
 	r.mu.Unlock()
 
-	var errs []error
+	result := groupApplyResult{active: active, pending: pending}
 	if pending != nil && pending != active && !sessionEnded(pending.session) {
 		if err := pending.session.Update(ctx, desired); err != nil && !errors.Is(err, ErrSessionGroupEnded) {
-			errs = append(errs, fmt.Errorf("replacement session: %w", err))
+			result.pendingErr = fmt.Errorf("replacement session: %w", err)
 		}
 	}
 	if active != nil && !sessionEnded(active.session) {
@@ -632,10 +634,41 @@ func (r *SessionGroupRunner) applyLocked(ctx context.Context) error {
 		// A session that is retiring underneath the update is benign: the
 		// desired set is authoritative for every later cycle.
 		if err := active.session.Update(ctx, routes); err != nil && !errors.Is(err, ErrSessionGroupEnded) {
-			errs = append(errs, fmt.Errorf("active session: %w", err))
+			result.activeErr = fmt.Errorf("active session: %w", err)
 		}
 	}
-	return errors.Join(errs...)
+	return result
+}
+
+// recordApplyResult attaches each result to the same cycle if it is still
+// active or pending. A concurrent promotion therefore transfers a pending
+// failure to the new active role and drops results for the retired cycle.
+// applyMu is held by every caller, so later applies replace earlier results.
+func (r *SessionGroupRunner) recordApplyResult(result groupApplyResult) error {
+	r.mu.Lock()
+	record := func(cycle *groupCycle, err error) {
+		if cycle == nil {
+			return
+		}
+		if r.active == cycle {
+			if err != nil {
+				r.activeDivergent = cycle
+			} else if r.activeDivergent == cycle {
+				r.activeDivergent = nil
+			}
+		}
+		if r.pending == cycle {
+			if err != nil {
+				r.pendingDivergent = cycle
+			} else if r.pendingDivergent == cycle {
+				r.pendingDivergent = nil
+			}
+		}
+	}
+	record(result.pending, result.pendingErr)
+	record(result.active, result.activeErr)
+	r.mu.Unlock()
+	return errors.Join(result.pendingErr, result.activeErr)
 }
 
 func sessionEnded(session ServingSession) bool {
@@ -909,8 +942,14 @@ func (r *SessionGroupRunner) withdrawGone(ctx context.Context, states map[string
 func (r *SessionGroupRunner) promote(ctx context.Context, cycle *groupCycle) error {
 	r.mu.Lock()
 	r.active = cycle
+	if r.pending == cycle && r.pendingDivergent == cycle {
+		r.activeDivergent = cycle
+	} else {
+		r.activeDivergent = nil
+	}
 	if r.pending == cycle {
 		r.pending = nil
+		r.pendingDivergent = nil
 	}
 	r.rotating = false
 	r.reported = make(map[string]string)
@@ -991,6 +1030,7 @@ func (r *SessionGroupRunner) takeActive() *groupCycle {
 	defer r.mu.Unlock()
 	active := r.active
 	r.active = nil
+	r.activeDivergent = nil
 	return active
 }
 
@@ -998,6 +1038,7 @@ func (r *SessionGroupRunner) setPending(cycle *groupCycle) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.pending = cycle
+	r.pendingDivergent = nil
 }
 
 func (r *SessionGroupRunner) clearPending(cycle *groupCycle) {
@@ -1005,6 +1046,7 @@ func (r *SessionGroupRunner) clearPending(cycle *groupCycle) {
 	defer r.mu.Unlock()
 	if r.pending == cycle {
 		r.pending = nil
+		r.pendingDivergent = nil
 	}
 }
 

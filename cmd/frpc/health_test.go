@@ -187,6 +187,104 @@ func TestRunWithConnectorHealthDisabledRunsDirectly(t *testing.T) {
 	}
 }
 
+func TestRunWithConnectorHealthRejectsNilInputs(t *testing.T) {
+	if err := runWithConnectorHealth(nil, func() bool { return false }, func(context.Context) error { return nil }); err == nil || !strings.Contains(err.Error(), "context is nil") {
+		t.Fatalf("nil context error = %v", err)
+	}
+
+	t.Setenv(envConnectorHealthAddr, "127.0.0.1:7401")
+	previousListen := listenConnectorHealth
+	listenConnectorHealth = func(_, _ string) (net.Listener, error) {
+		t.Error("listener bound with a nil readiness callback")
+		return nil, errors.New("must not listen")
+	}
+	t.Cleanup(func() { listenConnectorHealth = previousListen })
+	if err := runWithConnectorHealth(context.Background(), nil, func(context.Context) error { return nil }); err == nil || !strings.Contains(err.Error(), "callback is nil") {
+		t.Fatalf("nil readiness callback error = %v", err)
+	}
+}
+
+func TestRunWithConnectorHealthAllowsCleanEnabledRuntimeExit(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(envConnectorHealthAddr, listener.Addr().String())
+	previousListen := listenConnectorHealth
+	listenConnectorHealth = func(_, _ string) (net.Listener, error) { return listener, nil }
+	t.Cleanup(func() { listenConnectorHealth = previousListen })
+
+	if err := runWithConnectorHealth(context.Background(), func() bool { return true }, func(context.Context) error { return nil }); err != nil {
+		t.Fatalf("clean enabled runtime exit = %v", err)
+	}
+}
+
+func TestRunWithConnectorHealthForcesCloseAfterShutdownDeadline(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := listener.Addr().String()
+	t.Setenv(envConnectorHealthAddr, addr)
+	previousListen := listenConnectorHealth
+	listenConnectorHealth = func(_, _ string) (net.Listener, error) { return listener, nil }
+	t.Cleanup(func() { listenConnectorHealth = previousListen })
+
+	readyEntered := make(chan struct{})
+	releaseReady := make(chan struct{})
+	defer func() {
+		select {
+		case <-releaseReady:
+		default:
+			close(releaseReady)
+		}
+	}()
+	readyDone := make(chan struct{})
+	requestDone := make(chan error, 1)
+	started := time.Now()
+	err = runWithConnectorHealth(context.Background(), func() bool {
+		close(readyEntered)
+		<-releaseReady
+		close(readyDone)
+		return true
+	}, func(context.Context) error {
+		go func() {
+			resp, requestErr := http.Get("http://" + addr + connectorHealthPath) //nolint:gosec,noctx // Local test request is closed by the server under test.
+			if resp != nil {
+				_ = resp.Body.Close()
+			}
+			requestDone <- requestErr
+		}()
+		select {
+		case <-readyEntered:
+			return nil
+		case <-time.After(time.Second):
+			return errors.New("readiness handler did not start")
+		}
+	})
+	elapsed := time.Since(started)
+	if err != nil {
+		t.Fatalf("runWithConnectorHealth() after forced close = %v", err)
+	}
+	if elapsed < time.Second || elapsed > 2*time.Second {
+		t.Fatalf("forced close took %s, want the one-second shutdown bound", elapsed)
+	}
+	select {
+	case requestErr := <-requestDone:
+		if requestErr == nil {
+			t.Fatal("active request completed without the forced server close")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("forced server close did not release the active request")
+	}
+	close(releaseReady)
+	select {
+	case <-readyDone:
+	case <-time.After(time.Second):
+		t.Fatal("readiness callback did not finish after release")
+	}
+}
+
 type failedConnectorHealthListener struct {
 	err error
 }

@@ -723,13 +723,15 @@ func TestSessionGroupRunnerPromotionConfirmsPriorDivergence(t *testing.T) {
 		},
 		done: make(chan struct{}),
 	}
+	cycle := &groupCycle{session: session}
 	runner := &SessionGroupRunner{
-		desired:   map[string]LocalHTTPRoute{"a": route},
-		restarts:  map[string]uint64{},
-		divergent: true,
+		desired:          map[string]LocalHTTPRoute{"a": route},
+		restarts:         map[string]uint64{},
+		pending:          cycle,
+		pendingDivergent: cycle,
 	}
 
-	if err := runner.promote(context.Background(), &groupCycle{session: session}); err != nil {
+	if err := runner.promote(context.Background(), cycle); err != nil {
 		t.Fatalf("promote() = %v", err)
 	}
 	if !runner.RoutesReady() {
@@ -737,6 +739,45 @@ func TestSessionGroupRunnerPromotionConfirmsPriorDivergence(t *testing.T) {
 	}
 	if got := len(session.updates); got != 1 {
 		t.Fatalf("promotion confirmation updates = %d, want one existing-session apply", got)
+	}
+}
+
+func TestSessionGroupRunnerRoutesReadyIgnoresPendingOnlyDivergence(t *testing.T) {
+	route := groupTestRoutes("a")[0]
+	activeSession := &fakeGroupSession{
+		routes: map[string]RouteState{
+			"a": {Route: GroupRoute{LocalHTTPRoute: route}, ProxyName: "a-nhp1", Phase: RouteServing},
+		},
+		done:    make(chan struct{}),
+		changes: make(chan struct{}, 1),
+	}
+	pendingSession := &fakeGroupSession{
+		routes: map[string]RouteState{
+			"a": {Route: GroupRoute{LocalHTTPRoute: route}, ProxyName: "a-nhp2", Phase: RouteServing},
+		},
+		done:        make(chan struct{}),
+		changes:     make(chan struct{}, 1),
+		failUpdates: 1,
+	}
+	active := &groupCycle{session: activeSession}
+	pending := &groupCycle{session: pendingSession}
+	runner := &SessionGroupRunner{
+		desired:  map[string]LocalHTTPRoute{"a": route},
+		restarts: map[string]uint64{},
+		active:   active,
+		pending:  pending,
+		rotating: true,
+		wake:     make(chan struct{}, 1),
+	}
+
+	if err := runner.SetRoutes(context.Background(), []LocalHTTPRoute{route}); err == nil || !strings.Contains(err.Error(), "replacement session") {
+		t.Fatalf("SetRoutes() = %v, want only the replacement update failure", err)
+	}
+	if runner.activeDivergent != nil || runner.pendingDivergent != pending {
+		t.Fatalf("divergence = active %p, pending %p; want nil, %p", runner.activeDivergent, runner.pendingDivergent, pending)
+	}
+	if !runner.RoutesReady() {
+		t.Fatal("pending-only divergence hid the exact serving active session")
 	}
 }
 
