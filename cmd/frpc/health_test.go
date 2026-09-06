@@ -4,11 +4,39 @@ import (
 	"context"
 	"errors"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 )
+
+func TestConnectorHealthHandlerMethods(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		method     string
+		path       string
+		wantStatus int
+		wantAllow  string
+	}{
+		{name: "get", method: http.MethodGet, path: connectorHealthPath, wantStatus: http.StatusNoContent},
+		{name: "head", method: http.MethodHead, path: connectorHealthPath, wantStatus: http.StatusNoContent},
+		{name: "wrong method", method: http.MethodPost, path: connectorHealthPath, wantStatus: http.StatusMethodNotAllowed, wantAllow: "GET, HEAD"},
+		{name: "wrong path", method: http.MethodGet, path: "/", wantStatus: http.StatusNotFound},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			connectorHealthHandler(func() bool { return true }).ServeHTTP(recorder, httptest.NewRequest(test.method, test.path, nil))
+			if recorder.Code != test.wantStatus {
+				t.Fatalf("status = %d, want %d", recorder.Code, test.wantStatus)
+			}
+			if allow := recorder.Header().Get("Allow"); allow != test.wantAllow {
+				t.Fatalf("Allow = %q, want %q", allow, test.wantAllow)
+			}
+		})
+	}
+}
 
 func TestRunWithConnectorHealthServesLiveRunnerState(t *testing.T) {
 	listener, err := net.Listen("tcp", "127.0.0.1:0")

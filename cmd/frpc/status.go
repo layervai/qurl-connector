@@ -30,8 +30,6 @@ func init() {
 	statusCmd.Flags().BoolVar(&statusJSON, "json", false, "output status in JSON format")
 	statusCmd.Flags().BoolVar(&statusReady, "ready", false, "exit successfully only when every active route is serving")
 	statusCmd.MarkFlagsMutuallyExclusive("json", "ready")
-	// An unhealthy readiness probe is a runtime result, not a usage error.
-	statusCmd.SilenceUsage = true
 }
 
 // adminProxyStatus represents a single proxy status from the FRP admin API.
@@ -113,6 +111,12 @@ type routeStatus struct {
 // `discoverErr` independently.
 func runStatus(cmd *cobra.Command, _ []string) error {
 	if statusReady {
+		// An unhealthy readiness probe is a runtime result, not a usage error.
+		// Set this only after Cobra validates flags so other status failures
+		// keep their existing usage output.
+		if cmd != nil {
+			cmd.SilenceUsage = true
+		}
 		return probeConnectorHealth(commandContext(cmd))
 	}
 

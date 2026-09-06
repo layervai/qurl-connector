@@ -46,8 +46,13 @@ func connectorHealthAddress() (string, bool, error) {
 func connectorHealthHandler(ready func() bool) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Cache-Control", "no-store")
-		if r.Method != http.MethodGet || r.URL.Path != connectorHealthPath {
+		if r.URL.Path != connectorHealthPath {
 			http.NotFound(w, r)
+			return
+		}
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+			w.Header().Set("Allow", "GET, HEAD")
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
 		if !ready() {

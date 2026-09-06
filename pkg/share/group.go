@@ -533,7 +533,9 @@ func (r *SessionGroupRunner) RouteStates() map[string]RouteState {
 // result until promotion, so make-before-break rotation keeps reporting the
 // still-serving active session. Routes withdrawn after an authenticated
 // ErrResourceGone refusal are no longer desired and therefore do not make
-// healthy siblings fail readiness.
+// healthy siblings fail readiness. Readiness is a whole-group bit: one
+// retryably failed desired route makes the group unready, so use it only when
+// the session group is also the supervisor's unit of replacement.
 func (r *SessionGroupRunner) RoutesReady() bool {
 	r.mu.Lock()
 	active := r.active

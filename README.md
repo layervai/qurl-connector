@@ -257,10 +257,14 @@ QURL_CONNECTOR_HEALTH_ADDR=127.0.0.1:7401 qurl-connector status --ready
 
 `status --ready` does not load the Connector config or call the FRP admin API.
 Its local request is capped at 750 ms, so an ECS health-check timeout of 2 s or
-more leaves adequate process-start overhead. The address is disabled when the
-environment variable is absent and rejects non-loopback hosts. This repository
-still does not publish the command as a container; a deployment must own and
-verify the wrapper artifact that embeds the released module.
+more leaves adequate process overhead. The endpoint binds after config load,
+agent enrollment, and resource-identity resolution. Probes before that fail to
+connect; after bind they return 503 until every active route serves. Set the ECS
+health-check `startPeriod` to cover both normal setup phases. The address is
+disabled when the environment variable is absent and rejects non-loopback
+hosts. This repository still does not publish the command as a container; a
+deployment must own and verify the wrapper artifact that embeds the released
+module.
 
 ## Supply chain
 
