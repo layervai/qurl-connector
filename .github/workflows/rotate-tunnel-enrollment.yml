@@ -69,6 +69,8 @@ jobs:
             echo "::error::sandbox environment must use an exact custom branch policy and prevent self-review by the dispatcher"
             exit 1
           fi
+          # More than one page emits concatenated objects. The single-object
+          # shape check below rejects that output, so pagination fails closed.
           branches=$(gh api --paginate "repos/${GITHUB_REPOSITORY}/environments/sandbox/deployment-branch-policies?per_page=100")
           if ! jq -e '
             (.total_count | type) == "number" and .total_count == 1 and

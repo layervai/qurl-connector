@@ -15,6 +15,7 @@ from unittest import mock
 SCRIPT = pathlib.Path(__file__).with_name("prepare-headless-enrollment.py")
 WORKFLOW = SCRIPT.parent.parent / "workflows" / "rotate-tunnel-enrollment.yml"
 SANITIZER = SCRIPT.with_name("public_source_sanitization_test.go")
+GITIGNORE = SCRIPT.parent.parent.parent / ".gitignore"
 SPEC = importlib.util.spec_from_file_location("prepare_headless_enrollment", SCRIPT)
 assert SPEC is not None and SPEC.loader is not None
 MODULE = importlib.util.module_from_spec(SPEC)
@@ -45,6 +46,10 @@ class FakeResponse:
 
 
 class PrepareHeadlessEnrollmentTest(unittest.TestCase):
+    def test_generated_python_tool_directories_are_ignored(self) -> None:
+        entries = set(GITIGNORE.read_text().splitlines())
+        self.assertTrue({".ruff_cache/", ".venv/", "venv/"} <= entries)
+
     def test_workflow_exposes_every_reviewed_target_and_uses_target_selector(
         self,
     ) -> None:
@@ -240,6 +245,31 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
                 request, None, 302, "Found", {}, "https://other.example.com"
             )
         )
+
+    def test_api_opener_ignores_ambient_tls_and_proxy_overrides(self) -> None:
+        with mock.patch.dict(
+            MODULE.os.environ,
+            {
+                "SSL_CERT_FILE": "/tmp/untrusted-ca.pem",
+                "SSL_CERT_DIR": "/tmp/untrusted-certs",
+                "HTTPS_PROXY": "https://proxy.example.com",
+            },
+            clear=False,
+        ):
+            opener = MODULE.build_api_opener()
+        self.assertFalse(
+            any(
+                isinstance(handler, MODULE.urllib.request.ProxyHandler)
+                for handler in opener.handlers
+            )
+        )
+        https_handler = next(
+            handler
+            for handler in opener.handlers
+            if isinstance(handler, MODULE.urllib.request.HTTPSHandler)
+        )
+        self.assertEqual(https_handler._context.verify_mode, MODULE.ssl.CERT_REQUIRED)
+        self.assertTrue(https_handler._context.check_hostname)
 
     def test_api_request_sends_exact_json_and_idempotency_headers(self) -> None:
         response = FakeResponse(b'{"data":{"ok":true}}', status=201)
@@ -1625,6 +1655,12 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
         self.assertNotIn("left on", str(raised.exception))
         put.assert_not_called()
 
+    def test_sharing_poll_allows_propagation_before_operator_retry(self) -> None:
+        self.assertGreaterEqual(
+            (MODULE.SHARING_POLL_ATTEMPTS - 1) * MODULE.SHARING_POLL_SECONDS,
+            50,
+        )
+
     def test_stale_epoch_observed_on_reports_left_on(self) -> None:
         responses = [
             [
@@ -1882,7 +1918,9 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
             "AWS_DEFAULT_OUTPUT": "yaml",
             "AWS_ENDPOINT_URL": "https://private.example.com",
             "AWS_ENDPOINT_URL_SSM": "https://private.example.com/ssm",
+            "AWS_ENDPOINT_URL_STS": "https://private.example.com/sts",
             "AWS_CA_BUNDLE": "/tmp/private-ca.pem",
+            "AWS_CLI_FILE_ENCODING": "utf-16",
             "AWS_CONFIG_FILE": "/tmp/private-config",
             "AWS_SHARED_CREDENTIALS_FILE": "/tmp/private-credentials",
             "AWS_PAGER": "unsafe-pager",
@@ -1905,11 +1943,13 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
         self.assertNotIn("AWS_DEFAULT_OUTPUT", kwargs["env"])
         self.assertNotIn("AWS_ENDPOINT_URL", kwargs["env"])
         self.assertNotIn("AWS_ENDPOINT_URL_SSM", kwargs["env"])
+        self.assertNotIn("AWS_ENDPOINT_URL_STS", kwargs["env"])
         self.assertNotIn("AWS_CA_BUNDLE", kwargs["env"])
         self.assertEqual(kwargs["env"]["AWS_CONFIG_FILE"], MODULE.os.devnull)
         self.assertEqual(
             kwargs["env"]["AWS_SHARED_CREDENTIALS_FILE"], MODULE.os.devnull
         )
+        self.assertEqual(kwargs["env"]["AWS_CLI_FILE_ENCODING"], "utf-8")
         self.assertEqual(kwargs["env"]["AWS_PAGER"], "")
         self.assertEqual(kwargs["input"], "lv_live_secret-token")
         self.assertEqual(args[args.index("--value") + 1], "file:///dev/stdin")

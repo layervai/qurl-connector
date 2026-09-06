@@ -11,6 +11,7 @@ import http.client
 import json
 import os
 import re
+import ssl
 import subprocess
 import sys
 import time
@@ -34,7 +35,7 @@ MAX_RESPONSE_BYTES = 64 * 1024
 API_TIMEOUT_SECONDS = 10
 AWS_TIMEOUT_SECONDS = 30
 SHARING_POLL_ATTEMPTS = 6
-SHARING_POLL_SECONDS = 2
+SHARING_POLL_SECONDS = 10
 RETRY_SECONDS = 2
 MAX_RETRY_AFTER_SECONDS = 30
 TARGETS = {
@@ -120,7 +121,23 @@ class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
         return None
 
 
-NO_REDIRECT_OPENER = urllib.request.build_opener(NoRedirectHandler)
+def build_api_opener() -> urllib.request.OpenerDirector:
+    # Use the interpreter's compiled trust paths, not SSL_CERT_FILE or
+    # SSL_CERT_DIR from the runner environment. Do not send the bearer through
+    # an ambient proxy.
+    trust_paths = ssl.get_default_verify_paths()
+    tls_context = ssl.create_default_context(
+        cafile=trust_paths.openssl_cafile,
+        capath=trust_paths.openssl_capath,
+    )
+    return urllib.request.build_opener(
+        urllib.request.ProxyHandler({}),
+        urllib.request.HTTPSHandler(context=tls_context),
+        NoRedirectHandler,
+    )
+
+
+NO_REDIRECT_OPENER = build_api_opener()
 
 
 def validate_api_endpoint(value: str, *, expected_sha256: str) -> str:
@@ -317,9 +334,11 @@ def put_parameter(region: str, parameter: str, token: str) -> None:
     clean_env.pop("AWS_DEFAULT_OUTPUT", None)
     clean_env.pop("AWS_ENDPOINT_URL", None)
     clean_env.pop("AWS_ENDPOINT_URL_SSM", None)
+    clean_env.pop("AWS_ENDPOINT_URL_STS", None)
     clean_env.pop("AWS_CA_BUNDLE", None)
     clean_env["AWS_CONFIG_FILE"] = os.devnull
     clean_env["AWS_SHARED_CREDENTIALS_FILE"] = os.devnull
+    clean_env["AWS_CLI_FILE_ENCODING"] = "utf-8"
     clean_env["AWS_PAGER"] = ""
     try:
         result = subprocess.run(
