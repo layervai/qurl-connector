@@ -96,6 +96,10 @@ class APIRequestOutcomeUnknown(EnrollmentError):
         self.retry_after_seconds = retry_after_seconds
 
 
+class EnrollmentParameterOutcomeUnknown(EnrollmentError):
+    """The SSM parameter update might have completed before the client timed out."""
+
+
 class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
     def redirect_request(
         self, req: Any, fp: Any, code: int, msg: str, headers: Any, newurl: str
@@ -293,8 +297,8 @@ def put_parameter(region: str, parameter: str, token: str) -> None:
             timeout=AWS_TIMEOUT_SECONDS,
         )
     except subprocess.TimeoutExpired as exc:
-        raise EnrollmentError(
-            "AWS CLI timed out during the enrollment parameter update"
+        raise EnrollmentParameterOutcomeUnknown(
+            "AWS CLI timed out during the enrollment parameter update; the update may have completed"
         ) from exc
     except OSError as exc:
         raise EnrollmentError(
@@ -386,6 +390,10 @@ def mint_and_install_enrollment(
         if isinstance(credential_id, str) and re.fullmatch(
             r"key_[A-Za-z0-9]{8,64}", credential_id
         ):
+            if isinstance(exc, EnrollmentParameterOutcomeUnknown):
+                raise EnrollmentError(
+                    f"enrollment credential {credential_id} was minted, but its installation outcome is unknown; retry the same generation only while the recovered token has at least 45 minutes remaining to repeat the idempotent parameter write; do not revoke that non-secret credential ID unless the parameter is confirmed not to reference it"
+                ) from exc
             raise EnrollmentError(
                 f"enrollment credential {credential_id} was minted but not installed; retry the same generation only while the recovered token has at least 45 minutes remaining, otherwise use a new generation, or revoke that non-secret credential ID with JWT authority"
             ) from exc
@@ -458,7 +466,7 @@ def prepare_enrollment(
                 body={"desired_state": "on"},
             )
             sharing_enabled_by_this_run = True
-        except EnrollmentError as exc:
+        except APIRequestOutcomeUnknown as exc:
             # The server can apply the PUT before the response is lost. The GET
             # below decides whether it is safe to continue and keeps retries
             # possible when the mutation did not land.
@@ -469,9 +477,19 @@ def prepare_enrollment(
             try:
                 sharing = api_request(api_endpoint, api_key, resource_path + "/sharing")
                 last_poll_failure = None
-            except EnrollmentError as exc:
+            except APIRequestOutcomeUnknown as exc:
                 sharing = None
                 last_poll_failure = exc
+            except EnrollmentError as exc:
+                if sharing_enabled_by_this_run:
+                    raise EnrollmentError(
+                        "sharing status check was rejected after sharing for this resource was enabled by this run; sharing was left on"
+                    ) from exc
+                if put_failure is not None:
+                    raise EnrollmentError(
+                        "sharing status check was rejected after the sharing update outcome became unknown; sharing may have been applied before the response was lost and may have been left on"
+                    ) from exc
+                raise
             observed_epoch = (
                 sharing.get("serving_epoch") if isinstance(sharing, dict) else None
             )

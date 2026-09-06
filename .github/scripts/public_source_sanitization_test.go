@@ -16,24 +16,38 @@ var (
 	layerVRepoRef    = regexp.MustCompile(`(?i)\blayervai/([a-z0-9][a-z0-9-]*)`)
 	layerVHost       = regexp.MustCompile(`(?i)\b(?:[a-z0-9-]+\.)*layerv\.(?:ai|xyz)\b`)
 	// Find the exact upper-case parameter form and lower-case service paths
-	// with at least three segments below the qurl-* namespace. The allowlist
+	// with at least two segments below the qurl-* namespace. The allowlist
 	// below, not this expression, decides which private operational paths are
 	// reviewed for public source. References into reviewed public qurl-* repos
 	// are excluded separately after this deliberately broad match.
-	operationalPath = regexp.MustCompile(`/qurl-[a-z0-9-]+/(?:[A-Z][A-Z0-9_]*(?:/[A-Z][A-Z0-9_]*)*|[a-z0-9][a-z0-9-]*(?:/[a-z0-9](?:[a-z0-9-]*[a-z0-9])?){2,})`)
+	operationalPath = regexp.MustCompile(`(/qurl-[a-z0-9-]+/(?:[A-Z][A-Z0-9_]*(?:/[A-Z][A-Z0-9_]*)*|[a-z0-9][a-z0-9-]*(?:/[a-z0-9](?:[a-z0-9-]*[a-z0-9])?){1,}))(?:[^A-Za-z0-9_/-]|$)`)
 )
+
+func findOperationalPaths(text string) []string {
+	matches := operationalPath.FindAllStringSubmatch(text, -1)
+	paths := make([]string, 0, len(matches))
+	for _, match := range matches {
+		paths = append(paths, match[1])
+	}
+	return paths
+}
 
 func TestOperationalPathDetectorStaysBroaderThanAllowlist(t *testing.T) {
 	for _, path := range []string{
+		"/qurl-example-service/" + "nhp/bootstrap",
 		"/qurl-example-service/" + "nhp/replica-z/bootstrap",
 		"/qurl-example-service/" + "nhp/replica-z/bootstrap-legacy",
 		"/qurl-example-service/" + "nhp/replica-z/key",
 		"/qurl-example-service/" + "fileviewer-tunnel/replica-z/bootstrap",
 		"/qurl-example-service/" + "PRIVATE_PARAMETER",
 	} {
-		if got := operationalPath.FindString(path); got != path {
-			t.Fatalf("operationalPath.FindString(%q) = %q; new NHP service paths must reach the reviewed allowlist", path, got)
+		got := findOperationalPaths(path)
+		if len(got) != 1 || got[0] != path {
+			t.Fatalf("findOperationalPaths(%q) = %q; new NHP service paths must reach the reviewed allowlist", path, got)
 		}
+	}
+	if got := findOperationalPaths("/qurl-example-service/nhp/replica-{slot}/bootstrap"); len(got) != 0 {
+		t.Fatalf("dynamic operational path matched incomplete token %q", got)
 	}
 }
 
@@ -185,7 +199,7 @@ func TestPublicSourceContainsNoPrivateOperationalMaterial(t *testing.T) {
 				t.Errorf("%s contains private webhook or cloud endpoint %q", rel, endpoint)
 			}
 		}
-		for _, operational := range operationalPath.FindAllString(text, -1) {
+		for _, operational := range findOperationalPaths(text) {
 			if operationalPathBelongsToPublicRepository(operational, publicRepositories) {
 				continue
 			}

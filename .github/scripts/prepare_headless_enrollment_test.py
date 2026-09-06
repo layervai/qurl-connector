@@ -6,6 +6,7 @@ import importlib.util
 import pathlib
 import re
 import shutil
+import sys
 import threading
 import unittest
 from unittest import mock
@@ -122,6 +123,17 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
         self.assertIn("pip install --require-hashes", validation_workflow)
         self.assertIn("ruff check --no-cache", validation_workflow)
         self.assertIn("ruff format --check --no-cache", validation_workflow)
+        self.assertIn(
+            "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1\n"
+            "        with:\n"
+            "          persist-credentials: false",
+            validation_workflow,
+        )
+        self.assertIn(
+            "run: python3 .github/scripts/prepare_headless_enrollment_test.py",
+            validation_workflow,
+        )
+        self.assertNotIn("unittest discover", validation_workflow)
         requirements = (SCRIPT.parent / "requirements-lint.txt").read_text()
         self.assertRegex(
             requirements, r"ruff==0\.15\.8.*\\\n\s+--hash=sha256:[0-9a-f]{64}"
@@ -916,6 +928,46 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
         )
         self.assertIn("otherwise use a new generation", str(raised.exception))
 
+    def test_ssm_timeout_reports_unknown_installation_outcome(self) -> None:
+        responses = [
+            {
+                "kind": "enrollment_token",
+                "key_id": "key_abc123def456",
+                "target": "agent",
+                "claims": [{"type": "connector", "id": "detect-sandbox"}],
+                "api_key": "lv_live_valid-token",
+                "expires_at": VALID_EXPIRY,
+            }
+        ]
+        with (
+            mock.patch.object(MODULE, "api_request", side_effect=responses),
+            mock.patch.object(
+                MODULE.subprocess,
+                "run",
+                side_effect=MODULE.subprocess.TimeoutExpired("aws", 30),
+            ),
+        ):
+            with self.assertRaisesRegex(
+                MODULE.EnrollmentError,
+                "credential key_abc123def456 was minted, but its installation outcome is unknown",
+            ) as raised:
+                MODULE.mint_and_install_enrollment(
+                    "https://api.example.com",
+                    "lv_live_account-key",
+                    "detect-nhp-replica-a",
+                    "attempt-1",
+                    "us-east-2",
+                    "detect-sandbox",
+                    "/reviewed/name",
+                    now=FIXED_NOW,
+                )
+        self.assertIsInstance(
+            raised.exception.__cause__, MODULE.EnrollmentParameterOutcomeUnknown
+        )
+        self.assertNotIn("was minted but not installed", str(raised.exception))
+        self.assertNotIn("lv_live_valid-token", str(raised.exception))
+        self.assertIn("repeat the idempotent parameter write", str(raised.exception))
+
     def test_invalid_on_zero_state_never_mints_or_writes(self) -> None:
         responses = [
             [
@@ -995,7 +1047,7 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
                 }
             ],
             {"desired_state": "off", "serving_epoch": 0},
-            MODULE.EnrollmentError("qURL API request failed for PUT /sharing"),
+            MODULE.APIRequestOutcomeUnknown("qURL API PUT request failed"),
             {"desired_state": "on", "serving_epoch": 1},
             {
                 "kind": "enrollment_token",
@@ -1019,6 +1071,38 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
             )
         put.assert_called_once()
 
+    def test_deterministic_put_rejection_fails_without_polling(self) -> None:
+        responses = [
+            [
+                {
+                    "slug": "detect-sandbox",
+                    "type": "tunnel",
+                    "status": "active",
+                    "resource_id": "MFkw-resource",
+                }
+            ],
+            {"desired_state": "off", "serving_epoch": 0},
+            MODULE.EnrollmentError("qURL API rejected the PUT request with HTTP 403"),
+        ]
+        with (
+            mock.patch.object(MODULE, "api_request", side_effect=responses) as request,
+            mock.patch.object(MODULE, "put_parameter") as put,
+            mock.patch.object(MODULE.time, "sleep") as sleep,
+        ):
+            with self.assertRaisesRegex(MODULE.EnrollmentError, "HTTP 403") as raised:
+                MODULE.prepare_enrollment(
+                    "https://api.example.com",
+                    "lv_live_account-key",
+                    "detect-nhp-replica-a",
+                    "attempt-1",
+                    "us-east-2",
+                    now=FIXED_NOW,
+                )
+        self.assertEqual(request.call_count, 3)
+        self.assertNotIn("may have been applied", str(raised.exception))
+        sleep.assert_not_called()
+        put.assert_not_called()
+
     def test_lost_put_and_poll_responses_warn_that_sharing_may_be_on(self) -> None:
         responses = [
             [
@@ -1031,7 +1115,7 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
             ],
             {"desired_state": "off", "serving_epoch": 0},
             MODULE.APIRequestOutcomeUnknown("qURL API PUT request failed"),
-            *[MODULE.EnrollmentError("temporary status failure")]
+            *[MODULE.APIRequestOutcomeUnknown("temporary status failure")]
             * MODULE.SHARING_POLL_ATTEMPTS,
         ]
         with (
@@ -1065,7 +1149,7 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
             ],
             {"desired_state": "off", "serving_epoch": 3},
             {"desired_state": "on", "serving_epoch": 4},
-            MODULE.EnrollmentError("temporary status failure"),
+            MODULE.APIRequestOutcomeUnknown("temporary status failure"),
             {"desired_state": "on", "serving_epoch": 4},
             {
                 "kind": "enrollment_token",
@@ -1090,6 +1174,80 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
             )
         sleep.assert_called_once_with(MODULE.SHARING_POLL_SECONDS)
         put.assert_called_once()
+
+    def test_deterministic_poll_rejection_fails_without_retry(self) -> None:
+        responses = [
+            [
+                {
+                    "slug": "detect-sandbox",
+                    "type": "tunnel",
+                    "status": "active",
+                    "resource_id": "MFkw-resource",
+                }
+            ],
+            {"desired_state": "off", "serving_epoch": 0},
+            {"desired_state": "on", "serving_epoch": 1},
+            MODULE.EnrollmentError("qURL API rejected the GET request with HTTP 403"),
+        ]
+        with (
+            mock.patch.object(MODULE, "api_request", side_effect=responses) as request,
+            mock.patch.object(MODULE, "put_parameter") as put,
+            mock.patch.object(MODULE.time, "sleep") as sleep,
+        ):
+            with self.assertRaisesRegex(
+                MODULE.EnrollmentError,
+                "sharing status check was rejected.*sharing was left on",
+            ) as raised:
+                MODULE.prepare_enrollment(
+                    "https://api.example.com",
+                    "lv_live_account-key",
+                    "detect-nhp-replica-a",
+                    "attempt-1",
+                    "us-east-2",
+                    now=FIXED_NOW,
+                )
+        self.assertEqual(request.call_count, 4)
+        self.assertIsInstance(raised.exception.__cause__, MODULE.EnrollmentError)
+        self.assertIn("HTTP 403", str(raised.exception.__cause__))
+        sleep.assert_not_called()
+        put.assert_not_called()
+
+    def test_deterministic_poll_rejection_preserves_unknown_put_warning(self) -> None:
+        responses = [
+            [
+                {
+                    "slug": "detect-sandbox",
+                    "type": "tunnel",
+                    "status": "active",
+                    "resource_id": "MFkw-resource",
+                }
+            ],
+            {"desired_state": "off", "serving_epoch": 0},
+            MODULE.APIRequestOutcomeUnknown("qURL API PUT request failed"),
+            MODULE.EnrollmentError("qURL API rejected the GET request with HTTP 403"),
+        ]
+        with (
+            mock.patch.object(MODULE, "api_request", side_effect=responses) as request,
+            mock.patch.object(MODULE, "put_parameter") as put,
+            mock.patch.object(MODULE.time, "sleep") as sleep,
+        ):
+            with self.assertRaisesRegex(
+                MODULE.EnrollmentError,
+                "sharing update outcome became unknown.*may have been left on",
+            ) as raised:
+                MODULE.prepare_enrollment(
+                    "https://api.example.com",
+                    "lv_live_account-key",
+                    "detect-nhp-replica-a",
+                    "attempt-1",
+                    "us-east-2",
+                    now=FIXED_NOW,
+                )
+        self.assertEqual(request.call_count, 4)
+        self.assertIsInstance(raised.exception.__cause__, MODULE.EnrollmentError)
+        self.assertIn("HTTP 403", str(raised.exception.__cause__))
+        sleep.assert_not_called()
+        put.assert_not_called()
 
     def test_unadvanced_epoch_never_writes_secret(self) -> None:
         responses = [
@@ -1136,7 +1294,7 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
             ],
             {"desired_state": "off", "serving_epoch": 0},
             {"desired_state": "on", "serving_epoch": 1},
-            *[MODULE.EnrollmentError("temporary status failure")]
+            *[MODULE.APIRequestOutcomeUnknown("temporary status failure")]
             * MODULE.SHARING_POLL_ATTEMPTS,
         ]
         with (
@@ -1384,7 +1542,10 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
             "run",
             side_effect=MODULE.subprocess.TimeoutExpired("aws", 30),
         ):
-            with self.assertRaisesRegex(MODULE.EnrollmentError, "timed out"):
+            with self.assertRaisesRegex(
+                MODULE.EnrollmentParameterOutcomeUnknown,
+                "timed out.*may have completed",
+            ):
                 MODULE.put_parameter(
                     "us-east-2", "/reviewed/name", "lv_live_secret-token"
                 )
@@ -1588,4 +1749,9 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    unittest.main()
+    suite = unittest.defaultTestLoader.loadTestsFromModule(sys.modules[__name__])
+    result = unittest.TextTestRunner().run(suite)
+    if result.testsRun == 0:
+        print("error: no sandbox enrollment recovery tests ran", file=sys.stderr)
+        raise SystemExit(1)
+    raise SystemExit(0 if result.wasSuccessful() else 1)
