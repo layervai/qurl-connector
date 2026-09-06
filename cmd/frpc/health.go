@@ -116,14 +116,16 @@ func runWithConnectorHealth(ctx context.Context, ready func() bool, run func(con
 	shutdownErr := server.Shutdown(shutdownCtx)
 	stopShutdown()
 	if errors.Is(shutdownErr, context.DeadlineExceeded) {
-		// The forced listener close below is the shutdown guarantee. A probe
+		// The forced server close below is the shutdown guarantee. A probe
 		// connection that outlives the graceful-drain deadline is not a
 		// Connector runtime failure.
 		shutdownErr = nil
 	}
-	// Shutdown can race Serve before Serve records the listener. Closing the
-	// listener itself guarantees the server goroutine always returns.
-	_ = listener.Close()
+	// Shutdown can race Serve before Serve records the listener, and a
+	// connection can outlive the graceful-drain deadline. Close covers both:
+	// it closes the listener and every remaining connection, so the server
+	// goroutine always returns and nothing outlives this call.
+	_ = server.Close()
 	serverErr := <-serveErr
 	if serverErr != nil && errors.Is(runErr, context.Canceled) {
 		// The wrapper caused this cancellation to stop the runtime after its

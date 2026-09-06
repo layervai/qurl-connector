@@ -51,6 +51,9 @@ func TestConnectorHealthAddress(t *testing.T) {
 		{name: "wildcard", raw: "0.0.0.0:7401"},
 		{name: "hostname", raw: "example.com:7401"},
 		{name: "zero port", raw: "127.0.0.1:0"},
+		{name: "port above range", raw: "127.0.0.1:70000"},
+		{name: "non-numeric port", raw: "127.0.0.1:http"},
+		{name: "missing port", raw: "127.0.0.1"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			t.Setenv(envConnectorHealthAddr, test.raw)
