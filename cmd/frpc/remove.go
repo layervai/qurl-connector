@@ -355,8 +355,12 @@ func selectConnectorRemoval(cfg *nhpconfig.Config, cache *connectorIdentityCache
 	}
 
 	fallbackID := routeIDEnvFallback()
-	byID := make(map[string]connectorRemovalSelection, len(cfg.Routes))
-	byResource := make(map[string]string, len(cfg.Routes))
+	capacity := len(cfg.Routes)
+	if cached := len(cache.byID); cached <= int(^uint(0)>>1)-capacity {
+		capacity += cached
+	}
+	byID := make(map[string]connectorRemovalSelection, capacity)
+	byResource := make(map[string]string, capacity)
 	for i, route := range cfg.Routes {
 		routeID := routeIDWithFallback(cfg, route, fallbackID)
 		if err := nhpconfig.ValidateSlug(routeID); err != nil {

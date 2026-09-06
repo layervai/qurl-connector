@@ -198,6 +198,26 @@ func TestGroupProxyCompletionRejectsFilterAndInvalidProxy(t *testing.T) {
 	}
 }
 
+func TestGroupProxyCompletionAcceptsWorstCaseName(t *testing.T) {
+	factory, err := NewFRPSessionGroupFactory(FRPGroupFactoryConfig{Common: &v1.ClientCommonConfig{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	routes := groupRoutesOf(groupTestRoutes("fileviewer-sandbox"))
+	routes[0].Generation = math.MaxUint64
+	common, proxies, names, err := factory.BuildConfig(groupTestAdmission(math.MaxUint64), routes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	completed, err := completeGroupProxies(common, proxies)
+	if err != nil {
+		t.Fatalf("complete worst-case proxy name %q: %v", names[0], err)
+	}
+	if len(completed) != 1 || completed[0].GetBaseConfig().Name != names[0] {
+		t.Fatalf("completed proxies = %#v, want %q", completed, names[0])
+	}
+}
+
 func TestValidateGroupRoutes(t *testing.T) {
 	base := groupTestRoutes("a", "b", "c")
 	mutate := func(fn func(routes []LocalHTTPRoute)) []LocalHTTPRoute {

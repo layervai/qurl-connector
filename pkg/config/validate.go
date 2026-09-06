@@ -152,10 +152,10 @@ func validate(cfg *Config, requireManagedRouting bool) error {
 			errs = append(errs, fmt.Errorf("admin.port=%d invalid (must be 1-65535); check qurl-proxy.yaml or unset QURL_ADMIN_ENABLED if you did not mean to enable the admin API", cfg.Admin.Port))
 		}
 		if AdminBindLooksRoutable(cfg) && !cfg.Admin.AllowRemote {
-			errs = append(errs, fmt.Errorf("admin.addr=%q is non-loopback but admin.allow_remote is not set", cfg.Admin.Addr))
+			errs = append(errs, fmt.Errorf("admin.addr=%q is non-loopback but admin.allow_remote is not set; either revert to a loopback address (any 127.0.0.0/8 IPv4, ::1, or localhost) or add `admin.allow_remote: true` to confirm you want the local status/reload API reachable off-host", cfg.Admin.Addr))
 		}
 		if cfg.Admin.AllowRemote && cfg.Admin.Password == "" {
-			errs = append(errs, errors.New("admin.allow_remote=true requires an explicit admin.password"))
+			errs = append(errs, errors.New("admin.allow_remote=true requires an explicit admin.password even when admin.addr is currently loopback; the flag authorizes off-host exposure, where the host-stable, partly inferable machineID fallback is indefensible. Set admin.password to a strong random secret (e.g. `openssl rand -hex 32`) or revert admin.allow_remote to false"))
 		}
 	}
 

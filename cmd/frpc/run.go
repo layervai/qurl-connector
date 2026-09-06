@@ -915,6 +915,7 @@ func resolveConnectorIdentitiesLocked(
 	for _, resolution := range resolutions {
 		route := &cfg.Routes[resolution.index]
 		configuredRoutingID := route.ConnectorRoutingID
+		configuredKnockResourceID := route.KnockResourceID
 		request, err := gateConnectorStateResult(continuity, "persist exact Connector resource LST request", func() (*qurl.NativeConnectorResourceRequest, error) {
 			return cache.ensurePendingRequestLocked(txn, resolution.id, resolution.expectedResourceID)
 		})
@@ -964,6 +965,9 @@ func resolveConnectorIdentitiesLocked(
 		if configuredRoutingID != "" && configuredRoutingID != resource.ConnectorRoutingID {
 			return fmt.Errorf("route %q: configured connector_routing_id %q conflicts with authenticated producer value %q; exact resource binding is retained for explicit cleanup", resolution.id, configuredRoutingID, resource.ConnectorRoutingID)
 		}
+		if configuredKnockResourceID != "" && configuredKnockResourceID != resource.KnockResourceID {
+			return fmt.Errorf("route %q: configured knock_resource_id %q conflicts with authenticated producer value %q; exact resource binding is retained for explicit cleanup", resolution.id, configuredKnockResourceID, resource.KnockResourceID)
+		}
 		if existingResourceID, existingKnockResourceID, conflict := cfg.FirstDifferentKnockResourceID(resource.ResourceID, resource.KnockResourceID); conflict {
 			overrideNote := ""
 			if strings.TrimSpace(os.Getenv(EnvKnockResourceID)) != "" {
@@ -973,6 +977,7 @@ func resolveConnectorIdentitiesLocked(
 		}
 		route.ResourceID = resource.ResourceID
 		route.ConnectorRoutingID = resource.ConnectorRoutingID
+		route.KnockResourceID = resource.KnockResourceID
 		cfg.SetKnockResourceID(resource.ResourceID, resource.KnockResourceID)
 	}
 	if err := nhpconfig.ValidateManagedRouteIdentities(cfg.Routes); err != nil {

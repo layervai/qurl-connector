@@ -112,6 +112,7 @@ routes:
 		!cfg.NHP.Enabled || cfg.NHP.MachineID != "machine-1" || cfg.QURL.APIURL != "https://api.example/v1" ||
 		cfg.QURL.Token != "token-1" || !cfg.Admin.Enabled || cfg.Admin.Password != "desktop-secret" ||
 		cfg.Audit.FilePath != "/tmp/connector-audit.log" || len(cfg.Routes) != 2 ||
+		cfg.Routes[0].KnockResourceID != "cell-resource" ||
 		cfg.Routes[1].ID != "api" || cfg.Routes[1].Type != RouteTypeHTTP || cfg.Routes[1].LocalIP != "127.0.0.2" || cfg.Routes[1].LocalPort != 8443 {
 		t.Fatalf("retired-field strip changed sibling config: %#v", cfg)
 	}
@@ -124,8 +125,11 @@ routes:
 		t.Fatal(err)
 	}
 	if strings.Contains(string(raw), "public_domain:") || strings.Contains(string(raw), "replica_discriminator:") || strings.Contains(string(raw), "subdomain:") ||
-		strings.Contains(string(raw), "load_balancer_group:") || strings.Contains(string(raw), "knock_resource_id:") {
+		strings.Contains(string(raw), "load_balancer_group:") {
 		t.Fatalf("Save retained retired generated fields:\n%s", raw)
+	}
+	if !strings.Contains(string(raw), "knock_resource_id: cell-resource") {
+		t.Fatalf("Save dropped the Desktop admission continuity assertion:\n%s", raw)
 	}
 	if !strings.Contains(string(raw), "admin:") {
 		t.Fatalf("Save dropped the live Desktop admin contract:\n%s", raw)
@@ -140,6 +144,16 @@ func TestStripRetiredGeneratedFieldsPreservesCleanBytes(t *testing.T) {
 	}
 	if got != input {
 		t.Fatalf("clean config changed:\n%s", got)
+	}
+}
+
+func TestLoadAcceptsNullRetiredServerToken(t *testing.T) {
+	for _, value := range []string{"null", "~"} {
+		t.Run(value, func(t *testing.T) {
+			if _, err := Load(writeConfig(t, "server:\n  token: "+value+"\nroutes: []\n")); err != nil {
+				t.Fatalf("Load retired null token: %v", err)
+			}
+		})
 	}
 }
 
@@ -215,6 +229,10 @@ routes: []
 	_, err = Load(writeConfig(t, "admin:\n  enabled: true\n  addr: 0.0.0.0\n  allow_remote: true\nroutes: []\n"))
 	if err == nil || !strings.Contains(err.Error(), "admin.password") {
 		t.Fatalf("remote admin without password error = %v", err)
+	}
+	_, err = Load(writeConfig(t, "admin:\n  enabled: true\n  addr: 127.0.0.1\n  allow_remote: true\nroutes: []\n"))
+	if err == nil || !strings.Contains(err.Error(), "even when admin.addr is currently loopback") || !strings.Contains(err.Error(), "strong random secret") {
+		t.Fatalf("loopback allow_remote without password error = %v", err)
 	}
 }
 

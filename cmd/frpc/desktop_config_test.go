@@ -54,7 +54,7 @@ func TestReplaceDesktopConfigCreatesContinuityState(t *testing.T) {
 	if !cfg.Admin.Enabled || cfg.Admin.Password != "test-only-admin-password" {
 		t.Fatalf("Desktop admin config not preserved: %+v", cfg.Admin)
 	}
-	if len(cfg.Routes) != 1 || cfg.Routes[0].ConnectorRoutingID != testConnectorRoutingID {
+	if len(cfg.Routes) != 1 || cfg.Routes[0].ConnectorRoutingID != testConnectorRoutingID || cfg.Routes[0].KnockResourceID != "cell-resource" {
 		t.Fatalf("Desktop route config not preserved: %+v", cfg.Routes)
 	}
 }

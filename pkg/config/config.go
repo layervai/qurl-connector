@@ -147,8 +147,9 @@ type QURLConfig struct {
 //
 // Managed routes consume three separately carried producer values: ResourceID
 // is the public qURL identity, ConnectorRoutingID is the FRP/HRW routing label,
-// and Runtime.KnockResourceIDs holds the NHP admission target keyed by the
-// public identity.
+// and KnockResourceID is the persisted admission-target continuity assertion.
+// Runtime.KnockResourceIDs holds the authenticated NHP admission target used at
+// runtime, keyed by the public identity.
 type Route struct {
 	// ID is the customer-facing route identifier. For Connector resources,
 	// the registered-device qurl-go client sends this value verbatim as the
@@ -166,7 +167,10 @@ type Route struct {
 	// be client-derived from or normalized against ResourceID; the control plane owns
 	// the producer-side calculation.
 	ConnectorRoutingID string `yaml:"connector_routing_id,omitempty" json:"connector_routing_id,omitempty"`
-	TargetURL          string `yaml:"target_url,omitempty" json:"target_url,omitempty"`
+	// KnockResourceID is written by qURL Desktop and checked against authenticated
+	// resource hydration. Runtime code must use Runtime.KnockResourceIDs instead.
+	KnockResourceID string `yaml:"knock_resource_id,omitempty" json:"-"`
+	TargetURL       string `yaml:"target_url,omitempty" json:"target_url,omitempty"`
 }
 
 // PrimaryResourceID returns the first managed route's public resource identity.
@@ -324,7 +328,7 @@ func stripRetiredGeneratedFields(data string) (string, error) {
 	dropped := false
 	var errs []error
 	if server := yamlField(root, "server"); server != nil {
-		if token := yamlField(server, "token"); token != nil && (token.Kind != yaml.ScalarNode || strings.TrimSpace(token.Value) != "") {
+		if token := yamlField(server, "token"); token != nil && (token.Kind != yaml.ScalarNode || (token.Tag != "!!null" && strings.TrimSpace(token.Value) != "")) {
 			line, _ := yamlFieldLine(server, "token")
 			errs = append(errs, fmt.Errorf("config field server.token at line %d was removed; delete it because NHP admission supplies the FRP session token", line))
 		}
@@ -354,12 +358,6 @@ func stripRetiredGeneratedFields(data string) (string, error) {
 					line, _ := yamlFieldLine(route, key)
 					errs = append(errs, fmt.Errorf("config field routes[%d].%s at line %d was removed; delete it because managed routes use connector_routing_id", i, key, line))
 				}
-			}
-			// Current qURL Desktop writes this authenticated API value into YAML,
-			// but the Connector rehydrates it through device state before every
-			// admission. Accept it only as a compatibility input.
-			if yamlField(route, "knock_resource_id") != nil {
-				dropped = dropYAMLField(route, "knock_resource_id") || dropped
 			}
 			for _, key := range []string{"custom_domains", "remote_port", "host_rewrite", "headers"} {
 				if line, ok := yamlFieldLine(route, key); ok {

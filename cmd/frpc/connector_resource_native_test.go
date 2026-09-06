@@ -211,3 +211,31 @@ func TestNativeConnectorRoutingPinConflictRetainsAuthenticatedBinding(t *testing
 		t.Fatalf("conflicting operator pin was silently overwritten: %#v", cfg.Routes[0])
 	}
 }
+
+func TestNativeConnectorKnockPinConflictRetainsAuthenticatedBinding(t *testing.T) {
+	stateDir := newIdentityCacheTestDir(t)
+	if err := ensureConnectorIdentityCacheInitialized(stateDir); err != nil {
+		t.Fatal(err)
+	}
+	cfg := managedNativeTestConfig("web")
+	cfg.Routes[0].KnockResourceID = "wrong-cell"
+	resolve := func(_ context.Context, _ *qurl.AgentRuntimeBinding, request *qurl.NativeConnectorResourceRequest, _ ...qurl.AgentRuntimeUDPOption) (*qurl.ConnectorResourceResolution, error) {
+		assertNativeRequestWasDurableBeforeDispatch(t, stateDir, request)
+		return &qurl.ConnectorResourceResolution{Resource: testConnectorResourceBinding("web", testPublicResourceID)}, nil
+	}
+	err := resolveConnectorIdentities(context.Background(), cfg, &qurl.AgentRuntimeBinding{}, nil, stateDir, testConnectorCacheAgentID, nil, resolve)
+	if err == nil || !strings.Contains(err.Error(), "configured knock_resource_id") || !strings.Contains(err.Error(), "retained for explicit cleanup") {
+		t.Fatalf("resolution error = %v, want retained knock-pin conflict", err)
+	}
+	cache, loadErr := loadConnectorIdentityCache(stateDir)
+	if loadErr != nil {
+		t.Fatal(loadErr)
+	}
+	binding, ok := cache.binding("web")
+	if !ok || binding.KnockResourceID != "cell-resource" || cache.isPending("web") {
+		t.Fatalf("retained binding = %#v present=%v pending=%v", binding, ok, cache.isPending("web"))
+	}
+	if cfg.Routes[0].KnockResourceID != "wrong-cell" {
+		t.Fatalf("conflicting operator pin was silently overwritten: %#v", cfg.Routes[0])
+	}
+}
