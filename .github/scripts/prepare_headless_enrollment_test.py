@@ -109,6 +109,7 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
             "permissions:\n      contents: read\n      id-token: write",
             rotate_permissions,
         )
+        self.assertIn("timeout-minutes: 15", rotate_permissions)
         self.assertIn('"$GITHUB_REF" != "refs/heads/main"', workflow)
         self.assertIn(
             "RECOVERY_GENERATION: ${{ inputs.generation }}", verify_permissions
@@ -413,7 +414,7 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
     def test_api_request_distinguishes_unknown_from_retryable_rejection(
         self,
     ) -> None:
-        for status in (408, 503):
+        for status in (307, 308, 408, 503):
             with self.subTest(status=status):
                 error_body = mock.Mock()
                 error_body.read.return_value = b""
@@ -1949,6 +1950,14 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
             "AWS_ENDPOINT_URL_STS": "https://private.example.com/sts",
             "AWS_CA_BUNDLE": "/tmp/private-ca.pem",
             "AWS_DATA_PATH": "/tmp/private-service-models",
+            "AWS_CONTAINER_CREDENTIALS_FULL_URI": "https://private.example.com/credentials",
+            "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI": "/private-credentials",
+            "AWS_CONTAINER_AUTHORIZATION_TOKEN": "private-authorization-token",
+            "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE": "/tmp/private-authorization-token",
+            "AWS_WEB_IDENTITY_TOKEN_FILE": "/tmp/private-web-identity-token",
+            "AWS_ROLE_ARN": "arn:aws:iam::" + "111111" + "111111:role/private-role",
+            "AWS_ROLE_SESSION_NAME": "private-role-session",
+            "BOTO_CONFIG": "/tmp/private-boto-config",
             "HTTP_PROXY": "http://proxy.example.com",
             "HTTPS_PROXY": "https://proxy.example.com",
             "NO_PROXY": "localhost",
@@ -1988,6 +1997,17 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
         self.assertNotIn("AWS_ENDPOINT_URL_STS", kwargs["env"])
         self.assertNotIn("AWS_CA_BUNDLE", kwargs["env"])
         self.assertNotIn("AWS_DATA_PATH", kwargs["env"])
+        for credential_variable in (
+            "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+            "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+            "AWS_CONTAINER_AUTHORIZATION_TOKEN",
+            "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE",
+            "AWS_WEB_IDENTITY_TOKEN_FILE",
+            "AWS_ROLE_ARN",
+            "AWS_ROLE_SESSION_NAME",
+            "BOTO_CONFIG",
+        ):
+            self.assertNotIn(credential_variable, kwargs["env"])
         for proxy_variable in (
             "HTTP_PROXY",
             "HTTPS_PROXY",
@@ -2008,6 +2028,7 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
         self.assertEqual(kwargs["env"]["AWS_MAX_ATTEMPTS"], "1")
         self.assertEqual(kwargs["env"]["AWS_USE_FIPS_ENDPOINT"], "false")
         self.assertEqual(kwargs["env"]["AWS_USE_DUALSTACK_ENDPOINT"], "false")
+        self.assertEqual(kwargs["env"]["AWS_EC2_METADATA_DISABLED"], "true")
         self.assertEqual(kwargs["env"]["AWS_CLI_AUTO_PROMPT"], "off")
         self.assertEqual(kwargs["env"]["AWS_PAGER"], "")
         self.assertEqual(kwargs["input"], "lv_live_secret-token")

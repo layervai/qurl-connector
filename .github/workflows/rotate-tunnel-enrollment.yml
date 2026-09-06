@@ -93,7 +93,7 @@ jobs:
     runs-on: ubuntu-latest
     # The job timeout is the hard wall-clock cap; socket and process timeouts
     # bound ordinary failures inside it.
-    timeout-minutes: 10
+    timeout-minutes: 15
     permissions:
       contents: read
       id-token: write

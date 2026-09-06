@@ -15,12 +15,12 @@ var (
 	environmentHost  = regexp.MustCompile(`(?i)\b(?:[a-z0-9-]+\.)*(?:sandbox|canary|prod|production|[a-z0-9-]+-(?:sandbox|canary|prod|production)|(?:sandbox|canary|prod|production)-[a-z0-9-]+)\.(?:[a-z0-9-]+\.)*[a-z]{2,}\b`)
 	layerVRepoRef    = regexp.MustCompile(`(?i)\blayervai/([a-z0-9][a-z0-9-]*)`)
 	layerVHost       = regexp.MustCompile(`(?i)\b(?:[a-z0-9-]+\.)*layerv\.(?:ai|xyz)\b`)
-	// Find the exact upper-case parameter form and lower-case service paths
-	// with at least two segments below the qurl-* namespace. The allowlist
-	// below, not this expression, decides which private operational paths are
-	// reviewed for public source. References into reviewed public qurl-* repos
-	// are excluded separately after this deliberately broad match.
-	operationalPath = regexp.MustCompile(`(/qurl-[a-z0-9-]+/(?:[A-Z][A-Z0-9_]*(?:/[A-Z][A-Z0-9_]*)*|[a-z0-9][a-z0-9-]*(?:/[a-z0-9](?:[a-z0-9-]*[a-z0-9])?){1,}))(?:[^A-Za-z0-9_/-]|$)`)
+	// Find qurl-* paths without assuming their case or separator convention.
+	// The exact-case allowlist below, not this expression, decides which private
+	// operational paths are reviewed for public source. References into reviewed
+	// public qurl-* repos are excluded separately after this deliberately broad
+	// match.
+	operationalPath = regexp.MustCompile(`(?i)(/qurl-[a-z0-9_-]+/[a-z0-9_](?:[a-z0-9_-]*[a-z0-9_])?(?:/[a-z0-9_](?:[a-z0-9_-]*[a-z0-9_])?)*)(?:[^A-Za-z0-9_/-]|$)`)
 )
 
 func findOperationalPaths(text string) []string {
@@ -62,6 +62,8 @@ func TestOperationalPathDetectorStaysBroaderThanAllowlist(t *testing.T) {
 		"/qurl-example-service/" + "nhp/replica-z/bootstrap-legacy",
 		"/qurl-example-service/" + "nhp/replica-z/key",
 		"/qurl-example-service/" + "fileviewer-tunnel/replica-z/bootstrap",
+		"/qurl-example-service/" + "fileviewer_nhp/replica_z/bootstrap",
+		"/qurl-example-service/" + "FileViewer-NHP/Replica-Z/Bootstrap",
 		"/qurl-example-service/" + "PRIVATE_PARAMETER",
 	} {
 		got := findOperationalPaths(path)
@@ -81,6 +83,29 @@ func TestOperationalPathDetectorStaysBroaderThanAllowlist(t *testing.T) {
 
 func operationalPathBelongsToCurrentRepository(path string) bool {
 	return strings.HasPrefix(path, "/qurl-connector/")
+}
+
+func skipPublicSourceDirectory(rel string, name string) bool {
+	switch name {
+	case ".git", ".ruff_cache", ".venv", "venv", "__pycache__", ".pytest_cache":
+		return true
+	}
+	return filepath.ToSlash(rel) == "bin"
+}
+
+func TestPublicSourceDirectorySkipsCoverNestedToolArtifacts(t *testing.T) {
+	for _, path := range []string{
+		".github/scripts/.venv",
+		"pkg/example/__pycache__",
+		"pkg/example/.pytest_cache",
+	} {
+		if !skipPublicSourceDirectory(path, filepath.Base(path)) {
+			t.Fatalf("tool artifact directory %q was not skipped", path)
+		}
+	}
+	if skipPublicSourceDirectory("cmd/example/bin", "bin") {
+		t.Fatal("a nested source directory named bin must remain scanned")
+	}
 }
 
 func TestOperationalPathPublicRepositoryExemptionIsExact(t *testing.T) {
@@ -205,8 +230,7 @@ func TestPublicSourceContainsNoPrivateOperationalMaterial(t *testing.T) {
 			return err
 		}
 		if entry.IsDir() {
-			switch filepath.ToSlash(rel) {
-			case ".git", "bin", ".ruff_cache", ".venv", "venv", ".github/scripts/__pycache__":
+			if skipPublicSourceDirectory(rel, entry.Name()) {
 				return filepath.SkipDir
 			}
 			return nil

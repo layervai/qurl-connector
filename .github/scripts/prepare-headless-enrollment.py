@@ -305,7 +305,11 @@ def api_request(
                 message,
                 retry_after_seconds=retry_after_seconds,
             ) from exc
-        if exc.code == 408 or 500 <= exc.code <= 599:
+        if (
+            exc.code == 408
+            or 500 <= exc.code <= 599
+            or (method in {"POST", "PUT"} and 300 <= exc.code <= 399)
+        ):
             raise APIRequestOutcomeUnknown(
                 message,
                 retry_after_seconds=retry_after_seconds,
@@ -364,6 +368,17 @@ def put_parameter(region: str, parameter: str, token: str) -> None:
     clean_env.pop("AWS_ENDPOINT_URL_STS", None)
     clean_env.pop("AWS_CA_BUNDLE", None)
     clean_env.pop("AWS_DATA_PATH", None)
+    for credential_variable in (
+        "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+        "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+        "AWS_CONTAINER_AUTHORIZATION_TOKEN",
+        "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE",
+        "AWS_WEB_IDENTITY_TOKEN_FILE",
+        "AWS_ROLE_ARN",
+        "AWS_ROLE_SESSION_NAME",
+        "BOTO_CONFIG",
+    ):
+        clean_env.pop(credential_variable, None)
     for proxy_variable in (
         "HTTP_PROXY",
         "HTTPS_PROXY",
@@ -384,6 +399,7 @@ def put_parameter(region: str, parameter: str, token: str) -> None:
     clean_env["AWS_MAX_ATTEMPTS"] = "1"
     clean_env["AWS_USE_FIPS_ENDPOINT"] = "false"
     clean_env["AWS_USE_DUALSTACK_ENDPOINT"] = "false"
+    clean_env["AWS_EC2_METADATA_DISABLED"] = "true"
     clean_env["AWS_CLI_AUTO_PROMPT"] = "off"
     clean_env["AWS_PAGER"] = ""
     for attempt in range(2):
