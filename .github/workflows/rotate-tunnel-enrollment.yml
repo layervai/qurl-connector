@@ -38,8 +38,9 @@ jobs:
     name: Verify protected sandbox environment
     runs-on: ubuntu-latest
     timeout-minutes: 2
-    # GitHub documents actions: read as the exact fine-grained permission for
-    # these environment-policy reads. This job does not check out contents.
+    # GitHub documents Actions read as the fine-grained permission for both
+    # environment and deployment-branch-policy reads. The public repository
+    # also permits unauthenticated reads, but this declares the exact scope.
     permissions:
       actions: read
     steps:

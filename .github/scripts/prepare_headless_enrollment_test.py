@@ -83,8 +83,9 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
         self.assertLess(preflight, aws)
         self.assertLess(aws, prepare)
         self.assertIn("needs: verify-environment", workflow)
-        self.assertIn("actions: read", workflow)
-        self.assertIn("exact fine-grained permission", workflow)
+        verify_permissions = workflow[verify_job:rotate_job]
+        self.assertIn("permissions:\n      actions: read", verify_permissions)
+        self.assertNotIn("contents: read", verify_permissions)
         self.assertIn('"$GITHUB_REF" != "refs/heads/main"', workflow)
         self.assertIn(
             'gh api "repos/${GITHUB_REPOSITORY}/environments/sandbox"', workflow
@@ -314,7 +315,7 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
         self.assertNotIn(resource_id, str(raised.exception))
 
     def test_api_request_marks_retryable_status_as_unknown_outcome(self) -> None:
-        for status in (408, 429, 503):
+        for status in (408, 425, 429, 503):
             with self.subTest(status=status):
                 error_body = mock.Mock()
                 error_body.read.return_value = b""
@@ -338,6 +339,73 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
                             "/v1/api-keys",
                             method="POST",
                         )
+
+    def test_api_request_preserves_bounded_retry_after_on_unknown_outcome(
+        self,
+    ) -> None:
+        error_body = mock.Mock()
+        error_body.read.return_value = b""
+        rejected = MODULE.urllib.error.HTTPError(
+            "https://api.example.com/v1/api-keys",
+            429,
+            "Rate limited",
+            {"Retry-After": "17"},
+            error_body,
+        )
+        with mock.patch.object(MODULE.NO_REDIRECT_OPENER, "open", side_effect=rejected):
+            with self.assertRaises(MODULE.APIRequestOutcomeUnknown) as raised:
+                MODULE.api_request(
+                    "https://api.example.com",
+                    "lv_live_account-key",
+                    "/v1/api-keys",
+                    method="POST",
+                )
+        self.assertEqual(raised.exception.retry_after_seconds, 17)
+
+    def test_non_retryable_status_does_not_expose_retry_delay(self) -> None:
+        for status in (403, 600):
+            with self.subTest(status=status):
+                error_body = mock.Mock()
+                error_body.read.return_value = b""
+                rejected = MODULE.urllib.error.HTTPError(
+                    "https://api.example.com/v1/api-keys",
+                    status,
+                    "Rejected",
+                    {"Retry-After": "17"},
+                    error_body,
+                )
+                with mock.patch.object(
+                    MODULE.NO_REDIRECT_OPENER, "open", side_effect=rejected
+                ):
+                    with self.assertRaises(MODULE.EnrollmentError) as raised:
+                        MODULE.api_request(
+                            "https://api.example.com",
+                            "lv_live_account-key",
+                            "/v1/api-keys",
+                            method="POST",
+                        )
+                self.assertNotIsInstance(
+                    raised.exception, MODULE.APIRequestOutcomeUnknown
+                )
+
+    def test_retry_after_parser_accepts_http_date_and_bounds_wait(self) -> None:
+        now = dt.datetime(2026, 9, 4, 18, 0, tzinfo=dt.timezone.utc)
+        self.assertEqual(MODULE.parse_retry_after("12", now=now), 12)
+        self.assertEqual(
+            MODULE.parse_retry_after("999999999999999999999", now=now),
+            MODULE.MAX_MINT_RETRY_AFTER_SECONDS,
+        )
+        self.assertEqual(
+            MODULE.parse_retry_after("Fri, 04 Sep 2026 18:00:20 GMT", now=now),
+            20,
+        )
+        self.assertEqual(
+            MODULE.parse_retry_after("Fri, 04 Sep 2026 17:59:59 GMT", now=now),
+            0,
+        )
+        for value in (None, "", "1.5", "not-a-date"):
+            with self.subTest(value=value):
+                self.assertIsNone(MODULE.parse_retry_after(value, now=now))
 
     def test_api_request_normalizes_protocol_failure(self) -> None:
         with mock.patch.object(
@@ -581,6 +649,50 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
         sleep.assert_called_once_with(MODULE.MINT_RETRY_SECONDS)
         put.assert_called_once()
 
+    def test_mint_retry_honors_server_delay_with_hard_cap(self) -> None:
+        credential = {
+            "kind": "enrollment_token",
+            "target": "agent",
+            "claims": [{"type": "connector", "id": "detect-sandbox"}],
+            "api_key": "lv_live_test-token",
+            "expires_at": VALID_EXPIRY,
+        }
+        for retry_after, expected_delay in (
+            (9, 9),
+            (MODULE.MAX_MINT_RETRY_AFTER_SECONDS + 100, 30),
+            (-5, 0),
+        ):
+            responses = [
+                [
+                    {
+                        "slug": "detect-sandbox",
+                        "type": "tunnel",
+                        "status": "active",
+                        "resource_id": "r_one",
+                    }
+                ],
+                {"desired_state": "on", "serving_epoch": 1},
+                MODULE.APIRequestOutcomeUnknown(
+                    "retryable failure", retry_after_seconds=retry_after
+                ),
+                credential,
+            ]
+            with (
+                self.subTest(retry_after=retry_after),
+                mock.patch.object(MODULE, "api_request", side_effect=responses),
+                mock.patch.object(MODULE, "put_parameter"),
+                mock.patch.object(MODULE.time, "sleep") as sleep,
+            ):
+                MODULE.prepare_enrollment(
+                    "https://api.example.com",
+                    "lv_live_account-key",
+                    "detect-nhp-replica-a",
+                    "attempt-1",
+                    "us-east-2",
+                    now=FIXED_NOW,
+                )
+            sleep.assert_called_once_with(expected_delay)
+
     def test_mint_double_failure_is_recoverable_without_secret_output(self) -> None:
         responses = [
             [
@@ -645,6 +757,70 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
                 )
         self.assertEqual(request.call_count, 3)
         self.assertNotIn("unknown", str(raised.exception))
+        put.assert_not_called()
+
+    def test_later_failure_reports_sharing_enabled_by_this_run(self) -> None:
+        responses = [
+            [
+                {
+                    "slug": "detect-sandbox",
+                    "type": "tunnel",
+                    "status": "active",
+                    "resource_id": "r_one",
+                }
+            ],
+            {"desired_state": "off", "serving_epoch": 3},
+            {"desired_state": "on", "serving_epoch": 4},
+            {"desired_state": "on", "serving_epoch": 4},
+            MODULE.EnrollmentError("qURL API rejected the POST request with HTTP 403"),
+        ]
+        with (
+            mock.patch.object(MODULE, "api_request", side_effect=responses),
+            mock.patch.object(MODULE, "put_parameter") as put,
+        ):
+            with self.assertRaisesRegex(
+                MODULE.EnrollmentError,
+                "sharing for this resource was enabled by this run; sharing was left on",
+            ) as raised:
+                MODULE.prepare_enrollment(
+                    "https://api.example.com",
+                    "lv_live_account-key",
+                    "detect-nhp-replica-a",
+                    "attempt-1",
+                    "us-east-2",
+                    now=FIXED_NOW,
+                )
+        self.assertIsInstance(raised.exception.__cause__, MODULE.EnrollmentError)
+        self.assertIn("HTTP 403", str(raised.exception.__cause__))
+        put.assert_not_called()
+
+    def test_existing_sharing_state_does_not_claim_this_run_enabled_it(self) -> None:
+        responses = [
+            [
+                {
+                    "slug": "detect-sandbox",
+                    "type": "tunnel",
+                    "status": "active",
+                    "resource_id": "r_one",
+                }
+            ],
+            {"desired_state": "on", "serving_epoch": 4},
+            MODULE.EnrollmentError("qURL API rejected the POST request with HTTP 403"),
+        ]
+        with (
+            mock.patch.object(MODULE, "api_request", side_effect=responses),
+            mock.patch.object(MODULE, "put_parameter") as put,
+        ):
+            with self.assertRaises(MODULE.EnrollmentError) as raised:
+                MODULE.prepare_enrollment(
+                    "https://api.example.com",
+                    "lv_live_account-key",
+                    "detect-nhp-replica-a",
+                    "attempt-1",
+                    "us-east-2",
+                    now=FIXED_NOW,
+                )
+        self.assertNotIn("sharing was left on", str(raised.exception))
         put.assert_not_called()
 
     def test_malformed_token_and_expiry_report_safe_credential_id(self) -> None:
@@ -910,6 +1086,58 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
                     now=FIXED_NOW,
                 )
         put.assert_not_called()
+
+    def test_poll_failure_reports_successful_sharing_update(self) -> None:
+        responses = [
+            [
+                {
+                    "slug": "detect-sandbox",
+                    "type": "tunnel",
+                    "status": "active",
+                    "resource_id": "MFkw-resource",
+                }
+            ],
+            {"desired_state": "off", "serving_epoch": 0},
+            {"desired_state": "on", "serving_epoch": 1},
+            *[MODULE.EnrollmentError("temporary status failure")]
+            * MODULE.SHARING_POLL_ATTEMPTS,
+        ]
+        with (
+            mock.patch.object(MODULE, "api_request", side_effect=responses),
+            mock.patch.object(MODULE, "put_parameter") as put,
+            mock.patch.object(MODULE.time, "sleep"),
+        ):
+            with self.assertRaisesRegex(
+                MODULE.EnrollmentError,
+                "sharing for this resource was enabled by this run and was left on",
+            ):
+                MODULE.prepare_enrollment(
+                    "https://api.example.com",
+                    "lv_live_account-key",
+                    "detect-nhp-replica-a",
+                    "attempt-1",
+                    "us-east-2",
+                    now=FIXED_NOW,
+                )
+        put.assert_not_called()
+
+    def test_error_formatter_surfaces_only_enrollment_error_causes(self) -> None:
+        raw = ValueError("raw failure with lv_live_secret-token")
+        detail = MODULE.APIRequestOutcomeUnknown(
+            "qURL API rejected the POST request with HTTP 429"
+        )
+        detail.__cause__ = raw
+        top = MODULE.EnrollmentError("enrollment credential result is unknown")
+        top.__cause__ = detail
+
+        rendered = MODULE.format_enrollment_error(top)
+
+        self.assertEqual(
+            rendered,
+            "enrollment credential result is unknown "
+            "(caused by: qURL API rejected the POST request with HTTP 429)",
+        )
+        self.assertNotIn("lv_live_secret-token", rendered)
 
     def test_put_parameter_sends_token_only_on_stdin(self) -> None:
         clean_env = {

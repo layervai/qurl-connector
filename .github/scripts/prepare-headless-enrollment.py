@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import email.utils
 import hashlib
 import http.client
 import json
@@ -28,6 +29,7 @@ AWS_TIMEOUT_SECONDS = 30
 SHARING_POLL_ATTEMPTS = 6
 SHARING_POLL_SECONDS = 2
 MINT_RETRY_SECONDS = 2
+MAX_MINT_RETRY_AFTER_SECONDS = 30
 TARGETS = {
     "fileviewer-nhp-replica-a": (
         "fileviewer-sandbox",
@@ -86,6 +88,12 @@ class EnrollmentError(RuntimeError):
 
 class APIRequestOutcomeUnknown(EnrollmentError):
     """The origin might have accepted a request whose result was not usable."""
+
+    def __init__(
+        self, message: str, *, retry_after_seconds: float | None = None
+    ) -> None:
+        super().__init__(message)
+        self.retry_after_seconds = retry_after_seconds
 
 
 class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -150,6 +158,27 @@ def parse_expiry(value: Any, *, now: dt.datetime | None = None) -> dt.datetime:
     return expiry
 
 
+def parse_retry_after(value: Any, *, now: dt.datetime | None = None) -> float | None:
+    """Return a bounded Retry-After delay, or None for an invalid header."""
+    if not isinstance(value, str):
+        return None
+    retry_after = value.strip()
+    if retry_after.isascii() and retry_after.isdecimal():
+        # Avoid converting an attacker-controlled integer with arbitrary size.
+        if len(retry_after) > 10:
+            return float(MAX_MINT_RETRY_AFTER_SECONDS)
+        return float(min(int(retry_after), MAX_MINT_RETRY_AFTER_SECONDS))
+    try:
+        retry_at = email.utils.parsedate_to_datetime(retry_after)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if retry_at.tzinfo is None:
+        return None
+    current = now or dt.datetime.now(dt.timezone.utc)
+    seconds = (retry_at.astimezone(dt.timezone.utc) - current).total_seconds()
+    return min(max(seconds, 0.0), float(MAX_MINT_RETRY_AFTER_SECONDS))
+
+
 def api_request(
     api_endpoint: str,
     api_key: str,
@@ -193,6 +222,9 @@ def api_request(
                 )
             raw = response.read(MAX_RESPONSE_BYTES + 1)
     except urllib.error.HTTPError as exc:
+        retry_after_seconds = parse_retry_after(
+            exc.headers.get("Retry-After") if exc.headers is not None else None
+        )
         try:
             exc.read(MAX_RESPONSE_BYTES + 1)
         except (OSError, http.client.HTTPException):
@@ -202,14 +234,13 @@ def api_request(
                 exc.close()
             except (OSError, http.client.HTTPException):
                 pass
-        error_class = (
-            APIRequestOutcomeUnknown
-            if exc.code in {408, 429} or exc.code >= 500
-            else EnrollmentError
-        )
-        raise error_class(
-            f"qURL API rejected the {method} request with HTTP {exc.code}"
-        ) from exc
+        message = f"qURL API rejected the {method} request with HTTP {exc.code}"
+        if exc.code in {408, 425, 429} or 500 <= exc.code <= 599:
+            raise APIRequestOutcomeUnknown(
+                message,
+                retry_after_seconds=retry_after_seconds,
+            ) from exc
+        raise EnrollmentError(message) from exc
     except (OSError, http.client.HTTPException) as exc:
         raise APIRequestOutcomeUnknown(f"qURL API {method} request failed") from exc
     if len(raw) > MAX_RESPONSE_BYTES:
@@ -277,6 +308,91 @@ def put_parameter(region: str, parameter: str, token: str) -> None:
         )
 
 
+def mint_and_install_enrollment(
+    api_endpoint: str,
+    api_key: str,
+    target: str,
+    generation: str,
+    region: str,
+    slug: str,
+    parameter: str,
+    *,
+    now: dt.datetime | None = None,
+) -> dt.datetime:
+    mint_path = "/v1/api-keys"
+    mint_body = {
+        "kind": "enrollment_token",
+        "name": f"Sandbox {target} headless enrollment {generation}",
+        "target": "agent",
+        "claims": [{"type": "connector", "id": slug}],
+        "expires_in": "1h",
+    }
+    # The selected target, not only the shared Connector slug, is part of the
+    # idempotency key. Each fixed replica gets a distinct one-hour enrollment
+    # token even when all replicas share one route identity.
+    mint_idempotency_key = f"headless-v2-{generation}-{target}"
+    mint_failure: EnrollmentError | None = None
+    for attempt in range(2):
+        try:
+            credential = api_request(
+                api_endpoint,
+                api_key,
+                mint_path,
+                method="POST",
+                body=mint_body,
+                idempotency_key=mint_idempotency_key,
+                # 201 is a new operation. 200 is the byte-exact result from an
+                # idempotent retry after the first response was lost.
+                expected_status=(200, 201),
+            )
+            break
+        except APIRequestOutcomeUnknown as exc:
+            mint_failure = exc
+            if attempt == 0:
+                retry_delay = (
+                    exc.retry_after_seconds
+                    if exc.retry_after_seconds is not None
+                    else MINT_RETRY_SECONDS
+                )
+                time.sleep(min(max(retry_delay, 0.0), MAX_MINT_RETRY_AFTER_SECONDS))
+    else:
+        raise EnrollmentError(
+            "enrollment credential result is unknown; retry the same target and generation to recover the exact operation"
+        ) from mint_failure
+    credential_id = credential.get("key_id", "") if isinstance(credential, dict) else ""
+    try:
+        expected_claims = [{"type": "connector", "id": slug}]
+        if (
+            not isinstance(credential, dict)
+            or credential.get("kind") != "enrollment_token"
+            or credential.get("target") != "agent"
+            or credential.get("claims") != expected_claims
+        ):
+            raise EnrollmentError(
+                "qURL API did not confirm the exact enrollment authority"
+            )
+        token = credential.get("api_key", "")
+        if not isinstance(token, str) or not KEY.fullmatch(token):
+            raise EnrollmentError("enrollment token is missing or malformed")
+        expiry = parse_expiry(credential.get("expires_at", ""), now=now)
+        # The recovery role intentionally has write-only SSM access, so it
+        # cannot preflight this write. The API retains the idempotency
+        # operation for 24 hours, while the deployment preflight accepts a
+        # parameter write for only 15 minutes. A new generation creates a new
+        # operation after that deployment window; every minted token expires
+        # within one hour.
+        put_parameter(region, parameter, token)
+    except EnrollmentError as exc:
+        if isinstance(credential_id, str) and re.fullmatch(
+            r"key_[A-Za-z0-9]{8,64}", credential_id
+        ):
+            raise EnrollmentError(
+                f"enrollment credential {credential_id} was minted but not installed; retry the same generation only while the recovered token has at least 45 minutes remaining, otherwise use a new generation, or revoke that non-secret credential ID with JWT authority"
+            ) from exc
+        raise
+    return expiry
+
+
 def prepare_enrollment(
     api_endpoint: str,
     api_key: str,
@@ -327,6 +443,7 @@ def prepare_enrollment(
         )
 
     observed_epoch = serving_epoch
+    sharing_enabled_by_this_run = False
     if desired_state == "off":
         # Recovery deliberately leaves the selected resource on. A fixed
         # replica can enroll only while sharing is on, and restoring off would
@@ -340,6 +457,7 @@ def prepare_enrollment(
                 method="PUT",
                 body={"desired_state": "on"},
             )
+            sharing_enabled_by_this_run = True
         except EnrollmentError as exc:
             # The server can apply the PUT before the response is lost. The GET
             # below decides whether it is safe to continue and keeps retries
@@ -363,6 +481,7 @@ def prepare_enrollment(
                 and sharing.get("desired_state") == "on"
                 and observed_epoch >= minimum_epoch
             ):
+                sharing_enabled_by_this_run = True
                 break
             if attempt + 1 < SHARING_POLL_ATTEMPTS:
                 time.sleep(SHARING_POLL_SECONDS)
@@ -372,77 +491,32 @@ def prepare_enrollment(
                     "sharing did not reach the required serving epoch after its update failed"
                 ) from put_failure
             if last_poll_failure is not None:
-                raise EnrollmentError(
-                    "sharing did not reach the required serving epoch because status checks failed"
-                ) from last_poll_failure
-            raise EnrollmentError("sharing did not reach the required serving epoch")
+                message = "sharing did not reach the required serving epoch because status checks failed"
+                if sharing_enabled_by_this_run:
+                    message += "; sharing for this resource was enabled by this run and was left on"
+                raise EnrollmentError(message) from last_poll_failure
+            message = "sharing did not reach the required serving epoch"
+            if sharing_enabled_by_this_run:
+                message += "; sharing for this resource was enabled by this run and was left on"
+            raise EnrollmentError(message)
 
-    # Mint only after any required lifecycle transition is confirmed, so failures
-    # before this point cannot leave a live enrollment credential behind.
-    mint_path = "/v1/api-keys"
-    mint_body = {
-        "kind": "enrollment_token",
-        "name": f"Sandbox {target} headless enrollment {generation}",
-        "target": "agent",
-        "claims": [{"type": "connector", "id": slug}],
-        "expires_in": "1h",
-    }
-    # The selected target, not only the shared Connector slug, is part of the
-    # idempotency key. Each fixed replica gets a distinct one-hour enrollment
-    # token even when all replicas share one route identity.
-    mint_idempotency_key = f"headless-v2-{generation}-{target}"
-    mint_failure: EnrollmentError | None = None
-    for attempt in range(2):
-        try:
-            credential = api_request(
-                api_endpoint,
-                api_key,
-                mint_path,
-                method="POST",
-                body=mint_body,
-                idempotency_key=mint_idempotency_key,
-                # 201 is a new operation. 200 is the byte-exact result from an
-                # idempotent retry after the first response was lost.
-                expected_status=(200, 201),
-            )
-            break
-        except APIRequestOutcomeUnknown as exc:
-            mint_failure = exc
-            if attempt == 0:
-                time.sleep(MINT_RETRY_SECONDS)
-    else:
-        raise EnrollmentError(
-            "enrollment credential result is unknown; retry the same target and generation to recover the exact operation"
-        ) from mint_failure
-    credential_id = credential.get("key_id", "") if isinstance(credential, dict) else ""
     try:
-        expected_claims = [{"type": "connector", "id": slug}]
-        if (
-            not isinstance(credential, dict)
-            or credential.get("kind") != "enrollment_token"
-            or credential.get("target") != "agent"
-            or credential.get("claims") != expected_claims
-        ):
-            raise EnrollmentError(
-                "qURL API did not confirm the exact enrollment authority"
-            )
-        token = credential.get("api_key", "")
-        if not isinstance(token, str) or not KEY.fullmatch(token):
-            raise EnrollmentError("enrollment token is missing or malformed")
-        expiry = parse_expiry(credential.get("expires_at", ""), now=now)
-        # The recovery role intentionally has write-only SSM access, so it
-        # cannot preflight this write. The API retains the idempotency
-        # operation for 24 hours, while the deployment preflight accepts a
-        # parameter write for only 15 minutes. A new generation creates a new
-        # operation after that deployment window; every minted token expires
-        # within one hour.
-        put_parameter(region, parameter, token)
+        # Mint only after any required lifecycle transition is confirmed, so
+        # failures before this point cannot leave a live credential behind.
+        expiry = mint_and_install_enrollment(
+            api_endpoint,
+            api_key,
+            target,
+            generation,
+            region,
+            slug,
+            parameter,
+            now=now,
+        )
     except EnrollmentError as exc:
-        if isinstance(credential_id, str) and re.fullmatch(
-            r"key_[A-Za-z0-9]{8,64}", credential_id
-        ):
+        if sharing_enabled_by_this_run:
             raise EnrollmentError(
-                f"enrollment credential {credential_id} was minted but not installed: {exc}; retry the same generation only while the recovered token has at least 45 minutes remaining, otherwise use a new generation, or revoke that non-secret credential ID with JWT authority"
+                "enrollment preparation failed after sharing for this resource was enabled by this run; sharing was left on"
             ) from exc
         raise
     print(
@@ -473,9 +547,23 @@ def main() -> None:
     prepare_enrollment(api_endpoint, api_key, args.target, args.generation, args.region)
 
 
+def format_enrollment_error(exc: EnrollmentError) -> str:
+    """Render only the reviewed EnrollmentError layers of a cause chain."""
+    messages = [str(exc)]
+    seen = {id(exc)}
+    cause = exc.__cause__
+    while isinstance(cause, EnrollmentError) and id(cause) not in seen:
+        seen.add(id(cause))
+        messages.append(str(cause))
+        cause = cause.__cause__
+    if len(messages) == 1:
+        return messages[0]
+    return f"{messages[0]} (caused by: {'; '.join(messages[1:])})"
+
+
 if __name__ == "__main__":
     try:
         main()
     except EnrollmentError as exc:
-        print(f"error: {exc}", file=sys.stderr)
+        print(f"error: {format_enrollment_error(exc)}", file=sys.stderr)
         raise SystemExit(1)
