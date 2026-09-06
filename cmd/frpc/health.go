@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"os"
@@ -130,6 +131,7 @@ func runWithConnectorHealth(ctx context.Context, ready func() bool, run func(con
 		ReadTimeout:       time.Second,
 		WriteTimeout:      time.Second,
 		IdleTimeout:       time.Second,
+		ErrorLog:          log.New(io.Discard, "", 0),
 	}
 	runCtx, cancel := context.WithCancelCause(ctx)
 	serveErr := make(chan error, 1)

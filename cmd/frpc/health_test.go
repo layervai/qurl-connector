@@ -247,7 +247,7 @@ func TestRunWithConnectorHealthForcesCloseAfterShutdownDeadline(t *testing.T) {
 	}()
 	readyDone := make(chan struct{})
 	requestDone := make(chan error, 1)
-	started := time.Now()
+	var shutdownStarted time.Time
 	err = runWithConnectorHealth(context.Background(), func() bool {
 		close(readyEntered)
 		<-releaseReady
@@ -263,12 +263,13 @@ func TestRunWithConnectorHealthForcesCloseAfterShutdownDeadline(t *testing.T) {
 		}()
 		select {
 		case <-readyEntered:
+			shutdownStarted = time.Now()
 			return nil
 		case <-time.After(time.Second):
 			return errors.New("readiness handler did not start")
 		}
 	})
-	elapsed := time.Since(started)
+	elapsed := time.Since(shutdownStarted)
 	if err != nil {
 		t.Fatalf("runWithConnectorHealth() after forced close = %v", err)
 	}
