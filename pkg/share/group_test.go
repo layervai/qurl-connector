@@ -781,6 +781,34 @@ func TestSessionGroupRunnerRoutesReadyIgnoresPendingOnlyDivergence(t *testing.T)
 	}
 }
 
+func TestSessionGroupRunnerSkippedApplyPreservesDivergence(t *testing.T) {
+	route := groupTestRoutes("a")[0]
+	done := make(chan struct{})
+	close(done)
+	session := &fakeGroupSession{
+		routes: map[string]RouteState{
+			"a": {Route: GroupRoute{LocalHTTPRoute: route}, ProxyName: "a-nhp1", Phase: RouteServing},
+		},
+		done:    done,
+		changes: make(chan struct{}, 1),
+	}
+	active := &groupCycle{session: session}
+	runner := &SessionGroupRunner{
+		desired:         map[string]LocalHTTPRoute{"a": route},
+		restarts:        map[string]uint64{},
+		active:          active,
+		activeDivergent: active,
+		wake:            make(chan struct{}, 1),
+	}
+
+	if err := runner.SetRoutes(context.Background(), []LocalHTTPRoute{route}); err != nil {
+		t.Fatalf("SetRoutes() = %v", err)
+	}
+	if runner.activeDivergent != active {
+		t.Fatal("an apply skipped for an ended session cleared its prior divergence")
+	}
+}
+
 func TestSessionGroupRunnerReturnsWhenEveryRouteIsGone(t *testing.T) {
 	h := startGroupHarness(t, time.Hour, 0, nil, "a", "b", "c")
 	h.waitServing(t, 1, "a", "b", "c")
@@ -1115,6 +1143,28 @@ func TestSessionGroupRunnerHealsFailedSetRoutesApply(t *testing.T) {
 	h.waitServing(t, 1, "e")
 	if got := h.admissions(); got != 1 {
 		t.Fatalf("admissions after a failed heal = %d, want a retry on the existing session", got)
+	}
+
+	// A persistent failure keeps using the same bounded retry timer and active
+	// session. It does not spend another admission or become ready by timeout.
+	select {
+	case <-session.changes:
+	default:
+	}
+	session.mu.Lock()
+	session.failUpdates = 100
+	session.mu.Unlock()
+	_ = h.runner.SetRoutes(context.Background(), groupTestRoutes("a", "b", "c", "d", "e", "f"))
+	waitUntil(t, time.Second, func() bool {
+		session.mu.Lock()
+		defer session.mu.Unlock()
+		return session.failUpdates <= 96
+	}, "repeated bounded-backoff heal attempts")
+	if h.runner.RoutesReady() {
+		t.Fatal("runner reported ready while the active apply kept failing")
+	}
+	if got := h.admissions(); got != 1 {
+		t.Fatalf("admissions during persistent apply failure = %d, want existing-session retries only", got)
 	}
 }
 

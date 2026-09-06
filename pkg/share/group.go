@@ -608,8 +608,9 @@ func (r *SessionGroupRunner) apply(ctx context.Context) error {
 }
 
 type groupApplyResult struct {
-	active, pending       *groupCycle
-	activeErr, pendingErr error
+	active, pending               *groupCycle
+	activeErr, pendingErr         error
+	activeApplied, pendingApplied bool
 }
 
 // applyLocked pushes the current desired set while applyMu serializes it with
@@ -622,11 +623,13 @@ func (r *SessionGroupRunner) applyLocked(ctx context.Context) groupApplyResult {
 
 	result := groupApplyResult{active: active, pending: pending}
 	if pending != nil && pending != active && !sessionEnded(pending.session) {
+		result.pendingApplied = true
 		if err := pending.session.Update(ctx, desired); err != nil && !errors.Is(err, ErrSessionGroupEnded) {
 			result.pendingErr = fmt.Errorf("replacement session: %w", err)
 		}
 	}
 	if active != nil && !sessionEnded(active.session) {
+		result.activeApplied = true
 		routes := desired
 		if rotating {
 			routes = retainRoutes(active.session.RouteStates(), desired)
@@ -646,8 +649,8 @@ func (r *SessionGroupRunner) applyLocked(ctx context.Context) groupApplyResult {
 // applyMu is held by every caller, so later applies replace earlier results.
 func (r *SessionGroupRunner) recordApplyResult(result groupApplyResult) error {
 	r.mu.Lock()
-	record := func(cycle *groupCycle, err error) {
-		if cycle == nil {
+	record := func(cycle *groupCycle, applied bool, err error) {
+		if cycle == nil || !applied {
 			return
 		}
 		if r.active == cycle {
@@ -665,8 +668,8 @@ func (r *SessionGroupRunner) recordApplyResult(result groupApplyResult) error {
 			}
 		}
 	}
-	record(result.pending, result.pendingErr)
-	record(result.active, result.activeErr)
+	record(result.pending, result.pendingApplied, result.pendingErr)
+	record(result.active, result.activeApplied, result.activeErr)
 	r.mu.Unlock()
 	return errors.Join(result.pendingErr, result.activeErr)
 }

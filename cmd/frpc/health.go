@@ -77,10 +77,14 @@ func connectorHealthAddress() (string, bool, error) {
 	return net.JoinHostPort(ip.String(), strconv.Itoa(port)), true, nil
 }
 
-func connectorHealthHandler(ready func() bool) http.Handler {
+func connectorHealthHandler(addr string, ready func() bool) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Cache-Control", "no-store")
 		w.Header().Set(connectorHealthHeader, "1")
+		if r.Host != addr {
+			http.Error(w, "unexpected Host", http.StatusMisdirectedRequest)
+			return
+		}
 		if r.URL.Path != connectorHealthPath {
 			http.NotFound(w, r)
 			return
@@ -121,7 +125,7 @@ func runWithConnectorHealth(ctx context.Context, ready func() bool, run func(con
 		return fmt.Errorf("listen for Connector health on %s: %w", addr, err)
 	}
 	server := &http.Server{
-		Handler:           connectorHealthHandler(ready),
+		Handler:           connectorHealthHandler(addr, ready),
 		ReadHeaderTimeout: time.Second,
 		ReadTimeout:       time.Second,
 		WriteTimeout:      time.Second,

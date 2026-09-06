@@ -97,6 +97,7 @@ func TestConnectorHealthHandlerMethods(t *testing.T) {
 		name       string
 		method     string
 		path       string
+		host       string
 		wantStatus int
 		wantAllow  string
 	}{
@@ -104,10 +105,15 @@ func TestConnectorHealthHandlerMethods(t *testing.T) {
 		{name: "head", method: http.MethodHead, path: connectorHealthPath, wantStatus: http.StatusNoContent},
 		{name: "wrong method", method: http.MethodPost, path: connectorHealthPath, wantStatus: http.StatusMethodNotAllowed, wantAllow: "GET, HEAD"},
 		{name: "wrong path", method: http.MethodGet, path: "/", wantStatus: http.StatusNotFound},
+		{name: "wrong host", method: http.MethodGet, path: connectorHealthPath, host: "attacker.example", wantStatus: http.StatusMisdirectedRequest},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			recorder := httptest.NewRecorder()
-			connectorHealthHandler(func() bool { return true }).ServeHTTP(recorder, httptest.NewRequest(test.method, test.path, nil))
+			request := httptest.NewRequest(test.method, test.path, nil)
+			if test.host != "" {
+				request.Host = test.host
+			}
+			connectorHealthHandler("example.com", func() bool { return true }).ServeHTTP(recorder, request)
 			if marker := recorder.Header().Get(connectorHealthHeader); marker != "1" {
 				t.Fatalf("%s = %q, want 1", connectorHealthHeader, marker)
 			}

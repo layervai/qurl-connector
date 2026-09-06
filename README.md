@@ -285,11 +285,13 @@ lead of 503 responses; this diagnostic command does not change its route set
 while it runs.
 
 The address is disabled when the environment variable is absent and rejects
-non-loopback hosts. The response marker detects accidental port collisions; it
-is not authentication. Use this endpoint only inside a single-tenant process or
-container network boundary. This repository still does not publish the command
-as a container; a deployment must own and verify the wrapper artifact that
-embeds the released module.
+non-loopback hosts. The handler also requires the request Host to match the
+exact bound loopback address, so a browser request through another name cannot
+read the readiness bit. The response marker detects accidental port collisions;
+it is not authentication. Use this endpoint only inside a single-tenant process
+or container network boundary. This repository still does not publish the
+command as a container; a deployment must own and verify the wrapper artifact
+that embeds the released module.
 
 ## Supply chain
 
