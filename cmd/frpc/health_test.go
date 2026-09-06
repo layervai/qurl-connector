@@ -223,6 +223,31 @@ func TestRunWithConnectorHealthStopsRuntimeWhenListenerFails(t *testing.T) {
 	}
 }
 
+func TestRunWithConnectorHealthPreservesRuntimeFailureJoinedWithCancellation(t *testing.T) {
+	t.Setenv(envConnectorHealthAddr, "127.0.0.1:7401")
+	previousListen := listenConnectorHealth
+	wantListener := errors.New("listener failed")
+	listenConnectorHealth = func(_, _ string) (net.Listener, error) {
+		return &failedConnectorHealthListener{err: wantListener}, nil
+	}
+	t.Cleanup(func() { listenConnectorHealth = previousListen })
+
+	wantShutdown := errors.New("admission retirement failed")
+	err := runWithConnectorHealth(context.Background(), func() bool { return false }, func(ctx context.Context) error {
+		<-ctx.Done()
+		return errors.Join(ctx.Err(), wantShutdown)
+	})
+	if !errors.Is(err, wantListener) {
+		t.Fatalf("runWithConnectorHealth() error = %v, want listener error %v", err, wantListener)
+	}
+	if !errors.Is(err, wantShutdown) {
+		t.Fatalf("runWithConnectorHealth() error = %v, want runtime shutdown error %v", err, wantShutdown)
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("runWithConnectorHealth() error = %v, want joined context cancellation", err)
+	}
+}
+
 func TestProbeConnectorHealthDistinguishesWrongEndpoint(t *testing.T) {
 	for _, test := range []struct {
 		name             string
@@ -232,6 +257,7 @@ func TestProbeConnectorHealthDistinguishesWrongEndpoint(t *testing.T) {
 		wantIs           error
 	}{
 		{name: "unready runtime", status: http.StatusServiceUnavailable, connectorRuntime: true, wantError: "connector routes are not ready", wantIs: errConnectorRoutesNotReady},
+		{name: "unexpected runtime reply", status: http.StatusNotFound, connectorRuntime: true, wantError: "likely different versions"},
 		{name: "foreign 404", status: http.StatusNotFound, wantError: "did not come from a qurl-connector runtime"},
 		{name: "foreign 204", status: http.StatusNoContent, wantError: "did not come from a qurl-connector runtime"},
 		{name: "foreign 503", status: http.StatusServiceUnavailable, wantError: "did not come from a qurl-connector runtime"},

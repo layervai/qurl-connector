@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
@@ -127,10 +128,12 @@ func runWithConnectorHealth(ctx context.Context, ready func() bool, run func(con
 	// goroutine always returns and nothing outlives this call.
 	_ = server.Close()
 	serverErr := <-serveErr
-	if serverErr != nil && errors.Is(runErr, context.Canceled) {
+	if serverErr != nil && runErr == context.Canceled { //nolint:errorlint // Only a bare wrapper cancellation is safe to discard.
 		// The wrapper caused this cancellation to stop the runtime after its
 		// health listener failed. The actionable cause is serverErr; keeping
 		// both would let a caller mistake the failure for a clean cancellation.
+		// A joined error that contains context.Canceled can also carry a real
+		// shutdown failure, so preserve it.
 		runErr = nil
 	}
 	return errors.Join(runErr, shutdownErr, serverErr)
@@ -160,6 +163,7 @@ func probeConnectorHealth(ctx context.Context) error {
 		return fmt.Errorf("probe Connector readiness: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4<<10))
 	if resp.Header.Get(connectorHealthHeader) != "1" {
 		return fmt.Errorf("reply from http://%s%s did not come from a qurl-connector runtime; %s may point at another local listener",
 			addr, connectorHealthPath, envConnectorHealthAddr)
@@ -168,8 +172,8 @@ func probeConnectorHealth(ctx context.Context) error {
 		return errConnectorRoutesNotReady
 	}
 	if resp.StatusCode != http.StatusNoContent {
-		return fmt.Errorf("unexpected reply from http://%s%s (HTTP %d); %s may not point at a qurl-connector runtime",
-			addr, connectorHealthPath, resp.StatusCode, envConnectorHealthAddr)
+		return fmt.Errorf("unexpected reply from http://%s%s (HTTP %d); the listener identified itself as a qurl-connector runtime, so the probe and running Connector are likely different versions",
+			addr, connectorHealthPath, resp.StatusCode)
 	}
 	return nil
 }
