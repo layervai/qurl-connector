@@ -28,7 +28,8 @@ var statusCmd = &cobra.Command{
 
 func init() {
 	statusCmd.Flags().BoolVar(&statusJSON, "json", false, "output status in JSON format")
-	statusCmd.Flags().BoolVar(&statusReady, "ready", false, "exit successfully only when every active route is serving")
+	statusCmd.Flags().BoolVar(&statusReady, "ready", false,
+		"exit successfully only when every active route is serving; requires QURL_CONNECTOR_HEALTH_ADDR in run and probe and ignores --config")
 	statusCmd.MarkFlagsMutuallyExclusive("json", "ready")
 }
 

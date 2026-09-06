@@ -534,12 +534,14 @@ func (r *SessionGroupRunner) RouteStates() map[string]RouteState {
 // ErrResourceGone refusal are no longer desired and therefore do not make
 // healthy siblings fail readiness. Readiness is a whole-group bit: one
 // retryably failed desired route makes the group unready, so use it only when
-// the session group is also the supervisor's unit of replacement.
+// the session group is also the supervisor's unit of replacement. A route
+// addition, target change, or restart during rotation stays unready until the
+// replacement is promoted, which can take one full rotation lead.
 func (r *SessionGroupRunner) RoutesReady() bool {
 	r.mu.Lock()
 	active := r.active
 	r.mu.Unlock()
-	if active == nil || sessionEnded(active.session) {
+	if active == nil {
 		return false
 	}
 

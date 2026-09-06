@@ -184,6 +184,9 @@ func runCmdFunc(_ *cobra.Command, _ []string) error {
 // the production path must keep entering through runCmdFunc so SIGINT/SIGTERM
 // stay bound to this context.
 func runConnectorCommand(ctx context.Context) (retErr error) {
+	if _, _, err := connectorHealthAddress(); err != nil {
+		return err
+	}
 	printBanner()
 	exeBinDir := "."
 	if ep, err := os.Executable(); err == nil {

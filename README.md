@@ -262,9 +262,11 @@ agent enrollment, and resource-identity resolution. Probes before that fail to
 connect; after bind they return 503 until every active route serves. Set the ECS
 health-check `startPeriod` to cover both normal setup phases. The address is
 disabled when the environment variable is absent and rejects non-loopback
-hosts. This repository still does not publish the command as a container; a
-deployment must own and verify the wrapper artifact that embeds the released
-module.
+hosts. An embedded caller that changes or restarts routes during a session
+rotation must also allow up to one rotation lead of 503 responses; this
+diagnostic command does not change its route set while it runs. This repository
+still does not publish the command as a container; a deployment must own and
+verify the wrapper artifact that embeds the released module.
 
 ## Supply chain
 

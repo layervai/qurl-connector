@@ -61,6 +61,18 @@ func TestConnectorHealthAddress(t *testing.T) {
 	}
 }
 
+func TestRunConnectorCommandRejectsHealthAddressBeforeConfigDiscovery(t *testing.T) {
+	t.Setenv(envConnectorHealthAddr, "0.0.0.0:7401")
+	previousCfg := cfgFile
+	cfgFile = "/config/path/must/not/be/read"
+	t.Cleanup(func() { cfgFile = previousCfg })
+
+	err := runConnectorCommand(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "host must be a loopback IP") {
+		t.Fatalf("runConnectorCommand() error = %v, want early health-address rejection", err)
+	}
+}
+
 func TestConnectorHealthHandlerMethods(t *testing.T) {
 	for _, test := range []struct {
 		name       string
