@@ -46,6 +46,8 @@ func normalizeProxyDiscriminator(raw string) string {
 		return out
 	}
 	prefix := strings.TrimRight(out[:maxProxyDiscriminatorLen-proxyHashSuffixLen-1], "-")
+	// Hash the raw value so different admission discriminators cannot collide
+	// after normalization and prefix truncation.
 	sum := sha256.Sum256([]byte(raw))
 	return prefix + "-" + hex.EncodeToString(sum[:])[:proxyHashSuffixLen]
 }

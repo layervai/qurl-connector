@@ -3837,6 +3837,9 @@ func TestNativeAdmitterFencesServingReplacementUntilDurableRetirementTerminal(t 
 	if recoveryCalls != len(codes) {
 		t.Fatalf("final recovery calls=%d, want %d", recoveryCalls, len(codes))
 	}
+	if session := factory.session(1); session == nil || !session.isStopped() {
+		t.Fatal("serving replacement was not stopped during runner shutdown")
+	}
 	if records, loadErr := store.LoadSessionOperations(context.Background(), testProtectedResourceID); loadErr != nil || len(records) != 0 {
 		t.Fatalf("terminal durable retirement records=%+v err=%v", records, loadErr)
 	}

@@ -271,6 +271,10 @@ func Load(path string) (*Config, error) {
 
 func decodeConfig(data []byte, path string) (*Config, error) {
 	resolved := resolveEnvVars(string(data))
+	resolved, err := stripRetiredGeneratedFields(resolved)
+	if err != nil {
+		return nil, fmt.Errorf("parsing retired config fields in %s: %w", path, err)
+	}
 
 	var cfg Config
 	dec := yaml.NewDecoder(strings.NewReader(resolved))
@@ -292,6 +296,48 @@ func decodeConfig(data []byte, path string) (*Config, error) {
 	}
 
 	return &cfg, nil
+}
+
+// stripRetiredGeneratedFields keeps files written by older add commands
+// readable. Those files always contained these defaults even when the admin
+// API was disabled. A later Save omits them; other retired custom-FRP fields
+// remain unknown and fail strict decoding.
+func stripRetiredGeneratedFields(data string) (string, error) {
+	var document yaml.Node
+	if err := yaml.Unmarshal([]byte(data), &document); err != nil || len(document.Content) == 0 {
+		return data, nil
+	}
+	root := document.Content[0]
+	dropYAMLField(root, "admin")
+	if server := yamlField(root, "server"); server != nil {
+		dropYAMLField(server, "public_domain")
+	}
+	out, err := yaml.Marshal(&document)
+	return string(out), err
+}
+
+func yamlField(mapping *yaml.Node, key string) *yaml.Node {
+	if mapping == nil || mapping.Kind != yaml.MappingNode {
+		return nil
+	}
+	for i := 0; i+1 < len(mapping.Content); i += 2 {
+		if mapping.Content[i].Value == key {
+			return mapping.Content[i+1]
+		}
+	}
+	return nil
+}
+
+func dropYAMLField(mapping *yaml.Node, key string) {
+	if mapping == nil || mapping.Kind != yaml.MappingNode {
+		return
+	}
+	for i := 0; i+1 < len(mapping.Content); i += 2 {
+		if mapping.Content[i].Value == key {
+			mapping.Content = append(mapping.Content[:i], mapping.Content[i+2:]...)
+			return
+		}
+	}
 }
 
 // NewDefaulted returns an empty Config with the same defaults that

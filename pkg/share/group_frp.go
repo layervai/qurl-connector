@@ -933,8 +933,8 @@ func (s *frpGroupSession) shutdown(ctx context.Context, grace time.Duration) err
 		s.mu.Lock()
 		s.stopped = true
 		s.mu.Unlock()
-		// GracefulClose records the drain interval before it cancels FRP's
-		// internal service context; see frpServingSession.shutdown.
+		// Record the drain interval before canceling the parent context; an
+		// early cancel races FRP into an immediate close with zero grace.
 		s.svc.GracefulClose(grace)
 		s.cancel()
 	})

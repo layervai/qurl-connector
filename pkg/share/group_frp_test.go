@@ -98,6 +98,32 @@ func TestFRPSessionGroupFactoryBuildsOneSessionForManyRoutes(t *testing.T) {
 	}
 }
 
+func TestFRPSessionGroupFactoryRejectsUnsafeAdmittedHosts(t *testing.T) {
+	routes := groupRoutesOf(groupTestRoutes("a"))
+	factory, err := NewFRPSessionGroupFactory(FRPGroupFactoryConfig{Common: &v1.ClientCommonConfig{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, host := range []string{"frp.example", "2001:db8::1", ":7000", "frp.example:0", "frp.example:65536"} {
+		admission := groupTestAdmission(1)
+		admission.ResourceHost = host
+		if _, _, _, err := factory.BuildConfig(admission, routes); err == nil {
+			t.Errorf("unsafe admitted host %q was accepted", host)
+		}
+	}
+	tlsOn := true
+	tlsFactory, err := NewFRPSessionGroupFactory(FRPGroupFactoryConfig{Common: &v1.ClientCommonConfig{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tlsFactory.cfg.Common.Transport.TLS.Enable = &tlsOn
+	admission := groupTestAdmission(1)
+	admission.ResourceHost = "127.0.0.1:7000"
+	if _, _, _, err := tlsFactory.BuildConfig(admission, routes); err == nil {
+		t.Fatal("IP-literal admitted host with implicit TLS server name was accepted")
+	}
+}
+
 func TestGroupProxyNameGenerationZero(t *testing.T) {
 	route := groupTestRoutes("local-app")[0]
 	baseName := nhpconfig.FRPProxyName(route.RouteID, sessionProxyDiscriminator(4095))
@@ -597,6 +623,34 @@ func TestFRPGroupSessionStaleAdmissionEndsWholeSession(t *testing.T) {
 	}
 	if err := session.Update(context.Background(), groupRoutesOf(groupTestRoutes("a"))); !errors.Is(err, ErrSessionGroupEnded) {
 		t.Fatalf("Update after the session ended = %v, want %v", err, ErrSessionGroupEnded)
+	}
+}
+
+func TestInspectRouteStatusMapsExactRejectionTags(t *testing.T) {
+	for _, test := range []struct {
+		wire      string
+		routeErr  error
+		fatalErr  error
+		transient bool
+	}{
+		{wire: "knock_invalid: expired", fatalErr: ErrAdmissionStale},
+		{wire: "owner_missing: missing", fatalErr: ErrAdmissionStale},
+		{wire: "session_stale: stale", fatalErr: ErrAdmissionStale},
+		{wire: "resource_not_found: gone", routeErr: ErrResourceGone},
+		{wire: "registration_failed: retry", transient: true},
+	} {
+		status := &lockedStatusMap{}
+		status.set("a", frpproxy.ProxyPhaseStartErr, test.wire)
+		_, routeErr, fatalErr := inspectRouteStatus(status, "a")
+		if test.transient {
+			if routeErr == nil || fatalErr != nil {
+				t.Errorf("inspectRouteStatus(%q) = route %v, fatal %v; want a transient route error", test.wire, routeErr, fatalErr)
+			}
+			continue
+		}
+		if !errors.Is(routeErr, test.routeErr) || !errors.Is(fatalErr, test.fatalErr) {
+			t.Errorf("inspectRouteStatus(%q) = route %v, fatal %v; want %v, %v", test.wire, routeErr, fatalErr, test.routeErr, test.fatalErr)
+		}
 	}
 }
 

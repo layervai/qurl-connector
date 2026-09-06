@@ -2,6 +2,7 @@ package share
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -73,5 +74,22 @@ func TestAdmissionFormattingRedactsBearerToken(t *testing.T) {
 				t.Fatalf("format %q omitted non-secret identity %q: %s", format, useful, formatted)
 			}
 		}
+	}
+}
+
+func TestRetryAfterCountsCallbackTimeTowardDelay(t *testing.T) {
+	const (
+		wait          = time.Second
+		callbackDelay = 1500 * time.Millisecond
+	)
+	started := time.Now()
+	err := retryAfter(context.Background(), func(error, time.Duration) {
+		time.Sleep(callbackDelay)
+	}, errors.New("retry attempt failed"), wait)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if elapsed := time.Since(started); elapsed >= 2*time.Second {
+		t.Fatalf("retryAfter() took %s; callback time did not consume the retry delay", elapsed)
 	}
 }

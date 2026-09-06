@@ -17,7 +17,7 @@ const (
 	testPublicResourceB = "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEcOtuxu2qhc3gt1E7BiEU0CLqEDlXDwzZq0JnESgMAwERX6y_XXF5Cn5SKITWIZQmUhCZ0pHHlVn7SmFUTAnTGQ"
 )
 
-// returns its path.
+// writeConfig writes YAML content to a temporary file and returns its path.
 func writeConfig(t *testing.T, content string) string {
 	t.Helper()
 	dir := t.TempDir()
@@ -26,6 +26,36 @@ func writeConfig(t *testing.T, content string) string {
 		t.Fatalf("writing temp config: %v", err)
 	}
 	return p
+}
+
+func TestLoadAcceptsAndDropsRetiredGeneratedFields(t *testing.T) {
+	path := writeConfig(t, `
+server:
+  public_domain: qurl.site
+admin:
+  enabled: false
+  addr: 127.0.0.1
+  port: 7400
+routes:
+  - id: web
+    type: http
+    local_port: 8080
+`)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	savedPath := filepath.Join(t.TempDir(), "saved.yaml")
+	if err := Save(cfg, savedPath); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(savedPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), "public_domain:") || strings.Contains(string(raw), "admin:") {
+		t.Fatalf("Save retained retired generated fields:\n%s", raw)
+	}
 }
 
 func TestLoad_StaticServerAddrRequiresPort(t *testing.T) {

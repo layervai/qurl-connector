@@ -704,11 +704,10 @@ func TestSharedServiceRendersOneSessionForEveryRoute(t *testing.T) {
 			ResourceID: route.ResourceID, ConnectorRoutingID: route.ConnectorRoutingID,
 		}})
 	}
-	built, proxies, names, err := factory.BuildConfig(admission, routes)
+	_, proxies, names, err := factory.BuildConfig(admission, routes)
 	if err != nil {
 		t.Fatal(err)
 	}
-	_ = built
 	if len(proxies) != 3 || len(names) != 3 {
 		t.Fatalf("session renders %d proxies / %d names, want 3 on the one Login", len(proxies), len(names))
 	}

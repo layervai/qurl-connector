@@ -34,7 +34,9 @@ func TestReplaceDesktopConfigCreatesContinuityState(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_ = cfg
+	if len(cfg.Routes) != 0 {
+		t.Fatalf("Desktop config routes = %d, want 0", len(cfg.Routes))
+	}
 }
 
 func TestReplaceDesktopConfigRejectsMissingContinuityLock(t *testing.T) {
