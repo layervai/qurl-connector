@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"unicode/utf8"
 
@@ -359,6 +360,25 @@ func TestRunStatusReadyUsesRuntimeOwnedHealth(t *testing.T) {
 				t.Fatalf("runStatus --ready did not silence routine Cobra usage/error output")
 			}
 		})
+	}
+}
+
+func TestRunStatusReadyRejectsConfigFlag(t *testing.T) {
+	previous := statusReady
+	statusReady = true
+	t.Cleanup(func() { statusReady = previous })
+
+	cmd := &cobra.Command{}
+	cmd.Flags().String("config", "", "")
+	if err := cmd.Flags().Set("config", "/etc/qurl/site-b.yaml"); err != nil {
+		t.Fatal(err)
+	}
+	err := runStatus(cmd, nil)
+	if err == nil || !strings.Contains(err.Error(), "cannot be scoped by --config") {
+		t.Fatalf("runStatus --ready --config error = %v, want rejected combination", err)
+	}
+	if cmd.SilenceUsage || cmd.SilenceErrors {
+		t.Fatal("--ready --config misuse suppressed Cobra usage or error output")
 	}
 }
 

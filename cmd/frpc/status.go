@@ -112,6 +112,9 @@ type routeStatus struct {
 // `discoverErr` independently.
 func runStatus(cmd *cobra.Command, _ []string) error {
 	if statusReady {
+		if cmd != nil && cmd.Flags().Changed("config") {
+			return fmt.Errorf("--ready reads the running process over %s and cannot be scoped by --config", envConnectorHealthAddr)
+		}
 		// An unhealthy readiness probe is an expected runtime result. Let
 		// Execute print its error once without Cobra's prefix or usage block.
 		// Set this only after Cobra validates flags so other status failures

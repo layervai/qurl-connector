@@ -21,9 +21,9 @@ const (
 
 var listenConnectorHealth = net.Listen
 
-// errConnectorRoutesNotReady is the expected unhealthy result from a
-// reachable Connector runtime. It is distinct from an unreachable or foreign
-// listener so callers can decide whether to wait or report misconfiguration.
+// errConnectorRoutesNotReady keeps the handler and probe's expected unhealthy
+// result aligned and lets tests distinguish it from transport or configuration
+// failures.
 var errConnectorRoutesNotReady = errors.New("connector routes are not ready")
 
 func connectorHealthAddress() (string, bool, error) {
