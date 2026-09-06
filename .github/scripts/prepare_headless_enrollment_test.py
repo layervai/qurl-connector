@@ -1948,6 +1948,7 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
             "AWS_ENDPOINT_URL_SSM": "https://private.example.com/ssm",
             "AWS_ENDPOINT_URL_STS": "https://private.example.com/sts",
             "AWS_CA_BUNDLE": "/tmp/private-ca.pem",
+            "AWS_DATA_PATH": "/tmp/private-service-models",
             "HTTP_PROXY": "http://proxy.example.com",
             "HTTPS_PROXY": "https://proxy.example.com",
             "NO_PROXY": "localhost",
@@ -1961,6 +1962,7 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
             "AWS_MAX_ATTEMPTS": "99",
             "AWS_USE_FIPS_ENDPOINT": "true",
             "AWS_USE_DUALSTACK_ENDPOINT": "true",
+            "AWS_CLI_AUTO_PROMPT": "on",
             "AWS_CONFIG_FILE": "/tmp/private-config",
             "AWS_SHARED_CREDENTIALS_FILE": "/tmp/private-credentials",
             "AWS_PAGER": "unsafe-pager",
@@ -1985,6 +1987,7 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
         self.assertNotIn("AWS_ENDPOINT_URL_SSM", kwargs["env"])
         self.assertNotIn("AWS_ENDPOINT_URL_STS", kwargs["env"])
         self.assertNotIn("AWS_CA_BUNDLE", kwargs["env"])
+        self.assertNotIn("AWS_DATA_PATH", kwargs["env"])
         for proxy_variable in (
             "HTTP_PROXY",
             "HTTPS_PROXY",
@@ -2005,6 +2008,7 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
         self.assertEqual(kwargs["env"]["AWS_MAX_ATTEMPTS"], "1")
         self.assertEqual(kwargs["env"]["AWS_USE_FIPS_ENDPOINT"], "false")
         self.assertEqual(kwargs["env"]["AWS_USE_DUALSTACK_ENDPOINT"], "false")
+        self.assertEqual(kwargs["env"]["AWS_CLI_AUTO_PROMPT"], "off")
         self.assertEqual(kwargs["env"]["AWS_PAGER"], "")
         self.assertEqual(kwargs["input"], "lv_live_secret-token")
         self.assertEqual(args[args.index("--value") + 1], "file:///dev/stdin")

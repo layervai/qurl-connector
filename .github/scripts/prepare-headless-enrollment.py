@@ -363,6 +363,7 @@ def put_parameter(region: str, parameter: str, token: str) -> None:
     clean_env.pop("AWS_ENDPOINT_URL_SSM", None)
     clean_env.pop("AWS_ENDPOINT_URL_STS", None)
     clean_env.pop("AWS_CA_BUNDLE", None)
+    clean_env.pop("AWS_DATA_PATH", None)
     for proxy_variable in (
         "HTTP_PROXY",
         "HTTPS_PROXY",
@@ -383,6 +384,7 @@ def put_parameter(region: str, parameter: str, token: str) -> None:
     clean_env["AWS_MAX_ATTEMPTS"] = "1"
     clean_env["AWS_USE_FIPS_ENDPOINT"] = "false"
     clean_env["AWS_USE_DUALSTACK_ENDPOINT"] = "false"
+    clean_env["AWS_CLI_AUTO_PROMPT"] = "off"
     clean_env["AWS_PAGER"] = ""
     for attempt in range(2):
         try:

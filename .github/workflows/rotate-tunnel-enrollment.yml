@@ -7,6 +7,8 @@ on:
         description: Tunnel enrollment to prepare
         required: true
         type: choice
+        # prepare_headless_enrollment_test.py checks exact equality with the
+        # Python TARGETS map and the Go public-source allowlist.
         options:
           - fileviewer-nhp-replica-a
           - fileviewer-nhp-replica-b
