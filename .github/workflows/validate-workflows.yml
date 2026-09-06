@@ -22,5 +22,18 @@ jobs:
         with:
           go-version-file: go.mod
           cache: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.13"
+      - name: Install pinned Python linter
+        run: python3 -m pip install ruff==0.15.8
+      - name: Lint sandbox enrollment recovery
+        run: |
+          python3 -m ruff check .github/scripts/prepare-headless-enrollment.py .github/scripts/prepare_headless_enrollment_test.py
+          python3 -m ruff format --check .github/scripts/prepare-headless-enrollment.py .github/scripts/prepare_headless_enrollment_test.py
+      - name: Test sandbox enrollment recovery
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: python3 -m unittest discover -s .github/scripts -p 'prepare_headless_enrollment_test.py'
       - name: Test workflow contracts
         run: go test ./.github/scripts

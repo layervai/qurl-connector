@@ -1,0 +1,137 @@
+name: Rotate sandbox tunnel enrollment
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: Tunnel enrollment to prepare
+        required: true
+        type: choice
+        options:
+          - fileviewer-nhp-replica-a
+          - fileviewer-nhp-replica-b
+          - fileviewer-nhp-replica-c
+          - uploader-nhp-replica-a
+          - uploader-nhp-replica-b
+          - uploader-nhp-replica-c
+          - detect-nhp-replica-a
+          - detect-nhp-replica-b
+          - detect-nhp-replica-c
+          - watermark-nhp-replica-a
+          - watermark-nhp-replica-b
+          - watermark-nhp-replica-c
+      generation:
+        description: Unique lowercase letters, digits, and hyphens; reuse for retries and change only after deployment rejects its age
+        required: true
+        type: string
+
+concurrency:
+  group: rotate-sandbox-tunnel-enrollment-${{ inputs.target }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  verify-environment:
+    name: Verify protected sandbox environment
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    # GitHub documents actions: read as the exact fine-grained permission for
+    # GET /repos/{owner}/{repo}/environments/{environment_name}. This job does
+    # not check out repository contents.
+    permissions:
+      actions: read
+    steps:
+      - name: Require main and reviewed environment policy
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_REF" != "refs/heads/main" ]; then
+            echo "::error::enrollment recovery runs only from main"
+            exit 1
+          fi
+          policy=$(
+            gh api "repos/${GITHUB_REPOSITORY}/environments/sandbox" --jq '
+              [
+                (.deployment_branch_policy.protected_branches == true),
+                (.deployment_branch_policy.custom_branch_policies == false),
+                (any(.protection_rules[]?; .type == "required_reviewers" and (.reviewers | length) > 0))
+              ] | map(tostring) | join(" ")
+            '
+          )
+          if [ "$policy" != "true true true" ]; then
+            echo "::error::sandbox environment must allow protected branches only and require at least one reviewer"
+            exit 1
+          fi
+
+  rotate:
+    name: Rotate ${{ inputs.target }}
+    # This environment must allow only protected branches and require a reviewer.
+    environment: sandbox
+    needs: verify-environment
+    runs-on: ubuntu-latest
+    # The job timeout is the hard wall-clock cap; socket and process timeouts
+    # bound ordinary failures inside it.
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.13"
+
+      - name: Validate protected sandbox environment
+        env:
+          QURL_SANDBOX_API_KEY: ${{ secrets.QURL_SANDBOX_API_KEY }}
+          QURL_SANDBOX_API_ENDPOINT: ${{ secrets.QURL_SANDBOX_API_ENDPOINT }}
+          QURL_SANDBOX_API_ENDPOINT_SHA256: ${{ secrets.QURL_SANDBOX_API_ENDPOINT_SHA256 }}
+          QURL_TUNNEL_RECOVERY_ROLE_ARN: ${{ secrets.QURL_TUNNEL_RECOVERY_ROLE_ARN }}
+        run: |
+          set -euo pipefail
+          missing=()
+          [ -n "$QURL_SANDBOX_API_KEY" ] || missing+=(QURL_SANDBOX_API_KEY)
+          [ -n "$QURL_SANDBOX_API_ENDPOINT" ] || missing+=(QURL_SANDBOX_API_ENDPOINT)
+          [ -n "$QURL_SANDBOX_API_ENDPOINT_SHA256" ] || missing+=(QURL_SANDBOX_API_ENDPOINT_SHA256)
+          [ -n "$QURL_TUNNEL_RECOVERY_ROLE_ARN" ] || missing+=(QURL_TUNNEL_RECOVERY_ROLE_ARN)
+          if [ ${#missing[@]} -ne 0 ]; then
+            printf '::error::protected sandbox environment is missing %s\n' "${missing[*]}"
+            exit 1
+          fi
+          if [[ ! "$QURL_SANDBOX_API_KEY" =~ ^lv_live_[A-Za-z0-9_-]+$ ]]; then
+            echo "::error::protected sandbox API credential has an invalid shape"
+            exit 1
+          fi
+          if [[ ! "$QURL_SANDBOX_API_ENDPOINT_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "::error::protected sandbox API endpoint digest has an invalid shape"
+            exit 1
+          fi
+          if [[ ! "$QURL_TUNNEL_RECOVERY_ROLE_ARN" =~ ^arn:aws:iam::[0-9]{12}:role/qurl-tunnel-enrollment-recovery-github-actions$ ]]; then
+            echo "::error::protected sandbox recovery role ARN is invalid"
+            exit 1
+          fi
+
+      - name: Configure narrow AWS credentials
+        uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3
+        with:
+          role-to-assume: ${{ secrets.QURL_TUNNEL_RECOVERY_ROLE_ARN }}
+          aws-region: us-east-2
+          role-duration-seconds: 900
+          mask-aws-account-id: true
+
+      - name: Prepare reviewed enrollment tokens
+        env:
+          QURL_SANDBOX_API_KEY: ${{ secrets.QURL_SANDBOX_API_KEY }}
+          QURL_SANDBOX_API_ENDPOINT: ${{ secrets.QURL_SANDBOX_API_ENDPOINT }}
+          QURL_SANDBOX_API_ENDPOINT_SHA256: ${{ secrets.QURL_SANDBOX_API_ENDPOINT_SHA256 }}
+          RECOVERY_GENERATION: ${{ inputs.generation }}
+          RECOVERY_TARGET: ${{ inputs.target }}
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/prepare-headless-enrollment.py \
+            --target "$RECOVERY_TARGET" \
+            --generation "$RECOVERY_GENERATION" \
+            --region us-east-2

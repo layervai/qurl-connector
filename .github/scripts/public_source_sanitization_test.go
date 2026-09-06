@@ -14,8 +14,55 @@ var (
 	appIDPattern     = regexp.MustCompile(`(?i)app[_ -]?(?:id|client[_ -]?id)[[:space:]]*[:=][[:space:]]*["']?([0-9]+)`)
 	environmentHost  = regexp.MustCompile(`(?i)\b(?:[a-z0-9-]+\.)*(?:sandbox|canary|prod|production|[a-z0-9-]+-(?:sandbox|canary|prod|production)|(?:sandbox|canary|prod|production)-[a-z0-9-]+)\.(?:[a-z0-9-]+\.)*[a-z]{2,}\b`)
 	layerVRepoRef    = regexp.MustCompile(`(?i)\blayervai/([a-z0-9][a-z0-9-]*)`)
-	layerVHost       = regexp.MustCompile(`(?i)\b(?:[a-z0-9-]+\.)*layerv\.ai\b`)
+	layerVHost       = regexp.MustCompile(`(?i)\b(?:[a-z0-9-]+\.)*layerv\.(?:ai|xyz)\b`)
+	// Find the exact upper-case parameter form and lower-case service paths
+	// with at least three segments below the qurl-* namespace. The allowlist
+	// below, not this expression, decides which private operational paths are
+	// reviewed for public source. References into reviewed public qurl-* repos
+	// are excluded separately after this deliberately broad match.
+	operationalPath = regexp.MustCompile(`/qurl-[a-z0-9-]+/(?:[A-Z][A-Z0-9_]*(?:/[A-Z][A-Z0-9_]*)*|[a-z0-9][a-z0-9-]*(?:/[a-z0-9](?:[a-z0-9-]*[a-z0-9])?){2,})`)
 )
+
+func TestOperationalPathDetectorStaysBroaderThanAllowlist(t *testing.T) {
+	for _, path := range []string{
+		"/qurl-example-service/" + "nhp/replica-z/bootstrap",
+		"/qurl-example-service/" + "nhp/replica-z/bootstrap-legacy",
+		"/qurl-example-service/" + "nhp/replica-z/key",
+		"/qurl-example-service/" + "fileviewer-tunnel/replica-z/bootstrap",
+		"/qurl-example-service/" + "PRIVATE_PARAMETER",
+	} {
+		if got := operationalPath.FindString(path); got != path {
+			t.Fatalf("operationalPath.FindString(%q) = %q; new NHP service paths must reach the reviewed allowlist", path, got)
+		}
+	}
+}
+
+func operationalPathBelongsToPublicRepository(path string, publicRepositories map[string]bool) bool {
+	trimmed := strings.TrimPrefix(path, "/")
+	repository, _, found := strings.Cut(trimmed, "/")
+	return found && publicRepositories[repository]
+}
+
+func TestOperationalPathPublicRepositoryExemptionIsExact(t *testing.T) {
+	publicRepositories := map[string]bool{"qurl-connector": true}
+	if !operationalPathBelongsToPublicRepository("/qurl-connector/CONTRIBUTING", publicRepositories) {
+		t.Fatal("the current public repository must not be mistaken for a private operational path")
+	}
+	if operationalPathBelongsToPublicRepository("/qurl-connector-"+"private/CONTRIBUTING", publicRepositories) {
+		t.Fatal("a prefix lookalike must not inherit the public-repository exemption")
+	}
+}
+
+func TestLayerVHostDetectorIncludesEveryReviewedSuffix(t *testing.T) {
+	for _, host := range []string{
+		"api." + "layerv.ai",
+		"api." + "layerv." + "xyz",
+	} {
+		if got := layerVHost.FindString(host); got != host {
+			t.Fatalf("layerVHost.FindString(%q) = %q", host, got)
+		}
+	}
+}
 
 func TestPublicSourceContainsNoPrivateOperationalMaterial(t *testing.T) {
 	repoRoot := filepath.Clean(filepath.Join("..", ".."))
@@ -47,6 +94,20 @@ func TestPublicSourceContainsNoPrivateOperationalMaterial(t *testing.T) {
 		"discord.com/api/" + "webhooks/",
 		"execute-api" + ".amazonaws.com",
 	}
+	reviewedOperationalPaths := map[string]bool{
+		"/qurl-s3-connector/fileviewer-nhp/replica-a/bootstrap": true,
+		"/qurl-s3-connector/fileviewer-nhp/replica-b/bootstrap": true,
+		"/qurl-s3-connector/fileviewer-nhp/replica-c/bootstrap": true,
+		"/qurl-s3-connector/uploader-nhp/replica-a/bootstrap":   true,
+		"/qurl-s3-connector/uploader-nhp/replica-b/bootstrap":   true,
+		"/qurl-s3-connector/uploader-nhp/replica-c/bootstrap":   true,
+		"/qurl-s3-connector/detect-nhp/replica-a/bootstrap":     true,
+		"/qurl-s3-connector/detect-nhp/replica-b/bootstrap":     true,
+		"/qurl-s3-connector/detect-nhp/replica-c/bootstrap":     true,
+		"/qurl-watermark-service/nhp/replica-a/bootstrap":       true,
+		"/qurl-watermark-service/nhp/replica-b/bootstrap":       true,
+		"/qurl-watermark-service/nhp/replica-c/bootstrap":       true,
+	}
 
 	err := filepath.WalkDir(repoRoot, func(path string, entry fs.DirEntry, err error) error {
 		if err != nil {
@@ -58,7 +119,7 @@ func TestPublicSourceContainsNoPrivateOperationalMaterial(t *testing.T) {
 		}
 		if entry.IsDir() {
 			switch filepath.ToSlash(rel) {
-			case ".git", "bin":
+			case ".git", "bin", ".github/scripts/__pycache__":
 				return filepath.SkipDir
 			}
 			return nil
@@ -99,6 +160,14 @@ func TestPublicSourceContainsNoPrivateOperationalMaterial(t *testing.T) {
 		for _, endpoint := range secretEndpoints {
 			if strings.Contains(lower, endpoint) {
 				t.Errorf("%s contains private webhook or cloud endpoint %q", rel, endpoint)
+			}
+		}
+		for _, operational := range operationalPath.FindAllString(text, -1) {
+			if operationalPathBelongsToPublicRepository(operational, publicRepositories) {
+				continue
+			}
+			if !reviewedOperationalPaths[operational] {
+				t.Errorf("%s contains unreviewed operational path %q", rel, operational)
 			}
 		}
 		for _, host := range environmentHost.FindAllString(lower, -1) {

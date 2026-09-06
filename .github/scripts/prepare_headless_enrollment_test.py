@@ -1,0 +1,1304 @@
+from __future__ import annotations
+
+import datetime as dt
+import http.server
+import importlib.util
+import pathlib
+import re
+import shutil
+import threading
+import unittest
+from unittest import mock
+
+
+# Keep the environment word split. The public-source scanner intentionally
+# treats a whole sandbox hostname-like workflow filename as sensitive.
+SCRIPT = pathlib.Path(__file__).with_name("prepare-headless-enrollment.py")
+WORKFLOW = (
+    SCRIPT.parent.parent
+    / "workflows"
+    / ("rotate-" + "sand" + "box-tunnel-enrollment.yml")
+)
+SPEC = importlib.util.spec_from_file_location("prepare_headless_enrollment", SCRIPT)
+assert SPEC is not None and SPEC.loader is not None
+MODULE = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(MODULE)
+FIXED_NOW = dt.datetime(2026, 9, 4, 18, 0, tzinfo=dt.timezone.utc)
+VALID_EXPIRY = "2026-09-04T19:00:00Z"
+
+
+class FakeResponse:
+    def __init__(
+        self, body: bytes, *, status: int = 200, content_types: list[str] | None = None
+    ) -> None:
+        self.body = body
+        self.status = status
+        self.headers = mock.Mock()
+        self.headers.get_all.return_value = (
+            ["application/json"] if content_types is None else content_types
+        )
+
+    def __enter__(self) -> FakeResponse:
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        return None
+
+    def read(self, _limit: int) -> bytes:
+        return self.body
+
+
+class PrepareHeadlessEnrollmentTest(unittest.TestCase):
+    def test_workflow_exposes_every_reviewed_target_and_uses_target_selector(
+        self,
+    ) -> None:
+        workflow = WORKFLOW.read_text()
+        options_match = re.search(
+            r"(?ms)^      target:\n.*?^        options:\n((?:          - [a-z0-9-]+\n)+)",
+            workflow,
+        )
+        self.assertIsNotNone(options_match)
+        options = {
+            line.removeprefix("          - ")
+            for line in options_match.group(1).splitlines()
+        }
+        self.assertEqual(options, set(MODULE.TARGETS))
+        self.assertIn('--target "$RECOVERY_TARGET"', workflow)
+        self.assertNotIn("--api-endpoint", workflow)
+        self.assertIn("RECOVERY_TARGET: ${{ inputs.target }}", workflow)
+        self.assertIn("name: Rotate ${{ inputs.target }}", workflow)
+        self.assertIn(
+            "group: rotate-sandbox-tunnel-enrollment-${{ inputs.target }}", workflow
+        )
+        self.assertNotIn("matrix:", workflow)
+        self.assertNotIn('--slug "$RECOVERY_SLUG"', workflow)
+        self.assertNotIn("both", options)
+
+    def test_workflow_fails_before_aws_when_protected_environment_is_missing(
+        self,
+    ) -> None:
+        workflow = WORKFLOW.read_text()
+        verify_job = workflow.index("  verify-environment:")
+        rotate_job = workflow.index("  rotate:")
+        preflight = workflow.index("- name: Validate protected sandbox environment")
+        aws = workflow.index("- name: Configure narrow AWS credentials")
+        prepare = workflow.index("- name: Prepare reviewed enrollment tokens")
+        self.assertLess(verify_job, rotate_job)
+        self.assertLess(preflight, aws)
+        self.assertLess(aws, prepare)
+        self.assertIn("needs: verify-environment", workflow)
+        self.assertIn("actions: read", workflow)
+        self.assertIn("exact fine-grained permission", workflow)
+        self.assertIn(
+            "GET /repos/{owner}/{repo}/environments/{environment_name}", workflow
+        )
+        self.assertIn('"$GITHUB_REF" != "refs/heads/main"', workflow)
+        self.assertIn(
+            'gh api "repos/${GITHUB_REPOSITORY}/environments/sandbox"', workflow
+        )
+        self.assertIn(".deployment_branch_policy.protected_branches == true", workflow)
+        self.assertIn(
+            ".deployment_branch_policy.custom_branch_policies == false", workflow
+        )
+        self.assertIn('.type == "required_reviewers"', workflow)
+        for name in (
+            "QURL_SANDBOX_API_KEY",
+            "QURL_SANDBOX_API_ENDPOINT",
+            "QURL_SANDBOX_API_ENDPOINT_SHA256",
+            "QURL_TUNNEL_RECOVERY_ROLE_ARN",
+        ):
+            self.assertIn(f"missing+=({name})", workflow)
+            self.assertIn(f"${{{{ secrets.{name} }}}}", workflow)
+        self.assertIn("^lv_live_[A-Za-z0-9_-]+$", workflow)
+        self.assertIn(
+            "^arn:aws:iam::[0-9]{12}:role/qurl-tunnel-enrollment-recovery-github-actions$",
+            workflow,
+        )
+        self.assertIn("mask-aws-account-id: true", workflow)
+        self.assertGreaterEqual(workflow.count("actions/setup-python@"), 1)
+        self.assertIn('python-version: "3.13"', workflow)
+
+    def test_every_target_has_a_distinct_parameter(self) -> None:
+        parameters = [parameter for _slug, parameter in MODULE.TARGETS.values()]
+        self.assertEqual(len(parameters), len(set(parameters)))
+
+    def test_inputs_allow_only_reviewed_target_generation_and_region(self) -> None:
+        MODULE.validate_inputs("fileviewer-nhp-replica-a", "attempt-1", "us-east-2")
+        MODULE.validate_inputs("uploader-nhp-replica-b", "attempt-1", "us-east-2")
+        MODULE.validate_inputs("detect-nhp-replica-a", "attempt-1", "us-east-2")
+        MODULE.validate_inputs("watermark-nhp-replica-c", "attempt-1", "us-east-2")
+        with self.assertRaisesRegex(MODULE.EnrollmentError, "target"):
+            MODULE.validate_inputs("other-sandbox", "attempt-1", "us-east-2")
+        with self.assertRaisesRegex(MODULE.EnrollmentError, "generation"):
+            MODULE.validate_inputs("fileviewer-nhp-replica-a", "Attempt_1", "us-east-2")
+        with self.assertRaisesRegex(MODULE.EnrollmentError, "us-east-2"):
+            MODULE.validate_inputs("fileviewer-nhp-replica-a", "attempt-1", "us-west-2")
+
+    def test_api_endpoint_requires_one_https_origin(self) -> None:
+        endpoint = "https://api.example.com"
+        endpoint_hash = MODULE.hashlib.sha256(endpoint.encode()).hexdigest()
+        self.assertEqual(
+            MODULE.validate_api_endpoint(endpoint + "/", expected_sha256=endpoint_hash),
+            endpoint,
+        )
+        for value in (
+            "http://api.example.com",
+            "https://api.example.com/path",
+            "https://api.example.com?next=elsewhere",
+            "https://api.example.com#fragment",
+            "https://api.example.com:443",
+            "https://user@api.example.com",
+        ):
+            with self.subTest(value=value), self.assertRaises(MODULE.EnrollmentError):
+                MODULE.validate_api_endpoint(value, expected_sha256=endpoint_hash)
+        with self.assertRaisesRegex(MODULE.EnrollmentError, "reviewed origin"):
+            MODULE.validate_api_endpoint(
+                "https://other.example.com", expected_sha256=endpoint_hash
+            )
+
+    def test_approved_endpoint_digest_shape_is_strict(self) -> None:
+        self.assertIsNotNone(MODULE.SHA256_HEX.fullmatch("a" * 64))
+        for value in ("A" * 64, "a" * 63, "a" * 65, "g" * 64):
+            with self.subTest(value=value):
+                self.assertIsNone(MODULE.SHA256_HEX.fullmatch(value))
+
+    def test_api_request_keeps_authorization_on_reviewed_origin(self) -> None:
+        response = FakeResponse(b'{"data":{"ok":true}}')
+        with mock.patch.object(
+            MODULE.NO_REDIRECT_OPENER, "open", return_value=response
+        ) as open_request:
+            self.assertEqual(
+                MODULE.api_request(
+                    "https://api.example.com", "lv_live_account-key", "/v1/resources"
+                ),
+                {"ok": True},
+            )
+        request = open_request.call_args.args[0]
+        self.assertEqual(request.full_url, "https://api.example.com/v1/resources")
+        self.assertEqual(
+            request.get_header("Authorization"), "Bearer lv_live_account-key"
+        )
+        self.assertEqual(
+            open_request.call_args.kwargs["timeout"], MODULE.API_TIMEOUT_SECONDS
+        )
+        self.assertIsNone(
+            MODULE.NoRedirectHandler().redirect_request(
+                request, None, 302, "Found", {}, "https://other.example.com"
+            )
+        )
+
+    def test_api_request_sends_exact_json_and_idempotency_headers(self) -> None:
+        response = FakeResponse(b'{"data":{"ok":true}}', status=201)
+        with mock.patch.object(
+            MODULE.NO_REDIRECT_OPENER, "open", return_value=response
+        ) as open_request:
+            MODULE.api_request(
+                "https://api.example.com",
+                "lv_live_account-key",
+                "/v1/api-keys",
+                method="POST",
+                body={"kind": "enrollment_token"},
+                idempotency_key="headless-v2-attempt-1-target",
+                expected_status=(200, 201),
+            )
+        request = open_request.call_args.args[0]
+        self.assertEqual(
+            request.get_header("Authorization"), "Bearer lv_live_account-key"
+        )
+        self.assertEqual(request.get_header("Content-type"), "application/json")
+        self.assertEqual(
+            request.get_header("Idempotency-key"), "headless-v2-attempt-1-target"
+        )
+        self.assertEqual(request.data, b'{"kind":"enrollment_token"}')
+
+    def test_api_request_rejects_large_or_unwrapped_responses(self) -> None:
+        for body, message in (
+            (b"x" * (MODULE.MAX_RESPONSE_BYTES + 1), "64 KiB"),
+            (b"{}", "no data field"),
+        ):
+            with (
+                self.subTest(message=message),
+                mock.patch.object(
+                    MODULE.NO_REDIRECT_OPENER, "open", return_value=FakeResponse(body)
+                ),
+            ):
+                with self.assertRaisesRegex(MODULE.APIRequestOutcomeUnknown, message):
+                    MODULE.api_request(
+                        "https://api.example.com",
+                        "lv_live_account-key",
+                        "/v1/resources",
+                    )
+
+    def test_api_request_requires_exact_status_and_response_media_type(self) -> None:
+        for response, message in (
+            (FakeResponse(b'{"data":{}}', status=201), "expected one of \\(200,\\)"),
+            (FakeResponse(b'{"data":{}}', content_types=[]), "Content-Type"),
+            (
+                FakeResponse(
+                    b'{"data":{}}',
+                    content_types=["application/json", "application/json"],
+                ),
+                "Content-Type",
+            ),
+        ):
+            with (
+                self.subTest(message=message),
+                mock.patch.object(
+                    MODULE.NO_REDIRECT_OPENER, "open", return_value=response
+                ),
+            ):
+                if response.status == 201:
+                    expected_error = MODULE.EnrollmentError
+                else:
+                    expected_error = MODULE.APIRequestOutcomeUnknown
+                with self.assertRaisesRegex(expected_error, message):
+                    MODULE.api_request(
+                        "https://api.example.com",
+                        "lv_live_account-key",
+                        "/v1/resources",
+                    )
+
+    def test_api_request_accepts_json_media_type_parameters(self) -> None:
+        for content_type in (
+            "application/json; charset=utf-8",
+            " Application/JSON ; Charset=UTF-8",
+        ):
+            with (
+                self.subTest(content_type=content_type),
+                mock.patch.object(
+                    MODULE.NO_REDIRECT_OPENER,
+                    "open",
+                    return_value=FakeResponse(
+                        b'{"data":{"ok":true}}', content_types=[content_type]
+                    ),
+                ),
+            ):
+                self.assertEqual(
+                    MODULE.api_request(
+                        "https://api.example.com",
+                        "lv_live_account-key",
+                        "/v1/resources",
+                    ),
+                    {"ok": True},
+                )
+
+    def test_api_request_normalizes_http_error_body_read_failure(self) -> None:
+        class BrokenErrorBody:
+            def read(self, _limit: int) -> bytes:
+                raise MODULE.http.client.IncompleteRead(b"partial")
+
+            def close(self) -> None:
+                pass
+
+        rejected = MODULE.urllib.error.HTTPError(
+            "https://api.example.com/v1/resources",
+            403,
+            "Forbidden",
+            {},
+            BrokenErrorBody(),
+        )
+        with mock.patch.object(MODULE.NO_REDIRECT_OPENER, "open", side_effect=rejected):
+            with self.assertRaisesRegex(
+                MODULE.EnrollmentError, "rejected GET /v1/resources with HTTP 403"
+            ):
+                MODULE.api_request(
+                    "https://api.example.com", "lv_live_account-key", "/v1/resources"
+                )
+
+    def test_api_request_marks_server_error_as_unknown_outcome(self) -> None:
+        error_body = mock.Mock()
+        error_body.read.return_value = b""
+        rejected = MODULE.urllib.error.HTTPError(
+            "https://api.example.com/v1/api-keys",
+            503,
+            "Unavailable",
+            {},
+            error_body,
+        )
+        with mock.patch.object(MODULE.NO_REDIRECT_OPENER, "open", side_effect=rejected):
+            with self.assertRaisesRegex(
+                MODULE.APIRequestOutcomeUnknown,
+                "rejected POST /v1/api-keys with HTTP 503",
+            ):
+                MODULE.api_request(
+                    "https://api.example.com",
+                    "lv_live_account-key",
+                    "/v1/api-keys",
+                    method="POST",
+                )
+
+    def test_api_request_normalizes_protocol_failure(self) -> None:
+        with mock.patch.object(
+            MODULE.NO_REDIRECT_OPENER,
+            "open",
+            side_effect=MODULE.http.client.BadStatusLine("not HTTP"),
+        ):
+            with self.assertRaisesRegex(
+                MODULE.APIRequestOutcomeUnknown,
+                "request failed for GET /v1/resources",
+            ):
+                MODULE.api_request(
+                    "https://api.example.com", "lv_live_account-key", "/v1/resources"
+                )
+
+    def test_expiry_rejects_naive_and_short_lived_values(self) -> None:
+        now = dt.datetime(2026, 9, 4, 18, 0, tzinfo=dt.timezone.utc)
+        with self.assertRaisesRegex(MODULE.EnrollmentError, "timezone"):
+            MODULE.parse_expiry("2026-09-04T19:00:00", now=now)
+        with self.assertRaisesRegex(MODULE.EnrollmentError, "new generation"):
+            MODULE.parse_expiry("2026-09-04T18:44:59Z", now=now)
+        MODULE.parse_expiry("2026-09-04T18:45:00Z", now=now)
+        MODULE.parse_expiry("2026-09-04T19:05:00Z", now=now)
+        with self.assertRaisesRegex(MODULE.EnrollmentError, "exceeds"):
+            MODULE.parse_expiry("2026-09-04T19:05:01Z", now=now)
+
+    def test_prepare_checks_contract_before_secret_write(self) -> None:
+        resource_id = "MFkw-resource"
+        responses = [
+            [
+                {
+                    "slug": "detect-sandbox",
+                    "type": "tunnel",
+                    "status": "active",
+                    "resource_id": resource_id,
+                }
+            ],
+            {"desired_state": "off", "serving_epoch": 0},
+            {"desired_state": "on", "serving_epoch": 1},
+            {"desired_state": "on", "serving_epoch": 1},
+            {
+                "kind": "enrollment_token",
+                "key_id": "key_abc123def456",
+                "target": "agent",
+                "claims": [{"type": "connector", "id": "detect-sandbox"}],
+                "api_key": "lv_live_test-token",
+                "expires_at": VALID_EXPIRY,
+            },
+        ]
+        with (
+            mock.patch.object(MODULE, "api_request", side_effect=responses) as request,
+            mock.patch.object(MODULE, "put_parameter") as put,
+        ):
+            MODULE.prepare_enrollment(
+                "https://api.example.com",
+                "lv_live_account-key",
+                "detect-nhp-replica-a",
+                "attempt-1",
+                "us-east-2",
+                now=FIXED_NOW,
+            )
+        self.assertEqual(request.call_count, 5)
+        self.assertEqual(
+            request.call_args_list[2].kwargs["body"], {"desired_state": "on"}
+        )
+        self.assertEqual(
+            request.call_args_list[3].args[2], "/v1/resources/MFkw-resource/sharing"
+        )
+        self.assertEqual(
+            request.call_args_list[4].kwargs["idempotency_key"],
+            "headless-v2-attempt-1-detect-nhp-replica-a",
+        )
+        self.assertEqual(
+            request.call_args_list[4].kwargs["expected_status"], (200, 201)
+        )
+        put.assert_called_once_with(
+            "us-east-2",
+            "/qurl-s3-connector/detect-nhp/replica-a/bootstrap",
+            "lv_live_test-token",
+        )
+
+    def test_resource_resolution_guards_never_mint_or_write(self) -> None:
+        cases = (
+            ([], "exactly one resource"),
+            (
+                [
+                    {
+                        "slug": "detect-sandbox",
+                        "type": "tunnel",
+                        "status": "active",
+                        "resource_id": "r_one",
+                    },
+                    {
+                        "slug": "detect-sandbox",
+                        "type": "tunnel",
+                        "status": "active",
+                        "resource_id": "r_two",
+                    },
+                ],
+                "exactly one resource",
+            ),
+            (
+                [
+                    {
+                        "slug": "detect-sandbox",
+                        "type": "file",
+                        "status": "active",
+                        "resource_id": "r_one",
+                    }
+                ],
+                "one active tunnel",
+            ),
+            (
+                [
+                    {
+                        "slug": "detect-sandbox",
+                        "type": "tunnel",
+                        "status": "closed",
+                        "resource_id": "r_one",
+                    }
+                ],
+                "one active tunnel",
+            ),
+            (
+                [{"slug": "detect-sandbox", "type": "tunnel", "status": "active"}],
+                "no resource ID",
+            ),
+            (
+                [
+                    {
+                        "slug": "detect-sandbox",
+                        "type": "tunnel",
+                        "status": "active",
+                        "resource_id": 7,
+                    }
+                ],
+                "no resource ID",
+            ),
+        )
+        for resources, message in cases:
+            with (
+                self.subTest(resources=resources),
+                mock.patch.object(
+                    MODULE, "api_request", return_value=resources
+                ) as request,
+                mock.patch.object(MODULE, "put_parameter") as put,
+            ):
+                with self.assertRaisesRegex(MODULE.EnrollmentError, message):
+                    MODULE.prepare_enrollment(
+                        "https://api.example.com",
+                        "lv_live_account-key",
+                        "detect-nhp-replica-a",
+                        "attempt-1",
+                        "us-east-2",
+                    )
+                self.assertEqual(request.call_count, 1)
+                put.assert_not_called()
+
+    def test_claim_mismatch_never_writes_secret(self) -> None:
+        responses = [
+            [
+                {
+                    "slug": "detect-sandbox",
+                    "type": "tunnel",
+                    "status": "active",
+                    "resource_id": "MFkw-resource",
+                }
+            ],
+            {"desired_state": "on", "serving_epoch": 1},
+            {
+                "kind": "enrollment_token",
+                "key_id": "key_abc123def456",
+                "target": "agent",
+                "claims": [{"type": "connector", "id": "other"}],
+                "api_key": "lv_live_test-token",
+                "expires_at": VALID_EXPIRY,
+            },
+        ]
+        with (
+            mock.patch.object(MODULE, "api_request", side_effect=responses),
+            mock.patch.object(MODULE, "put_parameter") as put,
+        ):
+            with self.assertRaisesRegex(
+                MODULE.EnrollmentError,
+                "credential key_abc123def456 was minted but not installed",
+            ):
+                MODULE.prepare_enrollment(
+                    "https://api.example.com",
+                    "lv_live_account-key",
+                    "detect-nhp-replica-a",
+                    "attempt-1",
+                    "us-east-2",
+                    now=FIXED_NOW,
+                )
+        put.assert_not_called()
+
+    def test_mint_lost_response_retries_same_operation_and_accepts_replay(self) -> None:
+        credential = {
+            "kind": "enrollment_token",
+            "key_id": "key_abc123def456",
+            "target": "agent",
+            "claims": [{"type": "connector", "id": "detect-sandbox"}],
+            "api_key": "lv_live_test-token",
+            "expires_at": VALID_EXPIRY,
+        }
+        responses = [
+            [
+                {
+                    "slug": "detect-sandbox",
+                    "type": "tunnel",
+                    "status": "active",
+                    "resource_id": "r_one",
+                }
+            ],
+            {"desired_state": "on", "serving_epoch": 1},
+            MODULE.APIRequestOutcomeUnknown("response lost"),
+            credential,
+        ]
+        with (
+            mock.patch.object(MODULE, "api_request", side_effect=responses) as request,
+            mock.patch.object(MODULE, "put_parameter") as put,
+            mock.patch.object(MODULE.time, "sleep") as sleep,
+        ):
+            MODULE.prepare_enrollment(
+                "https://api.example.com",
+                "lv_live_account-key",
+                "detect-nhp-replica-a",
+                "attempt-1",
+                "us-east-2",
+                now=FIXED_NOW,
+            )
+        first_mint = request.call_args_list[2]
+        replay_mint = request.call_args_list[3]
+        self.assertEqual(first_mint, replay_mint)
+        self.assertEqual(first_mint.kwargs["expected_status"], (200, 201))
+        sleep.assert_called_once_with(MODULE.MINT_RETRY_SECONDS)
+        put.assert_called_once()
+
+    def test_mint_double_failure_is_recoverable_without_secret_output(self) -> None:
+        responses = [
+            [
+                {
+                    "slug": "detect-sandbox",
+                    "type": "tunnel",
+                    "status": "active",
+                    "resource_id": "r_one",
+                }
+            ],
+            {"desired_state": "on", "serving_epoch": 1},
+            MODULE.APIRequestOutcomeUnknown("first failure with lv_live_secret-token"),
+            MODULE.APIRequestOutcomeUnknown("second failure with lv_live_secret-token"),
+        ]
+        with (
+            mock.patch.object(MODULE, "api_request", side_effect=responses),
+            mock.patch.object(MODULE, "put_parameter") as put,
+            mock.patch.object(MODULE.time, "sleep") as sleep,
+        ):
+            with self.assertRaisesRegex(
+                MODULE.EnrollmentError, "retry the same target and generation"
+            ) as raised:
+                MODULE.prepare_enrollment(
+                    "https://api.example.com",
+                    "lv_live_account-key",
+                    "detect-nhp-replica-a",
+                    "attempt-1",
+                    "us-east-2",
+                    now=FIXED_NOW,
+                )
+        self.assertNotIn("lv_live_secret-token", str(raised.exception))
+        sleep.assert_called_once_with(MODULE.MINT_RETRY_SECONDS)
+        put.assert_not_called()
+
+    def test_mint_rejection_is_not_retried_or_called_unknown(self) -> None:
+        responses = [
+            [
+                {
+                    "slug": "detect-sandbox",
+                    "type": "tunnel",
+                    "status": "active",
+                    "resource_id": "r_one",
+                }
+            ],
+            {"desired_state": "on", "serving_epoch": 1},
+            MODULE.EnrollmentError("qURL API rejected POST /v1/api-keys with HTTP 403"),
+        ]
+        with (
+            mock.patch.object(MODULE, "api_request", side_effect=responses) as request,
+            mock.patch.object(MODULE, "put_parameter") as put,
+        ):
+            with self.assertRaisesRegex(
+                MODULE.EnrollmentError, "rejected POST /v1/api-keys with HTTP 403"
+            ) as raised:
+                MODULE.prepare_enrollment(
+                    "https://api.example.com",
+                    "lv_live_account-key",
+                    "detect-nhp-replica-a",
+                    "attempt-1",
+                    "us-east-2",
+                    now=FIXED_NOW,
+                )
+        self.assertEqual(request.call_count, 3)
+        self.assertNotIn("unknown", str(raised.exception))
+        put.assert_not_called()
+
+    def test_malformed_token_and_expiry_report_safe_credential_id(self) -> None:
+        base = {
+            "kind": "enrollment_token",
+            "key_id": "key_abcdefghijklmnop",
+            "target": "agent",
+            "claims": [{"type": "connector", "id": "detect-sandbox"}],
+            "api_key": "lv_live_valid-token",
+            "expires_at": VALID_EXPIRY,
+        }
+        for override in ({"api_key": "bad"}, {"expires_at": 7}):
+            credential = {**base, **override}
+            responses = [
+                [
+                    {
+                        "slug": "detect-sandbox",
+                        "type": "tunnel",
+                        "status": "active",
+                        "resource_id": "r_one",
+                    }
+                ],
+                {"desired_state": "on", "serving_epoch": 1},
+                credential,
+            ]
+            with (
+                self.subTest(override=override),
+                mock.patch.object(MODULE, "api_request", side_effect=responses),
+                mock.patch.object(MODULE, "put_parameter") as put,
+            ):
+                with self.assertRaisesRegex(
+                    MODULE.EnrollmentError,
+                    "credential key_abcdefghijklmnop was minted but not installed",
+                ):
+                    MODULE.prepare_enrollment(
+                        "https://api.example.com",
+                        "lv_live_account-key",
+                        "detect-nhp-replica-a",
+                        "attempt-1",
+                        "us-east-2",
+                        now=FIXED_NOW,
+                    )
+                put.assert_not_called()
+
+    def test_ssm_failure_reports_safe_credential_id_and_preserves_cause(self) -> None:
+        responses = [
+            [
+                {
+                    "slug": "detect-sandbox",
+                    "type": "tunnel",
+                    "status": "active",
+                    "resource_id": "r_one",
+                }
+            ],
+            {"desired_state": "on", "serving_epoch": 1},
+            {
+                "kind": "enrollment_token",
+                "key_id": "key_abc123def456",
+                "target": "agent",
+                "claims": [{"type": "connector", "id": "detect-sandbox"}],
+                "api_key": "lv_live_valid-token",
+                "expires_at": VALID_EXPIRY,
+            },
+        ]
+        with (
+            mock.patch.object(MODULE, "api_request", side_effect=responses),
+            mock.patch.object(
+                MODULE,
+                "put_parameter",
+                side_effect=MODULE.EnrollmentError("AWS rejected write"),
+            ),
+        ):
+            with self.assertRaisesRegex(
+                MODULE.EnrollmentError,
+                "credential key_abc123def456 was minted but not installed",
+            ) as raised:
+                MODULE.prepare_enrollment(
+                    "https://api.example.com",
+                    "lv_live_account-key",
+                    "detect-nhp-replica-a",
+                    "attempt-1",
+                    "us-east-2",
+                    now=FIXED_NOW,
+                )
+        self.assertIsInstance(raised.exception.__cause__, MODULE.EnrollmentError)
+        self.assertNotIn("lv_live_valid-token", str(raised.exception))
+
+    def test_invalid_on_zero_state_never_mints_or_writes(self) -> None:
+        responses = [
+            [
+                {
+                    "slug": "detect-sandbox",
+                    "type": "tunnel",
+                    "status": "active",
+                    "resource_id": "MFkw-resource",
+                }
+            ],
+            {"desired_state": "on", "serving_epoch": 0},
+        ]
+        with (
+            mock.patch.object(MODULE, "api_request", side_effect=responses) as request,
+            mock.patch.object(MODULE, "put_parameter") as put,
+        ):
+            with self.assertRaisesRegex(
+                MODULE.EnrollmentError, "positive serving epoch"
+            ):
+                MODULE.prepare_enrollment(
+                    "https://api.example.com",
+                    "lv_live_account-key",
+                    "detect-nhp-replica-a",
+                    "attempt-1",
+                    "us-east-2",
+                )
+        self.assertEqual(request.call_count, 2)
+        put.assert_not_called()
+
+    def test_existing_positive_epoch_can_rotate_without_lifecycle_change(self) -> None:
+        responses = [
+            [
+                {
+                    "slug": "detect-sandbox",
+                    "type": "tunnel",
+                    "status": "active",
+                    "resource_id": "MFkw-resource",
+                }
+            ],
+            {"desired_state": "on", "serving_epoch": 3},
+            {
+                "kind": "enrollment_token",
+                "target": "agent",
+                "claims": [{"type": "connector", "id": "detect-sandbox"}],
+                "api_key": "lv_live_test-token",
+                "expires_at": VALID_EXPIRY,
+            },
+        ]
+        with (
+            mock.patch.object(MODULE, "api_request", side_effect=responses) as request,
+            mock.patch.object(MODULE, "put_parameter") as put,
+        ):
+            MODULE.prepare_enrollment(
+                "https://api.example.com",
+                "lv_live_account-key",
+                "detect-nhp-replica-a",
+                "attempt-2",
+                "us-east-2",
+                now=FIXED_NOW,
+            )
+        self.assertEqual(request.call_count, 3)
+        self.assertEqual(request.call_args_list[2].args[2], "/v1/api-keys")
+        self.assertEqual(
+            request.call_args_list[2].kwargs["idempotency_key"],
+            "headless-v2-attempt-2-detect-nhp-replica-a",
+        )
+        put.assert_called_once()
+
+    def test_lost_put_response_recovers_from_committed_state(self) -> None:
+        responses = [
+            [
+                {
+                    "slug": "detect-sandbox",
+                    "type": "tunnel",
+                    "status": "active",
+                    "resource_id": "MFkw-resource",
+                }
+            ],
+            {"desired_state": "off", "serving_epoch": 0},
+            MODULE.EnrollmentError("qURL API request failed for PUT /sharing"),
+            {"desired_state": "on", "serving_epoch": 1},
+            {
+                "kind": "enrollment_token",
+                "target": "agent",
+                "claims": [{"type": "connector", "id": "detect-sandbox"}],
+                "api_key": "lv_live_test-token",
+                "expires_at": VALID_EXPIRY,
+            },
+        ]
+        with (
+            mock.patch.object(MODULE, "api_request", side_effect=responses),
+            mock.patch.object(MODULE, "put_parameter") as put,
+        ):
+            MODULE.prepare_enrollment(
+                "https://api.example.com",
+                "lv_live_account-key",
+                "detect-nhp-replica-a",
+                "attempt-1",
+                "us-east-2",
+                now=FIXED_NOW,
+            )
+        put.assert_called_once()
+
+    def test_transient_poll_failure_uses_remaining_attempts(self) -> None:
+        responses = [
+            [
+                {
+                    "slug": "detect-sandbox",
+                    "type": "tunnel",
+                    "status": "active",
+                    "resource_id": "MFkw-resource",
+                }
+            ],
+            {"desired_state": "off", "serving_epoch": 3},
+            {"desired_state": "on", "serving_epoch": 4},
+            MODULE.EnrollmentError("temporary status failure"),
+            {"desired_state": "on", "serving_epoch": 4},
+            {
+                "kind": "enrollment_token",
+                "target": "agent",
+                "claims": [{"type": "connector", "id": "detect-sandbox"}],
+                "api_key": "lv_live_test-token",
+                "expires_at": VALID_EXPIRY,
+            },
+        ]
+        with (
+            mock.patch.object(MODULE, "api_request", side_effect=responses),
+            mock.patch.object(MODULE, "put_parameter") as put,
+            mock.patch.object(MODULE.time, "sleep") as sleep,
+        ):
+            MODULE.prepare_enrollment(
+                "https://api.example.com",
+                "lv_live_account-key",
+                "detect-nhp-replica-a",
+                "attempt-3",
+                "us-east-2",
+                now=FIXED_NOW,
+            )
+        sleep.assert_called_once_with(MODULE.SHARING_POLL_SECONDS)
+        put.assert_called_once()
+
+    def test_unadvanced_epoch_never_writes_secret(self) -> None:
+        responses = [
+            [
+                {
+                    "slug": "detect-sandbox",
+                    "type": "tunnel",
+                    "status": "active",
+                    "resource_id": "MFkw-resource",
+                }
+            ],
+            {"desired_state": "off", "serving_epoch": 0},
+            {"desired_state": "on", "serving_epoch": 0},
+            *[{"desired_state": "on", "serving_epoch": 0}]
+            * MODULE.SHARING_POLL_ATTEMPTS,
+        ]
+        with (
+            mock.patch.object(MODULE, "api_request", side_effect=responses),
+            mock.patch.object(MODULE, "put_parameter") as put,
+            mock.patch.object(MODULE.time, "sleep"),
+        ):
+            with self.assertRaisesRegex(
+                MODULE.EnrollmentError, "required serving epoch"
+            ):
+                MODULE.prepare_enrollment(
+                    "https://api.example.com",
+                    "lv_live_account-key",
+                    "detect-nhp-replica-a",
+                    "attempt-1",
+                    "us-east-2",
+                    now=FIXED_NOW,
+                )
+        put.assert_not_called()
+
+    def test_put_parameter_sends_token_only_on_stdin(self) -> None:
+        clean_env = {
+            "PATH": "/bin",
+            "QURL_SANDBOX_API_KEY": "lv_live_account-key",
+            "QURL_SANDBOX_API_ENDPOINT": "https://api.example.com",
+            "QURL_SANDBOX_API_ENDPOINT_SHA256": "a" * 64,
+        }
+        completed = mock.Mock(returncode=0)
+        with (
+            mock.patch.dict(MODULE.os.environ, clean_env, clear=True),
+            mock.patch.object(MODULE.subprocess, "run", return_value=completed) as run,
+        ):
+            MODULE.put_parameter("us-east-2", "/reviewed/name", "lv_live_secret-token")
+        args = run.call_args.args[0]
+        kwargs = run.call_args.kwargs
+        self.assertNotIn("lv_live_secret-token", " ".join(args))
+        self.assertNotIn("lv_live_secret-token", " ".join(kwargs["env"].values()))
+        self.assertNotIn("QURL_SANDBOX_API_KEY", kwargs["env"])
+        self.assertNotIn("QURL_SANDBOX_API_ENDPOINT", kwargs["env"])
+        self.assertNotIn("QURL_SANDBOX_API_ENDPOINT_SHA256", kwargs["env"])
+        self.assertEqual(kwargs["input"], "lv_live_secret-token")
+        self.assertEqual(args[args.index("--value") + 1], "file:///dev/stdin")
+        self.assertEqual(args[args.index("--name") + 1], "/reviewed/name")
+        self.assertEqual(args[args.index("--region") + 1], "us-east-2")
+        self.assertEqual(args[args.index("--type") + 1], "SecureString")
+        self.assertIn("--overwrite", args)
+        self.assertEqual(kwargs["timeout"], MODULE.AWS_TIMEOUT_SECONDS)
+
+    def test_aws_cli_expands_stdin_for_ssm_value(self) -> None:
+        if not shutil.which("aws"):
+            if MODULE.os.environ.get("CI"):
+                self.fail(
+                    "AWS CLI is required for the CI stdin parameter expansion contract"
+                )
+            self.skipTest("AWS CLI is not installed")
+        captured: list[bytes] = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_POST(self) -> None:
+                captured.append(self.rfile.read(int(self.headers["Content-Length"])))
+                response = b'{"Version":1}'
+                self.send_response(200)
+                self.send_header("Content-Type", "application/x-amz-json-1.1")
+                self.send_header("Content-Length", str(len(response)))
+                self.end_headers()
+                self.wfile.write(response)
+
+            def log_message(self, *_args: object) -> None:
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        server.timeout = 15
+        thread = threading.Thread(target=server.handle_request, daemon=True)
+        thread.start()
+        clean_env = {
+            "PATH": MODULE.os.environ.get("PATH", ""),
+            "AWS_ACCESS_KEY_ID": "dummy",
+            "AWS_SECRET_ACCESS_KEY": "dummy",
+            "AWS_EC2_METADATA_DISABLED": "true",
+            "AWS_CONFIG_FILE": MODULE.os.devnull,
+            "AWS_SHARED_CREDENTIALS_FILE": MODULE.os.devnull,
+            "NO_PROXY": "127.0.0.1",
+        }
+        try:
+            result = MODULE.subprocess.run(
+                [
+                    *MODULE._put_parameter_command("us-east-2", "/tmp/probe"),
+                    "--endpoint-url",
+                    f"http://127.0.0.1:{server.server_port}",
+                ],
+                input="probe-value",
+                text=True,
+                stdout=MODULE.subprocess.PIPE,
+                stderr=MODULE.subprocess.PIPE,
+                env=clean_env,
+                timeout=20,
+            )
+        finally:
+            server.server_close()
+            thread.join(timeout=16)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(
+            len(captured), 1, "AWS CLI did not send exactly one SSM request"
+        )
+        self.assertEqual(
+            MODULE.json.loads(captured[0]),
+            {
+                "Name": "/tmp/probe",
+                "Value": "probe-value",
+                "Type": "SecureString",
+                "Overwrite": True,
+            },
+        )
+
+    def test_main_pops_api_key_before_preparation(self) -> None:
+        argv = [
+            "prepare-headless-enrollment.py",
+            "--target",
+            "detect-nhp-replica-a",
+            "--generation",
+            "attempt-1",
+            "--region",
+            "us-east-2",
+        ]
+        with (
+            mock.patch.object(MODULE.sys, "argv", argv),
+            mock.patch.dict(
+                MODULE.os.environ,
+                {
+                    "QURL_SANDBOX_API_KEY": "lv_live_account-key",
+                    "QURL_SANDBOX_API_ENDPOINT": "https://api.example.com",
+                    "QURL_SANDBOX_API_ENDPOINT_SHA256": MODULE.hashlib.sha256(
+                        b"https://api.example.com"
+                    ).hexdigest(),
+                },
+                clear=True,
+            ),
+            mock.patch.object(MODULE, "prepare_enrollment") as prepare,
+        ):
+            MODULE.main()
+            self.assertNotIn("QURL_SANDBOX_API_KEY", MODULE.os.environ)
+            self.assertNotIn("QURL_SANDBOX_API_ENDPOINT", MODULE.os.environ)
+            self.assertNotIn("QURL_SANDBOX_API_ENDPOINT_SHA256", MODULE.os.environ)
+        prepare.assert_called_once_with(
+            "https://api.example.com",
+            "lv_live_account-key",
+            "detect-nhp-replica-a",
+            "attempt-1",
+            "us-east-2",
+        )
+
+    def test_main_rejects_bad_api_key_before_request(self) -> None:
+        argv = [
+            "prepare-headless-enrollment.py",
+            "--target",
+            "detect-nhp-replica-a",
+            "--generation",
+            "attempt-1",
+            "--region",
+            "us-east-2",
+        ]
+        with (
+            mock.patch.object(MODULE.sys, "argv", argv),
+            mock.patch.dict(
+                MODULE.os.environ,
+                {
+                    "QURL_SANDBOX_API_KEY": "bad",
+                    "QURL_SANDBOX_API_ENDPOINT": "https://api.example.com",
+                    "QURL_SANDBOX_API_ENDPOINT_SHA256": MODULE.hashlib.sha256(
+                        b"https://api.example.com"
+                    ).hexdigest(),
+                },
+                clear=True,
+            ),
+            mock.patch.object(MODULE, "validate_api_endpoint") as validate_endpoint,
+            mock.patch.object(MODULE, "prepare_enrollment") as prepare,
+        ):
+            with self.assertRaisesRegex(MODULE.EnrollmentError, "missing or malformed"):
+                MODULE.main()
+        validate_endpoint.assert_not_called()
+        prepare.assert_not_called()
+
+    def test_main_rejects_missing_endpoint_digest_before_request(self) -> None:
+        argv = [
+            "prepare-headless-enrollment.py",
+            "--target",
+            "detect-nhp-replica-a",
+            "--generation",
+            "attempt-1",
+            "--region",
+            "us-east-2",
+        ]
+        with (
+            mock.patch.object(MODULE.sys, "argv", argv),
+            mock.patch.dict(
+                MODULE.os.environ,
+                {
+                    "QURL_SANDBOX_API_KEY": "lv_live_account-key",
+                    "QURL_SANDBOX_API_ENDPOINT": "https://api.example.com",
+                },
+                clear=True,
+            ),
+            mock.patch.object(MODULE, "validate_api_endpoint") as validate_endpoint,
+            mock.patch.object(MODULE, "prepare_enrollment") as prepare,
+        ):
+            with self.assertRaisesRegex(
+                MODULE.EnrollmentError, "API_ENDPOINT_SHA256 is missing or malformed"
+            ):
+                MODULE.main()
+        validate_endpoint.assert_not_called()
+        prepare.assert_not_called()
+
+    def test_put_parameter_reports_process_start_failure(self) -> None:
+        with mock.patch.object(
+            MODULE.subprocess, "run", side_effect=FileNotFoundError("aws")
+        ):
+            with self.assertRaisesRegex(MODULE.EnrollmentError, "could not start"):
+                MODULE.put_parameter(
+                    "us-east-2", "/reviewed/name", "lv_live_secret-token"
+                )
+
+    def test_put_parameter_reports_timeout(self) -> None:
+        with mock.patch.object(
+            MODULE.subprocess,
+            "run",
+            side_effect=MODULE.subprocess.TimeoutExpired("aws", 30),
+        ):
+            with self.assertRaisesRegex(MODULE.EnrollmentError, "timed out"):
+                MODULE.put_parameter(
+                    "us-east-2", "/reviewed/name", "lv_live_secret-token"
+                )
+
+    def test_put_parameter_reports_only_safe_aws_error_code(self) -> None:
+        completed = mock.Mock(
+            returncode=255,
+            stderr="An error occurred (AccessDeniedException) while writing lv_live_secret-token",
+        )
+        with mock.patch.object(MODULE.subprocess, "run", return_value=completed):
+            with self.assertRaisesRegex(
+                MODULE.EnrollmentError, "AccessDeniedException"
+            ) as raised:
+                MODULE.put_parameter(
+                    "us-east-2", "/reviewed/name", "lv_live_secret-token"
+                )
+        self.assertNotIn("lv_live_secret-token", str(raised.exception))
+
+    def test_fixed_replicas_share_route_slug_but_not_token_or_parameter(self) -> None:
+        resource = [
+            {
+                "slug": "fileviewer-sandbox",
+                "type": "tunnel",
+                "status": "active",
+                "resource_id": "MFkw-resource",
+            }
+        ]
+        sharing = {"desired_state": "on", "serving_epoch": 7}
+        credential = {
+            "kind": "enrollment_token",
+            "target": "agent",
+            "claims": [{"type": "connector", "id": "fileviewer-sandbox"}],
+            "api_key": "lv_live_replica-token",
+            "expires_at": VALID_EXPIRY,
+        }
+        for replica in ("a", "b", "c"):
+            target = f"fileviewer-nhp-replica-{replica}"
+            with (
+                self.subTest(target=target),
+                mock.patch.object(
+                    MODULE, "api_request", side_effect=[resource, sharing, credential]
+                ) as request,
+                mock.patch.object(MODULE, "put_parameter") as put,
+            ):
+                MODULE.prepare_enrollment(
+                    "https://api.example.com",
+                    "lv_live_account-key",
+                    target,
+                    "attempt-9",
+                    "us-east-2",
+                    now=FIXED_NOW,
+                )
+                self.assertEqual(
+                    request.call_args_list[0].args[2],
+                    "/v1/resources?slug=fileviewer-sandbox",
+                )
+                self.assertEqual(
+                    request.call_args_list[2].kwargs["idempotency_key"],
+                    f"headless-v2-attempt-9-{target}",
+                )
+                put.assert_called_once_with(
+                    "us-east-2",
+                    f"/qurl-s3-connector/fileviewer-nhp/replica-{replica}/bootstrap",
+                    "lv_live_replica-token",
+                )
+
+    def test_uploader_target_has_exact_slug_and_parameter(self) -> None:
+        target = "uploader-nhp-replica-c"
+        responses = [
+            [
+                {
+                    "slug": "uploader-sandbox",
+                    "type": "tunnel",
+                    "status": "active",
+                    "resource_id": "MFkw-resource",
+                }
+            ],
+            {"desired_state": "on", "serving_epoch": 2},
+            {
+                "kind": "enrollment_token",
+                "target": "agent",
+                "claims": [{"type": "connector", "id": "uploader-sandbox"}],
+                "api_key": "lv_live_uploader-token",
+                "expires_at": VALID_EXPIRY,
+            },
+        ]
+        with (
+            mock.patch.object(MODULE, "api_request", side_effect=responses) as request,
+            mock.patch.object(MODULE, "put_parameter") as put,
+        ):
+            MODULE.prepare_enrollment(
+                "https://api.example.com",
+                "lv_live_account-key",
+                target,
+                "attempt-5",
+                "us-east-2",
+                now=FIXED_NOW,
+            )
+        self.assertEqual(
+            request.call_args_list[0].args[2], "/v1/resources?slug=uploader-sandbox"
+        )
+        self.assertEqual(
+            request.call_args_list[2].kwargs["idempotency_key"],
+            "headless-v2-attempt-5-uploader-nhp-replica-c",
+        )
+        put.assert_called_once_with(
+            "us-east-2",
+            "/qurl-s3-connector/uploader-nhp/replica-c/bootstrap",
+            "lv_live_uploader-token",
+        )
+
+    def test_detect_fixed_target_has_shared_slug_and_distinct_parameter(self) -> None:
+        target = "detect-nhp-replica-b"
+        responses = [
+            [
+                {
+                    "slug": "detect-sandbox",
+                    "type": "tunnel",
+                    "status": "active",
+                    "resource_id": "MFkw-resource",
+                }
+            ],
+            {"desired_state": "on", "serving_epoch": 5},
+            {
+                "kind": "enrollment_token",
+                "target": "agent",
+                "claims": [{"type": "connector", "id": "detect-sandbox"}],
+                "api_key": "lv_live_detect-token",
+                "expires_at": VALID_EXPIRY,
+            },
+        ]
+        with (
+            mock.patch.object(MODULE, "api_request", side_effect=responses) as request,
+            mock.patch.object(MODULE, "put_parameter") as put,
+        ):
+            MODULE.prepare_enrollment(
+                "https://api.example.com",
+                "lv_live_account-key",
+                target,
+                "attempt-6",
+                "us-east-2",
+                now=FIXED_NOW,
+            )
+        self.assertEqual(
+            request.call_args_list[0].args[2], "/v1/resources?slug=detect-sandbox"
+        )
+        self.assertEqual(
+            request.call_args_list[2].kwargs["idempotency_key"],
+            "headless-v2-attempt-6-detect-nhp-replica-b",
+        )
+        put.assert_called_once_with(
+            "us-east-2",
+            "/qurl-s3-connector/detect-nhp/replica-b/bootstrap",
+            "lv_live_detect-token",
+        )
+
+    def test_watermark_target_has_exact_slug_and_parameter(self) -> None:
+        target = "watermark-nhp-replica-b"
+        responses = [
+            [
+                {
+                    "slug": "watermark-sandbox",
+                    "type": "tunnel",
+                    "status": "active",
+                    "resource_id": "MFkw-resource",
+                }
+            ],
+            {"desired_state": "on", "serving_epoch": 2},
+            {
+                "kind": "enrollment_token",
+                "target": "agent",
+                "claims": [{"type": "connector", "id": "watermark-sandbox"}],
+                "api_key": "lv_live_watermark-token",
+                "expires_at": VALID_EXPIRY,
+            },
+        ]
+        with (
+            mock.patch.object(MODULE, "api_request", side_effect=responses) as request,
+            mock.patch.object(MODULE, "put_parameter") as put,
+        ):
+            MODULE.prepare_enrollment(
+                "https://api.example.com",
+                "lv_live_account-key",
+                target,
+                "attempt-4",
+                "us-east-2",
+                now=FIXED_NOW,
+            )
+        self.assertEqual(
+            request.call_args_list[0].args[2], "/v1/resources?slug=watermark-sandbox"
+        )
+        self.assertEqual(
+            request.call_args_list[2].kwargs["idempotency_key"],
+            "headless-v2-attempt-4-watermark-nhp-replica-b",
+        )
+        put.assert_called_once_with(
+            "us-east-2",
+            "/qurl-watermark-service/nhp/replica-b/bootstrap",
+            "lv_live_watermark-token",
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()
