@@ -28,8 +28,10 @@ var statusCmd = &cobra.Command{
 
 func init() {
 	statusCmd.Flags().BoolVar(&statusJSON, "json", false, "output status in JSON format")
-	statusCmd.Flags().BoolVar(&statusReady, "ready", false, "exit successfully only when every route is running")
+	statusCmd.Flags().BoolVar(&statusReady, "ready", false, "exit successfully only when every active route is serving")
 	statusCmd.MarkFlagsMutuallyExclusive("json", "ready")
+	// An unhealthy readiness probe is a runtime result, not a usage error.
+	statusCmd.SilenceUsage = true
 }
 
 // adminProxyStatus represents a single proxy status from the FRP admin API.
@@ -110,6 +112,10 @@ type routeStatus struct {
 // right branch from `running`, `adminDisabled`, `loadErr`, and
 // `discoverErr` independently.
 func runStatus(cmd *cobra.Command, _ []string) error {
+	if statusReady {
+		return probeConnectorHealth(commandContext(cmd))
+	}
+
 	// Load config first — both to show configured routes AND to learn
 	// whether the admin API is opted in. Without the opt-in there's
 	// no live state to query, so we render an on-disk-only view rather
@@ -226,17 +232,6 @@ func runStatus(cmd *cobra.Command, _ []string) error {
 	// `routeID-` prefix fallback covers env divergence and random-fallback
 	// salts that status cannot reproduce cross-process.
 	routes := buildRouteStatuses(cfg, proxyMap, running, adminDisabled)
-	if statusReady {
-		if !running || len(routes) == 0 {
-			return fmt.Errorf("connector routes are not ready")
-		}
-		for _, route := range routes {
-			if route.Status != "running" {
-				return fmt.Errorf("connector routes are not ready")
-			}
-		}
-		return nil
-	}
 
 	if statusJSON {
 		out := statusOutput{

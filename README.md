@@ -244,6 +244,24 @@ The developer command stays in the foreground:
 qurl-connector run
 ```
 
+An orchestrator that builds this diagnostic command itself can enable its
+process-local readiness endpoint with a loopback IP and port. The probe reads
+the live session runner directly: pending routes fail, permanently retired or
+removed routes do not fail healthy siblings, and make-before-break renewal
+keeps the active session ready while its replacement starts.
+
+```bash
+QURL_CONNECTOR_HEALTH_ADDR=127.0.0.1:7401 qurl-connector run
+QURL_CONNECTOR_HEALTH_ADDR=127.0.0.1:7401 qurl-connector status --ready
+```
+
+`status --ready` does not load the Connector config or call the FRP admin API.
+Its local request is capped at 750 ms, so an ECS health-check timeout of 2 s or
+more leaves adequate process-start overhead. The address is disabled when the
+environment variable is absent and rejects non-loopback hosts. This repository
+still does not publish the command as a container; a deployment must own and
+verify the wrapper artifact that embeds the released module.
+
 ## Supply chain
 
 - Releases are immutable Go module source tags; this repository publishes no

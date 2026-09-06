@@ -579,6 +579,54 @@ func TestSessionGroupRunnerWithdrawsGoneRouteWithoutDisturbingSiblings(t *testin
 	}
 }
 
+func TestSessionGroupRunnerRoutesReadyTracksActiveRoutesAcrossRotation(t *testing.T) {
+	hold := func(sessionIndex int, routeID string) bool {
+		return (sessionIndex == 1 && routeID == "c") || sessionIndex == 2
+	}
+	h := startGroupHarness(t, 2*time.Second, 0, hold, "a", "b", "c")
+	h.waitServing(t, 1, "a", "b")
+	if h.runner.RoutesReady() {
+		t.Fatal("runner reported ready while active route c was pending")
+	}
+
+	first := h.factory.session(1)
+	first.serve("c")
+	h.waitServing(t, 1, "c")
+	waitUntil(t, time.Second, h.runner.RoutesReady, "all active routes ready")
+
+	first.failRoute("b", fmt.Errorf("%w: resource_not_found", ErrResourceGone))
+	waitUntil(t, time.Second, func() bool {
+		_, present := h.runner.RouteStates()["b"]
+		return !present
+	}, "retired route removed from the active session")
+	if !h.runner.RoutesReady() {
+		t.Fatal("retired route made healthy siblings fail readiness")
+	}
+
+	remaining := groupTestRoutes("a", "c")
+	if err := h.runner.SetRoutes(context.Background(), remaining[:1]); err != nil {
+		t.Fatal(err)
+	}
+	waitUntil(t, time.Second, func() bool {
+		_, present := h.runner.RouteStates()["c"]
+		return !present
+	}, "removed route withdrawn from the active session")
+	if !h.runner.RoutesReady() {
+		t.Fatal("removed route made the remaining active route fail readiness")
+	}
+
+	waitUntil(t, 3*time.Second, func() bool { return h.factory.startCount() == 2 }, "replacement session start")
+	second := h.factory.session(2)
+	if !h.runner.RoutesReady() {
+		t.Fatal("pending replacement hid the still-serving active session")
+	}
+	second.serve("a")
+	waitUntil(t, time.Second, func() bool { return len(h.events.promotions()) == 2 }, "replacement promotion")
+	if !h.runner.RoutesReady() {
+		t.Fatal("runner was not ready after replacement promotion")
+	}
+}
+
 func TestSessionGroupRunnerReturnsWhenEveryRouteIsGone(t *testing.T) {
 	h := startGroupHarness(t, time.Hour, 0, nil, "a", "b", "c")
 	h.waitServing(t, 1, "a", "b", "c")

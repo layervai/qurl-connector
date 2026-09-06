@@ -319,57 +319,42 @@ func TestBuildRouteStatuses_NilCfgReturnsNil(t *testing.T) {
 	}
 }
 
-func TestRunStatusReadyRequiresEveryLiveRoute(t *testing.T) {
+func TestRunStatusReadyUsesRuntimeOwnedHealth(t *testing.T) {
 	previous := statusReady
 	statusReady = true
 	t.Cleanup(func() { statusReady = previous })
 
 	for _, test := range []struct {
-		name      string
-		proxyBody string
-		wantErr   bool
+		name    string
+		status  int
+		wantErr bool
 	}{
-		{name: "running", proxyBody: `{"tcp":[{"name":"web","status":"running"}]}`},
-		{name: "starting", proxyBody: `{"tcp":[{"name":"web","status":"start error"}]}`, wantErr: true},
-		{name: "missing", proxyBody: `{}`, wantErr: true},
+		{name: "ready", status: http.StatusNoContent},
+		{name: "not ready", status: http.StatusServiceUnavailable, wantErr: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			admin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				w.Header().Set("Content-Type", "application/json")
-				_, _ = io.WriteString(w, test.proxyBody)
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path != connectorHealthPath {
+					t.Fatalf("readiness path = %q, want %q", r.URL.Path, connectorHealthPath)
+				}
+				w.WriteHeader(test.status)
 			}))
-			t.Cleanup(admin.Close)
-			host, portText, err := net.SplitHostPort(admin.Listener.Addr().String())
-			if err != nil {
-				t.Fatal(err)
-			}
-			dir := t.TempDir()
-			isolateConnectorStateForTest(t, dir)
-			path := filepath.Join(dir, "qurl-proxy.yaml")
-			if err := os.WriteFile(path, []byte(`
-server:
-  addr: boundary.example.com
-  port: 7000
-  protocol: tcp
-admin:
-  enabled: true
-  addr: `+host+`
-  port: `+portText+`
-  password: secret
-routes:
-  - id: web
-    type: http
-    local_ip: 127.0.0.1
-    local_port: 8080
-`), 0o600); err != nil {
-				t.Fatal(err)
-			}
-			previousCfg, previousJSON := cfgFile, statusJSON
-			cfgFile, statusJSON = path, false
-			t.Cleanup(func() { cfgFile, statusJSON = previousCfg, previousJSON })
-			err = runStatus(nil, nil)
+			t.Cleanup(server.Close)
+			t.Setenv(envConnectorHealthAddr, server.Listener.Addr().String())
+			err := runStatus(nil, nil)
 			if (err != nil) != test.wantErr {
 				t.Fatalf("runStatus --ready error = %v, wantErr %t", err, test.wantErr)
+			}
+		})
+	}
+}
+
+func TestConnectorHealthAddressRejectsNonLoopback(t *testing.T) {
+	for _, value := range []string{"", " 127.0.0.1:7401", "0.0.0.0:7401", "example.com:7401", "127.0.0.1:0"} {
+		t.Run(value, func(t *testing.T) {
+			t.Setenv(envConnectorHealthAddr, value)
+			if _, _, err := connectorHealthAddress(); err == nil {
+				t.Fatalf("connectorHealthAddress accepted %q", value)
 			}
 		})
 	}

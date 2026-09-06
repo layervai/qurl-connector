@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 	"unicode/utf8"
@@ -1099,7 +1100,16 @@ func startSharedService(ctx context.Context, common *v1.ClientCommonConfig, cfgP
 		return err
 	}
 	announcer := newReadyAnnouncer(readyRoutes(qcfg), os.Stdout, stdoutIsTerminal())
-	return runSharedService(ctx, qcfg, admitter, sessions, announcer)
+	var current atomic.Pointer[share.SessionGroupRunner]
+	return runWithConnectorHealth(ctx,
+		func() bool {
+			runner := current.Load()
+			return runner != nil && runner.RoutesReady()
+		},
+		func(runCtx context.Context) error {
+			return runSharedService(runCtx, qcfg, admitter, sessions, announcer, current.Store)
+		},
+	)
 }
 
 // newSharedServiceSessions builds the FRP session factory for the group. It
@@ -1124,7 +1134,7 @@ func newSharedServiceSessions(common *v1.ClientCommonConfig, cfgPath string) (*s
 // about the knock resource every route shares, each successive admission is
 // refused too; the cost is one knock per remaining route before the process
 // exits with the same error, never a stuck loop.
-func runSharedService(ctx context.Context, qcfg *nhpconfig.Config, admitter sharedServiceAdmitter, sessions share.SessionGroupFactory, announcer *readyAnnouncer) error {
+func runSharedService(ctx context.Context, qcfg *nhpconfig.Config, admitter sharedServiceAdmitter, sessions share.SessionGroupFactory, announcer *readyAnnouncer, runnerChanged func(*share.SessionGroupRunner)) error {
 	if qcfg == nil {
 		return errors.New("shared Connector runtime requires at least one resource")
 	}
@@ -1137,6 +1147,9 @@ func runSharedService(ctx context.Context, qcfg *nhpconfig.Config, admitter shar
 		if err != nil {
 			return err
 		}
+		if runnerChanged != nil {
+			runnerChanged(runner)
+		}
 		announcer.setLiveProbe(func() []string {
 			var serving []string
 			for routeID, state := range runner.RouteStates() {
@@ -1147,6 +1160,9 @@ func runSharedService(ctx context.Context, qcfg *nhpconfig.Config, admitter shar
 			return serving
 		})
 		err = runner.Run(ctx)
+		if runnerChanged != nil {
+			runnerChanged(nil)
+		}
 		if errors.Is(err, share.ErrGroupEmpty) {
 			return allRoutesRetiredError(err)
 		}

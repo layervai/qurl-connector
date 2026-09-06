@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"sort"
 	"sync"
 	"time"
@@ -525,6 +526,35 @@ func (r *SessionGroupRunner) RouteStates() map[string]RouteState {
 		return map[string]RouteState{}
 	}
 	return active.session.RouteStates()
+}
+
+// RoutesReady reports whether every route the runner currently desires is
+// serving on the active session. A replacement session does not affect the
+// result until promotion, so make-before-break rotation keeps reporting the
+// still-serving active session. Routes withdrawn after an authenticated
+// ErrResourceGone refusal are no longer desired and therefore do not make
+// healthy siblings fail readiness.
+func (r *SessionGroupRunner) RoutesReady() bool {
+	r.mu.Lock()
+	active := r.active
+	desired := maps.Clone(r.desired)
+	r.mu.Unlock()
+	if active == nil || len(desired) == 0 || sessionEnded(active.session) {
+		return false
+	}
+
+	states := active.session.RouteStates()
+	for routeID := range desired {
+		if state, ok := states[routeID]; !ok || state.Phase != RouteServing {
+			return false
+		}
+	}
+
+	// SetRoutes and promotion can race the session snapshot above. Return true
+	// only if both sources are still the ones that were checked.
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.active == active && maps.Equal(r.desired, desired) && !sessionEnded(active.session)
 }
 
 // apply pushes the desired set to the live sessions. A session that is being

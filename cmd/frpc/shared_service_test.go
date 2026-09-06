@@ -473,7 +473,7 @@ func startSharedServiceHarnessWith(t *testing.T, cfg *nhpconfig.Config, opts sha
 	ctx, cancel := context.WithCancel(context.Background())
 	h.cancel = cancel
 	h.announcer = newReadyAnnouncer(readyRoutes(cfg), h.out, false)
-	go func() { h.done <- runSharedService(ctx, cfg, h.admitter, h.factory, h.announcer) }()
+	go func() { h.done <- runSharedService(ctx, cfg, h.admitter, h.factory, h.announcer, nil) }()
 	t.Cleanup(func() {
 		cancel()
 		if _, returned := h.result(5 * time.Second); !returned {
