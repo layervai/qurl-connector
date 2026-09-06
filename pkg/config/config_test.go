@@ -30,7 +30,8 @@ func writeConfig(t *testing.T, content string) string {
 
 func TestLoadAcceptsAndDropsRetiredGeneratedFields(t *testing.T) {
 	t.Setenv(EnvAuditFile, "")
-	path := writeConfig(t, `
+	t.Setenv("QURL_ADMIN_ENABLED", "")
+	path := writeConfig(t, fmt.Sprintf(`
 server:
   addr: frp.example
   public_domain: qurl.site
@@ -43,9 +44,10 @@ qurl:
   api_url: https://api.example/v1
   token: token-1
 admin:
-  enabled: false
+  enabled: true
   addr: 127.0.0.1
   port: 7400
+  password: desktop-secret
 audit:
   enabled: false
   file_path: /tmp/connector-audit.log
@@ -54,18 +56,23 @@ routes:
   - id: web
     type: http
     local_port: 8080
+    subdomain: %s
+    resource_id: %s
+    connector_routing_id: %s
+    knock_resource_id: cell-resource
   - id: api
     type: http
     local_ip: 127.0.0.2
     local_port: 8443
-`)
+`, testRoutingA, testPublicResourceA, testRoutingA))
 	cfg, err := Load(path)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if cfg.Server.Addr != "frp.example" || cfg.Server.Port != 7000 || cfg.Server.Protocol != "websocket" ||
 		!cfg.NHP.Enabled || cfg.NHP.MachineID != "machine-1" || cfg.QURL.APIURL != "https://api.example/v1" ||
-		cfg.QURL.Token != "token-1" || cfg.Audit.FilePath != "/tmp/connector-audit.log" || len(cfg.Routes) != 2 ||
+		cfg.QURL.Token != "token-1" || !cfg.Admin.Enabled || cfg.Admin.Password != "desktop-secret" ||
+		cfg.Audit.FilePath != "/tmp/connector-audit.log" || len(cfg.Routes) != 2 ||
 		cfg.Routes[1].ID != "api" || cfg.Routes[1].Type != RouteTypeHTTP || cfg.Routes[1].LocalIP != "127.0.0.2" || cfg.Routes[1].LocalPort != 8443 {
 		t.Fatalf("retired-field strip changed sibling config: %#v", cfg)
 	}
@@ -77,8 +84,11 @@ routes:
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(string(raw), "public_domain:") || strings.Contains(string(raw), "admin:") {
+	if strings.Contains(string(raw), "public_domain:") || strings.Contains(string(raw), "subdomain:") || strings.Contains(string(raw), "knock_resource_id:") {
 		t.Fatalf("Save retained retired generated fields:\n%s", raw)
+	}
+	if !strings.Contains(string(raw), "admin:") {
+		t.Fatalf("Save dropped the live Desktop admin contract:\n%s", raw)
 	}
 }
 
@@ -114,6 +124,55 @@ func TestLoadRejectsOtherRetiredFRPFields(t *testing.T) {
 				t.Fatalf("Load error = %v, want migration guidance for %s", err, tt.path)
 			}
 		})
+	}
+
+	_, err := Load(writeConfig(t, `server:
+  token: old
+routes:
+  - id: web
+    type: http
+    local_port: 8080
+    remote_port: 7001
+    headers: {X-Test: value}
+`))
+	for _, field := range []string{"server.token", "routes[0].remote_port", "routes[0].headers"} {
+		if err == nil || !strings.Contains(err.Error(), field) {
+			t.Fatalf("combined migration error = %v, want %s", err, field)
+		}
+	}
+}
+
+func TestLoadAdminContract(t *testing.T) {
+	t.Setenv("QURL_ADMIN_ENABLED", "")
+	path := writeConfig(t, `admin:
+  enabled: true
+  addr: 127.0.0.2
+  port: 7401
+  password: desktop-secret
+routes: []
+`)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.Admin.Enabled || cfg.Admin.Addr != "127.0.0.2" || cfg.Admin.Port != 7401 || cfg.Admin.Password != "desktop-secret" {
+		t.Fatalf("admin config = %+v", cfg.Admin)
+	}
+
+	t.Setenv("QURL_ADMIN_ENABLED", "false")
+	cfg, err = Load(path)
+	if err != nil || cfg.Admin.Enabled {
+		t.Fatalf("env-disabled admin = %+v, err = %v", cfg.Admin, err)
+	}
+
+	t.Setenv("QURL_ADMIN_ENABLED", "true")
+	_, err = Load(writeConfig(t, "admin:\n  enabled: false\n  addr: 0.0.0.0\nroutes: []\n"))
+	if err == nil || !strings.Contains(err.Error(), "allow_remote") {
+		t.Fatalf("non-loopback admin error = %v", err)
+	}
+	_, err = Load(writeConfig(t, "admin:\n  enabled: true\n  addr: 0.0.0.0\n  allow_remote: true\nroutes: []\n"))
+	if err == nil || !strings.Contains(err.Error(), "admin.password") {
+		t.Fatalf("remote admin without password error = %v", err)
 	}
 }
 

@@ -122,6 +122,16 @@ func TestFRPSessionGroupFactoryRejectsUnsafeAdmittedHosts(t *testing.T) {
 	if _, _, _, err := tlsFactory.BuildConfig(admission, routes); err == nil {
 		t.Fatal("IP-literal admitted host with implicit TLS server name was accepted")
 	}
+	for _, protocol := range []string{"wss", "quic"} {
+		factory, err := NewFRPSessionGroupFactory(FRPGroupFactoryConfig{Common: &v1.ClientCommonConfig{}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		factory.cfg.Common.Transport.Protocol = protocol
+		if _, _, _, err := factory.BuildConfig(admission, routes); err == nil {
+			t.Errorf("IP-literal admitted host with %s transport was accepted without a TLS server name", protocol)
+		}
+	}
 }
 
 func TestGroupProxyNameGenerationZero(t *testing.T) {

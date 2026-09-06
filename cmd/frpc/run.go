@@ -1001,6 +1001,16 @@ func startFRPFromConfig(ctx context.Context, cfgPath, machineID string, cfg *nhp
 	if cfg.Server.EgressLocalIP != "" {
 		common.Transport.ConnectServerLocalIP = cfg.Server.EgressLocalIP
 	}
+	if cfg.Admin.Enabled {
+		password, err := adminAuthPassword(&cfg.Admin)
+		if err != nil {
+			return fmt.Errorf("admin auth: %w", err)
+		}
+		common.WebServer.Addr, common.WebServer.Port = cfg.Admin.Addr, cfg.Admin.Port
+		common.WebServer.User, common.WebServer.Password = "admin", password
+		slog.WarnContext(ctx, "admin API enabled: admission rotation replaces the shared FRP session cold and can cause a brief serving gap",
+			"addr", cfg.Admin.Addr, "port", cfg.Admin.Port)
+	}
 	applyLogPresentation(common, logLevel, colorEnabled)
 	if err := common.Complete(); err != nil {
 		return fmt.Errorf("completing config: %w", err)
@@ -1337,6 +1347,17 @@ func clientVersionMeta(clientVersion string) string {
 		return "dev"
 	}
 	return trimmed
+}
+
+func adminAuthPassword(cfg *nhpconfig.AdminConfig) (string, error) {
+	if cfg != nil && strings.TrimSpace(cfg.Password) != "" {
+		return cfg.Password, nil
+	}
+	machineID := getMachineID()
+	if machineID == "" || machineID == unknownMachineID {
+		return "", errors.New("machine ID is unavailable; set admin.password or disable admin.enabled")
+	}
+	return machineID, nil
 }
 
 func printBanner() {

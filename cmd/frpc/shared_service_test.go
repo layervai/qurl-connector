@@ -683,8 +683,10 @@ func TestSharedServiceReadyBlockNamesOnlyServingRoutes(t *testing.T) {
 	h.requireStillRunning(t)
 }
 
-func TestSharedServiceRendersOneSessionForEveryRoute(t *testing.T) {
+func TestSharedServiceRendersOneSessionAndDesktopAdminListener(t *testing.T) {
 	common := &v1.ClientCommonConfig{}
+	common.WebServer.Addr, common.WebServer.Port = "127.0.0.1", 7400
+	common.WebServer.User, common.WebServer.Password = "admin", "secret"
 	if err := common.Complete(); err != nil {
 		t.Fatal(err)
 	}
@@ -704,9 +706,12 @@ func TestSharedServiceRendersOneSessionForEveryRoute(t *testing.T) {
 			ResourceID: route.ResourceID, ConnectorRoutingID: route.ConnectorRoutingID,
 		}})
 	}
-	_, proxies, names, err := factory.BuildConfig(admission, routes)
+	built, proxies, names, err := factory.BuildConfig(admission, routes)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if built.WebServer.Addr != "127.0.0.1" || built.WebServer.Port != 7400 || built.WebServer.Password != "secret" {
+		t.Fatalf("session WebServer = %+v", built.WebServer)
 	}
 	if len(proxies) != 3 || len(names) != 3 {
 		t.Fatalf("session renders %d proxies / %d names, want 3 on the one Login", len(proxies), len(names))

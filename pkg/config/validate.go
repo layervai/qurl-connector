@@ -147,6 +147,18 @@ func validate(cfg *Config, requireManagedRouting bool) error {
 		errs = append(errs, fmt.Errorf("server.protocol %q is not a supported FRP transport; use one of tcp, kcp, quic, websocket, wss (exact lowercase), or omit it for the tcp default", cfg.Server.Protocol))
 	}
 
+	if cfg.Admin.Enabled {
+		if cfg.Admin.Port < 1 || cfg.Admin.Port > 65535 {
+			errs = append(errs, fmt.Errorf("admin.port=%d invalid (must be 1-65535); check qurl-proxy.yaml or unset QURL_ADMIN_ENABLED if you did not mean to enable the admin API", cfg.Admin.Port))
+		}
+		if AdminBindLooksRoutable(cfg) && !cfg.Admin.AllowRemote {
+			errs = append(errs, fmt.Errorf("admin.addr=%q is non-loopback but admin.allow_remote is not set", cfg.Admin.Addr))
+		}
+		if cfg.Admin.AllowRemote && cfg.Admin.Password == "" {
+			errs = append(errs, errors.New("admin.allow_remote=true requires an explicit admin.password"))
+		}
+	}
+
 	// Route validation
 	seenRouteIDs := make(map[string]bool, len(cfg.Routes))
 	for i, r := range cfg.Routes {

@@ -400,6 +400,13 @@ func TestANSIEscapeDetectorFindsEveryLiteralForm(t *testing.T) {
 	}
 }
 
+func TestAdminAuthPasswordUsesDesktopSecret(t *testing.T) {
+	got, err := adminAuthPassword(&nhpconfig.AdminConfig{Password: "desktop-secret"})
+	if err != nil || got != "desktop-secret" {
+		t.Fatalf("adminAuthPassword = %q, %v", got, err)
+	}
+}
+
 // assertNoANSI fails when out carries an ESC byte, checking the rendered
 // output rather than the source: this is the byte a log consumer actually
 // receives.

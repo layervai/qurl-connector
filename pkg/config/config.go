@@ -4,7 +4,9 @@
 package config
 
 import (
+	"errors"
 	"fmt"
+	"net"
 	"os"
 	"regexp"
 	"sort"
@@ -18,6 +20,7 @@ type Config struct {
 	Server  ServerConfig  `yaml:"server"`
 	NHP     NHPConfig     `yaml:"nhp"`
 	QURL    QURLConfig    `yaml:"qurl"`
+	Admin   AdminConfig   `yaml:"admin,omitempty"`
 	Audit   AuditConfig   `yaml:"audit,omitempty"`
 	Routes  []Route       `yaml:"routes"`
 	Runtime RuntimeConfig `yaml:"-"`
@@ -93,6 +96,16 @@ type RuntimeConfig struct {
 	// Only SetKnockResourceID mutates it. Populated once during device-owned
 	// resource hydration before the managed session starts; not safe for concurrent writes.
 	KnockResourceIDs map[string]string
+}
+
+// AdminConfig gates FRP's local status and reload API. It is off by default.
+// A non-loopback bind needs both AllowRemote and an explicit password.
+type AdminConfig struct {
+	Enabled     bool   `yaml:"enabled"`
+	Addr        string `yaml:"addr,omitempty"`
+	Port        int    `yaml:"port,omitempty"`
+	AllowRemote bool   `yaml:"allow_remote,omitempty"`
+	Password    string `yaml:"password,omitempty"` //nolint:gosec // operator-supplied FRP basic-auth credential
 }
 
 // ServerConfig holds connection details for the FRP server.
@@ -298,31 +311,44 @@ func decodeConfig(data []byte, path string) (*Config, error) {
 	return &cfg, nil
 }
 
-// stripRetiredGeneratedFields keeps files written by older add commands
-// readable. Those files always contained these defaults even when the admin
-// API was disabled. A later Save omits them; other retired custom-FRP fields
-// remain unknown and fail strict decoding.
+// stripRetiredGeneratedFields keeps files written by older connector clients
+// readable. A later Save omits these redundant fields. Other retired custom-
+// FRP fields fail with migration guidance. When fields are dropped, later YAML
+// decoder line numbers refer to the normalized document.
 func stripRetiredGeneratedFields(data string) (string, error) {
 	var document yaml.Node
 	if err := yaml.Unmarshal([]byte(data), &document); err != nil || len(document.Content) == 0 {
 		return data, nil
 	}
 	root := document.Content[0]
-	dropped := dropYAMLField(root, "admin")
+	dropped := false
+	var errs []error
 	if server := yamlField(root, "server"); server != nil {
 		if line, ok := yamlFieldLine(server, "token"); ok {
-			return data, fmt.Errorf("config field server.token at line %d was removed; delete it because NHP admission supplies the FRP session token", line)
+			errs = append(errs, fmt.Errorf("config field server.token at line %d was removed; delete it because NHP admission supplies the FRP session token", line))
 		}
 		dropped = dropYAMLField(server, "public_domain") || dropped
 	}
 	if routes := yamlField(root, "routes"); routes != nil && routes.Kind == yaml.SequenceNode {
 		for i, route := range routes.Content {
-			for _, key := range []string{"subdomain", "custom_domains", "remote_port", "host_rewrite", "headers", "load_balancer_group"} {
+			if subdomain := yamlField(route, "subdomain"); subdomain != nil {
+				routingID := yamlField(route, "connector_routing_id")
+				if routingID != nil && subdomain.Value == routingID.Value {
+					dropped = dropYAMLField(route, "subdomain") || dropped
+				} else if line, ok := yamlFieldLine(route, "subdomain"); ok {
+					errs = append(errs, fmt.Errorf("config field routes[%d].subdomain at line %d was removed; delete it because managed routes use connector_routing_id", i, line))
+				}
+			}
+			dropped = dropYAMLField(route, "knock_resource_id") || dropped
+			for _, key := range []string{"custom_domains", "remote_port", "host_rewrite", "headers", "load_balancer_group"} {
 				if line, ok := yamlFieldLine(route, key); ok {
-					return data, fmt.Errorf("config field routes[%d].%s at line %d was removed; delete it because managed routes use connector_routing_id and local_ip/local_port", i, key, line)
+					errs = append(errs, fmt.Errorf("config field routes[%d].%s at line %d was removed; delete it because managed routes use connector_routing_id and local_ip/local_port", i, key, line))
 				}
 			}
 		}
+	}
+	if err := errors.Join(errs...); err != nil {
+		return data, err
 	}
 	if !dropped {
 		return data, nil
@@ -414,6 +440,12 @@ func applyDefaults(cfg *Config) {
 			cfg.Routes[i].LocalIP = "127.0.0.1"
 		}
 	}
+	if cfg.Admin.Addr == "" {
+		cfg.Admin.Addr = DefaultAdminAddr
+	}
+	if cfg.Admin.Port == 0 {
+		cfg.Admin.Port = DefaultAdminPort
+	}
 
 	// Audit defaults: Enabled=true, MirrorSlog=true, FilePath →
 	// DefaultAuditFilePath.
@@ -438,6 +470,17 @@ func applyEnvOverrides(cfg *Config) {
 	if value := strings.TrimSpace(os.Getenv("QURL_CONNECTOR_EGRESS_LOCAL_IP")); value != "" {
 		cfg.Server.EgressLocalIP = value
 	}
+	if value, ok := os.LookupEnv("QURL_ADMIN_ENABLED"); ok {
+		switch strings.ToLower(strings.TrimSpace(value)) {
+		case "1", "true", "yes", "on":
+			cfg.Admin.Enabled = true
+		case "0", "false", "no", "off":
+			cfg.Admin.Enabled = false
+		case "":
+		default:
+			fmt.Fprintf(os.Stderr, "warning: QURL_ADMIN_ENABLED=%q not recognized (use true/false/1/0/yes/no/on/off); falling back to YAML admin.enabled=%v\n", value, cfg.Admin.Enabled)
+		}
+	}
 
 	// Audit file path override. Trimmed so a heredoc-pasted value with
 	// trailing whitespace doesn't bypass the YAML path. Empty (or
@@ -449,3 +492,21 @@ func applyEnvOverrides(cfg *Config) {
 	}
 
 }
+
+// AdminBindLooksRoutable reports whether the enabled admin listener can be
+// reached off host. Unknown hostnames fail closed as routable.
+func AdminBindLooksRoutable(cfg *Config) bool {
+	if cfg == nil || !cfg.Admin.Enabled {
+		return false
+	}
+	if strings.EqualFold(cfg.Admin.Addr, "localhost") {
+		return false
+	}
+	ip := net.ParseIP(cfg.Admin.Addr)
+	return ip == nil || !ip.IsLoopback()
+}
+
+const (
+	DefaultAdminAddr = "127.0.0.1"
+	DefaultAdminPort = 7400
+)
