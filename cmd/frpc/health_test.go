@@ -141,7 +141,7 @@ func TestRunWithConnectorHealthServesLiveRunnerState(t *testing.T) {
 
 	waitFor(t, time.Second, func() bool {
 		err := probeConnectorHealth(context.Background())
-		return err != nil && err.Error() == "connector routes are not ready"
+		return errors.Is(err, errConnectorRoutesNotReady)
 	}, "not-ready runtime health response")
 	ready.Store(true)
 	waitFor(t, time.Second, func() bool {
@@ -215,6 +215,9 @@ func TestRunWithConnectorHealthStopsRuntimeWhenListenerFails(t *testing.T) {
 	if !errors.Is(err, want) || !strings.Contains(err.Error(), "serve Connector health") {
 		t.Fatalf("runWithConnectorHealth() error = %v, want wrapped listener error %v", err, want)
 	}
+	if errors.Is(err, context.Canceled) {
+		t.Fatalf("listener failure matched context.Canceled: %v", err)
+	}
 }
 
 func TestProbeConnectorHealthDistinguishesWrongEndpoint(t *testing.T) {
@@ -223,8 +226,9 @@ func TestProbeConnectorHealthDistinguishesWrongEndpoint(t *testing.T) {
 		status           int
 		connectorRuntime bool
 		wantError        string
+		wantIs           error
 	}{
-		{name: "unready runtime", status: http.StatusServiceUnavailable, connectorRuntime: true, wantError: "connector routes are not ready"},
+		{name: "unready runtime", status: http.StatusServiceUnavailable, connectorRuntime: true, wantError: "connector routes are not ready", wantIs: errConnectorRoutesNotReady},
 		{name: "foreign 404", status: http.StatusNotFound, wantError: "did not come from a qurl-connector runtime"},
 		{name: "foreign 204", status: http.StatusNoContent, wantError: "did not come from a qurl-connector runtime"},
 		{name: "foreign 503", status: http.StatusServiceUnavailable, wantError: "did not come from a qurl-connector runtime"},
@@ -241,6 +245,9 @@ func TestProbeConnectorHealthDistinguishesWrongEndpoint(t *testing.T) {
 			err := probeConnectorHealth(context.Background())
 			if err == nil || !strings.Contains(err.Error(), test.wantError) {
 				t.Fatalf("probeConnectorHealth() error = %v, want text %q", err, test.wantError)
+			}
+			if test.wantIs != nil && !errors.Is(err, test.wantIs) {
+				t.Fatalf("probeConnectorHealth() error = %v, want errors.Is(_, %v)", err, test.wantIs)
 			}
 		})
 	}

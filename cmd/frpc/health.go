@@ -21,6 +21,11 @@ const (
 
 var listenConnectorHealth = net.Listen
 
+// errConnectorRoutesNotReady is the expected unhealthy result from a
+// reachable Connector runtime. It is distinct from an unreachable or foreign
+// listener so callers can decide whether to wait or report misconfiguration.
+var errConnectorRoutesNotReady = errors.New("connector routes are not ready")
+
 func connectorHealthAddress() (string, bool, error) {
 	raw, configured := os.LookupEnv(envConnectorHealthAddr)
 	if !configured {
@@ -58,7 +63,7 @@ func connectorHealthHandler(ready func() bool) http.Handler {
 			return
 		}
 		if !ready() {
-			http.Error(w, "connector routes are not ready", http.StatusServiceUnavailable)
+			http.Error(w, errConnectorRoutesNotReady.Error(), http.StatusServiceUnavailable)
 			return
 		}
 		w.WriteHeader(http.StatusNoContent)
@@ -119,7 +124,14 @@ func runWithConnectorHealth(ctx context.Context, ready func() bool, run func(con
 	// Shutdown can race Serve before Serve records the listener. Closing the
 	// listener itself guarantees the server goroutine always returns.
 	_ = listener.Close()
-	return errors.Join(runErr, shutdownErr, <-serveErr)
+	serverErr := <-serveErr
+	if serverErr != nil && errors.Is(runErr, context.Canceled) {
+		// The wrapper caused this cancellation to stop the runtime after its
+		// health listener failed. The actionable cause is serverErr; keeping
+		// both would let a caller mistake the failure for a clean cancellation.
+		runErr = nil
+	}
+	return errors.Join(runErr, shutdownErr, serverErr)
 }
 
 func probeConnectorHealth(ctx context.Context) error {
@@ -151,7 +163,7 @@ func probeConnectorHealth(ctx context.Context) error {
 			addr, connectorHealthPath, envConnectorHealthAddr)
 	}
 	if resp.StatusCode == http.StatusServiceUnavailable {
-		return errors.New("connector routes are not ready")
+		return errConnectorRoutesNotReady
 	}
 	if resp.StatusCode != http.StatusNoContent {
 		return fmt.Errorf("unexpected reply from http://%s%s (HTTP %d); %s may not point at a qurl-connector runtime",
