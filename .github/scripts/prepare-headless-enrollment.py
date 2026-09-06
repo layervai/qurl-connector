@@ -176,7 +176,12 @@ def api_request(
     try:
         with NO_REDIRECT_OPENER.open(request, timeout=API_TIMEOUT_SECONDS) as response:
             if response.status not in expected_statuses:
-                raise EnrollmentError(
+                error_class = (
+                    APIRequestOutcomeUnknown
+                    if 200 <= response.status < 300
+                    else EnrollmentError
+                )
+                raise error_class(
                     f"qURL API returned HTTP {response.status} for {method} {path}; expected one of {expected_statuses}"
                 )
             content_types = response.headers.get_all("Content-Type", [])
@@ -225,6 +230,9 @@ def api_request(
 def _put_parameter_command(region: str, parameter: str) -> list[str]:
     # KEY excludes non-ASCII and newlines, so text-mode paramfile expansion
     # preserves the validated token byte-for-byte.
+    # The paired Terraform foundation creates every reviewed parameter under
+    # the AWS-managed alias/aws/ssm key. The recovery role therefore needs no
+    # customer-managed KMS authority and cannot silently select another key.
     return [
         "aws",
         "ssm",
@@ -422,7 +430,7 @@ def prepare_enrollment(
         token = credential.get("api_key", "")
         if not isinstance(token, str) or not KEY.fullmatch(token):
             raise EnrollmentError("enrollment token is missing or malformed")
-        parse_expiry(credential.get("expires_at", ""), now=now)
+        expiry = parse_expiry(credential.get("expires_at", ""), now=now)
         # The recovery role intentionally has write-only SSM access, so it
         # cannot preflight this write. The API retains the idempotency
         # operation for 24 hours, while the deployment preflight accepts a
@@ -435,11 +443,12 @@ def prepare_enrollment(
             r"key_[A-Za-z0-9]{8,64}", credential_id
         ):
             raise EnrollmentError(
-                f"enrollment credential {credential_id} was minted but not installed: {exc}; retry the same generation or revoke that non-secret credential ID with JWT authority"
+                f"enrollment credential {credential_id} was minted but not installed: {exc}; retry the same generation only while the recovered token has at least 45 minutes remaining, otherwise use a new generation, or revoke that non-secret credential ID with JWT authority"
             ) from exc
         raise
     print(
-        f"prepared one-hour enrollment for {target} at serving epoch {observed_epoch}"
+        f"prepared one-hour enrollment for {target} at serving epoch {observed_epoch}; "
+        f"expires {expiry.isoformat()}"
     )
 
 

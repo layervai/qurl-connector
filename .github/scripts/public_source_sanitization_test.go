@@ -64,6 +64,29 @@ func TestLayerVHostDetectorIncludesEveryReviewedSuffix(t *testing.T) {
 	}
 }
 
+func TestEnvironmentHostDetectorDoesNotConfuseWorkflowFilename(t *testing.T) {
+	const workflowFilename = "rotate-tunnel-enrollment.yml"
+	if got := environmentHost.FindString(workflowFilename); got != "" {
+		t.Fatalf("environmentHost.FindString(%q) = %q, want no hostname", workflowFilename, got)
+	}
+
+	privateHost := "files-sand" + "box.internal.acme.io"
+	if got := environmentHost.FindString(privateHost); got != privateHost {
+		t.Fatalf("environmentHost.FindString(%q) = %q, want exact private host", privateHost, got)
+	}
+	if reservedEnvironmentHost(privateHost) {
+		t.Fatalf("reservedEnvironmentHost(%q) = true, want false", privateHost)
+	}
+
+	reservedHost := "files-sand" + "box.example.com"
+	if got := environmentHost.FindString(reservedHost); got != reservedHost {
+		t.Fatalf("environmentHost.FindString(%q) = %q, want exact reserved host", reservedHost, got)
+	}
+	if !reservedEnvironmentHost(reservedHost) {
+		t.Fatalf("reservedEnvironmentHost(%q) = false, want true", reservedHost)
+	}
+}
+
 func TestPublicSourceContainsNoPrivateOperationalMaterial(t *testing.T) {
 	repoRoot := filepath.Clean(filepath.Join("..", ".."))
 	reservedAccounts := map[string]bool{

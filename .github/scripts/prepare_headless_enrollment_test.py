@@ -11,14 +11,8 @@ import unittest
 from unittest import mock
 
 
-# Keep the environment word split. The public-source scanner intentionally
-# treats a whole sandbox hostname-like workflow filename as sensitive.
 SCRIPT = pathlib.Path(__file__).with_name("prepare-headless-enrollment.py")
-WORKFLOW = (
-    SCRIPT.parent.parent
-    / "workflows"
-    / ("rotate-" + "sand" + "box-tunnel-enrollment.yml")
-)
+WORKFLOW = SCRIPT.parent.parent / "workflows" / "rotate-tunnel-enrollment.yml"
 SPEC = importlib.util.spec_from_file_location("prepare_headless_enrollment", SCRIPT)
 assert SPEC is not None and SPEC.loader is not None
 MODULE = importlib.util.module_from_spec(SPEC)
@@ -70,6 +64,8 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
         self.assertIn(
             "group: rotate-sandbox-tunnel-enrollment-${{ inputs.target }}", workflow
         )
+        self.assertIn("reuse for immediate retries", workflow)
+        self.assertIn("less than 45 minutes left", workflow)
         self.assertNotIn("matrix:", workflow)
         self.assertNotIn('--slug "$RECOVERY_SLUG"', workflow)
         self.assertNotIn("both", options)
@@ -117,6 +113,15 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
         self.assertIn("mask-aws-account-id: true", workflow)
         self.assertGreaterEqual(workflow.count("actions/setup-python@"), 1)
         self.assertIn('python-version: "3.13"', workflow)
+
+        validation_workflow = (
+            SCRIPT.parent.parent / "workflows" / "validate-workflows.yml"
+        ).read_text()
+        self.assertIn("pip install --require-hashes", validation_workflow)
+        requirements = (SCRIPT.parent / "requirements-lint.txt").read_text()
+        self.assertRegex(
+            requirements, r"ruff==0\.15\.8.*\\\n\s+--hash=sha256:[0-9a-f]{64}"
+        )
 
     def test_every_target_has_a_distinct_parameter(self) -> None:
         parameters = [parameter for _slug, parameter in MODULE.TARGETS.values()]
@@ -247,11 +252,7 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
                     MODULE.NO_REDIRECT_OPENER, "open", return_value=response
                 ),
             ):
-                if response.status == 201:
-                    expected_error = MODULE.EnrollmentError
-                else:
-                    expected_error = MODULE.APIRequestOutcomeUnknown
-                with self.assertRaisesRegex(expected_error, message):
+                with self.assertRaisesRegex(MODULE.APIRequestOutcomeUnknown, message):
                     MODULE.api_request(
                         "https://api.example.com",
                         "lv_live_account-key",
@@ -378,6 +379,7 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
         with (
             mock.patch.object(MODULE, "api_request", side_effect=responses) as request,
             mock.patch.object(MODULE, "put_parameter") as put,
+            mock.patch("builtins.print") as output,
         ):
             MODULE.prepare_enrollment(
                 "https://api.example.com",
@@ -405,6 +407,10 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
             "us-east-2",
             "/qurl-s3-connector/detect-nhp/replica-a/bootstrap",
             "lv_live_test-token",
+        )
+        output.assert_called_once_with(
+            "prepared one-hour enrollment for detect-nhp-replica-a at serving epoch 1; "
+            "expires 2026-09-04T19:00:00+00:00"
         )
 
     def test_resource_resolution_guards_never_mint_or_write(self) -> None:
@@ -714,6 +720,11 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
                 )
         self.assertIsInstance(raised.exception.__cause__, MODULE.EnrollmentError)
         self.assertNotIn("lv_live_valid-token", str(raised.exception))
+        self.assertIn(
+            "only while the recovered token has at least 45 minutes",
+            str(raised.exception),
+        )
+        self.assertIn("otherwise use a new generation", str(raised.exception))
 
     def test_invalid_on_zero_state_never_mints_or_writes(self) -> None:
         responses = [

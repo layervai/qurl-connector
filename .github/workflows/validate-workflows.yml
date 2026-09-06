@@ -26,7 +26,7 @@ jobs:
         with:
           python-version: "3.13"
       - name: Install pinned Python linter
-        run: python3 -m pip install ruff==0.15.8
+        run: python3 -m pip install --require-hashes -r .github/scripts/requirements-lint.txt
       - name: Lint sandbox enrollment recovery
         run: |
           python3 -m ruff check .github/scripts/prepare-headless-enrollment.py .github/scripts/prepare_headless_enrollment_test.py

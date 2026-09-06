@@ -21,7 +21,7 @@ on:
           - watermark-nhp-replica-b
           - watermark-nhp-replica-c
       generation:
-        description: Unique lowercase letters, digits, and hyphens; reuse for retries and change only after deployment rejects its age
+        description: Unique lowercase letters, digits, and hyphens; reuse for immediate retries, but use a new value if the token has less than 45 minutes left
         required: true
         type: string
 
