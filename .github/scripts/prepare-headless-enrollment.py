@@ -31,6 +31,15 @@ AWS_LOCAL_ERROR_CLASSES = {
     "SSL validation failed for": "TLSValidation",
     "usage: aws": "InvalidCLIArguments",
 }
+AWS_RETRYABLE_ERROR_CODES = {
+    "InternalServerError",
+    "RequestLimitExceeded",
+    "ServiceUnavailable",
+    "Throttling",
+    "ThrottlingException",
+    "TooManyUpdates",
+}
+AWS_UNKNOWN_OUTCOME_ERROR_CODES = {"InternalServerError", "ServiceUnavailable"}
 MAX_RESPONSE_BYTES = 64 * 1024
 API_TIMEOUT_SECONDS = 10
 AWS_TIMEOUT_SECONDS = 30
@@ -126,10 +135,16 @@ def build_api_opener() -> urllib.request.OpenerDirector:
     # SSL_CERT_DIR from the runner environment. Do not send the bearer through
     # an ambient proxy.
     trust_paths = ssl.get_default_verify_paths()
-    tls_context = ssl.create_default_context(
-        cafile=trust_paths.openssl_cafile,
-        capath=trust_paths.openssl_capath,
-    )
+    cafile = trust_paths.openssl_cafile
+    capath = trust_paths.openssl_capath
+    cafile = cafile if cafile and os.path.isfile(cafile) else None
+    capath = capath if capath and os.path.isdir(capath) else None
+    if cafile is None and capath is None:
+        raise EnrollmentError("no compiled TLS trust store is available")
+    try:
+        tls_context = ssl.create_default_context(cafile=cafile, capath=capath)
+    except (OSError, ssl.SSLError) as exc:
+        raise EnrollmentError("could not load the compiled TLS trust store") from exc
     return urllib.request.build_opener(
         urllib.request.ProxyHandler({}),
         urllib.request.HTTPSHandler(context=tls_context),
@@ -137,7 +152,19 @@ def build_api_opener() -> urllib.request.OpenerDirector:
     )
 
 
-NO_REDIRECT_OPENER = build_api_opener()
+class LazyAPIOpener:
+    """Delay trust-store loading until run() can sanitize any failure."""
+
+    def __init__(self) -> None:
+        self._opener: urllib.request.OpenerDirector | None = None
+
+    def open(self, request: Any, *, timeout: float) -> Any:
+        if self._opener is None:
+            self._opener = build_api_opener()
+        return self._opener.open(request, timeout=timeout)
+
+
+NO_REDIRECT_OPENER = LazyAPIOpener()
 
 
 def validate_api_endpoint(value: str, *, expected_sha256: str) -> str:
@@ -351,26 +378,30 @@ def put_parameter(region: str, parameter: str, token: str) -> None:
     clean_env["AWS_SHARED_CREDENTIALS_FILE"] = os.devnull
     clean_env["AWS_CLI_FILE_ENCODING"] = "utf-8"
     clean_env["AWS_PAGER"] = ""
-    try:
-        result = subprocess.run(
-            _put_parameter_command(region, parameter),
-            input=token,
-            text=True,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-            env=clean_env,
-            check=False,
-            timeout=AWS_TIMEOUT_SECONDS,
-        )
-    except subprocess.TimeoutExpired as exc:
-        raise EnrollmentParameterOutcomeUnknown(
-            "AWS CLI timed out during the enrollment parameter update; the update may have completed"
-        ) from exc
-    except OSError as exc:
-        raise EnrollmentError(
-            "AWS CLI could not start for the enrollment parameter update"
-        ) from exc
-    if result.returncode != 0:
+    for attempt in range(2):
+        try:
+            result = subprocess.run(
+                _put_parameter_command(region, parameter),
+                input=token,
+                text=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                env=clean_env,
+                check=False,
+                timeout=AWS_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired as exc:
+            # A timeout can happen after SSM commits. Do not issue a blind
+            # retry when the first write outcome is unknown.
+            raise EnrollmentParameterOutcomeUnknown(
+                "AWS CLI timed out during the enrollment parameter update; the update may have completed"
+            ) from exc
+        except OSError as exc:
+            raise EnrollmentError(
+                "AWS CLI could not start for the enrollment parameter update"
+            ) from exc
+        if result.returncode == 0:
+            return
         # AWS CLI stderr can contain credentials, profile names, and private
         # endpoints. Only emit a bounded service error code or reviewed class.
         match = AWS_ERROR_CODE.search(result.stderr or "")
@@ -386,7 +417,14 @@ def put_parameter(region: str, parameter: str, token: str) -> None:
                 "",
             )
         )
+        if attempt == 0 and error_class in AWS_RETRYABLE_ERROR_CODES:
+            time.sleep(RETRY_SECONDS)
+            continue
         error_code = f" with {error_class}" if error_class else ""
+        if error_class in AWS_UNKNOWN_OUTCOME_ERROR_CODES:
+            raise EnrollmentParameterOutcomeUnknown(
+                f"AWS returned {error_class} after the enrollment parameter update; the update may have completed"
+            )
         raise EnrollmentError(
             f"AWS rejected the enrollment parameter update{error_code} (exit status {result.returncode})"
         )
@@ -591,6 +629,9 @@ def prepare_enrollment(
         retry_delay: float | None = None
         for attempt in range(2):
             try:
+                # The current qURL contract returns a 200 JSON envelope. A 204
+                # is treated as unknown and reconciled by the GET poll because
+                # it cannot confirm the exact state or serving epoch.
                 api_request(
                     api_endpoint,
                     api_key,
@@ -717,7 +758,7 @@ def prepare_enrollment(
         print(f"::warning::{mint_warning}", file=sys.stderr)
     if sharing_enabled_by_this_run:
         print(
-            f"sharing for {target} was enabled by this run and was deliberately left on"
+            f"::notice::sharing for {target} was enabled by this run and was deliberately left on"
         )
     print(
         f"prepared one-hour enrollment for {target} at serving epoch {observed_epoch}; "

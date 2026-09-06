@@ -76,6 +76,12 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
         self.assertNotIn("matrix:", workflow)
         self.assertNotIn('--slug "$RECOVERY_SLUG"', workflow)
         self.assertNotIn("both", options)
+        for target in options:
+            for other in options - {target}:
+                self.assertFalse(
+                    target.endswith("-" + other),
+                    f"target suffixes can collide in an idempotency key: {target}, {other}",
+                )
 
     def test_workflow_fails_before_aws_when_protected_environment_is_missing(
         self,
@@ -271,6 +277,14 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
         )
         self.assertEqual(https_handler._context.verify_mode, MODULE.ssl.CERT_REQUIRED)
         self.assertTrue(https_handler._context.check_hostname)
+
+    def test_api_opener_fails_safely_without_compiled_trust_store(self) -> None:
+        with (
+            mock.patch.object(MODULE.os.path, "isfile", return_value=False),
+            mock.patch.object(MODULE.os.path, "isdir", return_value=False),
+            self.assertRaisesRegex(MODULE.EnrollmentError, "no compiled TLS trust"),
+        ):
+            MODULE.build_api_opener()
 
     def test_api_request_sends_exact_json_and_idempotency_headers(self) -> None:
         response = FakeResponse(b'{"data":{"ok":true}}', status=201)
@@ -601,7 +615,7 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
         output.assert_has_calls(
             [
                 mock.call(
-                    "sharing for detect-nhp-replica-a was enabled by this run and was deliberately left on"
+                    "::notice::sharing for detect-nhp-replica-a was enabled by this run and was deliberately left on"
                 ),
                 mock.call(
                     "prepared one-hour enrollment for detect-nhp-replica-a at serving epoch 1; "
@@ -2179,6 +2193,72 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
                 MODULE.put_parameter(
                     "us-east-2", "/reviewed/name", "lv_live_secret-token"
                 )
+
+    def test_put_parameter_retries_one_safe_service_rejection(self) -> None:
+        throttled = mock.Mock(
+            returncode=255,
+            stderr="An error occurred (ThrottlingException) while writing lv_live_secret-token",
+        )
+        completed = mock.Mock(returncode=0, stderr="")
+        with (
+            mock.patch.object(
+                MODULE.subprocess, "run", side_effect=[throttled, completed]
+            ) as run,
+            mock.patch.object(MODULE.time, "sleep") as sleep,
+        ):
+            MODULE.put_parameter("us-east-2", "/reviewed/name", "lv_live_secret-token")
+        self.assertEqual(run.call_count, 2)
+        sleep.assert_called_once_with(MODULE.RETRY_SECONDS)
+
+    def test_put_parameter_stops_after_one_safe_service_retry(self) -> None:
+        throttled = mock.Mock(
+            returncode=255,
+            stderr="An error occurred (ThrottlingException) while writing lv_live_secret-token",
+        )
+        with (
+            mock.patch.object(
+                MODULE.subprocess, "run", side_effect=[throttled, throttled]
+            ) as run,
+            mock.patch.object(MODULE.time, "sleep") as sleep,
+            self.assertRaisesRegex(
+                MODULE.EnrollmentError, "ThrottlingException.*exit status 255"
+            ) as raised,
+        ):
+            MODULE.put_parameter("us-east-2", "/reviewed/name", "lv_live_secret-token")
+        self.assertEqual(run.call_count, 2)
+        sleep.assert_called_once_with(MODULE.RETRY_SECONDS)
+        self.assertNotIn("lv_live_secret-token", str(raised.exception))
+
+    def test_put_parameter_preserves_unknown_server_error_outcome(self) -> None:
+        failed = mock.Mock(
+            returncode=255,
+            stderr="An error occurred (InternalServerError) while writing lv_live_secret-token",
+        )
+        with (
+            mock.patch.object(MODULE.subprocess, "run", side_effect=[failed, failed]),
+            mock.patch.object(MODULE.time, "sleep") as sleep,
+            self.assertRaisesRegex(
+                MODULE.EnrollmentParameterOutcomeUnknown,
+                "InternalServerError.*may have completed",
+            ) as raised,
+        ):
+            MODULE.put_parameter("us-east-2", "/reviewed/name", "lv_live_secret-token")
+        sleep.assert_called_once_with(MODULE.RETRY_SECONDS)
+        self.assertNotIn("lv_live_secret-token", str(raised.exception))
+
+    def test_put_parameter_does_not_retry_unknown_timeout(self) -> None:
+        with (
+            mock.patch.object(
+                MODULE.subprocess,
+                "run",
+                side_effect=MODULE.subprocess.TimeoutExpired("aws", 30),
+            ) as run,
+            mock.patch.object(MODULE.time, "sleep") as sleep,
+            self.assertRaises(MODULE.EnrollmentParameterOutcomeUnknown),
+        ):
+            MODULE.put_parameter("us-east-2", "/reviewed/name", "lv_live_secret-token")
+        run.assert_called_once()
+        sleep.assert_not_called()
 
     def test_put_parameter_reports_only_safe_aws_error_code(self) -> None:
         completed = mock.Mock(
