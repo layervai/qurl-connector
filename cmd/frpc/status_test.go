@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"net"
@@ -10,6 +11,8 @@ import (
 	"path/filepath"
 	"testing"
 	"unicode/utf8"
+
+	"github.com/spf13/cobra"
 
 	"github.com/layervai/qurl-connector/pkg/agentstate"
 	nhpconfig "github.com/layervai/qurl-connector/pkg/config"
@@ -346,9 +349,14 @@ func TestRunStatusReadyUsesRuntimeOwnedHealth(t *testing.T) {
 			}))
 			t.Cleanup(server.Close)
 			t.Setenv(envConnectorHealthAddr, server.Listener.Addr().String())
-			err := runStatus(nil, nil)
+			cmd := &cobra.Command{}
+			cmd.SetContext(context.Background())
+			err := runStatus(cmd, nil)
 			if (err != nil) != test.wantErr {
 				t.Fatalf("runStatus --ready error = %v, wantErr %t", err, test.wantErr)
+			}
+			if !cmd.SilenceUsage || !cmd.SilenceErrors {
+				t.Fatalf("runStatus --ready did not silence routine Cobra usage/error output")
 			}
 		})
 	}

@@ -641,6 +641,31 @@ func TestSessionGroupRunnerRoutesReadyTracksActiveRoutesAcrossRotation(t *testin
 	}
 }
 
+func TestSessionGroupRunnerRoutesReadyRejectsEndedServingSnapshot(t *testing.T) {
+	route := groupTestRoutes("a")[0]
+	done := make(chan struct{})
+	close(done)
+	session := &fakeGroupSession{
+		routes: map[string]RouteState{
+			"a": {
+				Route:     GroupRoute{LocalHTTPRoute: route},
+				ProxyName: "a-nhp1",
+				Phase:     RouteServing,
+			},
+		},
+		done: done,
+	}
+	runner := &SessionGroupRunner{
+		desired:  map[string]LocalHTTPRoute{"a": route},
+		restarts: map[string]uint64{},
+		active:   &groupCycle{session: session},
+	}
+
+	if runner.RoutesReady() {
+		t.Fatal("runner reported ready from an ended session's last serving snapshot")
+	}
+}
+
 func TestSessionGroupRunnerReturnsWhenEveryRouteIsGone(t *testing.T) {
 	h := startGroupHarness(t, time.Hour, 0, nil, "a", "b", "c")
 	h.waitServing(t, 1, "a", "b", "c")

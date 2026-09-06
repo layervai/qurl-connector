@@ -112,11 +112,13 @@ type routeStatus struct {
 // `discoverErr` independently.
 func runStatus(cmd *cobra.Command, _ []string) error {
 	if statusReady {
-		// An unhealthy readiness probe is a runtime result, not a usage error.
+		// An unhealthy readiness probe is an expected runtime result. Let
+		// Execute print its error once without Cobra's prefix or usage block.
 		// Set this only after Cobra validates flags so other status failures
-		// keep their existing usage output.
+		// keep their existing output.
 		if cmd != nil {
 			cmd.SilenceUsage = true
+			cmd.SilenceErrors = true
 		}
 		return probeConnectorHealth(commandContext(cmd))
 	}

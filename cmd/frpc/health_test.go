@@ -184,6 +184,39 @@ func TestRunWithConnectorHealthDisabledRunsDirectly(t *testing.T) {
 	}
 }
 
+type failedConnectorHealthListener struct {
+	err error
+}
+
+func (l *failedConnectorHealthListener) Accept() (net.Conn, error) { return nil, l.err }
+func (*failedConnectorHealthListener) Close() error                { return nil }
+func (*failedConnectorHealthListener) Addr() net.Addr {
+	return &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 7401}
+}
+
+func TestRunWithConnectorHealthStopsRuntimeWhenListenerFails(t *testing.T) {
+	t.Setenv(envConnectorHealthAddr, "127.0.0.1:7401")
+	previousListen := listenConnectorHealth
+	want := errors.New("listener failed")
+	listenConnectorHealth = func(_, _ string) (net.Listener, error) {
+		return &failedConnectorHealthListener{err: want}, nil
+	}
+	t.Cleanup(func() { listenConnectorHealth = previousListen })
+
+	runtimeCanceled := false
+	err := runWithConnectorHealth(context.Background(), func() bool { return false }, func(ctx context.Context) error {
+		<-ctx.Done()
+		runtimeCanceled = true
+		return ctx.Err()
+	})
+	if !runtimeCanceled {
+		t.Fatal("runtime kept running after its readiness listener failed")
+	}
+	if !errors.Is(err, want) || !strings.Contains(err.Error(), "serve Connector health") {
+		t.Fatalf("runWithConnectorHealth() error = %v, want wrapped listener error %v", err, want)
+	}
+}
+
 func TestProbeConnectorHealthDistinguishesWrongEndpoint(t *testing.T) {
 	for _, test := range []struct {
 		name             string
