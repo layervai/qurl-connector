@@ -53,6 +53,7 @@ jobs:
       # then only at a path-segment boundary. Keep these exact; never shorten
       # one to a bare `github.com/layervai/`.
       exempt_module_prefixes: |
+        github.com/layervai/frp
         github.com/layervai/qurl-go
         github.com/layervai/qurl-conformance
       # Post a sticky PR comment when an age-check fails, listing each
