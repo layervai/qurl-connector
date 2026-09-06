@@ -312,6 +312,11 @@ def put_parameter(region: str, parameter: str, token: str) -> None:
     clean_env.pop("AWS_PROFILE", None)
     clean_env.pop("AWS_DEFAULT_PROFILE", None)
     clean_env.pop("AWS_DEFAULT_OUTPUT", None)
+    clean_env.pop("AWS_ENDPOINT_URL", None)
+    clean_env.pop("AWS_ENDPOINT_URL_SSM", None)
+    clean_env.pop("AWS_CA_BUNDLE", None)
+    clean_env["AWS_CONFIG_FILE"] = os.devnull
+    clean_env["AWS_SHARED_CREDENTIALS_FILE"] = os.devnull
     clean_env["AWS_PAGER"] = ""
     try:
         result = subprocess.run(
@@ -443,13 +448,18 @@ def mint_and_install_enrollment(
         # within one hour.
         put_parameter(region, parameter, token)
     except EnrollmentError as exc:
-        if isinstance(credential_id, str) and re.fullmatch(
+        known_credential_id = isinstance(credential_id, str) and re.fullmatch(
             r"key_[A-Za-z0-9]{8,64}", credential_id
-        ):
-            if isinstance(exc, EnrollmentParameterOutcomeUnknown):
+        )
+        if isinstance(exc, EnrollmentParameterOutcomeUnknown):
+            if known_credential_id:
                 raise EnrollmentError(
                     f"enrollment credential {credential_id} was minted, but its installation outcome is unknown; retry the same generation only while the recovered token has at least 45 minutes remaining to repeat the idempotent parameter write; do not revoke that non-secret credential ID unless the parameter is confirmed not to reference it"
                 ) from exc
+            raise EnrollmentError(
+                "an enrollment credential was minted, but its installation outcome is unknown and its credential ID is unavailable; retry the same generation only while the recovered token has at least 45 minutes remaining to repeat the idempotent parameter write, and do not assume the parameter is unchanged until the outcome is confirmed or the token expires within one hour"
+            ) from exc
+        if known_credential_id:
             raise EnrollmentError(
                 f"enrollment credential {credential_id} was minted but not installed; retry the same generation only while the recovered token has at least 45 minutes remaining, otherwise use a new generation, or revoke that non-secret credential ID with JWT authority"
             ) from exc
@@ -469,6 +479,7 @@ def prepare_enrollment(
     now: dt.datetime | None = None,
 ) -> None:
     slug, parameter = TARGETS[target]
+    # Pre-mint reads fail immediately; rerunning them cannot create state.
     resources = api_request(
         api_endpoint, api_key, "/v1/resources?" + urllib.parse.urlencode({"slug": slug})
     )
@@ -581,11 +592,9 @@ def prepare_enrollment(
                     raise EnrollmentError(
                         "sharing status check was rejected after sharing for this resource was enabled by this run; sharing was left on"
                     ) from exc
-                if put_failure is not None:
-                    raise EnrollmentError(
-                        "sharing status check was rejected after the sharing update outcome became unknown; sharing may have been applied before the response was lost and may have been left on"
-                    ) from exc
-                raise
+                raise EnrollmentError(
+                    "sharing status check was rejected after the sharing update outcome became unknown; sharing may have been applied before the response was lost and may have been left on"
+                ) from exc
             observed_epoch = (
                 sharing.get("serving_epoch") if isinstance(sharing, dict) else None
             )

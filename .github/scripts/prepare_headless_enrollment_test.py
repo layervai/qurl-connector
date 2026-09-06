@@ -1131,6 +1131,46 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
         self.assertNotIn("lv_live_valid-token", str(raised.exception))
         self.assertIn("repeat the idempotent parameter write", str(raised.exception))
 
+    def test_ssm_timeout_without_safe_id_preserves_unknown_outcome(self) -> None:
+        responses = [
+            {
+                "kind": "enrollment_token",
+                "key_id": "unsafe/private-id",
+                "target": "agent",
+                "claims": [{"type": "connector", "id": "detect-sandbox"}],
+                "api_key": "lv_live_valid-token",
+                "expires_at": VALID_EXPIRY,
+            }
+        ]
+        with (
+            mock.patch.object(MODULE, "api_request", side_effect=responses),
+            mock.patch.object(
+                MODULE.subprocess,
+                "run",
+                side_effect=MODULE.subprocess.TimeoutExpired("aws", 30),
+            ),
+        ):
+            with self.assertRaisesRegex(
+                MODULE.EnrollmentError,
+                "installation outcome is unknown.*credential ID is unavailable",
+            ) as raised:
+                MODULE.mint_and_install_enrollment(
+                    "https://api.example.com",
+                    "lv_live_account-key",
+                    "detect-nhp-replica-a",
+                    "attempt-1",
+                    "us-east-2",
+                    "detect-sandbox",
+                    "/reviewed/name",
+                    now=FIXED_NOW,
+                )
+        self.assertIsInstance(
+            raised.exception.__cause__, MODULE.EnrollmentParameterOutcomeUnknown
+        )
+        self.assertNotIn("unsafe/private-id", str(raised.exception))
+        self.assertNotIn("lv_live_valid-token", str(raised.exception))
+        self.assertIn("do not assume the parameter is unchanged", str(raised.exception))
+
     def test_invalid_on_zero_state_never_mints_or_writes(self) -> None:
         responses = [
             [
@@ -1657,6 +1697,11 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
             "AWS_PROFILE": "ambient-profile",
             "AWS_DEFAULT_PROFILE": "ambient-default-profile",
             "AWS_DEFAULT_OUTPUT": "yaml",
+            "AWS_ENDPOINT_URL": "https://private.example.com",
+            "AWS_ENDPOINT_URL_SSM": "https://private.example.com/ssm",
+            "AWS_CA_BUNDLE": "/tmp/private-ca.pem",
+            "AWS_CONFIG_FILE": "/tmp/private-config",
+            "AWS_SHARED_CREDENTIALS_FILE": "/tmp/private-credentials",
             "AWS_PAGER": "unsafe-pager",
         }
         completed = mock.Mock(returncode=0)
@@ -1675,6 +1720,13 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
         self.assertNotIn("AWS_PROFILE", kwargs["env"])
         self.assertNotIn("AWS_DEFAULT_PROFILE", kwargs["env"])
         self.assertNotIn("AWS_DEFAULT_OUTPUT", kwargs["env"])
+        self.assertNotIn("AWS_ENDPOINT_URL", kwargs["env"])
+        self.assertNotIn("AWS_ENDPOINT_URL_SSM", kwargs["env"])
+        self.assertNotIn("AWS_CA_BUNDLE", kwargs["env"])
+        self.assertEqual(kwargs["env"]["AWS_CONFIG_FILE"], MODULE.os.devnull)
+        self.assertEqual(
+            kwargs["env"]["AWS_SHARED_CREDENTIALS_FILE"], MODULE.os.devnull
+        )
         self.assertEqual(kwargs["env"]["AWS_PAGER"], "")
         self.assertEqual(kwargs["input"], "lv_live_secret-token")
         self.assertEqual(args[args.index("--value") + 1], "file:///dev/stdin")

@@ -30,6 +30,7 @@ make lint
 make vet
 make verify-deps
 go test ./.github/scripts
+(
 qurl_lint_venv=$(mktemp -d)
 trap 'rm -rf -- "$qurl_lint_venv"' EXIT
 python3 -m venv "$qurl_lint_venv"
@@ -37,6 +38,7 @@ python3 -m venv "$qurl_lint_venv"
 "$qurl_lint_venv/bin/python" -m ruff check --no-cache .github/scripts/prepare-headless-enrollment.py .github/scripts/prepare_headless_enrollment_test.py
 "$qurl_lint_venv/bin/python" -m ruff format --check --no-cache .github/scripts/prepare-headless-enrollment.py .github/scripts/prepare_headless_enrollment_test.py
 PYTHONDONTWRITEBYTECODE=1 python3 .github/scripts/prepare_headless_enrollment_test.py
+)
 ```
 
 Tests in this public repository are hermetic. Do not add credentials, private

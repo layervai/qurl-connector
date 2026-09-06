@@ -20,7 +20,7 @@ var (
 	// below, not this expression, decides which private operational paths are
 	// reviewed for public source. References into reviewed public qurl-* repos
 	// are excluded separately after this deliberately broad match.
-	operationalPath = regexp.MustCompile(`(?:^|[^A-Za-z0-9_.-])(/qurl-[a-z0-9-]+/(?:[A-Z][A-Z0-9_]*(?:/[A-Z][A-Z0-9_]*)*|[a-z0-9][a-z0-9-]*(?:/[a-z0-9](?:[a-z0-9-]*[a-z0-9])?){1,}))(?:[^A-Za-z0-9_/-]|$)`)
+	operationalPath = regexp.MustCompile(`(/qurl-[a-z0-9-]+/(?:[A-Z][A-Z0-9_]*(?:/[A-Z][A-Z0-9_]*)*|[a-z0-9][a-z0-9-]*(?:/[a-z0-9](?:[a-z0-9-]*[a-z0-9])?){1,}))(?:[^A-Za-z0-9_/-]|$)`)
 )
 
 func findOperationalPaths(text string) []string {
@@ -30,10 +30,29 @@ func findOperationalPaths(text string) []string {
 		if match == nil {
 			break
 		}
-		paths = append(paths, text[offset+match[2]:offset+match[3]])
+		start := offset + match[2]
+		if !hasPublicRepositoryPrefix(text, start) {
+			paths = append(paths, text[start:offset+match[3]])
+		}
 		offset += match[3]
 	}
 	return paths
+}
+
+func hasPublicRepositoryPrefix(text string, pathStart int) bool {
+	const prefix = "github.com/layervai"
+	prefixStart := pathStart - len(prefix)
+	if prefixStart < 0 || text[prefixStart:pathStart] != prefix {
+		return false
+	}
+	if prefixStart == 0 {
+		return true
+	}
+	preceding := text[prefixStart-1]
+	return !((preceding >= 'a' && preceding <= 'z') ||
+		(preceding >= 'A' && preceding <= 'Z') ||
+		(preceding >= '0' && preceding <= '9') ||
+		preceding == '.' || preceding == '-')
 }
 
 func TestOperationalPathDetectorStaysBroaderThanAllowlist(t *testing.T) {
@@ -86,6 +105,15 @@ func TestOperationalPathDetectorIgnoresRepositoryReferences(t *testing.T) {
 		if got := findOperationalPaths(reference); len(got) != 0 {
 			t.Fatalf("findOperationalPaths(%q) = %q, want repository reference ignored", reference, got)
 		}
+	}
+	path := "/qurl-example-service/" + "nhp/replica-a/bootstrap"
+	for _, prefix := range []string{"https://private.example.com", "/tmp"} {
+		if got := findOperationalPaths(prefix + path); len(got) != 1 || got[0] != path {
+			t.Fatalf("findOperationalPaths(%q) = %q, want embedded operational path", prefix+path, got)
+		}
+	}
+	if got := findOperationalPaths("evilgithub.com/layervai" + path); len(got) != 1 || got[0] != path {
+		t.Fatalf("lookalike GitHub host bypassed operational path detection: %q", got)
 	}
 }
 
