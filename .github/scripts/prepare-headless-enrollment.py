@@ -377,6 +377,12 @@ def put_parameter(region: str, parameter: str, token: str) -> None:
     clean_env["AWS_CONFIG_FILE"] = os.devnull
     clean_env["AWS_SHARED_CREDENTIALS_FILE"] = os.devnull
     clean_env["AWS_CLI_FILE_ENCODING"] = "utf-8"
+    # Make the single script-level retry below the complete retry budget.
+    # Retrying the same SecureString value with --overwrite is idempotent.
+    clean_env["AWS_RETRY_MODE"] = "standard"
+    clean_env["AWS_MAX_ATTEMPTS"] = "1"
+    clean_env["AWS_USE_FIPS_ENDPOINT"] = "false"
+    clean_env["AWS_USE_DUALSTACK_ENDPOINT"] = "false"
     clean_env["AWS_PAGER"] = ""
     for attempt in range(2):
         try:
@@ -499,8 +505,9 @@ def mint_and_install_enrollment(
             "enrollment credential result is unknown; retry the same target and generation to recover the exact operation"
         ) from mint_failure
     credential_id = credential.get("key_id", "") if isinstance(credential, dict) else ""
-    known_credential_id = isinstance(credential_id, str) and re.fullmatch(
-        r"key_[A-Za-z0-9]{8,64}", credential_id
+    known_credential_id = bool(
+        isinstance(credential_id, str)
+        and re.fullmatch(r"key_[A-Za-z0-9]{8,64}", credential_id)
     )
     mint_warning = ""
     possible_extra_credential = mint_outcome_unknown and mint_response_status == [201]

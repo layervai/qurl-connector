@@ -1957,6 +1957,10 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
             "no_proxy": "127.0.0.1",
             "all_proxy": "socks5://lower-proxy.example.com",
             "AWS_CLI_FILE_ENCODING": "utf-16",
+            "AWS_RETRY_MODE": "adaptive",
+            "AWS_MAX_ATTEMPTS": "99",
+            "AWS_USE_FIPS_ENDPOINT": "true",
+            "AWS_USE_DUALSTACK_ENDPOINT": "true",
             "AWS_CONFIG_FILE": "/tmp/private-config",
             "AWS_SHARED_CREDENTIALS_FILE": "/tmp/private-credentials",
             "AWS_PAGER": "unsafe-pager",
@@ -1997,6 +2001,10 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
             kwargs["env"]["AWS_SHARED_CREDENTIALS_FILE"], MODULE.os.devnull
         )
         self.assertEqual(kwargs["env"]["AWS_CLI_FILE_ENCODING"], "utf-8")
+        self.assertEqual(kwargs["env"]["AWS_RETRY_MODE"], "standard")
+        self.assertEqual(kwargs["env"]["AWS_MAX_ATTEMPTS"], "1")
+        self.assertEqual(kwargs["env"]["AWS_USE_FIPS_ENDPOINT"], "false")
+        self.assertEqual(kwargs["env"]["AWS_USE_DUALSTACK_ENDPOINT"], "false")
         self.assertEqual(kwargs["env"]["AWS_PAGER"], "")
         self.assertEqual(kwargs["input"], "lv_live_secret-token")
         self.assertEqual(args[args.index("--value") + 1], "file:///dev/stdin")
