@@ -65,6 +65,7 @@ func TestLoadAcceptsAndDropsRetiredGeneratedFields(t *testing.T) {
 	path := writeConfig(t, fmt.Sprintf(`
 server:
   addr: frp.example
+  token: "   "
   public_domain: qurl.site
   replica_discriminator: old-replica
   port: 7000

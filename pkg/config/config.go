@@ -324,13 +324,13 @@ func stripRetiredGeneratedFields(data string) (string, error) {
 	dropped := false
 	var errs []error
 	if server := yamlField(root, "server"); server != nil {
-		if line, ok := yamlFieldLine(server, "token"); ok {
+		if token := yamlField(server, "token"); token != nil && strings.TrimSpace(token.Value) != "" {
+			line, _ := yamlFieldLine(server, "token")
 			errs = append(errs, fmt.Errorf("config field server.token at line %d was removed; delete it because NHP admission supplies the FRP session token", line))
 		}
+		dropped = dropYAMLField(server, "token") || dropped
 		dropped = dropYAMLField(server, "public_domain") || dropped
-		if yamlField(server, "replica_discriminator") != nil {
-			dropped = dropYAMLField(server, "replica_discriminator") || dropped
-		}
+		dropped = dropYAMLField(server, "replica_discriminator") || dropped
 	}
 	if routes := yamlField(root, "routes"); routes != nil && routes.Kind == yaml.SequenceNode {
 		for i, route := range routes.Content {
