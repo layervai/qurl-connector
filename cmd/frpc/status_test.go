@@ -319,6 +319,62 @@ func TestBuildRouteStatuses_NilCfgReturnsNil(t *testing.T) {
 	}
 }
 
+func TestRunStatusReadyRequiresEveryLiveRoute(t *testing.T) {
+	previous := statusReady
+	statusReady = true
+	t.Cleanup(func() { statusReady = previous })
+
+	for _, test := range []struct {
+		name      string
+		proxyBody string
+		wantErr   bool
+	}{
+		{name: "running", proxyBody: `{"tcp":[{"name":"web","status":"running"}]}`},
+		{name: "starting", proxyBody: `{"tcp":[{"name":"web","status":"start error"}]}`, wantErr: true},
+		{name: "missing", proxyBody: `{}`, wantErr: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			admin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, test.proxyBody)
+			}))
+			t.Cleanup(admin.Close)
+			host, portText, err := net.SplitHostPort(admin.Listener.Addr().String())
+			if err != nil {
+				t.Fatal(err)
+			}
+			dir := t.TempDir()
+			isolateConnectorStateForTest(t, dir)
+			path := filepath.Join(dir, "qurl-proxy.yaml")
+			if err := os.WriteFile(path, []byte(`
+server:
+  addr: boundary.example.com
+  port: 7000
+  protocol: tcp
+admin:
+  enabled: true
+  addr: `+host+`
+  port: `+portText+`
+  password: secret
+routes:
+  - id: web
+    type: http
+    local_ip: 127.0.0.1
+    local_port: 8080
+`), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			previousCfg, previousJSON := cfgFile, statusJSON
+			cfgFile, statusJSON = path, false
+			t.Cleanup(func() { cfgFile, statusJSON = previousCfg, previousJSON })
+			err = runStatus(nil, nil)
+			if (err != nil) != test.wantErr {
+				t.Fatalf("runStatus --ready error = %v, wantErr %t", err, test.wantErr)
+			}
+		})
+	}
+}
+
 // TestBuildRouteStatuses_LivePropagatesRemoteAddr pins that the
 // RemoteAddr from the live proxy entry round-trips into the
 // routeStatus output. Pollers read RemoteAddr to display "where is

@@ -15,7 +15,10 @@ import (
 	nhpconfig "github.com/layervai/qurl-connector/pkg/config"
 )
 
-var statusJSON bool
+var (
+	statusJSON  bool
+	statusReady bool
+)
 
 var statusCmd = &cobra.Command{
 	Use:   "status",
@@ -25,6 +28,8 @@ var statusCmd = &cobra.Command{
 
 func init() {
 	statusCmd.Flags().BoolVar(&statusJSON, "json", false, "output status in JSON format")
+	statusCmd.Flags().BoolVar(&statusReady, "ready", false, "exit successfully only when every route is running")
+	statusCmd.MarkFlagsMutuallyExclusive("json", "ready")
 }
 
 // adminProxyStatus represents a single proxy status from the FRP admin API.
@@ -221,6 +226,17 @@ func runStatus(cmd *cobra.Command, _ []string) error {
 	// `routeID-` prefix fallback covers env divergence and random-fallback
 	// salts that status cannot reproduce cross-process.
 	routes := buildRouteStatuses(cfg, proxyMap, running, adminDisabled)
+	if statusReady {
+		if !running || len(routes) == 0 {
+			return fmt.Errorf("connector routes are not ready")
+		}
+		for _, route := range routes {
+			if route.Status != "running" {
+				return fmt.Errorf("connector routes are not ready")
+			}
+		}
+		return nil
+	}
 
 	if statusJSON {
 		out := statusOutput{
