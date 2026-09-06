@@ -14,6 +14,7 @@ import (
 	frpconfig "github.com/fatedier/frp/pkg/config"
 	"github.com/fatedier/frp/pkg/config/source"
 	v1 "github.com/fatedier/frp/pkg/config/v1"
+	frpvalidation "github.com/fatedier/frp/pkg/config/v1/validation"
 	"github.com/fatedier/frp/pkg/policy/security"
 
 	nhpconfig "github.com/layervai/qurl-connector/pkg/config"
@@ -316,7 +317,13 @@ func completeGroupProxies(common *v1.ClientCommonConfig, proxies []v1.ProxyConfi
 		}
 		return nil, fmt.Errorf("FRP client config filters out proxies %q", dropped)
 	}
-	return frpconfig.CompleteProxyConfigurers(filtered), nil
+	completed := frpconfig.CompleteProxyConfigurers(filtered)
+	for _, proxy := range completed {
+		if err := frpvalidation.ValidateProxyConfigurerForClient(proxy); err != nil {
+			return nil, fmt.Errorf("validate FRP proxy %q: %w", proxy.GetBaseConfig().Name, err)
+		}
+	}
+	return completed, nil
 }
 
 func (f *FRPSessionGroupFactory) Start(ctx context.Context, admission Admission, routes []GroupRoute) (GroupServingSession, error) {

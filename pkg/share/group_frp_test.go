@@ -168,7 +168,7 @@ func TestGroupProxyNameStaysUniquePastDiscriminatorCap(t *testing.T) {
 	}
 }
 
-func TestNewFRPSessionGroupFactoryRejectsStartFilter(t *testing.T) {
+func TestGroupProxyCompletionRejectsFilterAndInvalidProxy(t *testing.T) {
 	common := &v1.ClientCommonConfig{Start: []string{"other-proxy"}}
 	if _, err := NewFRPSessionGroupFactory(FRPGroupFactoryConfig{Common: common}); err == nil {
 		t.Fatal("a Login-level proxy start filter was accepted for a session group")
@@ -180,6 +180,11 @@ func TestNewFRPSessionGroupFactoryRejectsStartFilter(t *testing.T) {
 	}
 	if _, err := completeGroupProxies(common, proxies); err == nil || !strings.Contains(err.Error(), `"a-nhp1"`) {
 		t.Fatalf("completeGroupProxies() = %v, want an error naming the dropped proxies", err)
+	}
+	common.Start = nil
+	proxies[0].(*v1.HTTPProxyConfig).SubDomain = ""
+	if _, err := completeGroupProxies(common, proxies); err == nil || !strings.Contains(err.Error(), `validate FRP proxy "a-nhp1"`) {
+		t.Fatalf("completeGroupProxies() = %v, want per-proxy validation", err)
 	}
 }
 
@@ -638,6 +643,9 @@ func TestInspectRouteStatusMapsExactRejectionTags(t *testing.T) {
 		{wire: "session_stale: stale", fatalErr: ErrAdmissionStale},
 		{wire: "resource_not_found: gone", routeErr: ErrResourceGone},
 		{wire: "registration_failed: retry", transient: true},
+		{wire: "proxy knock_invalid: expired", transient: true},
+		{wire: " knock_invalid: expired", transient: true},
+		{wire: "knock_invalid:expired", transient: true},
 	} {
 		status := &lockedStatusMap{}
 		status.set("a", frpproxy.ProxyPhaseStartErr, test.wire)

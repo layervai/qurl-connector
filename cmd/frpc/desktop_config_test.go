@@ -13,7 +13,15 @@ import (
 	nhpconfig "github.com/layervai/qurl-connector/pkg/config"
 )
 
-const validDesktopConfig = "routes: []\n"
+const validDesktopConfig = `server:
+  public_domain: qurl.site
+admin:
+  enabled: true
+  addr: 127.0.0.1
+  port: 7400
+  password: test-only-admin-password
+routes: []
+`
 
 func TestReplaceDesktopConfigCreatesContinuityState(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "qurl-proxy.yaml")
