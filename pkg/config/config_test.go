@@ -207,6 +207,78 @@ routes: []
 	}
 }
 
+func TestAdminBindLooksRoutable(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		cfg  *Config
+		want bool
+	}{
+		{"nil", nil, false},
+		{"disabled", &Config{Admin: AdminConfig{Addr: "0.0.0.0"}}, false},
+		{"IPv4 loopback", &Config{Admin: AdminConfig{Enabled: true, Addr: "127.0.0.5"}}, false},
+		{"IPv6 loopback", &Config{Admin: AdminConfig{Enabled: true, Addr: "::1"}}, false},
+		{"localhost", &Config{Admin: AdminConfig{Enabled: true, Addr: "LOCALHOST"}}, false},
+		{"empty", &Config{Admin: AdminConfig{Enabled: true}}, true},
+		{"whitespace", &Config{Admin: AdminConfig{Enabled: true, Addr: "  "}}, true},
+		{"IPv4 any", &Config{Admin: AdminConfig{Enabled: true, Addr: "0.0.0.0"}}, true},
+		{"IPv6 any", &Config{Admin: AdminConfig{Enabled: true, Addr: "::"}}, true},
+		{"public IP", &Config{Admin: AdminConfig{Enabled: true, Addr: "8.8.8.8"}}, true},
+		{"hostname", &Config{Admin: AdminConfig{Enabled: true, Addr: "host.docker.internal"}}, true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := AdminBindLooksRoutable(tt.cfg); got != tt.want {
+				t.Fatalf("AdminBindLooksRoutable() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestAdminEnvContract(t *testing.T) {
+	for value, want := range map[string]bool{
+		"1": true, "true": true, " yes ": true, "ON": true,
+		"0": false, "false": false, " no ": false, "OFF": false,
+	} {
+		t.Run(value, func(t *testing.T) {
+			t.Setenv("QURL_ADMIN_ENABLED", value)
+			path := writeConfig(t, fmt.Sprintf("admin:\n  enabled: %t\nroutes: []\n", !want))
+			cfg, err := Load(path)
+			if err != nil || cfg.Admin.Enabled != want {
+				t.Fatalf("QURL_ADMIN_ENABLED=%q: enabled=%v, err=%v, want %v", value, cfg.Admin.Enabled, err, want)
+			}
+		})
+	}
+
+	t.Run("invalid value warns and preserves YAML", func(t *testing.T) {
+		t.Setenv("QURL_ADMIN_ENABLED", "enable")
+		onPath := writeConfig(t, "admin:\n  enabled: true\nroutes: []\n")
+		var cfg *Config
+		var err error
+		stderr := captureStderr(t, func() { cfg, err = Load(onPath) })
+		if err != nil || !cfg.Admin.Enabled || !strings.Contains(stderr, "not recognized") {
+			t.Fatalf("invalid env: config=%+v, err=%v, stderr=%q", cfg, err, stderr)
+		}
+	})
+
+	t.Run("disabled stale port stays inert", func(t *testing.T) {
+		t.Setenv("QURL_ADMIN_ENABLED", "false")
+		stalePath := writeConfig(t, "admin:\n  enabled: false\n  port: 99999\nroutes: []\n")
+		if _, err := Load(stalePath); err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv("QURL_ADMIN_ENABLED", "true")
+		if _, err := Load(stalePath); err == nil || !strings.Contains(err.Error(), "admin.port") {
+			t.Fatalf("enabled stale port error = %v", err)
+		}
+	})
+
+	t.Run("fresh config does not persist env", func(t *testing.T) {
+		t.Setenv("QURL_ADMIN_ENABLED", "true")
+		if NewDefaulted().Admin.Enabled {
+			t.Fatal("NewDefaulted persisted a runtime env override")
+		}
+	})
+}
+
 func TestLoad_StaticServerAddrRequiresPort(t *testing.T) {
 	yaml := `
 server:
@@ -749,10 +821,17 @@ routes:
     type: http
     local_port: 8080
     resource_id: %s
+    subdomain: old-managed-routing
+    load_balancer_group: old-managed-routing
 `, testPublicResourceA)
-	cfg, err := Load(writeConfig(t, yaml))
+	var cfg *Config
+	var err error
+	stderr := captureStderr(t, func() { cfg, err = Load(writeConfig(t, yaml)) })
 	if err != nil {
 		t.Fatalf("Load must allow API-backed routing hydration: %v", err)
+	}
+	if !strings.Contains(stderr, "subdomain") || !strings.Contains(stderr, "load_balancer_group") {
+		t.Fatalf("missing pending-hydration warnings: %q", stderr)
 	}
 	if cfg.Routes[0].ResourceID != testPublicResourceA || cfg.Routes[0].ConnectorRoutingID != "" {
 		t.Fatalf("Load altered incomplete managed identity: %+v", cfg.Routes[0])

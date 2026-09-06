@@ -337,10 +337,16 @@ func stripRetiredGeneratedFields(data string) (string, error) {
 					continue
 				}
 				routingID := yamlField(route, "connector_routing_id")
-				if routingID != nil && field.Value == routingID.Value {
+				resourceID := yamlField(route, "resource_id")
+				switch {
+				case routingID != nil && field.Value == routingID.Value:
 					dropped = dropYAMLField(route, key) || dropped
-				} else if line, ok := yamlFieldLine(route, key); ok {
-					errs = append(errs, fmt.Errorf("config field routes[%d].%s at line %d was removed; delete it because managed routes use connector_routing_id", i, key, line))
+				case routingID == nil && resourceID != nil && strings.TrimSpace(resourceID.Value) != "":
+					// A pinned managed resource can load before routing hydration.
+					fmt.Fprintf(os.Stderr, "warning: config field routes[%d].%s is ignored while managed resource routing is hydrated\n", i, key)
+					dropped = dropYAMLField(route, key) || dropped
+				default:
+					errs = append(errs, fmt.Errorf("config field routes[%d].%s at line %d was removed; delete it because managed routes use connector_routing_id", i, key, field.Line))
 				}
 			}
 			// Current qURL Desktop writes this authenticated API value into YAML,
