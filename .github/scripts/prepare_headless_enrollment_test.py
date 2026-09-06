@@ -110,7 +110,8 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
             "permissions:\n      contents: read\n      id-token: write",
             rotate_permissions,
         )
-        self.assertIn("timeout-minutes: 15", rotate_permissions)
+        self.assertIn("timeout-minutes: 12", rotate_permissions)
+        self.assertIn("role-duration-seconds: 900", workflow)
         self.assertIn('"$GITHUB_REF" != "refs/heads/main"', workflow)
         self.assertIn(
             "RECOVERY_GENERATION: ${{ inputs.generation }}", verify_permissions
@@ -2303,19 +2304,37 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
         run.assert_called_once()
         sleep.assert_not_called()
 
-    def test_put_parameter_reports_only_safe_aws_error_code(self) -> None:
-        completed = mock.Mock(
-            returncode=255,
-            stderr="An error occurred (AccessDeniedException) while writing lv_live_secret-token",
-        )
-        with mock.patch.object(MODULE.subprocess, "run", return_value=completed):
-            with self.assertRaisesRegex(
-                MODULE.EnrollmentError, "AccessDeniedException"
-            ) as raised:
-                MODULE.put_parameter(
-                    "us-east-2", "/reviewed/name", "lv_live_secret-token"
+    def test_put_parameter_reports_only_safe_rejected_aws_error_code(self) -> None:
+        for error_code in (
+            "AccessDeniedException",
+            "ExpiredToken",
+            "ExpiredTokenException",
+            "IncompleteSignature",
+            "IncompleteSignatureException",
+            "InvalidClientTokenId",
+            "InvalidSignatureException",
+            "RequestExpired",
+            "SignatureDoesNotMatch",
+            "UnrecognizedClientException",
+        ):
+            with self.subTest(error_code=error_code):
+                completed = mock.Mock(
+                    returncode=255,
+                    stderr=f"An error occurred ({error_code}) while writing lv_live_secret-token",
                 )
-        self.assertNotIn("lv_live_secret-token", str(raised.exception))
+                with mock.patch.object(
+                    MODULE.subprocess, "run", return_value=completed
+                ):
+                    with self.assertRaisesRegex(
+                        MODULE.EnrollmentError, error_code
+                    ) as raised:
+                        MODULE.put_parameter(
+                            "us-east-2", "/reviewed/name", "lv_live_secret-token"
+                        )
+                self.assertNotIsInstance(
+                    raised.exception, MODULE.EnrollmentParameterOutcomeUnknown
+                )
+                self.assertNotIn("lv_live_secret-token", str(raised.exception))
 
     def test_put_parameter_classifies_safe_local_aws_failure(self) -> None:
         for stderr, expected_class in (

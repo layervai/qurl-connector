@@ -93,7 +93,9 @@ jobs:
     runs-on: ubuntu-latest
     # The job timeout is the hard wall-clock cap; socket and process timeouts
     # bound ordinary failures inside it.
-    timeout-minutes: 15
+    # Keep the job deadline below the 15-minute STS session. This ensures the
+    # runner stops the operation before its write-only SSM authority expires.
+    timeout-minutes: 12
     permissions:
       contents: read
       id-token: write
