@@ -41,18 +41,10 @@ func findOperationalPaths(text string) []string {
 		candidate := text[start : offset+match[3]]
 		// A templated suffix cannot be allowlisted, but its concrete prefix still
 		// identifies an operational namespace and must reach the exact allowlist.
-		templated := false
 		if cut := strings.IndexAny(candidate, "{}"); cut >= 0 {
 			candidate = strings.TrimRight(candidate[:cut], "/")
-			templated = true
 		}
-		minimumSeparators := 2
-		if templated {
-			// The cut removed at least one path segment, so retain a shorter
-			// concrete namespace for exact allowlist review.
-			minimumSeparators = 1
-		}
-		if strings.Count(candidate, "/") >= minimumSeparators && !hasPublicRepositoryPrefix(text, start) {
+		if !hasPublicRepositoryPrefix(text, start) {
 			paths = append(paths, candidate)
 		}
 		offset += match[3]

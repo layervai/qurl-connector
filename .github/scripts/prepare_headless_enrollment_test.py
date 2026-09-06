@@ -50,7 +50,7 @@ class FakeResponse:
 class PrepareHeadlessEnrollmentTest(unittest.TestCase):
     def test_generated_python_tool_directories_are_ignored(self) -> None:
         entries = set(GITIGNORE.read_text().splitlines())
-        self.assertTrue({".ruff_cache/", ".venv/", "venv/"} <= entries)
+        self.assertTrue({".ruff_cache/", ".venv/", "/venv/"} <= entries)
 
     def test_workflow_exposes_every_reviewed_target_and_uses_target_selector(
         self,
@@ -96,9 +96,9 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
         aws_cli = workflow.index("- name: Require tested AWS CLI major")
         prepare = workflow.index("- name: Prepare reviewed enrollment tokens")
         self.assertLess(verify_job, rotate_job)
-        self.assertLess(preflight, aws)
-        self.assertLess(aws, aws_cli)
-        self.assertLess(aws_cli, prepare)
+        self.assertLess(preflight, aws_cli)
+        self.assertLess(aws_cli, aws)
+        self.assertLess(aws, prepare)
         self.assertIn("if ! aws_version=$(aws --version 2>&1); then", workflow)
         self.assertIn("AWS CLI v2, but aws is unavailable", workflow)
         self.assertIn('[[ ! "$aws_version" =~ ^aws-cli/2\\. ]]', workflow)
@@ -169,13 +169,16 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
             "          persist-credentials: false",
             workflow,
         )
-        self.assertIn(
-            "run: python3 .github/scripts/prepare_headless_enrollment_test.py",
-            workflow,
-        )
+        self.assertIn("run: make test-python", workflow)
         self.assertNotIn("unittest discover", workflow)
         makefile = MAKEFILE.read_text()
         self.assertIn("lint-python:", makefile)
+        self.assertIn("test-python:", makefile)
+        self.assertIn(
+            "PYTHONDONTWRITEBYTECODE=1 $(PYTHON) "
+            ".github/scripts/prepare_headless_enrollment_test.py",
+            makefile,
+        )
         self.assertIn("ruff check --no-cache $(PYTHON_LINT_FILES)", makefile)
         self.assertIn("ruff format --check --no-cache $(PYTHON_LINT_FILES)", makefile)
         self.assertIn(

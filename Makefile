@@ -20,7 +20,7 @@ BLUE := \033[34m
 GREEN := \033[32m
 RESET := \033[0m
 
-.PHONY: all build frpc test test-race lint lint-python vet fmt clean verify-deps proof-1000
+.PHONY: all build frpc test test-race test-python lint lint-python vet fmt clean verify-deps proof-1000
 
 all: print-version env frpc
 
@@ -63,6 +63,9 @@ test:
 # CGO_ENABLED=0 build works.
 test-race:
 	CGO_ENABLED=1 go test -race -count=1 ./pkg/... ./cmd/... ./internal/...
+
+test-python:
+	PYTHONDONTWRITEBYTECODE=1 $(PYTHON) .github/scripts/prepare_headless_enrollment_test.py
 
 vet:
 	go vet ./...

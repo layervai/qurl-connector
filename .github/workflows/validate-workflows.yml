@@ -33,6 +33,8 @@ jobs:
       - name: Lint sandbox enrollment recovery
         run: make lint-python
       - name: Require tested AWS CLI major
+        # ubuntu-latest supplies AWS CLI v2; fail with a clear contract error
+        # if a future runner image changes that dependency.
         run: |
           set -euo pipefail
           if ! aws_version=$(aws --version 2>&1); then
@@ -44,8 +46,6 @@ jobs:
             exit 1
           fi
       - name: Test sandbox enrollment recovery
-        env:
-          PYTHONDONTWRITEBYTECODE: "1"
-        run: python3 .github/scripts/prepare_headless_enrollment_test.py
+        run: make test-python
       - name: Test workflow contracts
         run: go test ./.github/scripts

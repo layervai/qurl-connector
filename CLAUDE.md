@@ -31,12 +31,13 @@ make vet
 make verify-deps
 go test ./.github/scripts
 (
+set -e
 qurl_lint_venv=$(mktemp -d)
 trap 'rm -rf -- "$qurl_lint_venv"' EXIT
 python3 -m venv "$qurl_lint_venv"
 "$qurl_lint_venv/bin/python" -m pip install --require-hashes -r .github/scripts/requirements-lint.txt
 PYTHON="$qurl_lint_venv/bin/python" make lint-python
-PYTHONDONTWRITEBYTECODE=1 python3 .github/scripts/prepare_headless_enrollment_test.py
+PYTHON="$qurl_lint_venv/bin/python" make test-python
 )
 ```
 

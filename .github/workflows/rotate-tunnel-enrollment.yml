@@ -140,15 +140,9 @@ jobs:
             exit 1
           fi
 
-      - name: Configure narrow AWS credentials
-        uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3
-        with:
-          role-to-assume: ${{ secrets.QURL_TUNNEL_RECOVERY_ROLE_ARN }}
-          aws-region: us-east-2
-          role-duration-seconds: 900
-          mask-aws-account-id: true
-
       - name: Require tested AWS CLI major
+        # ubuntu-latest supplies AWS CLI v2 today. This explicit precondition
+        # keeps an image change from assuming the recovery role before failure.
         run: |
           set -euo pipefail
           if ! aws_version=$(aws --version 2>&1); then
@@ -159,6 +153,14 @@ jobs:
             echo "::error::enrollment recovery requires AWS CLI v2"
             exit 1
           fi
+
+      - name: Configure narrow AWS credentials
+        uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3
+        with:
+          role-to-assume: ${{ secrets.QURL_TUNNEL_RECOVERY_ROLE_ARN }}
+          aws-region: us-east-2
+          role-duration-seconds: 900
+          mask-aws-account-id: true
 
       - name: Prepare reviewed enrollment tokens
         env:
