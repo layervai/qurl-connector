@@ -26,14 +26,17 @@ AWS_ERROR_CODE = re.compile(r"An error occurred \(([A-Za-z][A-Za-z0-9._-]{0,127}
 AWS_LOCAL_ERROR_CLASSES = {
     "Unable to locate credentials": "MissingCredentials",
     "Could not connect to the endpoint URL": "EndpointConnection",
+    "Failed to connect to proxy URL": "ProxyConnection",
+    "SSL validation failed for": "TLSValidation",
+    "usage: aws": "InvalidCLIArguments",
 }
 MAX_RESPONSE_BYTES = 64 * 1024
 API_TIMEOUT_SECONDS = 10
 AWS_TIMEOUT_SECONDS = 30
 SHARING_POLL_ATTEMPTS = 6
 SHARING_POLL_SECONDS = 2
-MINT_RETRY_SECONDS = 2
-MAX_MINT_RETRY_AFTER_SECONDS = 30
+RETRY_SECONDS = 2
+MAX_RETRY_AFTER_SECONDS = 30
 TARGETS = {
     "fileviewer-nhp-replica-a": (
         "fileviewer-sandbox",
@@ -121,6 +124,8 @@ NO_REDIRECT_OPENER = urllib.request.build_opener(NoRedirectHandler)
 
 
 def validate_api_endpoint(value: str, *, expected_sha256: str) -> str:
+    if value != value.strip():
+        raise EnrollmentError("sandbox API endpoint has leading or trailing whitespace")
     try:
         parsed = urllib.parse.urlsplit(value)
         port = parsed.port
@@ -181,8 +186,8 @@ def parse_retry_after(value: Any, *, now: dt.datetime | None = None) -> float | 
         # Avoid converting an attacker-controlled integer with arbitrary size.
         significant = retry_after.lstrip("0") or "0"
         if len(significant) > 10:
-            return float(MAX_MINT_RETRY_AFTER_SECONDS)
-        return float(min(int(significant), MAX_MINT_RETRY_AFTER_SECONDS))
+            return float(MAX_RETRY_AFTER_SECONDS)
+        return float(min(int(significant), MAX_RETRY_AFTER_SECONDS))
     try:
         retry_at = email.utils.parsedate_to_datetime(retry_after)
     except (TypeError, ValueError, OverflowError):
@@ -191,7 +196,7 @@ def parse_retry_after(value: Any, *, now: dt.datetime | None = None) -> float | 
         return None
     current = now or dt.datetime.now(dt.timezone.utc)
     seconds = (retry_at.astimezone(dt.timezone.utc) - current).total_seconds()
-    return min(max(seconds, 0.0), float(MAX_MINT_RETRY_AFTER_SECONDS))
+    return min(max(seconds, 0.0), float(MAX_RETRY_AFTER_SECONDS))
 
 
 def api_request(
@@ -276,7 +281,8 @@ def api_request(
 
 def _put_parameter_command(region: str, parameter: str) -> list[str]:
     # KEY excludes non-ASCII and newlines, so text-mode paramfile expansion
-    # preserves the validated token byte-for-byte.
+    # preserves the validated token byte-for-byte. /dev/stdin requires the
+    # POSIX environment pinned by the workflow's Ubuntu runner.
     # The paired Terraform foundation creates every reviewed parameter under
     # the AWS-managed alias/aws/ssm key. The recovery role therefore needs no
     # customer-managed KMS authority and cannot silently select another key.
@@ -321,6 +327,8 @@ def put_parameter(region: str, parameter: str, token: str) -> None:
             "AWS CLI could not start for the enrollment parameter update"
         ) from exc
     if result.returncode != 0:
+        # AWS CLI stderr can contain credentials, profile names, and private
+        # endpoints. Only emit a bounded service error code or reviewed class.
         match = AWS_ERROR_CODE.search(result.stderr or "")
         error_class = (
             match.group(1)
@@ -388,9 +396,9 @@ def mint_and_install_enrollment(
                 retry_delay = (
                     exc.retry_after_seconds
                     if exc.retry_after_seconds is not None
-                    else MINT_RETRY_SECONDS
+                    else RETRY_SECONDS
                 )
-                time.sleep(min(max(retry_delay, 0.0), MAX_MINT_RETRY_AFTER_SECONDS))
+                time.sleep(min(max(retry_delay, 0.0), MAX_RETRY_AFTER_SECONDS))
         except EnrollmentError as exc:
             if mint_outcome_unknown:
                 raise EnrollmentError(
@@ -533,12 +541,10 @@ def prepare_enrollment(
                 time.sleep(
                     min(
                         max(
-                            retry_delay
-                            if retry_delay is not None
-                            else MINT_RETRY_SECONDS,
+                            retry_delay if retry_delay is not None else RETRY_SECONDS,
                             0.0,
                         ),
-                        MAX_MINT_RETRY_AFTER_SECONDS,
+                        MAX_RETRY_AFTER_SECONDS,
                     )
                 )
                 continue
@@ -560,7 +566,7 @@ def prepare_enrollment(
                 if exc.retry_after_seconds is not None:
                     poll_delay = min(
                         max(exc.retry_after_seconds, 0.0),
-                        MAX_MINT_RETRY_AFTER_SECONDS,
+                        MAX_RETRY_AFTER_SECONDS,
                     )
             except EnrollmentError as exc:
                 if sharing_enabled_by_this_run:

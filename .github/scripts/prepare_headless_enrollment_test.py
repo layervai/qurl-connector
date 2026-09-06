@@ -96,6 +96,13 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
         )
         self.assertIn('"$GITHUB_REF" != "refs/heads/main"', workflow)
         self.assertIn(
+            "RECOVERY_GENERATION: ${{ inputs.generation }}", verify_permissions
+        )
+        self.assertIn(
+            '[[ ! "$RECOVERY_GENERATION" =~ ^[a-z0-9][a-z0-9-]{0,63}$ ]]',
+            verify_permissions,
+        )
+        self.assertIn(
             'gh api "repos/${GITHUB_REPOSITORY}/environments/sandbox"', workflow
         )
         self.assertIn(".deployment_branch_policy.protected_branches == false", workflow)
@@ -191,6 +198,14 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
             MODULE.validate_api_endpoint(
                 "https://other.example.com", expected_sha256=endpoint_hash
             )
+        for value in (" " + endpoint, endpoint + "\n", "\t" + endpoint + "/"):
+            with (
+                self.subTest(value=value),
+                self.assertRaisesRegex(
+                    MODULE.EnrollmentError, "leading or trailing whitespace"
+                ),
+            ):
+                MODULE.validate_api_endpoint(value, expected_sha256=endpoint_hash)
 
     def test_approved_endpoint_digest_shape_is_strict(self) -> None:
         self.assertIsNotNone(MODULE.SHA256_HEX.fullmatch("a" * 64))
@@ -448,7 +463,7 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
         self.assertEqual(MODULE.parse_retry_after("00000000005", now=now), 5)
         self.assertEqual(
             MODULE.parse_retry_after("999999999999999999999", now=now),
-            MODULE.MAX_MINT_RETRY_AFTER_SECONDS,
+            MODULE.MAX_RETRY_AFTER_SECONDS,
         )
         self.assertEqual(
             MODULE.parse_retry_after("Fri, 04 Sep 2026 18:00:20 GMT", now=now),
@@ -701,7 +716,7 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
         replay_mint = request.call_args_list[3]
         self.assertEqual(first_mint, replay_mint)
         self.assertEqual(first_mint.kwargs["expected_status"], (200, 201))
-        sleep.assert_called_once_with(MODULE.MINT_RETRY_SECONDS)
+        sleep.assert_called_once_with(MODULE.RETRY_SECONDS)
         put.assert_called_once()
 
     def test_mint_retry_honors_server_delay_with_hard_cap(self) -> None:
@@ -714,7 +729,7 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
         }
         for retry_after, expected_delay in (
             (9, 9),
-            (MODULE.MAX_MINT_RETRY_AFTER_SECONDS + 100, 30),
+            (MODULE.MAX_RETRY_AFTER_SECONDS + 100, 30),
             (-5, 0),
         ):
             responses = [
@@ -779,7 +794,7 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
                     now=FIXED_NOW,
                 )
         self.assertNotIn("lv_live_secret-token", str(raised.exception))
-        sleep.assert_called_once_with(MODULE.MINT_RETRY_SECONDS)
+        sleep.assert_called_once_with(MODULE.RETRY_SECONDS)
         put.assert_not_called()
 
     def test_mint_hard_rejection_after_unknown_keeps_recovery_warning(self) -> None:
@@ -879,7 +894,7 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
                 )
         self.assertEqual(request.call_count, 4)
         self.assertNotIn("unknown", str(raised.exception))
-        sleep.assert_called_once_with(MODULE.MINT_RETRY_SECONDS)
+        sleep.assert_called_once_with(MODULE.RETRY_SECONDS)
         put.assert_not_called()
 
     def test_later_failure_reports_sharing_enabled_by_this_run(self) -> None:
@@ -1285,7 +1300,7 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
                 )
         self.assertEqual(request.call_count, 4)
         self.assertNotIn("may have been applied", str(raised.exception))
-        sleep.assert_called_once_with(MODULE.MINT_RETRY_SECONDS)
+        sleep.assert_called_once_with(MODULE.RETRY_SECONDS)
         put.assert_not_called()
 
     def test_lost_put_and_poll_responses_warn_that_sharing_may_be_on(self) -> None:
@@ -1824,18 +1839,45 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
         self.assertNotIn("lv_live_secret-token", str(raised.exception))
 
     def test_put_parameter_classifies_safe_local_aws_failure(self) -> None:
+        for stderr, expected_class in (
+            (
+                "Unable to locate credentials for lv_live_secret-token",
+                "MissingCredentials",
+            ),
+            (
+                "SSL validation failed for https://private.example.com with lv_live_secret-token",
+                "TLSValidation",
+            ),
+        ):
+            with self.subTest(expected_class=expected_class):
+                completed = mock.Mock(returncode=255, stderr=stderr)
+                with mock.patch.object(
+                    MODULE.subprocess, "run", return_value=completed
+                ):
+                    with self.assertRaisesRegex(
+                        MODULE.EnrollmentError, expected_class
+                    ) as raised:
+                        MODULE.put_parameter(
+                            "us-east-2", "/reviewed/name", "lv_live_secret-token"
+                        )
+                rendered = str(raised.exception)
+                self.assertNotIn("lv_live_secret-token", rendered)
+                self.assertNotIn("private.example.com", rendered)
+
+    def test_put_parameter_discards_unclassified_aws_stderr(self) -> None:
         completed = mock.Mock(
             returncode=255,
-            stderr="Unable to locate credentials for lv_live_secret-token",
+            stderr="unknown failure at private.example.com with lv_live_secret-token",
         )
         with mock.patch.object(MODULE.subprocess, "run", return_value=completed):
-            with self.assertRaisesRegex(
-                MODULE.EnrollmentError, "MissingCredentials"
-            ) as raised:
+            with self.assertRaises(MODULE.EnrollmentError) as raised:
                 MODULE.put_parameter(
                     "us-east-2", "/reviewed/name", "lv_live_secret-token"
                 )
-        self.assertNotIn("lv_live_secret-token", str(raised.exception))
+        self.assertEqual(
+            str(raised.exception),
+            "AWS rejected the enrollment parameter update (exit status 255)",
+        )
 
     def test_fixed_replicas_share_route_slug_but_not_token_or_parameter(self) -> None:
         resource = [

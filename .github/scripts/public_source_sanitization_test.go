@@ -20,7 +20,7 @@ var (
 	// below, not this expression, decides which private operational paths are
 	// reviewed for public source. References into reviewed public qurl-* repos
 	// are excluded separately after this deliberately broad match.
-	operationalPath = regexp.MustCompile(`(/qurl-[a-z0-9-]+/(?:[A-Z][A-Z0-9_]*(?:/[A-Z][A-Z0-9_]*)*|[a-z0-9][a-z0-9-]*(?:/[a-z0-9](?:[a-z0-9-]*[a-z0-9])?){1,}))(?:[^A-Za-z0-9_/-]|$)`)
+	operationalPath = regexp.MustCompile(`(?:^|[^A-Za-z0-9_.-])(/qurl-[a-z0-9-]+/(?:[A-Z][A-Z0-9_]*(?:/[A-Z][A-Z0-9_]*)*|[a-z0-9][a-z0-9-]*(?:/[a-z0-9](?:[a-z0-9-]*[a-z0-9])?){1,}))(?:[^A-Za-z0-9_/-]|$)`)
 )
 
 func findOperationalPaths(text string) []string {
@@ -51,19 +51,32 @@ func TestOperationalPathDetectorStaysBroaderThanAllowlist(t *testing.T) {
 	}
 }
 
-func operationalPathBelongsToPublicRepository(path string, publicRepositories map[string]bool) bool {
-	trimmed := strings.TrimPrefix(path, "/")
-	repository, _, found := strings.Cut(trimmed, "/")
-	return found && publicRepositories[repository]
+func operationalPathBelongsToCurrentRepository(path string) bool {
+	return strings.HasPrefix(path, "/qurl-connector/")
 }
 
 func TestOperationalPathPublicRepositoryExemptionIsExact(t *testing.T) {
-	publicRepositories := map[string]bool{"qurl-connector": true}
-	if !operationalPathBelongsToPublicRepository("/qurl-connector/CONTRIBUTING", publicRepositories) {
+	if !operationalPathBelongsToCurrentRepository("/qurl-connector/CONTRIBUTING") {
 		t.Fatal("the current public repository must not be mistaken for a private operational path")
 	}
-	if operationalPathBelongsToPublicRepository("/qurl-connector-"+"private/CONTRIBUTING", publicRepositories) {
-		t.Fatal("a prefix lookalike must not inherit the public-repository exemption")
+	for _, path := range []string{
+		"/qurl-connector-" + "private/CONTRIBUTING",
+		"/qurl-go/" + "PRIVATE_PARAMETER",
+	} {
+		if operationalPathBelongsToCurrentRepository(path) {
+			t.Fatalf("%q must not inherit the current-repository exemption", path)
+		}
+	}
+}
+
+func TestOperationalPathDetectorIgnoresRepositoryReferences(t *testing.T) {
+	for _, reference := range []string{
+		"github.com/layervai/qurl-go/relayknock/nativeudp",
+		"https://github.com/layervai/qurl-connector/security/advisories/new",
+	} {
+		if got := findOperationalPaths(reference); len(got) != 0 {
+			t.Fatalf("findOperationalPaths(%q) = %q, want repository reference ignored", reference, got)
+		}
 	}
 }
 
@@ -200,7 +213,7 @@ func TestPublicSourceContainsNoPrivateOperationalMaterial(t *testing.T) {
 			}
 		}
 		for _, operational := range findOperationalPaths(text) {
-			if operationalPathBelongsToPublicRepository(operational, publicRepositories) {
+			if operationalPathBelongsToCurrentRepository(operational) {
 				continue
 			}
 			if !reviewedOperationalPaths[operational] {

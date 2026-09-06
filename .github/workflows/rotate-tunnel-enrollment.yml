@@ -45,10 +45,15 @@ jobs:
       - name: Require main and reviewed environment policy
         env:
           GH_TOKEN: ${{ github.token }}
+          RECOVERY_GENERATION: ${{ inputs.generation }}
         run: |
           set -euo pipefail
           if [ "$GITHUB_REF" != "refs/heads/main" ]; then
             echo "::error::enrollment recovery runs only from main"
+            exit 1
+          fi
+          if [[ ! "$RECOVERY_GENERATION" =~ ^[a-z0-9][a-z0-9-]{0,63}$ ]]; then
+            echo "::error::enrollment generation is invalid"
             exit 1
           fi
           policy=$(
