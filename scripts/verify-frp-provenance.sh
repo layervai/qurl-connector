@@ -14,7 +14,7 @@ readonly module='github.com/layervai/frp'
 readonly repository='https://github.com/layervai/frp.git'
 
 # Reviewed release commit on layerv/main. See FORK.md in the fork repository.
-readonly commit='ecb28a1dece90985dfc20f829f75ccbc7406adba'
+readonly commit='03712d9a51a9e72b1d0263ce3a116b4f7f1d294c'
 
 module_re="${module//./\\.}"
 replace_line="$(grep -E "^replace github\\.com/fatedier/frp => ${module_re} v" go.mod || true)"
