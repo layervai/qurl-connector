@@ -80,10 +80,13 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
         rotate_job = workflow.index("  rotate:")
         preflight = workflow.index("- name: Validate protected sandbox environment")
         aws = workflow.index("- name: Configure narrow AWS credentials")
+        aws_cli = workflow.index("- name: Require tested AWS CLI major")
         prepare = workflow.index("- name: Prepare reviewed enrollment tokens")
         self.assertLess(verify_job, rotate_job)
         self.assertLess(preflight, aws)
-        self.assertLess(aws, prepare)
+        self.assertLess(aws, aws_cli)
+        self.assertLess(aws_cli, prepare)
+        self.assertIn("grep -Eq '^aws-cli/2\\.'", workflow)
         self.assertIn("needs: verify-environment", workflow)
         verify_permissions = workflow[verify_job:rotate_job]
         self.assertIn("permissions:\n      actions: read", verify_permissions)
@@ -240,6 +243,7 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
 
     def test_api_request_sends_exact_json_and_idempotency_headers(self) -> None:
         response = FakeResponse(b'{"data":{"ok":true}}', status=201)
+        response_status: list[int] = []
         with mock.patch.object(
             MODULE.NO_REDIRECT_OPENER, "open", return_value=response
         ) as open_request:
@@ -251,6 +255,7 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
                 body={"kind": "enrollment_token"},
                 idempotency_key="headless-v2-attempt-1-target",
                 expected_status=(200, 201),
+                response_status=response_status,
             )
         request = open_request.call_args.args[0]
         self.assertEqual(
@@ -261,6 +266,7 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
             request.get_header("Idempotency-key"), "headless-v2-attempt-1-target"
         )
         self.assertEqual(request.data, b'{"kind":"enrollment_token"}')
+        self.assertEqual(response_status, [201])
 
     def test_api_request_rejects_large_or_unwrapped_responses(self) -> None:
         for body, message in (
@@ -562,6 +568,51 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
             "expires 2026-09-04T19:00:00+00:00"
         )
 
+    def test_prepare_prints_possible_extra_credential_warning(self) -> None:
+        responses = [
+            [
+                {
+                    "slug": "detect-sandbox",
+                    "type": "tunnel",
+                    "status": "active",
+                    "resource_id": "MFkw-resource",
+                }
+            ],
+            {"desired_state": "on", "serving_epoch": 1},
+        ]
+        with (
+            mock.patch.object(MODULE, "api_request", side_effect=responses),
+            mock.patch.object(
+                MODULE,
+                "mint_and_install_enrollment",
+                return_value=(
+                    FIXED_NOW + dt.timedelta(hours=1),
+                    "installed credential key_abc123def456, but another may remain live",
+                ),
+            ),
+            mock.patch("builtins.print") as output,
+        ):
+            MODULE.prepare_enrollment(
+                "https://api.example.com",
+                "lv_live_account-key",
+                "detect-nhp-replica-a",
+                "attempt-1",
+                "us-east-2",
+                now=FIXED_NOW,
+            )
+        output.assert_has_calls(
+            [
+                mock.call(
+                    "warning: installed credential key_abc123def456, but another may remain live",
+                    file=MODULE.sys.stderr,
+                ),
+                mock.call(
+                    "prepared one-hour enrollment for detect-nhp-replica-a at serving epoch 1; "
+                    "expires 2026-09-04T19:00:00+00:00"
+                ),
+            ]
+        )
+
     def test_resource_resolution_guards_never_mint_or_write(self) -> None:
         cases = (
             ([], "exactly one resource"),
@@ -717,6 +768,51 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
         self.assertEqual(first_mint, replay_mint)
         self.assertEqual(first_mint.kwargs["expected_status"], (200, 201))
         sleep.assert_called_once_with(MODULE.RETRY_SECONDS)
+        put.assert_called_once()
+
+    def test_new_mint_after_unknown_outcome_reports_possible_live_credential(
+        self,
+    ) -> None:
+        credential = {
+            "kind": "enrollment_token",
+            "key_id": "key_abc123def456",
+            "target": "agent",
+            "claims": [{"type": "connector", "id": "detect-sandbox"}],
+            "api_key": "lv_live_test-token",
+            "expires_at": VALID_EXPIRY,
+        }
+        attempts: list[object] = [
+            MODULE.APIRequestOutcomeUnknown("response lost"),
+            credential,
+        ]
+
+        def request(*_args: object, **kwargs: object) -> object:
+            result = attempts.pop(0)
+            if isinstance(result, Exception):
+                raise result
+            response_status = kwargs["response_status"]
+            assert isinstance(response_status, list)
+            response_status[:] = [201]
+            return result
+
+        with (
+            mock.patch.object(MODULE, "api_request", side_effect=request),
+            mock.patch.object(MODULE, "put_parameter") as put,
+            mock.patch.object(MODULE.time, "sleep"),
+        ):
+            expiry, warning = MODULE.mint_and_install_enrollment(
+                "https://api.example.com",
+                "lv_live_account-key",
+                "detect-nhp-replica-a",
+                "attempt-1",
+                "us-east-2",
+                "detect-sandbox",
+                "/reviewed/name",
+                now=FIXED_NOW,
+            )
+        self.assertEqual(expiry.isoformat(), "2026-09-04T19:00:00+00:00")
+        self.assertIn("installed credential key_abc123def456", warning)
+        self.assertIn("another one-hour credential may remain live", warning)
         put.assert_called_once()
 
     def test_mint_retry_honors_server_delay_with_hard_cap(self) -> None:
@@ -1529,6 +1625,78 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
         self.assertNotIn("left on", str(raised.exception))
         put.assert_not_called()
 
+    def test_stale_epoch_observed_on_reports_left_on(self) -> None:
+        responses = [
+            [
+                {
+                    "slug": "detect-sandbox",
+                    "type": "tunnel",
+                    "status": "active",
+                    "resource_id": "MFkw-resource",
+                }
+            ],
+            {"desired_state": "off", "serving_epoch": 1},
+            MODULE.APIRequestOutcomeUnknown("qURL API PUT response was lost"),
+            *[{"desired_state": "on", "serving_epoch": 1}]
+            * MODULE.SHARING_POLL_ATTEMPTS,
+        ]
+        with (
+            mock.patch.object(MODULE, "api_request", side_effect=responses),
+            mock.patch.object(MODULE, "put_parameter") as put,
+            mock.patch.object(MODULE.time, "sleep"),
+        ):
+            with self.assertRaisesRegex(
+                MODULE.EnrollmentError,
+                "sharing for this resource was observed on and was left on",
+            ):
+                MODULE.prepare_enrollment(
+                    "https://api.example.com",
+                    "lv_live_account-key",
+                    "detect-nhp-replica-a",
+                    "attempt-1",
+                    "us-east-2",
+                    now=FIXED_NOW,
+                )
+        put.assert_not_called()
+
+    def test_successful_retry_reports_definite_sharing_state(self) -> None:
+        responses = [
+            [
+                {
+                    "slug": "detect-sandbox",
+                    "type": "tunnel",
+                    "status": "active",
+                    "resource_id": "MFkw-resource",
+                }
+            ],
+            {"desired_state": "off", "serving_epoch": 0},
+            MODULE.APIRequestOutcomeUnknown(
+                "qURL API PUT response was lost", retry_after_seconds=0
+            ),
+            {"desired_state": "on", "serving_epoch": 1},
+            *[MODULE.APIRequestOutcomeUnknown("temporary status failure")]
+            * MODULE.SHARING_POLL_ATTEMPTS,
+        ]
+        with (
+            mock.patch.object(MODULE, "api_request", side_effect=responses),
+            mock.patch.object(MODULE, "put_parameter") as put,
+            mock.patch.object(MODULE.time, "sleep"),
+        ):
+            with self.assertRaisesRegex(
+                MODULE.EnrollmentError,
+                "sharing for this resource was enabled by this run and was left on",
+            ) as raised:
+                MODULE.prepare_enrollment(
+                    "https://api.example.com",
+                    "lv_live_account-key",
+                    "detect-nhp-replica-a",
+                    "attempt-1",
+                    "us-east-2",
+                    now=FIXED_NOW,
+                )
+        self.assertNotIn("may have been applied", str(raised.exception))
+        put.assert_not_called()
+
     def test_deterministic_poll_rejection_fails_without_retry(self) -> None:
         responses = [
             [
@@ -1687,6 +1855,21 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
             "(caused by: qURL API rejected the POST request with HTTP 429)",
         )
         self.assertNotIn("lv_live_secret-token", rendered)
+
+    def test_run_suppresses_unexpected_exception_details(self) -> None:
+        with (
+            mock.patch.object(
+                MODULE,
+                "main",
+                side_effect=ValueError("raw failure with lv_live_secret-token"),
+            ),
+            mock.patch("builtins.print") as output,
+        ):
+            with self.assertRaisesRegex(SystemExit, "1"):
+                MODULE.run()
+        output.assert_called_once_with(
+            "error: unexpected internal failure (ValueError)", file=MODULE.sys.stderr
+        )
 
     def test_put_parameter_sends_token_only_on_stdin(self) -> None:
         clean_env = {

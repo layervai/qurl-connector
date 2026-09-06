@@ -139,6 +139,14 @@ jobs:
           role-duration-seconds: 900
           mask-aws-account-id: true
 
+      - name: Require tested AWS CLI major
+        run: |
+          set -euo pipefail
+          if ! aws --version 2>&1 | grep -Eq '^aws-cli/2\.'; then
+            echo "::error::enrollment recovery requires AWS CLI v2"
+            exit 1
+          fi
+
       - name: Prepare reviewed enrollment tokens
         env:
           QURL_SANDBOX_API_KEY: ${{ secrets.QURL_SANDBOX_API_KEY }}

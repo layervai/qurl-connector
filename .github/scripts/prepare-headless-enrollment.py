@@ -208,6 +208,7 @@ def api_request(
     body: dict[str, Any] | None = None,
     idempotency_key: str = "",
     expected_status: int | tuple[int, ...] = 200,
+    response_status: list[int] | None = None,
 ) -> Any:
     headers = {"Authorization": f"Bearer {api_key}", "Accept": "application/json"}
     raw_body = None
@@ -276,6 +277,8 @@ def api_request(
         raise APIRequestOutcomeUnknown("qURL API returned invalid JSON") from exc
     if not isinstance(envelope, dict) or "data" not in envelope:
         raise APIRequestOutcomeUnknown("qURL API response has no data field")
+    if response_status is not None:
+        response_status[:] = [response.status]
     return envelope["data"]
 
 
@@ -369,7 +372,7 @@ def mint_and_install_enrollment(
     parameter: str,
     *,
     now: dt.datetime | None = None,
-) -> dt.datetime:
+) -> tuple[dt.datetime, str]:
     mint_path = "/v1/api-keys"
     mint_body = {
         "kind": "enrollment_token",
@@ -384,8 +387,10 @@ def mint_and_install_enrollment(
     mint_idempotency_key = f"headless-v2-{generation}-{target}"
     mint_failure: EnrollmentError | None = None
     mint_outcome_unknown = False
+    mint_response_status: list[int] = []
     for attempt in range(2):
         try:
+            mint_response_status.clear()
             credential = api_request(
                 api_endpoint,
                 api_key,
@@ -396,6 +401,7 @@ def mint_and_install_enrollment(
                 # 201 is a new operation. 200 is the byte-exact result from an
                 # idempotent retry after the first response was lost.
                 expected_status=(200, 201),
+                response_status=mint_response_status,
             )
             break
         except APIRequestRetryable as exc:
@@ -425,6 +431,22 @@ def mint_and_install_enrollment(
             "enrollment credential result is unknown; retry the same target and generation to recover the exact operation"
         ) from mint_failure
     credential_id = credential.get("key_id", "") if isinstance(credential, dict) else ""
+    known_credential_id = isinstance(credential_id, str) and re.fullmatch(
+        r"key_[A-Za-z0-9]{8,64}", credential_id
+    )
+    mint_warning = ""
+    possible_extra_credential = mint_outcome_unknown and mint_response_status == [201]
+    if possible_extra_credential:
+        if known_credential_id:
+            mint_warning = (
+                f"installed credential {credential_id}, but the first mint outcome is "
+                "unknown and another one-hour credential may remain live"
+            )
+        else:
+            mint_warning = (
+                "the first mint outcome is unknown and another one-hour credential may "
+                "remain live; the installed credential ID is unavailable"
+            )
     try:
         expected_claims = [{"type": "connector", "id": slug}]
         if (
@@ -448,25 +470,29 @@ def mint_and_install_enrollment(
         # within one hour.
         put_parameter(region, parameter, token)
     except EnrollmentError as exc:
-        known_credential_id = isinstance(credential_id, str) and re.fullmatch(
-            r"key_[A-Za-z0-9]{8,64}", credential_id
+        possible_extra_suffix = (
+            "; the first mint outcome is also unknown and another one-hour credential may remain live"
+            if possible_extra_credential
+            else ""
         )
         if isinstance(exc, EnrollmentParameterOutcomeUnknown):
             if known_credential_id:
                 raise EnrollmentError(
-                    f"enrollment credential {credential_id} was minted, but its installation outcome is unknown; retry the same generation only while the recovered token has at least 45 minutes remaining to repeat the idempotent parameter write; do not revoke that non-secret credential ID unless the parameter is confirmed not to reference it"
+                    f"enrollment credential {credential_id} was minted, but its installation outcome is unknown; retry the same generation only while the recovered token has at least 45 minutes remaining to repeat the idempotent parameter write; do not revoke that non-secret credential ID unless the parameter is confirmed not to reference it{possible_extra_suffix}"
                 ) from exc
             raise EnrollmentError(
                 "an enrollment credential was minted, but its installation outcome is unknown and its credential ID is unavailable; retry the same generation only while the recovered token has at least 45 minutes remaining to repeat the idempotent parameter write, and do not assume the parameter is unchanged until the outcome is confirmed or the token expires within one hour"
+                + possible_extra_suffix
             ) from exc
         if known_credential_id:
             raise EnrollmentError(
-                f"enrollment credential {credential_id} was minted but not installed; retry the same generation only while the recovered token has at least 45 minutes remaining, otherwise use a new generation, or revoke that non-secret credential ID with JWT authority"
+                f"enrollment credential {credential_id} was minted but not installed; retry the same generation only while the recovered token has at least 45 minutes remaining, otherwise use a new generation, or revoke that non-secret credential ID with JWT authority{possible_extra_suffix}"
             ) from exc
         raise EnrollmentError(
             "an enrollment credential was minted but not installed, and its credential ID is unavailable; retry the same target and generation to recover the exact operation, and wait up to one hour for expiry before using a new generation if the response remains invalid"
+            + possible_extra_suffix
         ) from exc
-    return expiry
+    return expiry, mint_warning
 
 
 def prepare_enrollment(
@@ -521,6 +547,7 @@ def prepare_enrollment(
 
     observed_epoch = serving_epoch
     sharing_enabled_by_this_run = False
+    sharing_observed_on = False
     if desired_state == "off":
         # Recovery deliberately leaves the selected resource on. A fixed
         # replica can enroll only while sharing is on, and restoring off would
@@ -592,11 +619,20 @@ def prepare_enrollment(
                     raise EnrollmentError(
                         "sharing status check was rejected after sharing for this resource was enabled by this run; sharing was left on"
                     ) from exc
+                if sharing_observed_on:
+                    raise EnrollmentError(
+                        "sharing status check was rejected after sharing for this resource was observed on; sharing was left on"
+                    ) from exc
                 raise EnrollmentError(
                     "sharing status check was rejected after the sharing update outcome became unknown; sharing may have been applied before the response was lost and may have been left on"
                 ) from exc
             observed_epoch = (
                 sharing.get("serving_epoch") if isinstance(sharing, dict) else None
+            )
+            sharing_observed_on = (
+                sharing_observed_on
+                or isinstance(sharing, dict)
+                and sharing.get("desired_state") == "on"
             )
             if (
                 isinstance(observed_epoch, int)
@@ -611,20 +647,26 @@ def prepare_enrollment(
         else:
             if last_poll_failure is not None:
                 message = "sharing did not reach the required serving epoch because status checks failed"
-                if put_failure is not None:
-                    message += "; the sharing update outcome is unknown and sharing may have been applied before the response was lost and may have been left on"
-                elif sharing_enabled_by_this_run:
+                if sharing_enabled_by_this_run:
                     message += "; sharing for this resource was enabled by this run and was left on"
+                elif sharing_observed_on:
+                    message += (
+                        "; sharing for this resource was observed on and was left on"
+                    )
+                elif put_failure is not None:
+                    message += "; the sharing update outcome is unknown and sharing may have been applied before the response was lost and may have been left on"
                 raise EnrollmentError(message) from last_poll_failure
             message = "sharing did not reach the required serving epoch"
             if sharing_enabled_by_this_run:
                 message += "; sharing for this resource was enabled by this run and was left on"
+            elif sharing_observed_on:
+                message += "; sharing for this resource was observed on and was left on"
             raise EnrollmentError(message)
 
     try:
         # Mint only after any required lifecycle transition is confirmed, so
         # failures before this point cannot leave a live credential behind.
-        expiry = mint_and_install_enrollment(
+        expiry, mint_warning = mint_and_install_enrollment(
             api_endpoint,
             api_key,
             target,
@@ -640,6 +682,8 @@ def prepare_enrollment(
                 "enrollment preparation failed after sharing for this resource was enabled by this run; sharing was left on"
             ) from exc
         raise
+    if mint_warning:
+        print(f"warning: {mint_warning}", file=sys.stderr)
     print(
         f"prepared one-hour enrollment for {target} at serving epoch {observed_epoch}; "
         f"expires {expiry.isoformat()}"
@@ -682,9 +726,19 @@ def format_enrollment_error(exc: EnrollmentError) -> str:
     return f"{messages[0]} (caused by: {'; '.join(messages[1:])})"
 
 
-if __name__ == "__main__":
+def run() -> None:
     try:
         main()
     except EnrollmentError as exc:
         print(f"error: {format_enrollment_error(exc)}", file=sys.stderr)
         raise SystemExit(1)
+    except Exception as exc:
+        print(
+            f"error: unexpected internal failure ({type(exc).__name__})",
+            file=sys.stderr,
+        )
+        raise SystemExit(1) from None
+
+
+if __name__ == "__main__":
+    run()
