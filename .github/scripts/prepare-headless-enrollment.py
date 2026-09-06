@@ -283,6 +283,8 @@ def _put_parameter_command(region: str, parameter: str) -> list[str]:
     # KEY excludes non-ASCII and newlines, so text-mode paramfile expansion
     # preserves the validated token byte-for-byte. /dev/stdin requires the
     # POSIX environment pinned by the workflow's Ubuntu runner.
+    # CI invokes the real AWS CLI against loopback and verifies the decoded
+    # PutParameter payload, including Value, instead of checking argv alone.
     # The paired Terraform foundation creates every reviewed parameter under
     # the AWS-managed alias/aws/ssm key. The recovery role therefore needs no
     # customer-managed KMS authority and cannot silently select another key.
@@ -307,6 +309,10 @@ def put_parameter(region: str, parameter: str, token: str) -> None:
     clean_env.pop("QURL_SANDBOX_API_KEY", None)
     clean_env.pop("QURL_SANDBOX_API_ENDPOINT", None)
     clean_env.pop("QURL_SANDBOX_API_ENDPOINT_SHA256", None)
+    clean_env.pop("AWS_PROFILE", None)
+    clean_env.pop("AWS_DEFAULT_PROFILE", None)
+    clean_env.pop("AWS_DEFAULT_OUTPUT", None)
+    clean_env["AWS_PAGER"] = ""
     try:
         result = subprocess.run(
             _put_parameter_command(region, parameter),
@@ -447,7 +453,9 @@ def mint_and_install_enrollment(
             raise EnrollmentError(
                 f"enrollment credential {credential_id} was minted but not installed; retry the same generation only while the recovered token has at least 45 minutes remaining, otherwise use a new generation, or revoke that non-secret credential ID with JWT authority"
             ) from exc
-        raise
+        raise EnrollmentError(
+            "an enrollment credential was minted but not installed, and its credential ID is unavailable; retry the same target and generation to recover the exact operation, and wait up to one hour for expiry before using a new generation if the response remains invalid"
+        ) from exc
     return expiry
 
 

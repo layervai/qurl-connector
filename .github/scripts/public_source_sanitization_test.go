@@ -24,10 +24,14 @@ var (
 )
 
 func findOperationalPaths(text string) []string {
-	matches := operationalPath.FindAllStringSubmatch(text, -1)
-	paths := make([]string, 0, len(matches))
-	for _, match := range matches {
-		paths = append(paths, match[1])
+	var paths []string
+	for offset := 0; offset < len(text); {
+		match := operationalPath.FindStringSubmatchIndex(text[offset:])
+		if match == nil {
+			break
+		}
+		paths = append(paths, text[offset+match[2]:offset+match[3]])
+		offset += match[3]
 	}
 	return paths
 }
@@ -48,6 +52,11 @@ func TestOperationalPathDetectorStaysBroaderThanAllowlist(t *testing.T) {
 	}
 	if got := findOperationalPaths("/qurl-example-service/nhp/replica-{slot}/bootstrap"); len(got) != 0 {
 		t.Fatalf("dynamic operational path matched incomplete token %q", got)
+	}
+	first := "/qurl-example-service/" + "nhp/replica-a/bootstrap"
+	second := "/qurl-example-service/" + "nhp/replica-b/bootstrap"
+	if got := findOperationalPaths(first + " " + second); len(got) != 2 || got[0] != first || got[1] != second {
+		t.Fatalf("findOperationalPaths(adjacent paths) = %q, want both paths", got)
 	}
 }
 

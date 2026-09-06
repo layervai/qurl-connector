@@ -1003,6 +1003,46 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
                     )
                 put.assert_not_called()
 
+    def test_malformed_response_without_safe_id_reports_live_credential(self) -> None:
+        responses = [
+            [
+                {
+                    "slug": "detect-sandbox",
+                    "type": "tunnel",
+                    "status": "active",
+                    "resource_id": "r_one",
+                }
+            ],
+            {"desired_state": "on", "serving_epoch": 1},
+            {
+                "kind": "enrollment_token",
+                "key_id": "unsafe/private-id",
+                "target": "agent",
+                "claims": [{"type": "connector", "id": "other"}],
+                "api_key": "lv_live_valid-token",
+                "expires_at": VALID_EXPIRY,
+            },
+        ]
+        with (
+            mock.patch.object(MODULE, "api_request", side_effect=responses),
+            mock.patch.object(MODULE, "put_parameter") as put,
+        ):
+            with self.assertRaisesRegex(
+                MODULE.EnrollmentError,
+                "credential was minted but not installed.*ID is unavailable",
+            ) as raised:
+                MODULE.prepare_enrollment(
+                    "https://api.example.com",
+                    "lv_live_account-key",
+                    "detect-nhp-replica-a",
+                    "attempt-1",
+                    "us-east-2",
+                    now=FIXED_NOW,
+                )
+        self.assertNotIn("unsafe/private-id", str(raised.exception))
+        self.assertIsInstance(raised.exception.__cause__, MODULE.EnrollmentError)
+        put.assert_not_called()
+
     def test_ssm_failure_reports_safe_credential_id_and_preserves_cause(self) -> None:
         responses = [
             [
@@ -1614,6 +1654,10 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
             "QURL_SANDBOX_API_KEY": "lv_live_account-key",
             "QURL_SANDBOX_API_ENDPOINT": "https://api.example.com",
             "QURL_SANDBOX_API_ENDPOINT_SHA256": "a" * 64,
+            "AWS_PROFILE": "ambient-profile",
+            "AWS_DEFAULT_PROFILE": "ambient-default-profile",
+            "AWS_DEFAULT_OUTPUT": "yaml",
+            "AWS_PAGER": "unsafe-pager",
         }
         completed = mock.Mock(returncode=0)
         with (
@@ -1628,6 +1672,10 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
         self.assertNotIn("QURL_SANDBOX_API_KEY", kwargs["env"])
         self.assertNotIn("QURL_SANDBOX_API_ENDPOINT", kwargs["env"])
         self.assertNotIn("QURL_SANDBOX_API_ENDPOINT_SHA256", kwargs["env"])
+        self.assertNotIn("AWS_PROFILE", kwargs["env"])
+        self.assertNotIn("AWS_DEFAULT_PROFILE", kwargs["env"])
+        self.assertNotIn("AWS_DEFAULT_OUTPUT", kwargs["env"])
+        self.assertEqual(kwargs["env"]["AWS_PAGER"], "")
         self.assertEqual(kwargs["input"], "lv_live_secret-token")
         self.assertEqual(args[args.index("--value") + 1], "file:///dev/stdin")
         self.assertEqual(args[args.index("--name") + 1], "/reviewed/name")
