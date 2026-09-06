@@ -382,6 +382,32 @@ func TestRunStatusReadyRejectsConfigFlag(t *testing.T) {
 	}
 }
 
+func TestStatusReadyAndJSONAreMutuallyExclusive(t *testing.T) {
+	readyFlag := statusCmd.Flags().Lookup("ready")
+	jsonFlag := statusCmd.Flags().Lookup("json")
+	previousReady, previousJSON := readyFlag.Value.String(), jsonFlag.Value.String()
+	previousReadyChanged, previousJSONChanged := readyFlag.Changed, jsonFlag.Changed
+	t.Cleanup(func() {
+		if err := readyFlag.Value.Set(previousReady); err != nil {
+			t.Error(err)
+		}
+		if err := jsonFlag.Value.Set(previousJSON); err != nil {
+			t.Error(err)
+		}
+		readyFlag.Changed, jsonFlag.Changed = previousReadyChanged, previousJSONChanged
+	})
+
+	if err := statusCmd.Flags().Set("ready", "true"); err != nil {
+		t.Fatal(err)
+	}
+	if err := statusCmd.Flags().Set("json", "true"); err != nil {
+		t.Fatal(err)
+	}
+	if err := statusCmd.ValidateFlagGroups(); err == nil || !strings.Contains(err.Error(), "if any flags in the group") {
+		t.Fatalf("status --ready --json validation = %v, want mutual-exclusion error", err)
+	}
+}
+
 // TestBuildRouteStatuses_LivePropagatesRemoteAddr pins that the
 // RemoteAddr from the live proxy entry round-trips into the
 // routeStatus output. Pollers read RemoteAddr to display "where is

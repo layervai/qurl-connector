@@ -704,7 +704,9 @@ func TestSessionGroupRunnerRoutesReadyFailsClosedUntilRemovalConverges(t *testin
 		t.Fatal("runner reported ready while a removed route remained registered after a failed apply")
 	}
 
-	runner.healDivergence(context.Background())
+	if err := runner.healDivergence(context.Background()); err != nil {
+		t.Fatalf("healDivergence() = %v", err)
+	}
 	if _, present := session.RouteStates()["b"]; present {
 		t.Fatal("divergence healing did not withdraw route b")
 	}
@@ -727,7 +729,9 @@ func TestSessionGroupRunnerPromotionConfirmsPriorDivergence(t *testing.T) {
 		divergent: true,
 	}
 
-	runner.promote(context.Background(), &groupCycle{session: session})
+	if err := runner.promote(context.Background(), &groupCycle{session: session}); err != nil {
+		t.Fatalf("promote() = %v", err)
+	}
 	if !runner.RoutesReady() {
 		t.Fatal("new active session confirmed the desired set but prior divergence stayed latched")
 	}
@@ -1056,12 +1060,21 @@ func TestSessionGroupRunnerHealsFailedSetRoutesApply(t *testing.T) {
 		t.Fatalf("admissions = %d, want convergence without a new knock", got)
 	}
 
-	// A transient session-side failure heals the same way.
+	// Two transient session-side failures consume the caller apply and Run's
+	// immediate heal. The delayed bounded-backoff wake must retry without a
+	// session event, rotation, or new admission.
+	select {
+	case <-session.changes:
+	default:
+	}
 	session.mu.Lock()
-	session.failUpdates = 1
+	session.failUpdates = 2
 	session.mu.Unlock()
 	_ = h.runner.SetRoutes(context.Background(), groupTestRoutes("a", "b", "c", "d", "e"))
 	h.waitServing(t, 1, "e")
+	if got := h.admissions(); got != 1 {
+		t.Fatalf("admissions after a failed heal = %d, want a retry on the existing session", got)
+	}
 }
 
 func TestSessionGroupRunnerPromotesWhenOldSessionDiesMidRotation(t *testing.T) {

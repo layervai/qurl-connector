@@ -32,6 +32,28 @@ var listenConnectorHealth = net.Listen
 // failures.
 var errConnectorRoutesNotReady = errors.New("connector routes are not ready")
 
+// joinedCancellationOnly recognizes errors.Join's production shutdown shape
+// without discarding a real error that happened while cancellation propagated.
+func joinedCancellationOnly(err error) bool {
+	if err == context.Canceled { //nolint:errorlint // Only the exact cancellation leaf is discardable.
+		return true
+	}
+	joined, ok := err.(interface{ Unwrap() []error })
+	if !ok {
+		return false
+	}
+	children := joined.Unwrap()
+	if len(children) == 0 {
+		return false
+	}
+	for _, child := range children {
+		if !joinedCancellationOnly(child) {
+			return false
+		}
+	}
+	return true
+}
+
 func connectorHealthAddress() (string, bool, error) {
 	raw, configured := os.LookupEnv(envConnectorHealthAddr)
 	if !configured {
@@ -133,12 +155,12 @@ func runWithConnectorHealth(ctx context.Context, ready func() bool, run func(con
 	// goroutine always returns and nothing outlives this call.
 	_ = server.Close()
 	serverErr := <-serveErr
-	if serverErr != nil && runErr == context.Canceled { //nolint:errorlint // Only a bare wrapper cancellation is safe to discard.
+	if serverErr != nil && errors.Is(context.Cause(runCtx), serverErr) && joinedCancellationOnly(runErr) {
 		// The wrapper caused this cancellation to stop the runtime after its
 		// health listener failed. The actionable cause is serverErr; keeping
 		// both would let a caller mistake the failure for a clean cancellation.
-		// A joined error that contains context.Canceled can also carry a real
-		// shutdown failure, so preserve it.
+		// The production runtime returns a one-element errors.Join after its
+		// deferred closes; preserve any join that also carries a real failure.
 		runErr = nil
 	}
 	return errors.Join(runErr, shutdownErr, serverErr)

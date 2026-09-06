@@ -210,7 +210,9 @@ func TestRunWithConnectorHealthStopsRuntimeWhenListenerFails(t *testing.T) {
 	err := runWithConnectorHealth(context.Background(), func() bool { return false }, func(ctx context.Context) error {
 		<-ctx.Done()
 		runtimeCanceled = true
-		return ctx.Err()
+		// runConnectorCommandBody joins its result with deferred close
+		// results, even when those results are nil.
+		return errors.Join(ctx.Err(), nil)
 	})
 	if !runtimeCanceled {
 		t.Fatal("runtime kept running after its readiness listener failed")
@@ -220,6 +222,21 @@ func TestRunWithConnectorHealthStopsRuntimeWhenListenerFails(t *testing.T) {
 	}
 	if errors.Is(err, context.Canceled) {
 		t.Fatalf("listener failure matched context.Canceled: %v", err)
+	}
+}
+
+func TestProbeConnectorHealthReportsDisabledEndpoint(t *testing.T) {
+	t.Setenv(envConnectorHealthAddr, "restored after test")
+	if err := os.Unsetenv(envConnectorHealthAddr); err != nil {
+		t.Fatal(err)
+	}
+
+	err := probeConnectorHealth(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "connector readiness is disabled") {
+		t.Fatalf("probeConnectorHealth() error = %v, want disabled-endpoint diagnostic", err)
+	}
+	if errors.Is(err, errConnectorRoutesNotReady) {
+		t.Fatalf("disabled endpoint was reported as a live unready runtime: %v", err)
 	}
 }
 

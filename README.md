@@ -250,7 +250,10 @@ the live session runner directly: pending routes fail, retired or removed
 routes stop affecting healthy siblings after their withdrawal converges, and
 make-before-break renewal keeps the active session ready while its replacement
 starts. A failed add, change, restart, or removal apply keeps the whole group
-unready until the runner heals the difference.
+unready until the runner heals the difference. If its immediate heal also
+fails, the runner retries on its existing bounded backoff instead of waiting
+for the next rotation. This retry uses the current session and does not admit
+or knock again.
 
 ```bash
 QURL_CONNECTOR_HEALTH_ADDR=127.0.0.1:7401 qurl-connector run

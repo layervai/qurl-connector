@@ -329,6 +329,27 @@ func (r *SessionGroupRunner) Run(ctx context.Context) (retErr error) {
 
 	var drains cycleDrainSet
 	backoff := r.cfg.MinBackoff
+	healBackoff := r.cfg.MinBackoff
+	var healRetryTimer *time.Timer
+	var healRetry <-chan time.Time
+	setHealRetry := func(err error) {
+		if err == nil {
+			stopTimer(healRetryTimer)
+			healRetry = nil
+			healBackoff = r.cfg.MinBackoff
+			return
+		}
+		wait := jitter(healBackoff)
+		if healRetryTimer == nil {
+			healRetryTimer = time.NewTimer(wait)
+		} else {
+			stopTimer(healRetryTimer)
+			healRetryTimer.Reset(wait)
+		}
+		healRetry = healRetryTimer.C
+		healBackoff = nextBackoff(healBackoff, r.cfg.MaxBackoff)
+	}
+	defer func() { stopTimer(healRetryTimer) }()
 	defer drains.stopAndWait(r.cfg.StopTimeout)
 	defer func() { retErr = errors.Join(retErr, r.stopCycle(r.takeActive())) }()
 
@@ -350,7 +371,7 @@ func (r *SessionGroupRunner) Run(ctx context.Context) (retErr error) {
 				continue
 			}
 			backoff = r.cfg.MinBackoff
-			r.promote(ctx, cycle)
+			setHealRetry(r.promote(ctx, cycle))
 			if r.desiredCount() == 0 {
 				return ErrGroupEmpty
 			}
@@ -364,7 +385,11 @@ func (r *SessionGroupRunner) Run(ctx context.Context) (retErr error) {
 			return ctx.Err()
 		case <-r.wake:
 			stopTimer(rotate)
-			r.healDivergence(ctx)
+			setHealRetry(r.healDivergence(ctx))
+		case <-healRetry:
+			stopTimer(rotate)
+			healRetry = nil
+			setHealRetry(r.healDivergence(ctx))
 		case <-active.session.Done():
 			stopTimer(rotate)
 			sessionErr := active.session.Err()
@@ -375,7 +400,7 @@ func (r *SessionGroupRunner) Run(ctx context.Context) (retErr error) {
 			}
 		case <-active.session.Changes():
 			stopTimer(rotate)
-			r.healDivergence(ctx)
+			setHealRetry(r.healDivergence(ctx))
 			r.reportActive(ctx)
 			if r.desiredCount() == 0 {
 				return ErrGroupEmpty
@@ -401,7 +426,7 @@ func (r *SessionGroupRunner) Run(ctx context.Context) (retErr error) {
 				}
 				continue
 			}
-			r.promote(ctx, replacement)
+			setHealRetry(r.promote(ctx, replacement))
 			drains.start(active.session, r.cfg.StopTimeout, func() { _ = r.retireAdmission(active.admission) })
 			if r.desiredCount() == 0 {
 				return ErrGroupEmpty
@@ -495,14 +520,14 @@ func (r *SessionGroupRunner) applyAndWake(ctx context.Context) error {
 }
 
 // healDivergence re-applies the desired set under Run's context after a
-// caller's apply failed, so desired state converges on the next wake or
-// change signal instead of at the next rotation.
-func (r *SessionGroupRunner) healDivergence(ctx context.Context) {
+// caller's apply failed. It returns an apply failure so Run can retry it with
+// bounded backoff instead of waiting for a session change or rotation.
+func (r *SessionGroupRunner) healDivergence(ctx context.Context) error {
 	r.mu.Lock()
 	divergent := r.divergent
 	r.mu.Unlock()
 	if !divergent {
-		return
+		return nil
 	}
 	r.applyMu.Lock()
 	err := r.applyLocked(ctx)
@@ -512,6 +537,7 @@ func (r *SessionGroupRunner) healDivergence(ctx context.Context) {
 		r.mu.Unlock()
 	}
 	r.applyMu.Unlock()
+	return err
 }
 
 func (r *SessionGroupRunner) signalWake() {
@@ -880,7 +906,7 @@ func (r *SessionGroupRunner) withdrawGone(ctx context.Context, states map[string
 }
 
 // promote makes cycle the active session and reports it.
-func (r *SessionGroupRunner) promote(ctx context.Context, cycle *groupCycle) {
+func (r *SessionGroupRunner) promote(ctx context.Context, cycle *groupCycle) error {
 	r.mu.Lock()
 	r.active = cycle
 	if r.pending == cycle {
@@ -893,11 +919,12 @@ func (r *SessionGroupRunner) promote(ctx context.Context, cycle *groupCycle) {
 	// that session ends. Confirm the current desired set on the new active
 	// session before readiness can recover. This uses the existing session and
 	// does not admit, knock, or create another control session.
-	r.healDivergence(ctx)
+	healErr := r.healDivergence(ctx)
 	if r.cfg.OnServing != nil {
 		r.cfg.OnServing(cycle.admission)
 	}
 	r.reportActive(ctx)
+	return healErr
 }
 
 // reportActive folds the active session's route states into callbacks.
