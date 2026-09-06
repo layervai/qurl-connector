@@ -3779,6 +3779,8 @@ func TestNativeAdmitterFencesServingReplacementUntilDurableRetirementTerminal(t 
 		},
 		pending: map[nativeAdmissionKey]bool{key: true},
 	}
+	// TestSessionGroupRunnerRotationRegistersEveryRouteBeforeRetiringOld owns
+	// the no-gap rotation invariant; this test owns the durable retirement fence.
 	factory := &fakeGroupFactory{}
 	serving := make(chan Admission, 1)
 	runner, err := NewSessionGroupRunner(SessionGroupConfig{

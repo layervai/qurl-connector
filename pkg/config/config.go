@@ -328,8 +328,7 @@ func stripRetiredGeneratedFields(data string) (string, error) {
 			errs = append(errs, fmt.Errorf("config field server.token at line %d was removed; delete it because NHP admission supplies the FRP session token", line))
 		}
 		dropped = dropYAMLField(server, "public_domain") || dropped
-		if line, ok := yamlFieldLine(server, "replica_discriminator"); ok {
-			fmt.Fprintf(os.Stderr, "warning: config field server.replica_discriminator at line %d is ignored; FRP proxy names now use the NHP session ID\n", line)
+		if yamlField(server, "replica_discriminator") != nil {
 			dropped = dropYAMLField(server, "replica_discriminator") || dropped
 		}
 	}
@@ -346,11 +345,10 @@ func stripRetiredGeneratedFields(data string) (string, error) {
 				}
 				resourceID := yamlField(route, "resource_id")
 				switch {
-				case routingValue != "" && field.Value == routingValue:
+				case routingValue != "" && strings.TrimSpace(field.Value) == routingValue:
 					dropped = dropYAMLField(route, key) || dropped
 				case routingValue == "" && resourceID != nil && strings.TrimSpace(resourceID.Value) != "":
 					// A pinned managed resource can load before routing hydration.
-					fmt.Fprintf(os.Stderr, "warning: config field routes[%d].%s is ignored while managed resource routing is hydrated\n", i, key)
 					dropped = dropYAMLField(route, key) || dropped
 				default:
 					line, _ := yamlFieldLine(route, key)
@@ -359,9 +357,8 @@ func stripRetiredGeneratedFields(data string) (string, error) {
 			}
 			// Current qURL Desktop writes this authenticated API value into YAML,
 			// but the Connector rehydrates it through device state before every
-			// admission. Accept it only as a noisy compatibility input.
-			if line, ok := yamlFieldLine(route, "knock_resource_id"); ok {
-				fmt.Fprintf(os.Stderr, "warning: config field routes[%d].knock_resource_id at line %d is ignored; authenticated resource hydration supplies the NHP admission target\n", i, line)
+			// admission. Accept it only as a compatibility input.
+			if yamlField(route, "knock_resource_id") != nil {
 				dropped = dropYAMLField(route, "knock_resource_id") || dropped
 			}
 			for _, key := range []string{"custom_domains", "remote_port", "host_rewrite", "headers"} {

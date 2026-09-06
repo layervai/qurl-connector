@@ -88,7 +88,7 @@ routes:
   - id: web
     type: http
     local_port: 8080
-    subdomain: %s
+    subdomain: "%s "
     load_balancer_group: %s
     resource_id: %s
     connector_routing_id: %s
@@ -104,8 +104,8 @@ routes:
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(stderr, "replica_discriminator") || !strings.Contains(stderr, "knock_resource_id") || !strings.Contains(stderr, "ignored") {
-		t.Fatalf("missing compatibility warning: %q", stderr)
+	if stderr != "" {
+		t.Fatalf("generated compatibility fields produced repeated command noise: %q", stderr)
 	}
 	if cfg.Server.Addr != "frp.example" || cfg.Server.Port != 7000 || cfg.Server.Protocol != "websocket" ||
 		!cfg.NHP.Enabled || cfg.NHP.MachineID != "machine-1" || cfg.QURL.APIURL != "https://api.example/v1" ||
@@ -841,8 +841,8 @@ routes:
 	if err != nil {
 		t.Fatalf("Load must allow API-backed routing hydration: %v", err)
 	}
-	if !strings.Contains(stderr, "subdomain") || !strings.Contains(stderr, "load_balancer_group") {
-		t.Fatalf("missing pending-hydration warnings: %q", stderr)
+	if stderr != "" {
+		t.Fatalf("pending managed hydration produced repeated command noise: %q", stderr)
 	}
 	if cfg.Routes[0].ResourceID != testPublicResourceA || cfg.Routes[0].ConnectorRoutingID != "" {
 		t.Fatalf("Load altered incomplete managed identity: %+v", cfg.Routes[0])

@@ -2,8 +2,6 @@ package main
 
 import (
 	"context"
-	"net/http"
-	"net/http/httptest"
 	"strings"
 	"testing"
 
@@ -41,13 +39,8 @@ func TestAdminAuthPassword(t *testing.T) {
 	})
 }
 
-func TestAdminDashboardRoutes404WithoutEmbeddedAssets(t *testing.T) {
-	previous := assets.FileSystem
-	t.Cleanup(func() { assets.FileSystem = previous })
-	assets.Load("")
-	recorder := httptest.NewRecorder()
-	http.FileServer(assets.FileSystem).ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/", nil))
-	if recorder.Code != http.StatusNotFound {
-		t.Fatalf("dashboard status = %d, want 404", recorder.Code)
+func TestAdminDashboardAssetsAreNotEmbedded(t *testing.T) {
+	if assets.FileSystem != nil {
+		t.Fatal("dashboard assets were registered in the connector binary")
 	}
 }
