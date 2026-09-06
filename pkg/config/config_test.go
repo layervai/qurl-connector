@@ -98,6 +98,8 @@ routes:
     type: http
     local_ip: 127.0.0.2
     local_port: 8443
+    subdomain:
+    load_balancer_group: ""
 `, testRoutingA, testRoutingA, testPublicResourceA, testRoutingA))
 	var cfg *Config
 	var err error

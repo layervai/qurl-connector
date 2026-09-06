@@ -128,7 +128,6 @@ type ServerConfig struct {
 	Keepalive     int   `yaml:"keepalive,omitempty"`       // TCP keepalive probe interval in seconds (default: 60)
 	DialTimeout   int   `yaml:"dial_timeout,omitempty"`    // Server connection timeout in seconds (default: 10)
 	LoginFailExit *bool `yaml:"login_fail_exit,omitempty"` // Exit on initial login failure (default: false)
-
 }
 
 // NHPConfig holds Network Hiding Protocol settings.
@@ -349,6 +348,9 @@ func stripRetiredGeneratedFields(data string) (string, error) {
 				}
 				resourceID := yamlField(route, "resource_id")
 				switch {
+				case field.Kind == yaml.ScalarNode && strings.TrimSpace(field.Value) == "":
+					// An explicitly empty generated field carries no operator intent.
+					dropped = dropYAMLField(route, key) || dropped
 				case routingValue != "" && strings.TrimSpace(field.Value) == routingValue:
 					dropped = dropYAMLField(route, key) || dropped
 				case routingValue == "" && resourceID != nil && strings.TrimSpace(resourceID.Value) != "":

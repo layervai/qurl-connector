@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"math"
 	"net/url"
 	"os"
 	"strings"
@@ -356,11 +355,7 @@ func selectConnectorRemoval(cfg *nhpconfig.Config, cache *connectorIdentityCache
 	}
 
 	fallbackID := routeIDEnvFallback()
-	capacity := len(cfg.Routes)
-	if len(cache.byID) > math.MaxInt-capacity {
-		return connectorRemovalSelection{}, errors.New("Connector removal state exceeds addressable memory")
-	}
-	capacity += len(cache.byID)
+	capacity := len(cfg.Routes) + len(cache.byID)
 	byID := make(map[string]connectorRemovalSelection, capacity)
 	byResource := make(map[string]string, capacity)
 	for i, route := range cfg.Routes {
