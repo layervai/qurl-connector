@@ -35,11 +35,13 @@ qurl_lint_venv=$(mktemp -d)
 trap 'rm -rf -- "$qurl_lint_venv"' EXIT
 python3 -m venv "$qurl_lint_venv"
 "$qurl_lint_venv/bin/python" -m pip install --require-hashes -r .github/scripts/requirements-lint.txt
-"$qurl_lint_venv/bin/python" -m ruff check --no-cache .github/scripts/prepare-headless-enrollment.py .github/scripts/prepare_headless_enrollment_test.py
-"$qurl_lint_venv/bin/python" -m ruff format --check --no-cache .github/scripts/prepare-headless-enrollment.py .github/scripts/prepare_headless_enrollment_test.py
+PYTHON="$qurl_lint_venv/bin/python" make lint-python
 PYTHONDONTWRITEBYTECODE=1 python3 .github/scripts/prepare_headless_enrollment_test.py
 )
 ```
+
+The Python check requires Python 3.13 with `venv` support and AWS CLI v2. On
+Debian or Ubuntu, install the matching `python3.13-venv` package first.
 
 Tests in this public repository are hermetic. Do not add credentials, private
 endpoints, cloud account identifiers, customer data, or live rollout evidence.

@@ -1,5 +1,7 @@
 export PATH := $(PATH):$(shell go env GOPATH)/bin
 export GO111MODULE=on
+PYTHON ?= python3
+PYTHON_LINT_FILES := .github/scripts/prepare-headless-enrollment.py .github/scripts/prepare_headless_enrollment_test.py
 
 # Version info injected at build time
 BASE_VERSION ?= $(shell git describe --tags --abbrev=0 2>/dev/null || echo "0.1.0")
@@ -18,7 +20,7 @@ BLUE := \033[34m
 GREEN := \033[32m
 RESET := \033[0m
 
-.PHONY: all build frpc test test-race lint vet fmt clean verify-deps proof-1000
+.PHONY: all build frpc test test-race lint lint-python vet fmt clean verify-deps proof-1000
 
 all: print-version env frpc
 
@@ -42,6 +44,10 @@ verify-deps:
 lint:
 	golangci-lint run ./pkg/... ./cmd/... ./internal/...
 	GOOS=windows GOARCH=amd64 CGO_ENABLED=0 golangci-lint run ./pkg/... ./cmd/... ./internal/...
+
+lint-python:
+	$(PYTHON) -m ruff check --no-cache $(PYTHON_LINT_FILES)
+	$(PYTHON) -m ruff format --check --no-cache $(PYTHON_LINT_FILES)
 
 frpc:
 	@printf "$(BLUE)[qURL Connector] Building developer command...$(RESET)\n"

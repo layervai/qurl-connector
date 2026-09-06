@@ -17,6 +17,7 @@ WORKFLOW = SCRIPT.parent.parent / "workflows" / "rotate-tunnel-enrollment.yml"
 VALIDATE_WORKFLOW = SCRIPT.parent.parent / "workflows" / "validate-workflows.yml"
 SANITIZER = SCRIPT.with_name("public_source_sanitization_test.go")
 GITIGNORE = SCRIPT.parent.parent.parent / ".gitignore"
+MAKEFILE = SCRIPT.parent.parent.parent / "Makefile"
 SPEC = importlib.util.spec_from_file_location("prepare_headless_enrollment", SCRIPT)
 assert SPEC is not None and SPEC.loader is not None
 MODULE = importlib.util.module_from_spec(SPEC)
@@ -98,7 +99,8 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
         self.assertLess(preflight, aws)
         self.assertLess(aws, aws_cli)
         self.assertLess(aws_cli, prepare)
-        self.assertIn("aws_version=$(aws --version 2>&1)", workflow)
+        self.assertIn("if ! aws_version=$(aws --version 2>&1); then", workflow)
+        self.assertIn("AWS CLI v2, but aws is unavailable", workflow)
         self.assertIn('[[ ! "$aws_version" =~ ^aws-cli/2\\. ]]', workflow)
         self.assertIn("needs: verify-environment", workflow)
         verify_permissions = workflow[verify_job:rotate_job]
@@ -149,16 +151,18 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
 
     def test_validation_workflow_requires_tested_aws_cli_major(self) -> None:
         workflow = VALIDATE_WORKFLOW.read_text()
+        self.assertIn("timeout-minutes: 10", workflow)
         require_cli = workflow.index("- name: Require tested AWS CLI major")
         contract_test = workflow.index("- name: Test sandbox enrollment recovery")
         self.assertLess(require_cli, contract_test)
-        self.assertIn("aws_version=$(aws --version 2>&1)", workflow)
+        self.assertIn("if ! aws_version=$(aws --version 2>&1); then", workflow)
+        self.assertIn("AWS CLI v2, but aws is unavailable", workflow)
         self.assertIn('[[ ! "$aws_version" =~ ^aws-cli/2\\. ]]', workflow)
         self.assertGreaterEqual(workflow.count("actions/setup-python@"), 1)
         self.assertIn('python-version: "3.13"', workflow)
         self.assertIn("pip install --require-hashes", workflow)
-        self.assertIn("ruff check --no-cache", workflow)
-        self.assertIn("ruff format --check --no-cache", workflow)
+        self.assertIn("run: make lint-python", workflow)
+        self.assertNotIn("ruff check --no-cache", workflow)
         self.assertIn(
             "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1\n"
             "        with:\n"
@@ -170,6 +174,15 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
             workflow,
         )
         self.assertNotIn("unittest discover", workflow)
+        makefile = MAKEFILE.read_text()
+        self.assertIn("lint-python:", makefile)
+        self.assertIn("ruff check --no-cache $(PYTHON_LINT_FILES)", makefile)
+        self.assertIn("ruff format --check --no-cache $(PYTHON_LINT_FILES)", makefile)
+        self.assertIn(
+            "PYTHON_LINT_FILES := .github/scripts/prepare-headless-enrollment.py "
+            ".github/scripts/prepare_headless_enrollment_test.py",
+            makefile,
+        )
         requirements = (SCRIPT.parent / "requirements-lint.txt").read_text()
         self.assertRegex(
             requirements, r"ruff==0\.15\.8.*\\\n\s+--hash=sha256:[0-9a-f]{64}"

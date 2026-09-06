@@ -41,10 +41,18 @@ func findOperationalPaths(text string) []string {
 		candidate := text[start : offset+match[3]]
 		// A templated suffix cannot be allowlisted, but its concrete prefix still
 		// identifies an operational namespace and must reach the exact allowlist.
+		templated := false
 		if cut := strings.IndexAny(candidate, "{}"); cut >= 0 {
 			candidate = strings.TrimRight(candidate[:cut], "/")
+			templated = true
 		}
-		if strings.Count(candidate, "/") >= 2 && !hasPublicRepositoryPrefix(text, start) {
+		minimumSeparators := 2
+		if templated {
+			// The cut removed at least one path segment, so retain a shorter
+			// concrete namespace for exact allowlist review.
+			minimumSeparators = 1
+		}
+		if strings.Count(candidate, "/") >= minimumSeparators && !hasPublicRepositoryPrefix(text, start) {
 			paths = append(paths, candidate)
 		}
 		offset += match[3]
@@ -95,6 +103,10 @@ func TestOperationalPathDetectorStaysBroaderThanAllowlist(t *testing.T) {
 	dynamicPrefix := "/qurl-example-service/" + "nhp/replica-"
 	if got := findOperationalPaths(dynamicPrefix + "{slot}/bootstrap"); len(got) != 1 || got[0] != dynamicPrefix {
 		t.Fatalf("dynamic operational path did not preserve concrete prefix: %q", got)
+	}
+	secondSegmentTemplate := "/qurl-example-service/" + "{service}/replica-a/bootstrap"
+	if got := findOperationalPaths(secondSegmentTemplate); len(got) != 1 || got[0] != "/qurl-example-service" {
+		t.Fatalf("early template did not preserve its operational namespace: %q", got)
 	}
 	trailingSlash := "/qurl-example-service/" + "nhp/replica-z/"
 	if got := findOperationalPaths(trailingSlash); len(got) != 1 || got[0] != strings.TrimSuffix(trailingSlash, "/") {

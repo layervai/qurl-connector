@@ -15,6 +15,7 @@ permissions:
 jobs:
   actionlint:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -30,13 +31,14 @@ jobs:
       - name: Install pinned Python linter
         run: python3 -m pip install --require-hashes -r .github/scripts/requirements-lint.txt
       - name: Lint sandbox enrollment recovery
-        run: |
-          python3 -m ruff check --no-cache .github/scripts/prepare-headless-enrollment.py .github/scripts/prepare_headless_enrollment_test.py
-          python3 -m ruff format --check --no-cache .github/scripts/prepare-headless-enrollment.py .github/scripts/prepare_headless_enrollment_test.py
+        run: make lint-python
       - name: Require tested AWS CLI major
         run: |
           set -euo pipefail
-          aws_version=$(aws --version 2>&1)
+          if ! aws_version=$(aws --version 2>&1); then
+            echo "::error::enrollment recovery tests require AWS CLI v2, but aws is unavailable"
+            exit 1
+          fi
           if [[ ! "$aws_version" =~ ^aws-cli/2\. ]]; then
             echo "::error::enrollment recovery tests require AWS CLI v2"
             exit 1
