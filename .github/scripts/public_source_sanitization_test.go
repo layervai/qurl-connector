@@ -20,7 +20,7 @@ var (
 	// operational paths are reviewed for public source. References into reviewed
 	// public qurl-* repos are excluded separately after this deliberately broad
 	// match.
-	operationalPath = regexp.MustCompile(`(?i)(/qurl-[a-z0-9_-]+/[a-z0-9_](?:[a-z0-9_-]*[a-z0-9_])?(?:/[a-z0-9_](?:[a-z0-9_-]*[a-z0-9_])?)*)(?:[^A-Za-z0-9_/-]|$)`)
+	operationalPath = regexp.MustCompile(`(?i)(/qurl-[a-z0-9_.-]+(?:/[a-z0-9_.{}-]+)+)(?:[^A-Za-z0-9_.{}/-]|$)`)
 )
 
 func findOperationalPaths(text string) []string {
@@ -31,8 +31,9 @@ func findOperationalPaths(text string) []string {
 			break
 		}
 		start := offset + match[2]
-		if !hasPublicRepositoryPrefix(text, start) {
-			paths = append(paths, text[start:offset+match[3]])
+		candidate := text[start : offset+match[3]]
+		if !strings.ContainsAny(candidate, "{}") && !hasPublicRepositoryPrefix(text, start) {
+			paths = append(paths, candidate)
 		}
 		offset += match[3]
 	}
@@ -64,6 +65,7 @@ func TestOperationalPathDetectorStaysBroaderThanAllowlist(t *testing.T) {
 		"/qurl-example-service/" + "fileviewer-tunnel/replica-z/bootstrap",
 		"/qurl-example-service/" + "fileviewer_nhp/replica_z/bootstrap",
 		"/qurl-example-service/" + "FileViewer-NHP/Replica-Z/Bootstrap",
+		"/qurl-example_service/" + "fileviewer.nhp/-replica-/bootstrap-",
 		"/qurl-example-service/" + "PRIVATE_PARAMETER",
 	} {
 		got := findOperationalPaths(path)
