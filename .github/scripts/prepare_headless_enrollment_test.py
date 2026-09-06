@@ -616,7 +616,7 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
         output.assert_has_calls(
             [
                 mock.call(
-                    "::notice::sharing for detect-nhp-replica-a was enabled by this run and was deliberately left on"
+                    "::notice::sharing for detect-nhp-replica-a changed from off to on during this run and was deliberately left on"
                 ),
                 mock.call(
                     "prepared one-hour enrollment for detect-nhp-replica-a at serving epoch 1; "
@@ -1052,7 +1052,7 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
         sleep.assert_called_once_with(MODULE.RETRY_SECONDS)
         put.assert_not_called()
 
-    def test_later_failure_reports_sharing_enabled_by_this_run(self) -> None:
+    def test_later_failure_reports_observed_sharing_transition(self) -> None:
         responses = [
             [
                 {
@@ -1073,7 +1073,7 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
         ):
             with self.assertRaisesRegex(
                 MODULE.EnrollmentError,
-                "sharing for this resource was enabled by this run; sharing was left on",
+                "sharing changed from off to on during this run; sharing was left on",
             ) as raised:
                 MODULE.prepare_enrollment(
                     "https://api.example.com",
@@ -1749,7 +1749,7 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
         ):
             with self.assertRaisesRegex(
                 MODULE.EnrollmentError,
-                "sharing for this resource was enabled by this run and was left on",
+                "sharing changed from off to on during this run and was left on",
             ) as raised:
                 MODULE.prepare_enrollment(
                     "https://api.example.com",
@@ -1891,7 +1891,7 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
         ):
             with self.assertRaisesRegex(
                 MODULE.EnrollmentError,
-                "sharing for this resource was enabled by this run and was left on",
+                "sharing changed from off to on during this run and was left on",
             ):
                 MODULE.prepare_enrollment(
                     "https://api.example.com",
@@ -2392,7 +2392,8 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
                 )
                 put.assert_called_once_with(
                     "us-east-2",
-                    f"/qurl-s3-connector/fileviewer-nhp/replica-{replica}/bootstrap",
+                    "/qurl-s3-connector/"
+                    + f"fileviewer-nhp/replica-{replica}/bootstrap",
                     "lv_live_replica-token",
                 )
 

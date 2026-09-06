@@ -32,7 +32,12 @@ func findOperationalPaths(text string) []string {
 		}
 		start := offset + match[2]
 		candidate := text[start : offset+match[3]]
-		if !strings.ContainsAny(candidate, "{}") && !hasPublicRepositoryPrefix(text, start) {
+		// A templated suffix cannot be allowlisted, but its concrete prefix still
+		// identifies an operational namespace and must reach the exact allowlist.
+		if cut := strings.IndexAny(candidate, "{}"); cut >= 0 {
+			candidate = strings.TrimRight(candidate[:cut], "/")
+		}
+		if strings.Count(candidate, "/") >= 2 && !hasPublicRepositoryPrefix(text, start) {
 			paths = append(paths, candidate)
 		}
 		offset += match[3]
@@ -73,8 +78,9 @@ func TestOperationalPathDetectorStaysBroaderThanAllowlist(t *testing.T) {
 			t.Fatalf("findOperationalPaths(%q) = %q; new NHP service paths must reach the reviewed allowlist", path, got)
 		}
 	}
-	if got := findOperationalPaths("/qurl-example-service/nhp/replica-{slot}/bootstrap"); len(got) != 0 {
-		t.Fatalf("dynamic operational path matched incomplete token %q", got)
+	dynamicPrefix := "/qurl-example-service/" + "nhp/replica-"
+	if got := findOperationalPaths(dynamicPrefix + "{slot}/bootstrap"); len(got) != 1 || got[0] != dynamicPrefix {
+		t.Fatalf("dynamic operational path did not preserve concrete prefix: %q", got)
 	}
 	first := "/qurl-example-service/" + "nhp/replica-a/bootstrap"
 	second := "/qurl-example-service/" + "nhp/replica-b/bootstrap"
@@ -89,10 +95,11 @@ func operationalPathBelongsToCurrentRepository(path string) bool {
 
 func skipPublicSourceDirectory(rel string, name string) bool {
 	switch name {
-	case ".git", ".ruff_cache", ".venv", "venv", "__pycache__", ".pytest_cache":
+	case ".git", ".ruff_cache", ".venv", "__pycache__", ".pytest_cache":
 		return true
 	}
-	return filepath.ToSlash(rel) == "bin"
+	rootRelative := filepath.ToSlash(rel)
+	return rootRelative == "bin" || rootRelative == "venv"
 }
 
 func TestPublicSourceDirectorySkipsCoverNestedToolArtifacts(t *testing.T) {
@@ -107,6 +114,9 @@ func TestPublicSourceDirectorySkipsCoverNestedToolArtifacts(t *testing.T) {
 	}
 	if skipPublicSourceDirectory("cmd/example/bin", "bin") {
 		t.Fatal("a nested source directory named bin must remain scanned")
+	}
+	if skipPublicSourceDirectory("pkg/example/venv", "venv") {
+		t.Fatal("a nested source directory named venv must remain scanned")
 	}
 }
 

@@ -642,7 +642,7 @@ def prepare_enrollment(
         )
 
     observed_epoch = serving_epoch
-    sharing_enabled_by_this_run = False
+    sharing_transition_observed = False
     sharing_observed_on = False
     if desired_state == "off":
         # Recovery deliberately leaves the selected resource on. A fixed
@@ -664,7 +664,7 @@ def prepare_enrollment(
                     method="PUT",
                     body={"desired_state": "on"},
                 )
-                sharing_enabled_by_this_run = True
+                sharing_transition_observed = True
                 break
             except APIRequestOutcomeUnknown as exc:
                 # The server can apply the PUT before the response is lost. A
@@ -694,7 +694,7 @@ def prepare_enrollment(
                 )
                 continue
             break
-        if not sharing_enabled_by_this_run and put_failure is None:
+        if not sharing_transition_observed and put_failure is None:
             raise EnrollmentError(
                 "sharing update was rejected after one bounded retry"
             ) from last_put_rejection
@@ -714,9 +714,9 @@ def prepare_enrollment(
                         MAX_RETRY_AFTER_SECONDS,
                     )
             except EnrollmentError as exc:
-                if sharing_enabled_by_this_run:
+                if sharing_transition_observed:
                     raise EnrollmentError(
-                        "sharing status check was rejected after sharing for this resource was enabled by this run; sharing was left on"
+                        "sharing status check was rejected after sharing changed from off to on during this run; sharing was left on"
                     ) from exc
                 if sharing_observed_on:
                     raise EnrollmentError(
@@ -737,15 +737,15 @@ def prepare_enrollment(
                 and sharing.get("desired_state") == "on"
                 and observed_epoch >= minimum_epoch
             ):
-                sharing_enabled_by_this_run = True
+                sharing_transition_observed = True
                 break
             if attempt + 1 < SHARING_POLL_ATTEMPTS:
                 time.sleep(poll_delay)
         else:
             if last_poll_failure is not None:
                 message = "sharing did not reach the required serving epoch because status checks failed"
-                if sharing_enabled_by_this_run:
-                    message += "; sharing for this resource was enabled by this run and was left on"
+                if sharing_transition_observed:
+                    message += "; sharing changed from off to on during this run and was left on"
                 elif sharing_observed_on:
                     message += (
                         "; sharing for this resource was observed on and was left on"
@@ -754,8 +754,10 @@ def prepare_enrollment(
                     message += "; the sharing update outcome is unknown and sharing may have been applied before the response was lost and may have been left on"
                 raise EnrollmentError(message) from last_poll_failure
             message = "sharing did not reach the required serving epoch"
-            if sharing_enabled_by_this_run:
-                message += "; sharing for this resource was enabled by this run and was left on"
+            if sharing_transition_observed:
+                message += (
+                    "; sharing changed from off to on during this run and was left on"
+                )
             elif sharing_observed_on:
                 message += "; sharing for this resource was observed on and was left on"
             raise EnrollmentError(message)
@@ -774,16 +776,16 @@ def prepare_enrollment(
             now=now,
         )
     except EnrollmentError as exc:
-        if sharing_enabled_by_this_run:
+        if sharing_transition_observed:
             raise EnrollmentError(
-                "enrollment preparation failed after sharing for this resource was enabled by this run; sharing was left on"
+                "enrollment preparation failed after sharing changed from off to on during this run; sharing was left on"
             ) from exc
         raise
     if mint_warning:
         print(f"::warning::{mint_warning}", file=sys.stderr)
-    if sharing_enabled_by_this_run:
+    if sharing_transition_observed:
         print(
-            f"::notice::sharing for {target} was enabled by this run and was deliberately left on"
+            f"::notice::sharing for {target} changed from off to on during this run and was deliberately left on"
         )
     print(
         f"prepared one-hour enrollment for {target} at serving epoch {observed_epoch}; "
