@@ -92,9 +92,8 @@ The reusable production runtime lives under `pkg/share`. It owns native
 assignment recovery, resource-bound NHP admission, FRP session readiness,
 make-before-break renewal, and per-resource failure isolation. Command code
 must use that implementation rather than introducing another knock/session
-supervisor. `ResourceRunner` serves one route per admission;
-`SessionGroupRunner` serves many routes (up to `MaxGroupRoutes`) on one
-admission and one FRP session, with live route add/remove/restart and
+supervisor. `SessionGroupRunner` serves one or many routes on one admission
+and one FRP session (up to `MaxGroupRoutes`), with live route add/remove/restart and
 per-route failure reporting.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for change and validation expectations.

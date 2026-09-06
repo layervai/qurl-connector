@@ -99,25 +99,6 @@ func TestValidate_RejectsTransportHostilePublicResourceID(t *testing.T) {
 	}
 }
 
-func TestValidate_RejectsServerTokenWithoutStaticDialTarget(t *testing.T) {
-	cfg := &Config{
-		Server: ServerConfig{Token: "shared-secret"},
-		Routes: []Route{{
-			ID:        "tucker",
-			Type:      RouteTypeHTTP,
-			LocalIP:   "127.0.0.1",
-			LocalPort: 8080,
-		}},
-	}
-	err := Validate(cfg)
-	if err == nil {
-		t.Fatal("expected error for server.token without server.addr/server.port, got nil")
-	}
-	if !strings.Contains(err.Error(), "server.token") || !strings.Contains(err.Error(), "NHP ACK") {
-		t.Errorf("error %q should mention server.token and the NHP ACK path", err.Error())
-	}
-}
-
 func TestValidateRejectsNonCanonicalEgressLocalIPWhitespace(t *testing.T) {
 	for name, value := range map[string]string{
 		"leading":  " 192.0.2.10",
@@ -290,57 +271,6 @@ func TestValidate_RejectsInvalidRouteID(t *testing.T) {
 	}
 }
 
-// TestValidate_AllowsUnmanagedSubdomainWithoutResourceID protects the direct
-// custom-FRP surface. ResourceID is the managed-route discriminator; without
-// it, explicit FRP routing fields retain their historical behavior.
-func TestValidate_AllowsUnmanagedSubdomainWithoutResourceID(t *testing.T) {
-	cfg := &Config{
-		Server: ServerConfig{Addr: "proxy.example.com", Port: 7000},
-		Routes: []Route{{
-			Type:      RouteTypeHTTP,
-			LocalIP:   "127.0.0.1",
-			LocalPort: 8080,
-			Subdomain: "hand-set-vhost",
-			ID:        "tucker-test",
-		}},
-	}
-	if err := Validate(cfg); err != nil {
-		t.Fatalf("Validate rejected unmanaged explicit subdomain: %v", err)
-	}
-}
-
-func TestValidate_AllowsUnmanagedLoadBalancerGroup(t *testing.T) {
-	cfg := &Config{Routes: []Route{{
-		ID: "custom-tcp", Type: RouteTypeTCP, LocalIP: "127.0.0.1", LocalPort: 9000,
-		LoadBalancerGroup: "operator-group",
-	}}}
-	if err := Validate(cfg); err != nil {
-		t.Fatalf("Validate rejected unmanaged explicit load_balancer_group: %v", err)
-	}
-}
-
-func TestValidate_RejectsManagedTCPRoute(t *testing.T) {
-	cfg := &Config{Routes: []Route{{
-		ID: "managed-tcp", Type: RouteTypeTCP, LocalIP: "127.0.0.1", LocalPort: 9000,
-		ResourceID: testPublicResourceA, ConnectorRoutingID: testRoutingA,
-	}}}
-	err := Validate(cfg)
-	if err == nil || !strings.Contains(err.Error(), "require type: http") {
-		t.Fatalf("Validate error = %v, want managed HTTP-only rejection", err)
-	}
-}
-
-func TestValidate_BootstrapInputRejectsPinnedTCPBeforeHydration(t *testing.T) {
-	cfg := &Config{Routes: []Route{{
-		ID: "pinned-tcp", Type: RouteTypeTCP, LocalIP: "127.0.0.1", LocalPort: 9000,
-		ResourceID: testPublicResourceA,
-	}}}
-	err := validateStartupInput(cfg)
-	if err == nil || !strings.Contains(err.Error(), "require type: http") {
-		t.Fatalf("startup-input validation error = %v, want managed HTTP-only rejection", err)
-	}
-}
-
 func TestValidate_BootstrapInputAllowsPinnedResourcePendingHydration(t *testing.T) {
 	cfg := &Config{Routes: []Route{{
 		ID: "pinned", Type: RouteTypeHTTP, LocalIP: "127.0.0.1", LocalPort: 8080,
@@ -351,79 +281,6 @@ func TestValidate_BootstrapInputAllowsPinnedResourcePendingHydration(t *testing.
 	}
 	if err := Validate(cfg); err == nil || !strings.Contains(err.Error(), "connector_routing_id") {
 		t.Fatalf("final validation error = %v, want missing connector_routing_id", err)
-	}
-}
-
-func TestValidate_RejectsManagedCustomDomainsBeforeAndAfterHydration(t *testing.T) {
-	for _, routingID := range []string{"", testRoutingA} {
-		cfg := &Config{Routes: []Route{{
-			ID: "managed", Type: RouteTypeHTTP, LocalIP: "127.0.0.1", LocalPort: 8080,
-			ResourceID: testPublicResourceA, ConnectorRoutingID: routingID,
-			CustomDomains: []string{"victim.example.com"},
-		}}}
-
-		var err error
-		if routingID == "" {
-			err = validateStartupInput(cfg)
-		} else {
-			err = Validate(cfg)
-		}
-		if err == nil || !strings.Contains(err.Error(), "cannot set custom_domains") {
-			t.Fatalf("routing_id=%q: error = %v, want managed custom_domains rejection", routingID, err)
-		}
-	}
-}
-
-// TestValidate_RejectsSubdomainIDResourceIDMismatch pins the
-// disagreement check when all three fields are set: the existing
-// validateRouteSubdomainMatchesResourceID guard catches the case
-// where subdomain is not resource_id, regardless of whether the id is
-// also present. Complements
-// TestValidate_AllowsSubdomainWithIDAndResourceID (matching case)
-// — together they fence both branches of the id-backed Route
-// shape.
-func TestValidate_RejectsSubdomainIDResourceIDMismatch(t *testing.T) {
-	cfg := &Config{
-		Server: ServerConfig{Addr: "proxy.example.com", Port: 7000},
-		Routes: []Route{{
-			Type:               RouteTypeHTTP,
-			LocalIP:            "127.0.0.1",
-			LocalPort:          8080,
-			Subdomain:          "hand-set-vhost",
-			ID:                 "tucker-test",
-			ResourceID:         testPublicResourceA,
-			ConnectorRoutingID: testRoutingA,
-		}},
-	}
-	err := Validate(cfg)
-	if err == nil {
-		t.Fatal("expected error for subdomain/resource_id mismatch, got nil")
-	}
-	if !strings.Contains(err.Error(), "must be absent or exactly match") {
-		t.Errorf("error %q should mention the disagreement", err.Error())
-	}
-}
-
-// TestValidate_AllowsSubdomainWithIDAndResourceID pins the escape
-// hatch: when the operator pins resource_id alongside the id, the
-// hijack guard above is satisfied (the existing
-// validateRouteSubdomainMatchesResourceID check fires instead and
-// catches actual disagreement).
-func TestValidate_AllowsSubdomainWithIDAndResourceID(t *testing.T) {
-	cfg := &Config{
-		Server: ServerConfig{Addr: "proxy.example.com", Port: 7000},
-		Routes: []Route{{
-			Type:               RouteTypeHTTP,
-			LocalIP:            "127.0.0.1",
-			LocalPort:          8080,
-			Subdomain:          testRoutingA,
-			ID:                 "tucker-test",
-			ResourceID:         testPublicResourceA,
-			ConnectorRoutingID: testRoutingA,
-		}},
-	}
-	if err := Validate(cfg); err != nil {
-		t.Errorf("Validate rejected a pinned-resource_id route: %v", err)
 	}
 }
 

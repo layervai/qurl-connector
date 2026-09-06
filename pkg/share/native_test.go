@@ -3779,10 +3779,14 @@ func TestNativeAdmitterFencesServingReplacementUntilDurableRetirementTerminal(t 
 		},
 		pending: map[nativeAdmissionKey]bool{key: true},
 	}
-	factory := &overlapFactory{}
+	factory := &fakeGroupFactory{}
 	serving := make(chan Admission, 1)
-	runner, err := NewResourceRunner(ResourceConfig{
+	runner, err := NewSessionGroupRunner(SessionGroupConfig{
 		KnockResourceID: "resource-b", ResourceID: testProtectedResourceID,
+		Routes: []LocalHTTPRoute{{
+			RouteID: "route-b", LocalIP: "127.0.0.1", LocalPort: 8080,
+			ResourceID: testProtectedResourceID, ConnectorRoutingID: "route-b",
+		}},
 		Admitter: admitter, Sessions: factory, OnServing: func(admission Admission) { serving <- admission },
 	})
 	if err != nil {
@@ -3799,9 +3803,7 @@ func TestNativeAdmitterFencesServingReplacementUntilDurableRetirementTerminal(t 
 	case <-time.After(2 * time.Second):
 		t.Fatal("durable retirement did not reach terminal 52030 poll")
 	}
-	factory.mu.Lock()
-	startedBeforeTerminal := factory.next
-	factory.mu.Unlock()
+	startedBeforeTerminal := factory.startCount()
 	if recoveryCalls != 4 || waits != 3 || startedBeforeTerminal != 0 || !oldAuthorityLive {
 		t.Fatalf("pre-terminal recovery calls/waits/starts/live=%d/%d/%d/%t, want 4/3/0/true",
 			recoveryCalls, waits, startedBeforeTerminal, oldAuthorityLive)
@@ -3832,11 +3834,8 @@ func TestNativeAdmitterFencesServingReplacementUntilDurableRetirementTerminal(t 
 	if err := <-runDone; !errors.Is(err, context.Canceled) {
 		t.Fatalf("runner shutdown = %v, want context cancellation", err)
 	}
-	factory.mu.Lock()
-	servingCount, gap := factory.serving, factory.gap
-	factory.mu.Unlock()
-	if servingCount != 0 || gap || recoveryCalls != len(codes) {
-		t.Fatalf("final serving/gap/recovery=%d/%t/%d, want 0/false/%d", servingCount, gap, recoveryCalls, len(codes))
+	if recoveryCalls != len(codes) {
+		t.Fatalf("final recovery calls=%d, want %d", recoveryCalls, len(codes))
 	}
 	if records, loadErr := store.LoadSessionOperations(context.Background(), testProtectedResourceID); loadErr != nil || len(records) != 0 {
 		t.Fatalf("terminal durable retirement records=%+v err=%v", records, loadErr)

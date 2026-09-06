@@ -20,8 +20,6 @@ import (
 	"github.com/denisbrodbeck/machineid"
 	frpconfig "github.com/fatedier/frp/pkg/config"
 	v1 "github.com/fatedier/frp/pkg/config/v1"
-	"github.com/fatedier/frp/pkg/config/v1/validation"
-	"github.com/fatedier/frp/pkg/policy/security"
 	qurl "github.com/layervai/qurl-go/qurl"
 	"github.com/spf13/cobra"
 
@@ -31,7 +29,6 @@ import (
 	nhpconfig "github.com/layervai/qurl-connector/pkg/config"
 	"github.com/layervai/qurl-connector/pkg/hubpin"
 	"github.com/layervai/qurl-connector/pkg/proofprovenance"
-	"github.com/layervai/qurl-connector/pkg/replica"
 	"github.com/layervai/qurl-connector/pkg/share"
 	"github.com/layervai/qurl-connector/pkg/version"
 )
@@ -454,9 +451,8 @@ func acquireConnectorRunConfigAccess(ctx context.Context, cfgPath string) (_ *co
 
 // validateConnectorRunRoutes is the last local-only gate before native
 // registration can consume an enrollment credential or mutate SDK state. The
-// low-level config package still supports ResourceID-free custom FRP routes,
-// but the qurl-connector run command manages every route as a device-owned HTTP
-// Connector resource and must reject incompatible shapes before remote work.
+// qurl-connector run command manages every route as a device-owned HTTP
+// Connector resource and rejects incompatible shapes before remote work.
 func validateConnectorRunRoutes(cfg *nhpconfig.Config) error {
 	if cfg == nil {
 		return errors.New("Connector config is nil")
@@ -466,9 +462,6 @@ func validateConnectorRunRoutes(cfg *nhpconfig.Config) error {
 	for i, route := range cfg.Routes {
 		if route.Type != nhpconfig.RouteTypeHTTP {
 			return fmt.Errorf("routes[%d] (%s): qURL Connector run supports managed HTTP routes only; got %q", i, route.ID, route.Type)
-		}
-		if len(route.CustomDomains) != 0 {
-			return fmt.Errorf("routes[%d] (%s): managed qURL Connector routes cannot set custom_domains", i, route.ID)
 		}
 		id := routeIDWithFallback(cfg, route, fallbackID)
 		if id == "" {
@@ -482,9 +475,6 @@ func validateConnectorRunRoutes(cfg *nhpconfig.Config) error {
 			if err := nhpconfig.ValidateSlug(id); err != nil {
 				return fmt.Errorf("routes[%d] (%s): invalid Connector id before native registration: %w", i, id, err)
 			}
-		}
-		if route.ResourceID == "" && (route.Subdomain != "" || route.LoadBalancerGroup != "") {
-			return fmt.Errorf("routes[%d] (%s): omit subdomain and load_balancer_group until the producer returns connector_routing_id", i, id)
 		}
 	}
 	return nil
@@ -1001,35 +991,13 @@ func startFRPFromConfig(ctx context.Context, cfgPath, machineID string, cfg *nhp
 	if err := swapAuditLoggerFromYAML(cfg, machineID, agentID); err != nil {
 		slog.WarnContext(ctx, "audit: YAML-driven audit logger swap failed; keeping early-init logger", "err", err.Error())
 	}
-	resolveReplicaDiscriminator(ctx, cfg)
-	common, proxyCfgs, visitorCfgs, err := nhpconfig.GenerateFRPClientConfig(cfg, machineID)
-	if err != nil {
-		return fmt.Errorf("generating Connector config: %w", err)
-	}
-	// FRP's HTTP admin API is opt-in. When disabled, leave
-	// common.WebServer at its zero value so FRP skips the listener entirely.
-	// Operators can opt in through YAML or QURL_ADMIN_ENABLED=true.
-	//
-	// FRP binds this listener inside frpclient.NewService, at construction,
-	// from a clone of common.WebServer -- one listener per FRP control
-	// session. startSharedService serves every route on ONE session, which
-	// is what makes this one admin listener per process: a session per
-	// route had the second route's NewService fail with address-in-use and
-	// retry forever. The make-before-break overlap at rotation, where the
-	// replacement session is constructed while the old one still holds the
-	// port, predates multi-route serving and is unchanged here.
+	common := &v1.ClientCommonConfig{ServerAddr: cfg.Server.Addr, ServerPort: cfg.Server.Port}
+	common.Transport.Protocol = cfg.Server.Protocol
+	common.LoginFailExit = cfg.Server.LoginFailExit
+	common.Transport.DialServerKeepAlive = int64(cfg.Server.Keepalive)
+	common.Transport.DialServerTimeout = int64(cfg.Server.DialTimeout)
 	if cfg.Server.EgressLocalIP != "" {
 		common.Transport.ConnectServerLocalIP = cfg.Server.EgressLocalIP
-	}
-	if cfg.Admin.Enabled {
-		password, err := adminAuthPassword(&cfg.Admin)
-		if err != nil {
-			return fmt.Errorf("admin auth: %w", err)
-		}
-		common.WebServer.Addr, common.WebServer.Port = cfg.Admin.Addr, cfg.Admin.Port
-		common.WebServer.User, common.WebServer.Password = "admin", password
-		slog.WarnContext(ctx, "admin API enabled: FRP binds its listener per control session, so each admission rotation replaces the session cold instead of make-before-break; expect a brief serving gap per admission window",
-			"addr", cfg.Admin.Addr, "port", cfg.Admin.Port)
 	}
 	applyLogPresentation(common, logLevel, colorEnabled)
 	if err := common.Complete(); err != nil {
@@ -1037,16 +1005,6 @@ func startFRPFromConfig(ctx context.Context, cfgPath, machineID string, cfg *nhp
 	}
 	if common.Transport.ProxyURL != "" {
 		return errors.New("FRP http_proxy/proxyURL is incompatible with native UDP admission because the proxy would change the Connector session source address; unset it or use an explicitly supported shared-egress topology")
-	}
-	for _, proxy := range proxyCfgs {
-		proxy.Complete()
-	}
-	warning, err := validation.ValidateAllClientConfig(common, proxyCfgs, visitorCfgs, &security.UnsafeFeatures{})
-	if warning != nil {
-		fmt.Printf("  %sWarning: %v%s\n", colorYellow, warning, colorReset)
-	}
-	if err != nil {
-		return fmt.Errorf("config validation: %w", err)
 	}
 	fmt.Printf("  %s%d route(s) configured%s\n", colorGreen, len(cfg.Routes), colorReset)
 	if admitter == nil {
@@ -1066,33 +1024,12 @@ type sharedServiceAdmitter interface {
 // startSharedService serves every configured route on one NHP admission and
 // one FRP control session.
 //
-// One session per route was the previous shape: a share.ResourceRunner per
-// route under an errgroup. That had three defects, all removed here by
-// construction rather than patched:
+// The session group isolates route retirement, reports readiness per route,
+// and carries all routes on one admission and one FRP control session.
 //
-//   - Sibling teardown. A route whose resource was revoked server-side
-//     returned ErrResourceGone from its runner, the errgroup canceled every
-//     healthy sibling, and the process exited 1 with the revoked route still
-//     in the config -- so the supervisor crashlooped and the good shares went
-//     down with the bad one. The session group retires a gone route in place
-//     (OnRouteFailed) and keeps serving the rest; Run returns only when ctx
-//     ends, when no route is left (share.ErrGroupEmpty), or when the group's
-//     own admission is terminally refused.
-//   - The ready block lied. It latched on the first route's OnServing and
-//     printed every configured route as live. It is now driven per route by
-//     OnRouteServing and waits for every route still configured (see
-//     readyAnnouncer).
-//   - Admin port collision. With admin.enabled, every per-route
-//     frpclient.NewService cloned common.WebServer and bound the admin
-//     listener at construction, so the second route's session failed with
-//     address-in-use and retried forever. One session is one listener; see
-//     the admin wiring in startFRPFromConfig.
-//
-// It is also the affordable shape. A session per route costs a knock, a
-// Login, a NewProxy authorization and a registration heartbeat stream each,
-// on every rotation; one session costs one knock and one Login for the whole
-// set, and only the per-proxy NewProxy authorizations scale with the route
-// count. A restart with N routes is one knock and one Login.
+// A revoked route is retired in place while its siblings continue. Readiness
+// waits for every active route. Run returns when the context ends, no route is
+// left, or the shared admission is terminally refused.
 func startSharedService(ctx context.Context, common *v1.ClientCommonConfig, cfgPath string, qcfg *nhpconfig.Config, admitter sharedServiceAdmitter) error {
 	sessions, err := newSharedServiceSessions(common, cfgPath)
 	if err != nil {
@@ -1103,8 +1040,8 @@ func startSharedService(ctx context.Context, common *v1.ClientCommonConfig, cfgP
 }
 
 // newSharedServiceSessions builds the FRP session factory for the group. It
-// carries the same common config, client version and config path the
-// per-route factories did; the routes themselves belong to the group runner.
+// carries the common config, client version and config path; the routes
+// themselves belong to the group runner.
 func newSharedServiceSessions(common *v1.ClientCommonConfig, cfgPath string) (*share.FRPSessionGroupFactory, error) {
 	return share.NewFRPSessionGroupFactory(share.FRPGroupFactoryConfig{
 		Common: common, ClientVersion: clientVersionMeta(version.Version), ConfigPath: cfgPath,
@@ -1270,8 +1207,8 @@ func retireSharedRoute(ctx context.Context, ledger *sharedRouteLedger, announcer
 // knock resource differs from its siblings' (FirstDifferentKnockResourceID)
 // before the runtime starts, because one FRP control session cannot span
 // admission targets. The group therefore knocks once, for the primary
-// resource, exactly as the single-route runtime did. The check below is the
-// runtime's own guard on that invariant, so a config that reached this point
+// resource. The check below is the runtime's own guard on that invariant, so
+// a config that reached this point
 // by another path fails clearly instead of registering proxies under an
 // admission that does not cover them.
 //
@@ -1405,17 +1342,6 @@ func printBanner() {
 	fmt.Printf("  %s%s (client)%s\n\n", colorGreen, version.Short(), colorReset)
 }
 
-func adminAuthPassword(cfg *nhpconfig.AdminConfig) (string, error) {
-	if cfg != nil && strings.TrimSpace(cfg.Password) != "" {
-		return cfg.Password, nil
-	}
-	machineID := getMachineID()
-	if machineID == "" || machineID == unknownMachineID {
-		return "", errors.New("machine ID is unavailable; set admin.password or disable admin.enabled")
-	}
-	return machineID, nil
-}
-
 func getMachineID() string {
 	machineIDOnce.Do(func() {
 		id, err := machineid.ProtectedID("qurl-frp")
@@ -1426,65 +1352,4 @@ func getMachineID() string {
 		cachedMachineID = id[:8]
 	})
 	return cachedMachineID
-}
-
-func resolveReplicaDiscriminator(ctx context.Context, cfg *nhpconfig.Config) {
-	resolveReplicaDiscriminatorWithResolver(ctx, cfg, nil)
-}
-
-// logDiscriminatorResolved emits the "replica discriminator resolved" line,
-// including the pre-normalization raw value only when it differs from the
-// resolved discriminator.
-func logDiscriminatorResolved(ctx context.Context, source, discriminator, raw string) {
-	logArgs := []any{
-		"source", source,
-		"discriminator", discriminator,
-	}
-	if raw != "" && raw != discriminator {
-		logArgs = append(logArgs, "raw", raw)
-	}
-	slog.InfoContext(ctx, "replica discriminator resolved", logArgs...)
-}
-
-func resolveReplicaDiscriminatorWithResolver(ctx context.Context, cfg *nhpconfig.Config, resolver *replica.Resolver) {
-	if raw := strings.TrimSpace(cfg.Server.ReplicaDiscriminator); raw != "" {
-		normalized := replica.Normalize(raw)
-		if normalized == "" {
-			slog.WarnContext(ctx, "server.replica_discriminator dropped after normalization; falling through to resolver chain",
-				"raw", raw)
-			cfg.Server.ReplicaDiscriminator = ""
-		} else {
-			cfg.Server.ReplicaDiscriminator = normalized
-			logDiscriminatorResolved(ctx, string(replica.SourceExplicit), normalized, raw)
-			return
-		}
-	}
-	r := resolver
-	if r == nil {
-		r = &replica.Resolver{}
-	}
-	disc, meta, err := r.Resolve(ctx)
-	if err != nil {
-		// Preserve the current safe single-replica behavior if a future resolver
-		// mode introduces a hard error: continue without a salt, but say so.
-		slog.WarnContext(ctx, "replica discriminator resolver returned error; continuing without salt",
-			"err", err.Error())
-		return
-	}
-	cfg.Server.ReplicaDiscriminator = disc
-	logDiscriminatorResolved(ctx, string(meta.Source), disc, meta.Raw)
-	if meta.Warning != "" {
-		slog.WarnContext(ctx, "replica discriminator warning",
-			"warning", meta.Warning,
-			"source", string(meta.Source),
-		)
-	}
-	for _, warning := range r.Warnings() {
-		slog.WarnContext(ctx, "replica discriminator warning",
-			"warning", warning)
-	}
-	if softErrs := r.Errors(); softErrs != nil {
-		slog.DebugContext(ctx, "replica discriminator soft errors",
-			"errs", softErrs.Error())
-	}
 }

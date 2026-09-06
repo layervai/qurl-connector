@@ -80,12 +80,11 @@ func initEarlyAuditLogger(machineID string) (audit.Logger, error) {
 // silence the audit pipeline during incident triage or compliance-
 // scope debugging without rewriting the YAML.
 //
-// Vocabulary aligned with pkg/config's QURL_ADMIN_ENABLED parser:
 // on values {1, true, yes, on}, off values {0, false, no, off},
 // case-insensitive + whitespace-trimmed. An empty value falls
-// through to the default (audit on) silently — mirrors the
-// admin-parser carve-out for the "exported-but-unset" CI shell
-// shape (`export QURL_AUDIT_ENABLED` with no value). An unrecognized
+// through to the default (audit on) silently for the
+// "exported-but-unset" CI shell shape (`export QURL_AUDIT_ENABLED`
+// with no value). An unrecognized
 // value warns to stderr and falls through to on; a typo'd kill
 // switch silently leaving audit on during compliance debugging is
 // the foot-gun the loud-warn closes.
@@ -101,9 +100,7 @@ func auditEnabledFromEnv() bool {
 	case "0", "false", "no", "off":
 		return false
 	case "":
-		// Exported-but-empty (`export QURL_AUDIT_ENABLED`); silent
-		// fall-through to default. See QURL_ADMIN_ENABLED parser
-		// for the same carve-out rationale.
+		// Exported-but-empty; fall through to the default.
 		return true
 	default:
 		fmt.Fprintf(os.Stderr,

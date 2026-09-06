@@ -33,18 +33,9 @@ func TestSaveAndLoadRoundTrip(t *testing.T) {
 				Type:               RouteTypeHTTP,
 				LocalIP:            "127.0.0.1",
 				LocalPort:          8081,
-				Subdomain:          testRoutingB,
 				ResourceID:         testPublicResourceB,
 				ConnectorRoutingID: testRoutingB,
 				TargetURL:          "http://localhost:8081",
-			},
-			{
-				ID:         "my-db",
-				Type:       RouteTypeTCP,
-				LocalIP:    "127.0.0.1",
-				LocalPort:  5432,
-				RemotePort: 15432,
-				TargetURL:  "tcp://localhost:5432",
 			},
 		},
 	}
@@ -79,9 +70,6 @@ func TestSaveAndLoadRoundTrip(t *testing.T) {
 		}
 		if got.LocalPort != want.LocalPort {
 			t.Errorf("route %d LocalPort: got %d, want %d", i, got.LocalPort, want.LocalPort)
-		}
-		if got.Subdomain != want.Subdomain {
-			t.Errorf("route %d Subdomain: got %q, want %q", i, got.Subdomain, want.Subdomain)
 		}
 		if got.ResourceID != want.ResourceID {
 			t.Errorf("route %d ResourceID: got %q, want %q", i, got.ResourceID, want.ResourceID)

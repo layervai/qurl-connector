@@ -342,7 +342,7 @@ func hydrateConnectorResourceIDsReadOnlyContext(ctx context.Context, cfg *nhpcon
 		}
 		// Read-only diagnostics still validate every configured identity
 		// against the authenticated cache, but stale entries for routes no
-		// longer present in YAML must not make list/status unavailable. The
+		// longer present in YAML must not make list unavailable. The
 		// mutating run path rejects those orphans before any resource traffic.
 		if _, err := validateConfiguredConnectorIdentityGraph(cfg, cache); err != nil {
 			return err

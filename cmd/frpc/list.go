@@ -61,36 +61,16 @@ func runList(cmd *cobra.Command, _ []string) error {
 
 	// Table output
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(w, "ID\tTYPE\tTARGET\tPUBLIC URL\tRESOURCE ID")
-	publicDomain := cfg.Server.PublicDomain
-	if publicDomain == "" {
-		publicDomain = "qurl.site"
-	}
+	fmt.Fprintln(w, "ID\tTYPE\tTARGET\tRESOURCE ID")
 	for _, r := range routes {
 		target := fmt.Sprintf("%s:%d", r.LocalIP, r.LocalPort)
 		resID := r.ResourceID
 		if resID == "" {
 			resID = "-"
 		}
-		publicURL := "-"
-		if publicLabel := routePublicLabel(r); publicLabel != "" {
-			publicURL = fmt.Sprintf("https://%s.%s", publicLabel, publicDomain)
-		}
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n", r.ID, r.Type, target, publicURL, resID)
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", r.ID, r.Type, target, resID)
 	}
 	return w.Flush()
-}
-
-// routePublicLabel returns a customer-visible label only for an explicitly
-// configured custom FRP route. Managed Connector routes deliberately return
-// no label: connector_routing_id is an internal FRP/HRW operand, while the
-// private qurl.site lookup host is disclosed only by the qURL control plane after a qURL
-// is resolved and the NHP grant is open.
-func routePublicLabel(route nhpconfig.Route) string {
-	if route.ResourceID != "" {
-		return ""
-	}
-	return route.Subdomain
 }
 
 func encodeListJSON(routes []nhpconfig.Route) error {

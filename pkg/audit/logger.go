@@ -336,8 +336,8 @@ func (l *JSONLLogger) Close() error {
 }
 
 // DroppedCount returns the cumulative number of entries dropped due to
-// the channel buffer being full. Exported for tests and (future) admin/
-// metrics surfaces; not part of the Logger interface contract.
+// the channel buffer being full. Exported for tests and metrics surfaces;
+// not part of the Logger interface contract.
 func (l *JSONLLogger) DroppedCount() uint64 {
 	return l.dropped.Load()
 }

@@ -2,14 +2,33 @@ package main
 
 import (
 	"encoding/json"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/layervai/qurl-connector/pkg/agentstate"
-	nhpconfig "github.com/layervai/qurl-connector/pkg/config"
 )
+
+func withCapturedStdout(t *testing.T, fn func() error) (string, error) {
+	t.Helper()
+	orig := os.Stdout
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	os.Stdout = w
+	t.Cleanup(func() {
+		os.Stdout = orig
+		_ = w.Close()
+		_ = r.Close()
+	})
+	runErr := fn()
+	_ = w.Close()
+	buf, _ := io.ReadAll(r)
+	return string(buf), runErr
+}
 
 func TestRunListEmptyPromptSaysConfigure(t *testing.T) {
 	cfgPath := filepath.Join(t.TempDir(), "missing-qurl-proxy.yaml")
@@ -118,97 +137,6 @@ routes:
 	}
 	if got["id"] != "web" {
 		t.Fatalf("id = %v, want web", got["id"])
-	}
-}
-
-func TestRoutePublicLabelKeepsManagedAndCustomIdentitiesSeparate(t *testing.T) {
-	tests := []struct {
-		name  string
-		route nhpconfig.Route
-		want  string
-	}{
-		{
-			name: "managed route does not expose internal routing label",
-			route: nhpconfig.Route{
-				ResourceID:         testPublicResourceID,
-				ConnectorRoutingID: testConnectorRoutingID,
-			},
-			want: "",
-		},
-		{
-			name: "managed route missing producer routing identity fails closed",
-			route: nhpconfig.Route{
-				ResourceID: testPublicResourceID,
-				Subdomain:  "stale-client-label",
-			},
-			want: "",
-		},
-		{
-			name:  "custom FRP route retains explicit subdomain",
-			route: nhpconfig.Route{Subdomain: "custom-label"},
-			want:  "custom-label",
-		},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := routePublicLabel(tc.route); got != tc.want {
-				t.Fatalf("routePublicLabel() = %q, want %q", got, tc.want)
-			}
-		})
-	}
-}
-
-func TestRunListDoesNotExposeManagedRoutingIdentityAsPublicURL(t *testing.T) {
-	dir := t.TempDir()
-	isolateConnectorStateForTest(t, dir)
-	cfgPath := filepath.Join(dir, "qurl-proxy.yaml")
-	if err := os.WriteFile(cfgPath, []byte(`
-server:
-  public_domain: connector.example
-routes:
-  - id: managed
-    type: http
-    local_ip: 127.0.0.1
-    local_port: 8080
-    resource_id: `+testPublicResourceID+`
-    connector_routing_id: `+testConnectorRoutingID+`
-  - id: stale-managed
-    type: http
-    local_ip: 127.0.0.1
-    local_port: 8081
-    subdomain: stale-client-label
-    resource_id: `+testPublicResourceID2+`
-  - id: custom
-    type: http
-    local_ip: 127.0.0.1
-    local_port: 8082
-    subdomain: custom-label
-`), 0o600); err != nil {
-		t.Fatalf("write config: %v", err)
-	}
-
-	prevCfgFile := cfgFile
-	prevListJSON := listJSON
-	cfgFile = cfgPath
-	listJSON = false
-	t.Cleanup(func() {
-		cfgFile = prevCfgFile
-		listJSON = prevListJSON
-	})
-
-	out, err := withCapturedStdout(t, func() error { return runList(nil, nil) })
-	if err != nil {
-		t.Fatalf("runList returned error: %v", err)
-	}
-	if strings.Contains(out, "https://"+testConnectorRoutingID+".connector.example") {
-		t.Fatalf("managed route exposed internal routing identity as a public URL:\n%s", out)
-	}
-	if strings.Contains(out, "https://stale-client-label.connector.example") {
-		t.Fatalf("managed route fell back to stale subdomain:\n%s", out)
-	}
-	if !strings.Contains(out, "https://custom-label.connector.example") {
-		t.Fatalf("custom route lost explicit subdomain:\n%s", out)
 	}
 }
 

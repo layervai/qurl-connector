@@ -205,43 +205,6 @@ func TestPrintBannerHonorsColorGate(t *testing.T) {
 	}
 }
 
-func TestRunStatusHumanOutputHonorsColorGate(t *testing.T) {
-	dir := realPrivateConnectorTestDir(t)
-	isolateConnectorStateForTest(t, dir)
-	cfgPath := filepath.Join(dir, "qurl-proxy.yaml")
-	// admin stays disabled so status renders the on-disk view and never
-	// probes a listener; the colored surface here is the header, the
-	// Service/Hint lines, and the route table's per-status color.
-	if err := os.WriteFile(cfgPath, []byte("routes:\n  - id: web\n    type: http\n    local_ip: 127.0.0.1\n    local_port: 8080\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	previousCfgFile, previousJSON := cfgFile, statusJSON
-	cfgFile, statusJSON = cfgPath, false
-	t.Cleanup(func() { cfgFile, statusJSON = previousCfgFile, previousJSON })
-
-	withColorEnabled(t, true)
-	colored, err := withCapturedStdout(t, func() error { return runStatus(nil, nil) })
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(colored, ansiBold) {
-		t.Fatalf("status header lost its color with the gate on:\n%q", colored)
-	}
-
-	setColorEnabled(false)
-	plain, err := withCapturedStdout(t, func() error { return runStatus(nil, nil) })
-	if err != nil {
-		t.Fatal(err)
-	}
-	assertNoANSI(t, "runStatus", plain)
-	if !strings.Contains(plain, "qURL Connector Status") {
-		t.Fatalf("status header text missing with color off:\n%q", plain)
-	}
-	if !strings.Contains(plain, "web") {
-		t.Fatalf("route row missing with color off:\n%q", plain)
-	}
-}
-
 func TestReadyBlockHonorsColorGate(t *testing.T) {
 	// The readiness block is the print this gate exists for. It is designed to
 	// be read by non-interactive log consumers, so escapes in it land squarely

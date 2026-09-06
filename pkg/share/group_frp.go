@@ -105,8 +105,8 @@ var ErrSessionGroupEnded = errors.New("FRP session group has ended")
 // GroupRoute is one route of a session group. Generation is the route's
 // restart generation: it is folded into the FRP proxy name, so a restarted
 // route registers as a fresh proxy (a new NewProxy on the server) on the same
-// admission without disturbing its siblings. Generation 0 renders exactly the
-// single-route proxy name.
+// admission without disturbing its siblings. Generation 0 uses only the
+// admission discriminator.
 type GroupRoute struct {
 	LocalHTTPRoute
 	Generation uint64
@@ -214,8 +214,8 @@ func validateGroupRouteIdentities(count int, at func(int) LocalHTTPRoute) error 
 // groupProxyName renders the proxy name for one route generation on one
 // admission. Generation 0 is the single-route name; later generations append
 // a hyphen-separated restart suffix so a restarted route and any other cycle
-// can never collide. FRPProxyName caps the discriminator at
-// replica.MaxDiscriminatorLen; a session ID wide enough to fill it renders a
+// can never collide. FRPProxyName caps the discriminator at 16 characters. A
+// session ID wide enough to fill it renders a
 // restart generation as a short prefix plus a digest of the full
 // discriminator, which stays unique but is no longer readable in server logs.
 func groupProxyName(route GroupRoute, sessionID uint64) string {
@@ -239,7 +239,7 @@ type FRPGroupFactoryConfig struct {
 // FRPSessionGroupFactory builds one FRP control session carrying N HTTP
 // proxies per admission. Login carries the group's knock token once; each
 // proxy carries its own route's public resource ID, subdomain, and
-// load-balancer group exactly as the single-route factory renders them.
+// load-balancer group.
 type FRPSessionGroupFactory struct {
 	cfg FRPGroupFactoryConfig
 }
@@ -370,8 +370,8 @@ func (f *FRPSessionGroupFactory) Start(ctx context.Context, admission Admission,
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	// As with the single-route factory, the caller's context bounds Start
-	// only; the session owns its serving lifetime until Stop or Drain.
+	// The caller's context bounds Start only; the session owns its serving
+	// lifetime until Stop or Drain.
 	runCtx, cancel := context.WithCancel(context.Background())
 	session.cancel = cancel
 	go session.run(runCtx)

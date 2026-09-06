@@ -48,12 +48,9 @@ func runAdd(cmd *cobra.Command, _ []string) error {
 	// Validate the complete local route before touching the config file. Remote
 	// resource work is deliberately absent from add; the next registered run
 	// provisions with the device credential.
-	routeType, host, port, targetURL, err := nhpconfig.ParseTarget(addTarget)
+	host, port, targetURL, err := nhpconfig.ParseTarget(addTarget)
 	if err != nil {
 		return err
-	}
-	if routeType != nhpconfig.RouteTypeHTTP {
-		return fmt.Errorf("managed qURL Connector routes require an HTTP target; %q targets are not accepted by the protected Connector server path", routeType)
 	}
 	if err := nhpconfig.ValidateSlug(addID); err != nil {
 		return fmt.Errorf("invalid route id: %w", err)
@@ -86,7 +83,7 @@ func runAdd(cmd *cobra.Command, _ []string) error {
 	}
 	route := nhpconfig.Route{
 		ID:        addID,
-		Type:      routeType,
+		Type:      nhpconfig.RouteTypeHTTP,
 		LocalIP:   host,
 		LocalPort: port,
 		TargetURL: targetURL,
@@ -101,7 +98,7 @@ func runAdd(cmd *cobra.Command, _ []string) error {
 	fmt.Printf("Added route %q (%s) -> %s:%d\n", route.ID, route.Type, route.LocalIP, route.LocalPort)
 	fmt.Printf("Config saved to %s\n", cfgPath)
 	fmt.Println("The Connector will provision this route with its device credential on the next run.")
-	fmt.Println("Restart `qurl-connector run` to provision and activate it; local admin reload cannot mint a device-owned resource.")
+	fmt.Println("Restart `qurl-connector run` to provision and activate it.")
 	return nil
 }
 
@@ -122,7 +119,7 @@ func addRouteToConfig(ctx context.Context, cfgPath string, route nhpconfig.Route
 			}
 		} else {
 			// NewDefaulted seeds the same defaults Load would apply
-			// (Protocol, PublicDomain, Keepalive, …), keeping a newly
+			// (protocol, keepalive, and dial timeout), keeping a newly
 			// created file readable rather than merely valid.
 			cfg = nhpconfig.NewDefaulted()
 		}

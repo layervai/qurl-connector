@@ -343,7 +343,7 @@ func pollHermeticRoute(t *testing.T, port int, hostHeader, want string, runner <
 	for time.Now().Before(deadline) {
 		select {
 		case err := <-runner:
-			t.Fatalf("resource runner exited before traffic was ready: %v", err)
+			t.Fatalf("session group runner exited before traffic was ready: %v", err)
 		default:
 		}
 		request, err := http.NewRequest(http.MethodGet, "http://127.0.0.1:"+strconv.Itoa(port)+"/", nil)
@@ -371,7 +371,7 @@ func pollHermeticRoute(t *testing.T, port int, hostHeader, want string, runner <
 	t.Fatalf("traffic did not traverse the hermetic NHP-admitted FRP route: %v", lastErr)
 }
 
-func TestHermeticResourceRunnerRecoversFromQRTSSessionLoss(t *testing.T) {
+func TestHermeticSessionGroupRecoversFromQRTSSessionLoss(t *testing.T) {
 	const (
 		knockResourceID = "q_catalog_resource"
 		resourceID      = "public-resource"
@@ -400,12 +400,12 @@ func TestHermeticResourceRunnerRecoversFromQRTSSessionLoss(t *testing.T) {
 	if err := common.Complete(); err != nil {
 		t.Fatal(err)
 	}
-	factory, err := NewFRPSessionFactory(FRPFactoryConfig{
-		Common: common,
-		Route: LocalHTTPRoute{
-			RouteID: "hermetic", LocalIP: "127.0.0.1", LocalPort: echoPort,
-			ResourceID: resourceID, ConnectorRoutingID: "hermetic",
-		},
+	route := LocalHTTPRoute{
+		RouteID: "hermetic", LocalIP: "127.0.0.1", LocalPort: echoPort,
+		ResourceID: resourceID, ConnectorRoutingID: "hermetic",
+	}
+	factory, err := NewFRPSessionGroupFactory(FRPGroupFactoryConfig{
+		Common:        common,
 		ClientVersion: "v1.0.0", ReadyPoll: 10 * time.Millisecond,
 	})
 	if err != nil {
@@ -427,9 +427,9 @@ func TestHermeticResourceRunnerRecoversFromQRTSSessionLoss(t *testing.T) {
 		},
 	}}
 	serving := make(chan Admission, 2)
-	runner, err := NewResourceRunner(ResourceConfig{
+	runner, err := NewSessionGroupRunner(SessionGroupConfig{
 		KnockResourceID: knockResourceID, ResourceID: resourceID,
-		Admitter: admitter, Sessions: factory,
+		Routes: []LocalHTTPRoute{route}, Admitter: admitter, Sessions: factory,
 		MinBackoff: 10 * time.Millisecond, MaxBackoff: 25 * time.Millisecond,
 		RotationLead: time.Minute, StopTimeout: 5 * time.Second,
 		OnServing: func(admission Admission) { serving <- admission },
@@ -476,7 +476,7 @@ func TestHermeticResourceRunnerRecoversFromQRTSSessionLoss(t *testing.T) {
 			t.Fatalf("runner exit = %v", err)
 		}
 	case <-time.After(10 * time.Second):
-		t.Fatal("resource runner did not stop")
+		t.Fatal("session group runner did not stop")
 	}
 
 	retired := admitter.retiredSnapshot()
