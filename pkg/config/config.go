@@ -324,7 +324,7 @@ func stripRetiredGeneratedFields(data string) (string, error) {
 	dropped := false
 	var errs []error
 	if server := yamlField(root, "server"); server != nil {
-		if token := yamlField(server, "token"); token != nil && strings.TrimSpace(token.Value) != "" {
+		if token := yamlField(server, "token"); token != nil && (token.Kind != yaml.ScalarNode || strings.TrimSpace(token.Value) != "") {
 			line, _ := yamlFieldLine(server, "token")
 			errs = append(errs, fmt.Errorf("config field server.token at line %d was removed; delete it because NHP admission supplies the FRP session token", line))
 		}
@@ -407,7 +407,9 @@ func dropYAMLField(mapping *yaml.Node, key string) bool {
 		return false
 	}
 	for i := 0; i+1 < len(mapping.Content); i += 2 {
-		if mapping.Content[i].Value == key {
+		// Only remove the scalar shape the old string field accepted. Leave a
+		// malformed value for strict decoding instead of silently discarding it.
+		if mapping.Content[i].Value == key && mapping.Content[i+1].Kind == yaml.ScalarNode {
 			mapping.Content = append(mapping.Content[:i], mapping.Content[i+2:]...)
 			return true
 		}

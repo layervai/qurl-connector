@@ -301,7 +301,9 @@ func renderGroupProxies(routes []GroupRoute, sessionID uint64) ([]v1.ProxyConfig
 // service applies to its initial proxy set. UpdateAllConfigurer diffs live
 // proxies against the new set with reflect.DeepEqual, so an incomplete config
 // would restart every unchanged proxy on each hot update. A proxy the filter
-// would drop is an error rather than a silently pending route.
+// would drop is an error rather than a silently pending route. Validation is
+// an internal assertion over connector-built proxies; a failure is session-
+// wide by design and the work runs only while a configuration push is owed.
 func completeGroupProxies(common *v1.ClientCommonConfig, proxies []v1.ProxyConfigurer) ([]v1.ProxyConfigurer, error) {
 	filtered, _ := frpconfig.FilterClientConfigurers(common, proxies, nil)
 	if len(filtered) != len(proxies) {
