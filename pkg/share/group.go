@@ -547,9 +547,10 @@ func (r *SessionGroupRunner) RoutesReady() bool {
 	// cheaper, but it cannot distinguish an old serving generation from a
 	// pending restart or local-target change that keeps the same route ID.
 	states := active.session.RouteStates()
+	ended := sessionEnded(active.session)
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if r.active != active || len(r.desired) == 0 || sessionEnded(active.session) {
+	if r.active != active || len(r.desired) == 0 || ended {
 		return false
 	}
 	for routeID, route := range r.desired {

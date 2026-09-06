@@ -6,11 +6,60 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 )
+
+func TestConnectorHealthAddress(t *testing.T) {
+	t.Run("unset", func(t *testing.T) {
+		t.Setenv(envConnectorHealthAddr, "restored after test")
+		if err := os.Unsetenv(envConnectorHealthAddr); err != nil {
+			t.Fatal(err)
+		}
+		addr, configured, err := connectorHealthAddress()
+		if err != nil || configured || addr != "" {
+			t.Fatalf("connectorHealthAddress() = %q, %t, %v; want disabled", addr, configured, err)
+		}
+	})
+
+	for _, test := range []struct {
+		name string
+		raw  string
+		want string
+	}{
+		{name: "IPv4 loopback", raw: "127.0.0.1:7401", want: "127.0.0.1:7401"},
+		{name: "IPv6 loopback", raw: "[::1]:7401", want: "[::1]:7401"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Setenv(envConnectorHealthAddr, test.raw)
+			addr, configured, err := connectorHealthAddress()
+			if err != nil || !configured || addr != test.want {
+				t.Fatalf("connectorHealthAddress() = %q, %t, %v; want %q, true, nil", addr, configured, err, test.want)
+			}
+		})
+	}
+
+	for _, test := range []struct {
+		name string
+		raw  string
+	}{
+		{name: "empty", raw: ""},
+		{name: "surrounding whitespace", raw: " 127.0.0.1:7401"},
+		{name: "wildcard", raw: "0.0.0.0:7401"},
+		{name: "hostname", raw: "example.com:7401"},
+		{name: "zero port", raw: "127.0.0.1:0"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Setenv(envConnectorHealthAddr, test.raw)
+			if _, configured, err := connectorHealthAddress(); err == nil || !configured {
+				t.Fatalf("connectorHealthAddress accepted %q", test.raw)
+			}
+		})
+	}
+}
 
 func TestConnectorHealthHandlerMethods(t *testing.T) {
 	for _, test := range []struct {
@@ -61,7 +110,7 @@ func TestRunWithConnectorHealthServesLiveRunnerState(t *testing.T) {
 
 	waitFor(t, time.Second, func() bool {
 		err := probeConnectorHealth(context.Background())
-		return err != nil && strings.Contains(err.Error(), "HTTP 503")
+		return err != nil && err.Error() == "connector routes are not ready"
 	}, "not-ready runtime health response")
 	ready.Store(true)
 	waitFor(t, time.Second, func() bool {
@@ -75,5 +124,54 @@ func TestRunWithConnectorHealthServesLiveRunnerState(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("runWithConnectorHealth did not stop")
+	}
+}
+
+func TestRunWithConnectorHealthDisabledRunsDirectly(t *testing.T) {
+	t.Setenv(envConnectorHealthAddr, "restored after test")
+	if err := os.Unsetenv(envConnectorHealthAddr); err != nil {
+		t.Fatal(err)
+	}
+	previousListen := listenConnectorHealth
+	listenConnectorHealth = func(_, _ string) (net.Listener, error) {
+		t.Error("health listener bound while the endpoint was disabled")
+		return nil, errors.New("must not listen")
+	}
+	t.Cleanup(func() { listenConnectorHealth = previousListen })
+
+	want := errors.New("runtime result")
+	called := false
+	err := runWithConnectorHealth(context.Background(), func() bool { return false }, func(context.Context) error {
+		called = true
+		return want
+	})
+	if !called {
+		t.Fatal("disabled health wrapper did not run the Connector")
+	}
+	if !errors.Is(err, want) {
+		t.Fatalf("runWithConnectorHealth() error = %v, want runtime error %v", err, want)
+	}
+}
+
+func TestProbeConnectorHealthDistinguishesWrongEndpoint(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		status    int
+		wantError string
+	}{
+		{name: "unready runtime", status: http.StatusServiceUnavailable, wantError: "connector routes are not ready"},
+		{name: "wrong endpoint", status: http.StatusNotFound, wantError: "may not point at a qurl-connector runtime"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(test.status)
+			}))
+			t.Cleanup(server.Close)
+			t.Setenv(envConnectorHealthAddr, server.Listener.Addr().String())
+			err := probeConnectorHealth(context.Background())
+			if err == nil || !strings.Contains(err.Error(), test.wantError) {
+				t.Fatalf("probeConnectorHealth() error = %v, want text %q", err, test.wantError)
+			}
+		})
 	}
 }

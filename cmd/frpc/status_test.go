@@ -349,17 +349,6 @@ func TestRunStatusReadyUsesRuntimeOwnedHealth(t *testing.T) {
 	}
 }
 
-func TestConnectorHealthAddressRejectsNonLoopback(t *testing.T) {
-	for _, value := range []string{"", " 127.0.0.1:7401", "0.0.0.0:7401", "example.com:7401", "127.0.0.1:0"} {
-		t.Run(value, func(t *testing.T) {
-			t.Setenv(envConnectorHealthAddr, value)
-			if _, _, err := connectorHealthAddress(); err == nil {
-				t.Fatalf("connectorHealthAddress accepted %q", value)
-			}
-		})
-	}
-}
-
 // TestBuildRouteStatuses_LivePropagatesRemoteAddr pins that the
 // RemoteAddr from the live proxy entry round-trips into the
 // routeStatus output. Pollers read RemoteAddr to display "where is

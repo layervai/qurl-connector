@@ -132,8 +132,12 @@ func probeConnectorHealth(ctx context.Context) error {
 		return fmt.Errorf("probe Connector readiness: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode == http.StatusServiceUnavailable {
+		return errors.New("connector routes are not ready")
+	}
 	if resp.StatusCode != http.StatusNoContent {
-		return fmt.Errorf("connector routes are not ready (HTTP %d)", resp.StatusCode)
+		return fmt.Errorf("unexpected reply from http://%s%s (HTTP %d); %s may not point at a qurl-connector runtime",
+			addr, connectorHealthPath, resp.StatusCode, envConnectorHealthAddr)
 	}
 	return nil
 }

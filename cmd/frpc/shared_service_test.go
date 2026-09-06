@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -446,6 +447,8 @@ type sharedServiceHarnessOptions struct {
 	hold func(sessionIndex int, routeID string) bool
 	// deny refuses admission for a protected resource ID with that error.
 	deny map[string]error
+	// runnerChanged observes the exact runner published to local health.
+	runnerChanged func(*share.SessionGroupRunner)
 }
 
 // startSharedServiceHarness runs the shared runtime over cfg with every
@@ -473,7 +476,7 @@ func startSharedServiceHarnessWith(t *testing.T, cfg *nhpconfig.Config, opts sha
 	ctx, cancel := context.WithCancel(context.Background())
 	h.cancel = cancel
 	h.announcer = newReadyAnnouncer(readyRoutes(cfg), h.out, false)
-	go func() { h.done <- runSharedService(ctx, cfg, h.admitter, h.factory, h.announcer, nil) }()
+	go func() { h.done <- runSharedService(ctx, cfg, h.admitter, h.factory, h.announcer, opts.runnerChanged) }()
 	t.Cleanup(func() {
 		cancel()
 		if _, returned := h.result(5 * time.Second); !returned {
@@ -481,6 +484,24 @@ func startSharedServiceHarnessWith(t *testing.T, cfg *nhpconfig.Config, opts sha
 		}
 	})
 	return h
+}
+
+func TestRunSharedServicePublishesAndClearsHealthRunner(t *testing.T) {
+	var current atomic.Pointer[share.SessionGroupRunner]
+	h := startSharedServiceHarnessWith(t, sharedServiceTestConfig("a"), sharedServiceHarnessOptions{
+		runnerChanged: current.Store,
+	})
+	waitFor(t, 2*time.Second, func() bool {
+		runner := current.Load()
+		return runner != nil && runner.RoutesReady()
+	}, "serving runner published to local health")
+
+	if err := h.stop(t); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run returned %v after cancel, want context.Canceled", err)
+	}
+	if runner := current.Load(); runner != nil {
+		t.Fatal("runner remained published after the shared service stopped")
+	}
 }
 
 // result waits up to timeout for the runtime to return, caching the outcome
