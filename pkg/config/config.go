@@ -308,9 +308,12 @@ func stripRetiredGeneratedFields(data string) (string, error) {
 		return data, nil
 	}
 	root := document.Content[0]
-	dropYAMLField(root, "admin")
+	dropped := dropYAMLField(root, "admin")
 	if server := yamlField(root, "server"); server != nil {
-		dropYAMLField(server, "public_domain")
+		dropped = dropYAMLField(server, "public_domain") || dropped
+	}
+	if !dropped {
+		return data, nil
 	}
 	out, err := yaml.Marshal(&document)
 	return string(out), err
@@ -328,16 +331,17 @@ func yamlField(mapping *yaml.Node, key string) *yaml.Node {
 	return nil
 }
 
-func dropYAMLField(mapping *yaml.Node, key string) {
+func dropYAMLField(mapping *yaml.Node, key string) bool {
 	if mapping == nil || mapping.Kind != yaml.MappingNode {
-		return
+		return false
 	}
 	for i := 0; i+1 < len(mapping.Content); i += 2 {
 		if mapping.Content[i].Value == key {
 			mapping.Content = append(mapping.Content[:i], mapping.Content[i+2:]...)
-			return
+			return true
 		}
 	}
+	return false
 }
 
 // NewDefaulted returns an empty Config with the same defaults that

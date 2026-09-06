@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	goast "go/ast"
 	goparser "go/parser"
 	gotoken "go/token"
@@ -12,6 +13,8 @@ import (
 	"testing"
 
 	v1 "github.com/fatedier/frp/pkg/config/v1"
+
+	nhpconfig "github.com/layervai/qurl-connector/pkg/config"
 )
 
 // withColorEnabled forces the color gate for one test and restores whatever
@@ -254,6 +257,20 @@ func TestApplyLogPresentationTracksColorGate(t *testing.T) {
 		if want := !useColor; common.Log.DisablePrintColor != want {
 			t.Fatalf("useColor=%v: Log.DisablePrintColor = %v, want %v", useColor, common.Log.DisablePrintColor, want)
 		}
+	}
+}
+
+func TestStartFRPFromConfigRejectsInvalidLogLevel(t *testing.T) {
+	oldLevel := logLevel
+	logLevel = "loud"
+	t.Cleanup(func() { logLevel = oldLevel })
+	disabled := false
+	err := startFRPFromConfig(context.Background(), "", "machine", &nhpconfig.Config{
+		Server: nhpconfig.ServerConfig{Protocol: "tcp"},
+		Audit:  nhpconfig.AuditConfig{Enabled: &disabled},
+	}, "agent", nil)
+	if err == nil || !strings.Contains(err.Error(), "invalid log level") {
+		t.Fatalf("startFRPFromConfig error = %v, want invalid log level", err)
 	}
 }
 

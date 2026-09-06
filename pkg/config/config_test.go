@@ -29,21 +29,45 @@ func writeConfig(t *testing.T, content string) string {
 }
 
 func TestLoadAcceptsAndDropsRetiredGeneratedFields(t *testing.T) {
+	t.Setenv(EnvAuditFile, "")
 	path := writeConfig(t, `
 server:
+  addr: frp.example
   public_domain: qurl.site
+  port: 7000
+  protocol: websocket
+nhp:
+  enabled: true
+  machine_id: machine-1
+qurl:
+  api_url: https://api.example/v1
+  token: token-1
 admin:
   enabled: false
   addr: 127.0.0.1
   port: 7400
+audit:
+  enabled: false
+  file_path: /tmp/connector-audit.log
+  mirror_slog: false
 routes:
   - id: web
     type: http
     local_port: 8080
+  - id: api
+    type: http
+    local_ip: 127.0.0.2
+    local_port: 8443
 `)
 	cfg, err := Load(path)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if cfg.Server.Addr != "frp.example" || cfg.Server.Port != 7000 || cfg.Server.Protocol != "websocket" ||
+		!cfg.NHP.Enabled || cfg.NHP.MachineID != "machine-1" || cfg.QURL.APIURL != "https://api.example/v1" ||
+		cfg.QURL.Token != "token-1" || cfg.Audit.FilePath != "/tmp/connector-audit.log" || len(cfg.Routes) != 2 ||
+		cfg.Routes[1].ID != "api" || cfg.Routes[1].Type != RouteTypeHTTP || cfg.Routes[1].LocalIP != "127.0.0.2" || cfg.Routes[1].LocalPort != 8443 {
+		t.Fatalf("retired-field strip changed sibling config: %#v", cfg)
 	}
 	savedPath := filepath.Join(t.TempDir(), "saved.yaml")
 	if err := Save(cfg, savedPath); err != nil {
@@ -55,6 +79,41 @@ routes:
 	}
 	if strings.Contains(string(raw), "public_domain:") || strings.Contains(string(raw), "admin:") {
 		t.Fatalf("Save retained retired generated fields:\n%s", raw)
+	}
+}
+
+func TestStripRetiredGeneratedFieldsPreservesCleanBytes(t *testing.T) {
+	const input = "\n# keep operator line numbers\nroutes:\n  - id: web\n    type: http\n    local_port: 8080\n"
+	got, err := stripRetiredGeneratedFields(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != input {
+		t.Fatalf("clean config changed:\n%s", got)
+	}
+}
+
+func TestLoadRejectsOtherRetiredFRPFields(t *testing.T) {
+	tests := []struct {
+		name  string
+		field string
+		yaml  string
+	}{
+		{"server token", "token", "server:\n  token: old\n"},
+		{"subdomain", "subdomain", "routes:\n  - id: web\n    type: http\n    local_port: 8080\n    subdomain: old\n"},
+		{"custom domains", "custom_domains", "routes:\n  - id: web\n    type: http\n    local_port: 8080\n    custom_domains: [old.example]\n"},
+		{"remote port", "remote_port", "routes:\n  - id: web\n    type: http\n    local_port: 8080\n    remote_port: 7001\n"},
+		{"host rewrite", "host_rewrite", "routes:\n  - id: web\n    type: http\n    local_port: 8080\n    host_rewrite: old.example\n"},
+		{"headers", "headers", "routes:\n  - id: web\n    type: http\n    local_port: 8080\n    headers: {X-Test: value}\n"},
+		{"load balancer group", "load_balancer_group", "routes:\n  - id: web\n    type: http\n    local_port: 8080\n    load_balancer_group: old\n"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := Load(writeConfig(t, tt.yaml))
+			if err == nil || !strings.Contains(err.Error(), "field "+tt.field+" not found") {
+				t.Fatalf("Load error = %v, want strict rejection of %s", err, tt.field)
+			}
+		})
 	}
 }
 

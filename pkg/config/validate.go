@@ -120,7 +120,7 @@ func validate(cfg *Config, requireManagedRouting bool) error {
 			errs = append(errs, fmt.Errorf("server.egress_local_ip must be a non-loopback, non-link-local unicast IPv4 or IPv6 address, got %q", cfg.Server.EgressLocalIP))
 		}
 	}
-	// Server.Protocol is handed to FRP verbatim (frpgen.go), so an
+	// Server.Protocol is handed to FRP verbatim by the runtime common config, so an
 	// unsupported value would otherwise surface only at runtime, deep inside
 	// FRP, with an FRP-shaped error. The allowed set mirrors the vendored FRP
 	// v1 validator's SupportedTransportProtocols (pkg/config/v1/validation),

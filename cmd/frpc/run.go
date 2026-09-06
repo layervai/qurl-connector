@@ -20,6 +20,8 @@ import (
 	"github.com/denisbrodbeck/machineid"
 	frpconfig "github.com/fatedier/frp/pkg/config"
 	v1 "github.com/fatedier/frp/pkg/config/v1"
+	"github.com/fatedier/frp/pkg/config/v1/validation"
+	"github.com/fatedier/frp/pkg/policy/security"
 	qurl "github.com/layervai/qurl-go/qurl"
 	"github.com/spf13/cobra"
 
@@ -1005,6 +1007,13 @@ func startFRPFromConfig(ctx context.Context, cfgPath, machineID string, cfg *nhp
 	}
 	if common.Transport.ProxyURL != "" {
 		return errors.New("FRP http_proxy/proxyURL is incompatible with native UDP admission because the proxy would change the Connector session source address; unset it or use an explicitly supported shared-egress topology")
+	}
+	warning, err := validation.ValidateAllClientConfig(common, nil, nil, &security.UnsafeFeatures{})
+	if warning != nil {
+		fmt.Printf("  %sWarning: %v%s\n", colorYellow, warning, colorReset)
+	}
+	if err != nil {
+		return fmt.Errorf("config validation: %w", err)
 	}
 	fmt.Printf("  %s%d route(s) configured%s\n", colorGreen, len(cfg.Routes), colorReset)
 	if admitter == nil {
