@@ -46,6 +46,7 @@ lint:
 	GOOS=windows GOARCH=amd64 CGO_ENABLED=0 golangci-lint run ./pkg/... ./cmd/... ./internal/...
 
 lint-python:
+	@test -n "$(PYTHON_LINT_FILES)" || { echo "no Python files found under .github/scripts" >&2; exit 1; }
 	$(PYTHON) -m ruff check --no-cache $(PYTHON_LINT_FILES)
 	$(PYTHON) -m ruff format --check --no-cache $(PYTHON_LINT_FILES)
 

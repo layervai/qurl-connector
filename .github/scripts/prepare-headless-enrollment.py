@@ -68,12 +68,14 @@ AWS_REJECTED_ERROR_CODES = {
 MAX_RESPONSE_BYTES = 64 * 1024
 API_TIMEOUT_SECONDS = 10
 AWS_TIMEOUT_SECONDS = 30
-# Allow up to two minutes for an off-to-on serving epoch to propagate. Each API
-# call has its own timeout, and the protected workflow has a 12-minute hard cap.
+# Allow up to two minutes of normal polling for an off-to-on serving epoch to
+# propagate. The internal deadline below also bounds slow requests and
+# Retry-After responses before the protected workflow's 12-minute hard cap.
 SHARING_POLL_ATTEMPTS = 13
 SHARING_POLL_SECONDS = 10
 RETRY_SECONDS = 2
 MAX_RETRY_AFTER_SECONDS = 30
+SCRIPT_DEADLINE_SECONDS = 8 * 60
 TARGETS = {
     "fileviewer-nhp-replica-a": (
         "fileviewer-sandbox",
@@ -148,6 +150,10 @@ class APIRequestRejectedRetryable(APIRequestRetryable):
 
 class EnrollmentParameterOutcomeUnknown(EnrollmentError):
     """The SSM parameter update might have completed before the client timed out."""
+
+
+class EnrollmentDeadlineExceeded(EnrollmentError):
+    """The script stopped before the workflow runner could kill it."""
 
 
 class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -278,6 +284,45 @@ def parse_retry_after(value: Any, *, now: dt.datetime | None = None) -> float | 
     )
 
 
+def _operation_deadline(deadline: float | None) -> float:
+    return time.monotonic() + SCRIPT_DEADLINE_SECONDS if deadline is None else deadline
+
+
+def require_deadline_budget(deadline: float, reserve_seconds: float) -> None:
+    if time.monotonic() + reserve_seconds >= deadline:
+        raise EnrollmentDeadlineExceeded(
+            "enrollment preparation reached its internal deadline"
+        )
+
+
+def sleep_before_deadline(
+    delay_seconds: float, deadline: float, *, reserve_seconds: float
+) -> None:
+    require_deadline_budget(deadline, delay_seconds + reserve_seconds)
+    time.sleep(delay_seconds)
+
+
+def sharing_deadline_message(
+    *,
+    sharing_transition_observed: bool,
+    sharing_observed_on: bool,
+    update_outcome_unknown: bool,
+) -> str:
+    message = "enrollment preparation reached its internal deadline"
+    if sharing_transition_observed:
+        return (
+            message + "; sharing changed from off to on during this run and was left on"
+        )
+    if sharing_observed_on:
+        return message + "; sharing for this resource was observed on and was left on"
+    if update_outcome_unknown:
+        return (
+            message
+            + "; the sharing update outcome is unknown and sharing may have been applied before the response was lost and may have been left on"
+        )
+    return message
+
+
 def api_request(
     api_endpoint: str,
     api_key: str,
@@ -363,6 +408,13 @@ def api_request(
     if response_status is not None:
         response_status[:] = [response.status]
     return envelope["data"]
+
+
+def api_request_before_deadline(
+    deadline: float, api_endpoint: str, api_key: str, path: str, **kwargs: Any
+) -> Any:
+    require_deadline_budget(deadline, API_TIMEOUT_SECONDS)
+    return api_request(api_endpoint, api_key, path, **kwargs)
 
 
 def _put_parameter_command(region: str, parameter: str) -> list[str]:
@@ -507,7 +559,9 @@ def mint_and_install_enrollment(
     parameter: str,
     *,
     now: dt.datetime | None = None,
+    deadline: float | None = None,
 ) -> tuple[dt.datetime, str]:
+    operation_deadline = _operation_deadline(deadline)
     mint_path = "/v1/api-keys"
     mint_body = {
         "kind": "enrollment_token",
@@ -526,7 +580,8 @@ def mint_and_install_enrollment(
     for attempt in range(2):
         try:
             mint_response_status.clear()
-            credential = api_request(
+            credential = api_request_before_deadline(
+                operation_deadline,
                 api_endpoint,
                 api_key,
                 mint_path,
@@ -550,7 +605,21 @@ def mint_and_install_enrollment(
                     if exc.retry_after_seconds is not None
                     else RETRY_SECONDS
                 )
-                time.sleep(min(max(retry_delay, 0.0), MAX_RETRY_AFTER_SECONDS))
+                bounded_retry_delay = min(
+                    max(retry_delay, 0.0), MAX_RETRY_AFTER_SECONDS
+                )
+                try:
+                    sleep_before_deadline(
+                        bounded_retry_delay,
+                        operation_deadline,
+                        reserve_seconds=API_TIMEOUT_SECONDS,
+                    )
+                except EnrollmentDeadlineExceeded as deadline_exc:
+                    if mint_outcome_unknown:
+                        raise EnrollmentError(
+                            "enrollment credential result is unknown; retry the same target and generation to recover the exact operation"
+                        ) from deadline_exc
+                    raise
         except EnrollmentError as exc:
             if mint_outcome_unknown:
                 raise EnrollmentError(
@@ -604,6 +673,9 @@ def mint_and_install_enrollment(
         # parameter write for only 15 minutes. A new generation creates a new
         # operation after that deployment window; every minted token expires
         # within one hour.
+        require_deadline_budget(
+            operation_deadline, (2 * AWS_TIMEOUT_SECONDS) + RETRY_SECONDS
+        )
         put_parameter(region, parameter, token)
     except EnrollmentError as exc:
         possible_extra_suffix = (
@@ -639,14 +711,19 @@ def prepare_enrollment(
     region: str,
     *,
     now: dt.datetime | None = None,
+    deadline: float | None = None,
 ) -> None:
     # The caller supplies one pre-provisioned qURL API key. Reuse it for the
     # complete bounded operation; this tool does not perform an OAuth or Auth0
     # client-credentials exchange per request or per resource.
+    operation_deadline = _operation_deadline(deadline)
     slug, parameter = TARGETS[target]
     # Pre-mint reads fail immediately; rerunning them cannot create state.
-    resources = api_request(
-        api_endpoint, api_key, "/v1/resources?" + urllib.parse.urlencode({"slug": slug})
+    resources = api_request_before_deadline(
+        operation_deadline,
+        api_endpoint,
+        api_key,
+        "/v1/resources?" + urllib.parse.urlencode({"slug": slug}),
     )
     if (
         not isinstance(resources, list)
@@ -666,7 +743,9 @@ def prepare_enrollment(
         raise EnrollmentError("connector resource has no resource ID")
     resource_path = "/v1/resources/" + urllib.parse.quote(resource_id, safe="")
 
-    sharing = api_request(api_endpoint, api_key, resource_path + "/sharing")
+    sharing = api_request_before_deadline(
+        operation_deadline, api_endpoint, api_key, resource_path + "/sharing"
+    )
     desired_state = sharing.get("desired_state") if isinstance(sharing, dict) else None
     serving_epoch = sharing.get("serving_epoch") if isinstance(sharing, dict) else None
     if (
@@ -701,7 +780,8 @@ def prepare_enrollment(
                 # The current qURL contract returns a 200 JSON envelope. A 204
                 # is treated as unknown and reconciled by the GET poll because
                 # it cannot confirm the exact state or serving epoch.
-                api_request(
+                api_request_before_deadline(
+                    operation_deadline,
                     api_endpoint,
                     api_key,
                     resource_path + "/sharing",
@@ -728,15 +808,27 @@ def prepare_enrollment(
                 last_put_rejection = exc
                 break
             if attempt == 0 and retry_put:
-                time.sleep(
-                    min(
-                        max(
-                            retry_delay if retry_delay is not None else RETRY_SECONDS,
-                            0.0,
-                        ),
-                        MAX_RETRY_AFTER_SECONDS,
-                    )
+                bounded_retry_delay = min(
+                    max(
+                        retry_delay if retry_delay is not None else RETRY_SECONDS,
+                        0.0,
+                    ),
+                    MAX_RETRY_AFTER_SECONDS,
                 )
+                try:
+                    sleep_before_deadline(
+                        bounded_retry_delay,
+                        operation_deadline,
+                        reserve_seconds=API_TIMEOUT_SECONDS,
+                    )
+                except EnrollmentDeadlineExceeded as deadline_exc:
+                    raise EnrollmentError(
+                        sharing_deadline_message(
+                            sharing_transition_observed=sharing_transition_observed,
+                            sharing_observed_on=sharing_observed_on,
+                            update_outcome_unknown=put_failure is not None,
+                        )
+                    ) from deadline_exc
                 continue
             break
         if not sharing_transition_observed and put_failure is None:
@@ -748,7 +840,12 @@ def prepare_enrollment(
         for attempt in range(SHARING_POLL_ATTEMPTS):
             poll_delay = float(SHARING_POLL_SECONDS)
             try:
-                sharing = api_request(api_endpoint, api_key, resource_path + "/sharing")
+                sharing = api_request_before_deadline(
+                    operation_deadline,
+                    api_endpoint,
+                    api_key,
+                    resource_path + "/sharing",
+                )
                 last_poll_failure = None
             except APIRequestRetryable as exc:
                 sharing = None
@@ -758,6 +855,14 @@ def prepare_enrollment(
                         max(exc.retry_after_seconds, 0.0),
                         MAX_RETRY_AFTER_SECONDS,
                     )
+            except EnrollmentDeadlineExceeded as exc:
+                raise EnrollmentError(
+                    sharing_deadline_message(
+                        sharing_transition_observed=sharing_transition_observed,
+                        sharing_observed_on=sharing_observed_on,
+                        update_outcome_unknown=put_failure is not None,
+                    )
+                ) from exc
             except EnrollmentError as exc:
                 if sharing_transition_observed:
                     raise EnrollmentError(
@@ -785,7 +890,20 @@ def prepare_enrollment(
                 sharing_transition_observed = True
                 break
             if attempt + 1 < SHARING_POLL_ATTEMPTS:
-                time.sleep(poll_delay)
+                try:
+                    sleep_before_deadline(
+                        poll_delay,
+                        operation_deadline,
+                        reserve_seconds=API_TIMEOUT_SECONDS,
+                    )
+                except EnrollmentDeadlineExceeded as exc:
+                    raise EnrollmentError(
+                        sharing_deadline_message(
+                            sharing_transition_observed=sharing_transition_observed,
+                            sharing_observed_on=sharing_observed_on,
+                            update_outcome_unknown=put_failure is not None,
+                        )
+                    ) from exc
         else:
             if last_poll_failure is not None:
                 message = "sharing did not reach the required serving epoch because status checks failed"
@@ -819,6 +937,7 @@ def prepare_enrollment(
             slug,
             parameter,
             now=now,
+            deadline=operation_deadline,
         )
     except EnrollmentError as exc:
         if sharing_transition_observed:

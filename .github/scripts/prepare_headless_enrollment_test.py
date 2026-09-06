@@ -181,6 +181,7 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
         )
         self.assertIn("ruff check --no-cache $(PYTHON_LINT_FILES)", makefile)
         self.assertIn("ruff format --check --no-cache $(PYTHON_LINT_FILES)", makefile)
+        self.assertIn('test -n "$(PYTHON_LINT_FILES)"', makefile)
         self.assertIn("PYTHON_LINT_FILES := $(wildcard .github/scripts/*.py)", makefile)
         requirements = (SCRIPT.parent / "requirements-lint.txt").read_text()
         self.assertRegex(
@@ -547,6 +548,17 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
         for value in (None, "", "1.5", "not-a-date"):
             with self.subTest(value=value):
                 self.assertIsNone(MODULE.parse_retry_after(value, now=now))
+
+    def test_deadline_guard_refuses_sleep_that_cannot_finish_safely(self) -> None:
+        with (
+            mock.patch.object(MODULE.time, "monotonic", return_value=90),
+            mock.patch.object(MODULE.time, "sleep") as sleep,
+        ):
+            with self.assertRaisesRegex(
+                MODULE.EnrollmentDeadlineExceeded, "internal deadline"
+            ):
+                MODULE.sleep_before_deadline(2, 100, reserve_seconds=10)
+        sleep.assert_not_called()
 
     def test_api_request_normalizes_protocol_failure(self) -> None:
         with mock.patch.object(
@@ -973,6 +985,73 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
                 )
         self.assertNotIn("lv_live_secret-token", str(raised.exception))
         sleep.assert_called_once_with(MODULE.RETRY_SECONDS)
+        put.assert_not_called()
+
+    def test_mint_deadline_after_unknown_result_keeps_recovery_guidance(self) -> None:
+        with (
+            mock.patch.object(
+                MODULE,
+                "api_request",
+                side_effect=MODULE.APIRequestOutcomeUnknown("response lost"),
+            ),
+            mock.patch.object(MODULE, "put_parameter") as put,
+            mock.patch.object(MODULE.time, "monotonic", side_effect=[0, 90]),
+            mock.patch.object(MODULE.time, "sleep") as sleep,
+        ):
+            with self.assertRaisesRegex(
+                MODULE.EnrollmentError, "retry the same target and generation"
+            ) as raised:
+                MODULE.mint_and_install_enrollment(
+                    "https://api.example.com",
+                    "lv_live_account-key",
+                    "detect-nhp-replica-a",
+                    "attempt-1",
+                    "us-east-2",
+                    "detect-sandbox",
+                    "/reviewed/name",
+                    now=FIXED_NOW,
+                    deadline=100,
+                )
+        self.assertIsInstance(
+            raised.exception.__cause__, MODULE.EnrollmentDeadlineExceeded
+        )
+        sleep.assert_not_called()
+        put.assert_not_called()
+
+    def test_minted_credential_keeps_operator_guidance_when_ssm_budget_is_gone(
+        self,
+    ) -> None:
+        credential = {
+            "kind": "enrollment_token",
+            "key_id": "key_abc123def456",
+            "target": "agent",
+            "claims": [{"type": "connector", "id": "detect-sandbox"}],
+            "api_key": "lv_live_test-token",
+            "expires_at": VALID_EXPIRY,
+        }
+        with (
+            mock.patch.object(MODULE, "api_request", return_value=credential),
+            mock.patch.object(MODULE, "put_parameter") as put,
+            mock.patch.object(MODULE.time, "monotonic", side_effect=[0, 40]),
+        ):
+            with self.assertRaisesRegex(
+                MODULE.EnrollmentError,
+                "credential key_abc123def456 was minted but not installed",
+            ) as raised:
+                MODULE.mint_and_install_enrollment(
+                    "https://api.example.com",
+                    "lv_live_account-key",
+                    "detect-nhp-replica-a",
+                    "attempt-1",
+                    "us-east-2",
+                    "detect-sandbox",
+                    "/reviewed/name",
+                    now=FIXED_NOW,
+                    deadline=100,
+                )
+        self.assertIsInstance(
+            raised.exception.__cause__, MODULE.EnrollmentDeadlineExceeded
+        )
         put.assert_not_called()
 
     def test_mint_hard_rejection_after_unknown_keeps_recovery_warning(self) -> None:
@@ -1712,6 +1791,43 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
             (MODULE.SHARING_POLL_ATTEMPTS - 1) * MODULE.SHARING_POLL_SECONDS,
             50,
         )
+        self.assertLess(MODULE.SCRIPT_DEADLINE_SECONDS, 12 * 60)
+
+    def test_deadline_after_sharing_transition_reports_left_on(self) -> None:
+        responses = [
+            [
+                {
+                    "slug": "detect-sandbox",
+                    "type": "tunnel",
+                    "status": "active",
+                    "resource_id": "MFkw-resource",
+                }
+            ],
+            {"desired_state": "off", "serving_epoch": 3},
+            {"desired_state": "on", "serving_epoch": 4},
+        ]
+        with (
+            mock.patch.object(MODULE, "api_request", side_effect=responses) as request,
+            mock.patch.object(MODULE, "put_parameter") as put,
+            mock.patch.object(MODULE.time, "monotonic", side_effect=[0, 0, 0, 91]),
+            mock.patch.object(MODULE.time, "sleep") as sleep,
+        ):
+            with self.assertRaisesRegex(
+                MODULE.EnrollmentError,
+                "internal deadline.*sharing changed from off to on.*left on",
+            ):
+                MODULE.prepare_enrollment(
+                    "https://api.example.com",
+                    "lv_live_account-key",
+                    "detect-nhp-replica-a",
+                    "attempt-1",
+                    "us-east-2",
+                    now=FIXED_NOW,
+                    deadline=100,
+                )
+        self.assertEqual(request.call_count, 3)
+        sleep.assert_not_called()
+        put.assert_not_called()
 
     def test_stale_epoch_observed_on_reports_left_on(self) -> None:
         responses = [

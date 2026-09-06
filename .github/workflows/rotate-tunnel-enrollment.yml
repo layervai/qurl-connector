@@ -28,6 +28,9 @@ on:
         type: string
 
 concurrency:
+  # Replica targets for one route can run together. Sharing updates are
+  # idempotent, each run requires an adequate serving epoch, and token
+  # idempotency keys remain target-specific.
   group: rotate-sandbox-tunnel-enrollment-${{ inputs.target }}
   cancel-in-progress: false
 

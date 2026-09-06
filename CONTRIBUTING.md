@@ -24,6 +24,7 @@ Use reserved example domains and documentation account IDs in tests and docs.
    make test
    make test-race
    make lint
+   make lint-python
    make test-python
    make vet
    make verify-deps

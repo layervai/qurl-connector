@@ -28,6 +28,13 @@ var (
 		"qurl-connector":         true,
 		"qurl-go":                true,
 	}
+	// These exact qurl-connector paths are public local namespaces, not cloud
+	// parameter paths. Do not use a prefix exemption: an unlisted child path
+	// must still reach the operational allowlist.
+	reviewedCurrentRepositoryPaths = map[string]bool{
+		"/qurl-connector/audit.log":                   true,
+		"/qurl-connector/native-session-operation/v1": true,
+	}
 )
 
 func findOperationalPaths(text string) []string {
@@ -111,8 +118,8 @@ func TestOperationalPathDetectorStaysBroaderThanAllowlist(t *testing.T) {
 	}
 }
 
-func operationalPathBelongsToCurrentRepository(path string) bool {
-	return strings.HasPrefix(path, "/qurl-connector/")
+func reviewedCurrentRepositoryPath(path string) bool {
+	return reviewedCurrentRepositoryPaths[path]
 }
 
 func skipPublicSourceDirectory(rel string, name string) bool {
@@ -143,14 +150,18 @@ func TestPublicSourceDirectorySkipsCoverNestedToolArtifacts(t *testing.T) {
 }
 
 func TestOperationalPathPublicRepositoryExemptionIsExact(t *testing.T) {
-	if !operationalPathBelongsToCurrentRepository("/qurl-connector/CONTRIBUTING") {
-		t.Fatal("the current public repository must not be mistaken for a private operational path")
+	for path := range reviewedCurrentRepositoryPaths {
+		if !reviewedCurrentRepositoryPath(path) {
+			t.Fatalf("reviewed local path %q was not exempt", path)
+		}
 	}
 	for _, path := range []string{
 		"/qurl-connector-" + "private/CONTRIBUTING",
+		"/qurl-connector/" + "prod/replica-a/bootstrap",
+		"/qurl-connector/audit.log" + "/private-child",
 		"/qurl-go/" + "PRIVATE_PARAMETER",
 	} {
-		if operationalPathBelongsToCurrentRepository(path) {
+		if reviewedCurrentRepositoryPath(path) {
 			t.Fatalf("%q must not inherit the current-repository exemption", path)
 		}
 	}
@@ -266,7 +277,9 @@ func TestPublicSourceContainsNoPrivateOperationalMaterial(t *testing.T) {
 			}
 			return nil
 		}
-		if rel == "coverage.out" {
+		// Git worktrees use a .git metadata file instead of a directory. Neither
+		// form is public source, so exclude both from content scanning.
+		if rel == ".git" || rel == "coverage.out" {
 			return nil
 		}
 		body, err := os.ReadFile(path)
@@ -305,7 +318,7 @@ func TestPublicSourceContainsNoPrivateOperationalMaterial(t *testing.T) {
 			}
 		}
 		for _, operational := range findOperationalPaths(text) {
-			if operationalPathBelongsToCurrentRepository(operational) {
+			if reviewedCurrentRepositoryPath(operational) {
 				continue
 			}
 			if !reviewedOperationalPaths[operational] {
