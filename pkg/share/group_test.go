@@ -593,6 +593,12 @@ func TestSessionGroupRunnerRoutesReadyTracksActiveRoutesAcrossRotation(t *testin
 	first.serve("c")
 	h.waitServing(t, 1, "c")
 	waitUntil(t, time.Second, h.runner.RoutesReady, "all active routes ready")
+	first.failRoute("c", errors.New("temporary route failure"))
+	if h.runner.RoutesReady() {
+		t.Fatal("runner reported ready while an active desired route had failed")
+	}
+	first.serve("c")
+	waitUntil(t, time.Second, h.runner.RoutesReady, "failed route serving again")
 
 	first.failRoute("b", fmt.Errorf("%w: resource_not_found", ErrResourceGone))
 	waitUntil(t, time.Second, func() bool {
