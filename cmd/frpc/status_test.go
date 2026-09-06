@@ -320,6 +320,10 @@ func TestBuildRouteStatuses_NilCfgReturnsNil(t *testing.T) {
 }
 
 func TestRunStatusReadyUsesRuntimeOwnedHealth(t *testing.T) {
+	previousCfg := cfgFile
+	cfgFile = "/config/path/must/not/be/read"
+	t.Cleanup(func() { cfgFile = previousCfg })
+
 	previous := statusReady
 	statusReady = true
 	t.Cleanup(func() { statusReady = previous })

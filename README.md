@@ -260,16 +260,21 @@ The loopback listener exposes no origin address and cannot forward application
 traffic. A probe reads only in-process route state; it does not enroll, knock,
 or fetch or mint an authentication token. Its local request is capped at 750
 ms, so an ECS health-check timeout of 2 s or more leaves adequate process
-overhead. The endpoint binds after config load, agent enrollment, and
-resource-identity resolution. Probes before that fail to connect; after bind
-they return 503 until every active route serves. Set the ECS health-check
-`startPeriod` to cover both normal setup phases. The address is disabled when
-the environment variable is absent and rejects non-loopback hosts. An embedded
-caller that changes or restarts routes during a session rotation must also
-allow up to one rotation lead of 503 responses; this diagnostic command does
-not change its route set while it runs. This repository still does not publish
-the command as a container; a deployment must own and verify the wrapper
-artifact that embeds the released module.
+overhead. The process claims the listener before config load, agent enrollment,
+or resource-identity resolution and returns 503 until every active route
+serves. Set the ECS health-check `startPeriod` to cover normal setup. A lost
+control session also returns 503 until re-admission, retry backoff, Login, and
+route registration finish. Set `interval` and `unhealthyThreshold` so that this
+recovery window does not cause a restart loop. An embedded caller that changes
+or restarts routes during rotation must allow up to one rotation lead of 503
+responses; this diagnostic command does not change its route set while it runs.
+
+The address is disabled when the environment variable is absent and rejects
+non-loopback hosts. The response marker detects accidental port collisions; it
+is not authentication. Use this endpoint only inside a single-tenant process or
+container network boundary. This repository still does not publish the command
+as a container; a deployment must own and verify the wrapper artifact that
+embeds the released module.
 
 ## Supply chain
 

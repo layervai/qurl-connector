@@ -73,6 +73,22 @@ func TestRunConnectorCommandRejectsHealthAddressBeforeConfigDiscovery(t *testing
 	}
 }
 
+func TestRunConnectorCommandClaimsHealthListenerBeforeConfigDiscovery(t *testing.T) {
+	t.Setenv(envConnectorHealthAddr, "127.0.0.1:7401")
+	previousCfg := cfgFile
+	cfgFile = "/config/path/must/not/be/read"
+	t.Cleanup(func() { cfgFile = previousCfg })
+	previousListen := listenConnectorHealth
+	want := errors.New("address already in use")
+	listenConnectorHealth = func(_, _ string) (net.Listener, error) { return nil, want }
+	t.Cleanup(func() { listenConnectorHealth = previousListen })
+
+	err := runConnectorCommand(context.Background())
+	if !errors.Is(err, want) {
+		t.Fatalf("runConnectorCommand() error = %v, want early listener error %v", err, want)
+	}
+}
+
 func TestConnectorHealthHandlerMethods(t *testing.T) {
 	for _, test := range []struct {
 		name       string

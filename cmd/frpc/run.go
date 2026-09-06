@@ -183,10 +183,20 @@ func runCmdFunc(_ *cobra.Command, _ []string) error {
 // cancellation during native registration/warm-open with an injected context;
 // the production path must keep entering through runCmdFunc so SIGINT/SIGTERM
 // stay bound to this context.
-func runConnectorCommand(ctx context.Context) (retErr error) {
-	if _, _, err := connectorHealthAddress(); err != nil {
-		return err
-	}
+func runConnectorCommand(ctx context.Context) error {
+	var current atomic.Pointer[share.SessionGroupRunner]
+	return runWithConnectorHealth(ctx,
+		func() bool {
+			runner := current.Load()
+			return runner != nil && runner.RoutesReady()
+		},
+		func(runCtx context.Context) error {
+			return runConnectorCommandBody(runCtx, current.Store)
+		},
+	)
+}
+
+func runConnectorCommandBody(ctx context.Context, runnerChanged func(*share.SessionGroupRunner)) (retErr error) {
 	printBanner()
 	exeBinDir := "."
 	if ep, err := os.Executable(); err == nil {
@@ -219,7 +229,7 @@ func runConnectorCommand(ctx context.Context) (retErr error) {
 	defer func() { retErr = errors.Join(retErr, admitter.Close()) }()
 
 	fmt.Printf("  Config: %s%s%s\n", colorCyan, cfgPath, colorReset)
-	return startFRPFromConfig(ctx, cfgPath, machineID, cfg, runtime.AgentID, admitter)
+	return startFRPFromConfig(ctx, cfgPath, machineID, cfg, runtime.AgentID, admitter, runnerChanged)
 }
 
 func prepareConnectorRun(ctx context.Context, cfgPath string) (_ *nhpconfig.Config, _ connectorRuntime, _ *share.NativeAdmitter, retErr error) {
@@ -1001,7 +1011,7 @@ func authoritativeConnectorResourceRejection(err error) bool {
 		errors.Is(err, qurl.ErrConnectorResourceRequestRejected)
 }
 
-func startFRPFromConfig(ctx context.Context, cfgPath, machineID string, cfg *nhpconfig.Config, agentID string, admitter *share.NativeAdmitter) error {
+func startFRPFromConfig(ctx context.Context, cfgPath, machineID string, cfg *nhpconfig.Config, agentID string, admitter *share.NativeAdmitter, runnerChanged func(*share.SessionGroupRunner)) error {
 	if err := swapAuditLoggerFromYAML(cfg, machineID, agentID); err != nil {
 		slog.WarnContext(ctx, "audit: YAML-driven audit logger swap failed; keeping early-init logger", "err", err.Error())
 	}
@@ -1056,7 +1066,7 @@ func startFRPFromConfig(ctx context.Context, cfgPath, machineID string, cfg *nhp
 	if admitter == nil {
 		return errors.New("Connector lifecycle implementation is unavailable")
 	}
-	return startSharedService(ctx, common, cfgPath, cfg, admitter)
+	return startSharedService(ctx, common, cfgPath, cfg, admitter, runnerChanged)
 }
 
 // sharedServiceAdmitter is the admitter surface the shared runtime needs:
@@ -1097,22 +1107,13 @@ type sharedServiceAdmitter interface {
 // on every rotation; one session costs one knock and one Login for the whole
 // set, and only the per-proxy NewProxy authorizations scale with the route
 // count. A restart with N routes is one knock and one Login.
-func startSharedService(ctx context.Context, common *v1.ClientCommonConfig, cfgPath string, qcfg *nhpconfig.Config, admitter sharedServiceAdmitter) error {
+func startSharedService(ctx context.Context, common *v1.ClientCommonConfig, cfgPath string, qcfg *nhpconfig.Config, admitter sharedServiceAdmitter, runnerChanged func(*share.SessionGroupRunner)) error {
 	sessions, err := newSharedServiceSessions(common, cfgPath)
 	if err != nil {
 		return err
 	}
 	announcer := newReadyAnnouncer(readyRoutes(qcfg), os.Stdout, stdoutIsTerminal())
-	var current atomic.Pointer[share.SessionGroupRunner]
-	return runWithConnectorHealth(ctx,
-		func() bool {
-			runner := current.Load()
-			return runner != nil && runner.RoutesReady()
-		},
-		func(runCtx context.Context) error {
-			return runSharedService(runCtx, qcfg, admitter, sessions, announcer, current.Store)
-		},
-	)
+	return runSharedService(ctx, qcfg, admitter, sessions, announcer, runnerChanged)
 }
 
 // newSharedServiceSessions builds the FRP session factory for the group. It
