@@ -310,7 +310,19 @@ func stripRetiredGeneratedFields(data string) (string, error) {
 	root := document.Content[0]
 	dropped := dropYAMLField(root, "admin")
 	if server := yamlField(root, "server"); server != nil {
+		if line, ok := yamlFieldLine(server, "token"); ok {
+			return data, fmt.Errorf("config field server.token at line %d was removed; delete it because NHP admission supplies the FRP session token", line)
+		}
 		dropped = dropYAMLField(server, "public_domain") || dropped
+	}
+	if routes := yamlField(root, "routes"); routes != nil && routes.Kind == yaml.SequenceNode {
+		for i, route := range routes.Content {
+			for _, key := range []string{"subdomain", "custom_domains", "remote_port", "host_rewrite", "headers", "load_balancer_group"} {
+				if line, ok := yamlFieldLine(route, key); ok {
+					return data, fmt.Errorf("config field routes[%d].%s at line %d was removed; delete it because managed routes use connector_routing_id and local_ip/local_port", i, key, line)
+				}
+			}
+		}
 	}
 	if !dropped {
 		return data, nil
@@ -329,6 +341,18 @@ func yamlField(mapping *yaml.Node, key string) *yaml.Node {
 		}
 	}
 	return nil
+}
+
+func yamlFieldLine(mapping *yaml.Node, key string) (int, bool) {
+	if mapping == nil || mapping.Kind != yaml.MappingNode {
+		return 0, false
+	}
+	for i := 0; i+1 < len(mapping.Content); i += 2 {
+		if mapping.Content[i].Value == key {
+			return mapping.Content[i].Line, true
+		}
+	}
+	return 0, false
 }
 
 func dropYAMLField(mapping *yaml.Node, key string) bool {

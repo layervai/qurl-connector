@@ -95,23 +95,23 @@ func TestStripRetiredGeneratedFieldsPreservesCleanBytes(t *testing.T) {
 
 func TestLoadRejectsOtherRetiredFRPFields(t *testing.T) {
 	tests := []struct {
-		name  string
-		field string
-		yaml  string
+		name string
+		path string
+		yaml string
 	}{
-		{"server token", "token", "server:\n  token: old\n"},
-		{"subdomain", "subdomain", "routes:\n  - id: web\n    type: http\n    local_port: 8080\n    subdomain: old\n"},
-		{"custom domains", "custom_domains", "routes:\n  - id: web\n    type: http\n    local_port: 8080\n    custom_domains: [old.example]\n"},
-		{"remote port", "remote_port", "routes:\n  - id: web\n    type: http\n    local_port: 8080\n    remote_port: 7001\n"},
-		{"host rewrite", "host_rewrite", "routes:\n  - id: web\n    type: http\n    local_port: 8080\n    host_rewrite: old.example\n"},
-		{"headers", "headers", "routes:\n  - id: web\n    type: http\n    local_port: 8080\n    headers: {X-Test: value}\n"},
-		{"load balancer group", "load_balancer_group", "routes:\n  - id: web\n    type: http\n    local_port: 8080\n    load_balancer_group: old\n"},
+		{"server token", "server.token", "server:\n  token: old\n"},
+		{"subdomain", "routes[0].subdomain", "routes:\n  - id: web\n    type: http\n    local_port: 8080\n    subdomain: old\n"},
+		{"custom domains", "routes[0].custom_domains", "routes:\n  - id: web\n    type: http\n    local_port: 8080\n    custom_domains: [old.example]\n"},
+		{"remote port", "routes[0].remote_port", "routes:\n  - id: web\n    type: http\n    local_port: 8080\n    remote_port: 7001\n"},
+		{"host rewrite", "routes[0].host_rewrite", "routes:\n  - id: web\n    type: http\n    local_port: 8080\n    host_rewrite: old.example\n"},
+		{"headers", "routes[0].headers", "routes:\n  - id: web\n    type: http\n    local_port: 8080\n    headers: {X-Test: value}\n"},
+		{"load balancer group", "routes[0].load_balancer_group", "routes:\n  - id: web\n    type: http\n    local_port: 8080\n    load_balancer_group: old\n"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			_, err := Load(writeConfig(t, tt.yaml))
-			if err == nil || !strings.Contains(err.Error(), "field "+tt.field+" not found") {
-				t.Fatalf("Load error = %v, want strict rejection of %s", err, tt.field)
+			if err == nil || !strings.Contains(err.Error(), "config field "+tt.path) || !strings.Contains(err.Error(), "was removed; delete it") {
+				t.Fatalf("Load error = %v, want migration guidance for %s", err, tt.path)
 			}
 		})
 	}
