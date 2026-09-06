@@ -246,9 +246,11 @@ qurl-connector run
 
 An orchestrator that builds this diagnostic command itself can enable its
 process-local readiness endpoint with a loopback IP and port. The probe reads
-the live session runner directly: pending routes fail, permanently retired or
-removed routes do not fail healthy siblings, and make-before-break renewal
-keeps the active session ready while its replacement starts.
+the live session runner directly: pending routes fail, retired or removed
+routes stop affecting healthy siblings after their withdrawal converges, and
+make-before-break renewal keeps the active session ready while its replacement
+starts. A failed add, change, restart, or removal apply keeps the whole group
+unready until the runner heals the difference.
 
 ```bash
 QURL_CONNECTOR_HEALTH_ADDR=127.0.0.1:7401 qurl-connector run

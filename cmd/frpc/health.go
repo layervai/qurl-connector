@@ -22,6 +22,11 @@ const (
 
 var listenConnectorHealth = net.Listen
 
+// This HTTP adapter is intentionally local to the diagnostic cmd/frpc
+// command. pkg/share.SessionGroupRunner.RoutesReady is the reusable runtime
+// signal. This repository does not distribute cmd/frpc, so a deployment that
+// uses this adapter must own and verify the binary or container artifact.
+
 // errConnectorRoutesNotReady keeps the handler and probe's expected unhealthy
 // result aligned and lets tests distinguish it from transport or configuration
 // failures.

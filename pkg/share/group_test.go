@@ -666,6 +666,53 @@ func TestSessionGroupRunnerRoutesReadyRejectsEndedServingSnapshot(t *testing.T) 
 	}
 }
 
+func TestSessionGroupRunnerRoutesReadyFailsClosedUntilRemovalConverges(t *testing.T) {
+	routes := groupTestRoutes("a", "b")
+	session := &fakeGroupSession{
+		routes: map[string]RouteState{
+			"a": {Route: GroupRoute{LocalHTTPRoute: routes[0]}, ProxyName: "a-nhp1", Phase: RouteServing},
+			"b": {Route: GroupRoute{LocalHTTPRoute: routes[1]}, ProxyName: "b-nhp1", Phase: RouteServing},
+		},
+		done:        make(chan struct{}),
+		failUpdates: 1,
+	}
+	runner := &SessionGroupRunner{
+		desired:  map[string]LocalHTTPRoute{"a": routes[0], "b": routes[1]},
+		restarts: map[string]uint64{},
+		active:   &groupCycle{session: session},
+	}
+	if !runner.RoutesReady() {
+		t.Fatal("runner was not ready with its exact desired set serving")
+	}
+
+	session.failRoute("b", errors.New("temporary route failure"))
+	if runner.RoutesReady() {
+		t.Fatal("runner reported ready while a desired route had failed")
+	}
+	session.serve("b")
+	if !runner.RoutesReady() {
+		t.Fatal("runner stayed unready after the desired route recovered")
+	}
+
+	if err := runner.SetRoutes(context.Background(), routes[:1]); err == nil || !strings.Contains(err.Error(), "fake update failure") {
+		t.Fatalf("SetRoutes removing b = %v, want the failed apply", err)
+	}
+	if _, present := session.RouteStates()["b"]; !present {
+		t.Fatal("failed removal did not leave route b on the live session")
+	}
+	if runner.RoutesReady() {
+		t.Fatal("runner reported ready while a removed route remained registered after a failed apply")
+	}
+
+	runner.healDivergence(context.Background())
+	if _, present := session.RouteStates()["b"]; present {
+		t.Fatal("divergence healing did not withdraw route b")
+	}
+	if !runner.RoutesReady() {
+		t.Fatal("runner stayed unready after the route removal converged")
+	}
+}
+
 func TestSessionGroupRunnerReturnsWhenEveryRouteIsGone(t *testing.T) {
 	h := startGroupHarness(t, time.Hour, 0, nil, "a", "b", "c")
 	h.waitServing(t, 1, "a", "b", "c")

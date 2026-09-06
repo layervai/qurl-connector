@@ -304,3 +304,32 @@ func TestProbeConnectorHealthRefusesRedirects(t *testing.T) {
 		t.Fatal("readiness probe followed a redirect away from its loopback listener")
 	}
 }
+
+func TestProbeConnectorHealthBoundsAStalledListener(t *testing.T) {
+	entered := make(chan struct{}, 1)
+	release := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		entered <- struct{}{}
+		<-release
+	}))
+	t.Cleanup(func() {
+		close(release)
+		server.Close()
+	})
+	t.Setenv(envConnectorHealthAddr, server.Listener.Addr().String())
+
+	started := time.Now()
+	err := probeConnectorHealth(context.Background())
+	elapsed := time.Since(started)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("probeConnectorHealth() error = %v, want context deadline exceeded", err)
+	}
+	select {
+	case <-entered:
+	default:
+		t.Fatal("stalled listener never received the readiness request")
+	}
+	if elapsed < connectorHealthTimeout/2 || elapsed >= 2*time.Second {
+		t.Fatalf("stalled readiness probe took %s, want bounded near %s and below the documented 2s supervisor timeout", elapsed, connectorHealthTimeout)
+	}
+}

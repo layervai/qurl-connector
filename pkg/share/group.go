@@ -97,8 +97,8 @@ type SessionGroupRunner struct {
 
 	mu      sync.Mutex
 	desired map[string]LocalHTTPRoute
-	// divergent records that a caller's apply failed before the live
-	// sessions saw the desired set; Run re-applies under its own context.
+	// divergent records that a caller's apply failed before every live
+	// session confirmed the desired set; Run re-applies under its own context.
 	divergent bool
 	// restarts holds each route's generation for the runner's lifetime,
 	// including routes that have left the group: a route that comes back
@@ -482,12 +482,14 @@ func (r *SessionGroupRunner) RestartRoute(ctx context.Context, routeID string) e
 // applyAndWake pushes the desired set from a caller, records a failure for
 // Run to heal, and wakes Run so the rotation timer follows the route count.
 func (r *SessionGroupRunner) applyAndWake(ctx context.Context) error {
-	err := r.apply(ctx)
+	r.applyMu.Lock()
+	err := r.applyLocked(ctx)
 	if err != nil {
 		r.mu.Lock()
 		r.divergent = true
 		r.mu.Unlock()
 	}
+	r.applyMu.Unlock()
 	r.signalWake()
 	return err
 }
@@ -498,16 +500,18 @@ func (r *SessionGroupRunner) applyAndWake(ctx context.Context) error {
 func (r *SessionGroupRunner) healDivergence(ctx context.Context) {
 	r.mu.Lock()
 	divergent := r.divergent
-	r.divergent = false
 	r.mu.Unlock()
 	if !divergent {
 		return
 	}
-	if err := r.apply(ctx); err != nil {
+	r.applyMu.Lock()
+	err := r.applyLocked(ctx)
+	if err == nil {
 		r.mu.Lock()
-		r.divergent = true
+		r.divergent = false
 		r.mu.Unlock()
 	}
+	r.applyMu.Unlock()
 }
 
 func (r *SessionGroupRunner) signalWake() {
@@ -527,16 +531,18 @@ func (r *SessionGroupRunner) RouteStates() map[string]RouteState {
 	return active.session.RouteStates()
 }
 
-// RoutesReady reports whether every route the runner currently desires is
-// serving on the active session. A replacement session does not affect the
-// result until promotion, so make-before-break rotation keeps reporting the
-// still-serving active session. Routes withdrawn after an authenticated
-// ErrResourceGone refusal are no longer desired and therefore do not make
-// healthy siblings fail readiness. Readiness is a whole-group bit: one
-// retryably failed desired route makes the group unready, so use it only when
-// the session group is also the supervisor's unit of replacement. A route
-// addition, target change, or restart during rotation stays unready until the
-// replacement is promoted, which can take one full rotation lead.
+// RoutesReady reports whether the active session has exactly the route set the
+// runner currently desires, every route is serving at its desired generation,
+// and no failed apply remains to be healed. A replacement session does not
+// affect the result until promotion, so make-before-break rotation keeps
+// reporting the still-serving active session. Routes withdrawn after an
+// authenticated ErrResourceGone refusal are no longer desired and therefore
+// do not make healthy siblings fail readiness once their withdrawal converges.
+// Readiness is a whole-group bit: one retryably failed desired route or failed
+// withdrawal makes the group unready, so use it only when the session group is
+// also the supervisor's unit of replacement. A route addition, target change,
+// or restart during rotation stays unready until the replacement is promoted,
+// which can take one full rotation lead.
 func (r *SessionGroupRunner) RoutesReady() bool {
 	r.mu.Lock()
 	active := r.active
@@ -552,7 +558,10 @@ func (r *SessionGroupRunner) RoutesReady() bool {
 	ended := sessionEnded(active.session)
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if r.active != active || len(r.desired) == 0 || ended {
+	if r.active != active || len(r.desired) == 0 || r.divergent || ended {
+		return false
+	}
+	if len(states) != len(r.desired) {
 		return false
 	}
 	for routeID, route := range r.desired {
@@ -572,6 +581,12 @@ func (r *SessionGroupRunner) RoutesReady() bool {
 func (r *SessionGroupRunner) apply(ctx context.Context) error {
 	r.applyMu.Lock()
 	defer r.applyMu.Unlock()
+	return r.applyLocked(ctx)
+}
+
+// applyLocked pushes the current desired set while applyMu serializes it with
+// caller changes and divergence healing.
+func (r *SessionGroupRunner) applyLocked(ctx context.Context) error {
 	r.mu.Lock()
 	desired := r.desiredRoutesLocked()
 	active, pending, rotating := r.active, r.pending, r.rotating
@@ -856,7 +871,7 @@ func (r *SessionGroupRunner) withdrawGone(ctx context.Context, states map[string
 		return
 	}
 	sort.Slice(gone, func(i, j int) bool { return gone[i].routeID < gone[j].routeID })
-	_ = r.apply(ctx)
+	_ = r.applyAndWake(ctx)
 	if r.cfg.OnRouteFailed != nil {
 		for _, route := range gone {
 			r.cfg.OnRouteFailed(route.routeID, route.err)
