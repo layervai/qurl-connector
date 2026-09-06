@@ -391,6 +391,12 @@ def mint_and_install_enrollment(
                     else MINT_RETRY_SECONDS
                 )
                 time.sleep(min(max(retry_delay, 0.0), MAX_MINT_RETRY_AFTER_SECONDS))
+        except EnrollmentError as exc:
+            if mint_outcome_unknown:
+                raise EnrollmentError(
+                    "enrollment credential result is unknown; retry the same target and generation to recover the exact operation"
+                ) from exc
+            raise
     else:
         if not mint_outcome_unknown:
             raise EnrollmentError(
@@ -494,6 +500,8 @@ def prepare_enrollment(
         # invalidate the enrollment that this operation prepares.
         put_failure: EnrollmentError | None = None
         last_put_rejection: EnrollmentError | None = None
+        retry_put = False
+        retry_delay: float | None = None
         for attempt in range(2):
             try:
                 api_request(
@@ -542,12 +550,18 @@ def prepare_enrollment(
         minimum_epoch = serving_epoch + 1
         last_poll_failure: EnrollmentError | None = None
         for attempt in range(SHARING_POLL_ATTEMPTS):
+            poll_delay = float(SHARING_POLL_SECONDS)
             try:
                 sharing = api_request(api_endpoint, api_key, resource_path + "/sharing")
                 last_poll_failure = None
-            except APIRequestOutcomeUnknown as exc:
+            except APIRequestRetryable as exc:
                 sharing = None
                 last_poll_failure = exc
+                if exc.retry_after_seconds is not None:
+                    poll_delay = min(
+                        max(exc.retry_after_seconds, 0.0),
+                        MAX_MINT_RETRY_AFTER_SECONDS,
+                    )
             except EnrollmentError as exc:
                 if sharing_enabled_by_this_run:
                     raise EnrollmentError(
@@ -570,15 +584,13 @@ def prepare_enrollment(
                 sharing_enabled_by_this_run = True
                 break
             if attempt + 1 < SHARING_POLL_ATTEMPTS:
-                time.sleep(SHARING_POLL_SECONDS)
+                time.sleep(poll_delay)
         else:
-            if put_failure is not None:
-                raise EnrollmentError(
-                    "sharing did not reach the required serving epoch after its update failed; sharing may have been applied before the response was lost and may have been left on"
-                ) from put_failure
             if last_poll_failure is not None:
                 message = "sharing did not reach the required serving epoch because status checks failed"
-                if sharing_enabled_by_this_run:
+                if put_failure is not None:
+                    message += "; the sharing update outcome is unknown and sharing may have been applied before the response was lost and may have been left on"
+                elif sharing_enabled_by_this_run:
                     message += "; sharing for this resource was enabled by this run and was left on"
                 raise EnrollmentError(message) from last_poll_failure
             message = "sharing did not reach the required serving epoch"

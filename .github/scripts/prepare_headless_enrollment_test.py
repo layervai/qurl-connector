@@ -782,6 +782,39 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
         sleep.assert_called_once_with(MODULE.MINT_RETRY_SECONDS)
         put.assert_not_called()
 
+    def test_mint_hard_rejection_after_unknown_keeps_recovery_warning(self) -> None:
+        responses = [
+            [
+                {
+                    "slug": "detect-sandbox",
+                    "type": "tunnel",
+                    "status": "active",
+                    "resource_id": "r_one",
+                }
+            ],
+            {"desired_state": "on", "serving_epoch": 1},
+            MODULE.APIRequestOutcomeUnknown("first response was lost"),
+            MODULE.EnrollmentError("qURL API rejected the POST request with HTTP 403"),
+        ]
+        with (
+            mock.patch.object(MODULE, "api_request", side_effect=responses),
+            mock.patch.object(MODULE, "put_parameter") as put,
+            mock.patch.object(MODULE.time, "sleep"),
+        ):
+            with self.assertRaisesRegex(
+                MODULE.EnrollmentError, "retry the same target and generation"
+            ) as raised:
+                MODULE.prepare_enrollment(
+                    "https://api.example.com",
+                    "lv_live_account-key",
+                    "detect-nhp-replica-a",
+                    "attempt-1",
+                    "us-east-2",
+                    now=FIXED_NOW,
+                )
+        self.assertIn("HTTP 403", str(raised.exception.__cause__))
+        put.assert_not_called()
+
     def test_mint_rejection_is_not_retried_or_called_unknown(self) -> None:
         responses = [
             [
@@ -1326,6 +1359,80 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
             )
         sleep.assert_called_once_with(MODULE.SHARING_POLL_SECONDS)
         put.assert_called_once()
+
+    def test_rate_limited_poll_honors_retry_after_and_continues(self) -> None:
+        responses = [
+            [
+                {
+                    "slug": "detect-sandbox",
+                    "type": "tunnel",
+                    "status": "active",
+                    "resource_id": "MFkw-resource",
+                }
+            ],
+            {"desired_state": "off", "serving_epoch": 3},
+            {"desired_state": "on", "serving_epoch": 4},
+            MODULE.APIRequestRejectedRetryable("HTTP 429", retry_after_seconds=17),
+            {"desired_state": "on", "serving_epoch": 4},
+            {
+                "kind": "enrollment_token",
+                "target": "agent",
+                "claims": [{"type": "connector", "id": "detect-sandbox"}],
+                "api_key": "lv_live_test-token",
+                "expires_at": VALID_EXPIRY,
+            },
+        ]
+        with (
+            mock.patch.object(MODULE, "api_request", side_effect=responses),
+            mock.patch.object(MODULE, "put_parameter") as put,
+            mock.patch.object(MODULE.time, "sleep") as sleep,
+        ):
+            MODULE.prepare_enrollment(
+                "https://api.example.com",
+                "lv_live_account-key",
+                "detect-nhp-replica-a",
+                "attempt-3",
+                "us-east-2",
+                now=FIXED_NOW,
+            )
+        sleep.assert_called_once_with(17)
+        put.assert_called_once()
+
+    def test_clean_off_polls_clear_unknown_put_warning(self) -> None:
+        responses = [
+            [
+                {
+                    "slug": "detect-sandbox",
+                    "type": "tunnel",
+                    "status": "active",
+                    "resource_id": "MFkw-resource",
+                }
+            ],
+            {"desired_state": "off", "serving_epoch": 0},
+            MODULE.APIRequestOutcomeUnknown("qURL API PUT response was lost"),
+            *[{"desired_state": "off", "serving_epoch": 0}]
+            * MODULE.SHARING_POLL_ATTEMPTS,
+        ]
+        with (
+            mock.patch.object(MODULE, "api_request", side_effect=responses),
+            mock.patch.object(MODULE, "put_parameter") as put,
+            mock.patch.object(MODULE.time, "sleep"),
+        ):
+            with self.assertRaisesRegex(
+                MODULE.EnrollmentError,
+                "sharing did not reach the required serving epoch",
+            ) as raised:
+                MODULE.prepare_enrollment(
+                    "https://api.example.com",
+                    "lv_live_account-key",
+                    "detect-nhp-replica-a",
+                    "attempt-1",
+                    "us-east-2",
+                    now=FIXED_NOW,
+                )
+        self.assertNotIn("may have been", str(raised.exception))
+        self.assertNotIn("left on", str(raised.exception))
+        put.assert_not_called()
 
     def test_deterministic_poll_rejection_fails_without_retry(self) -> None:
         responses = [
