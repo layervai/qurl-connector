@@ -331,16 +331,26 @@ func stripRetiredGeneratedFields(data string) (string, error) {
 	}
 	if routes := yamlField(root, "routes"); routes != nil && routes.Kind == yaml.SequenceNode {
 		for i, route := range routes.Content {
-			if subdomain := yamlField(route, "subdomain"); subdomain != nil {
+			for _, key := range []string{"subdomain", "load_balancer_group"} {
+				field := yamlField(route, key)
+				if field == nil {
+					continue
+				}
 				routingID := yamlField(route, "connector_routing_id")
-				if routingID != nil && subdomain.Value == routingID.Value {
-					dropped = dropYAMLField(route, "subdomain") || dropped
-				} else if line, ok := yamlFieldLine(route, "subdomain"); ok {
-					errs = append(errs, fmt.Errorf("config field routes[%d].subdomain at line %d was removed; delete it because managed routes use connector_routing_id", i, line))
+				if routingID != nil && field.Value == routingID.Value {
+					dropped = dropYAMLField(route, key) || dropped
+				} else if line, ok := yamlFieldLine(route, key); ok {
+					errs = append(errs, fmt.Errorf("config field routes[%d].%s at line %d was removed; delete it because managed routes use connector_routing_id", i, key, line))
 				}
 			}
-			dropped = dropYAMLField(route, "knock_resource_id") || dropped
-			for _, key := range []string{"custom_domains", "remote_port", "host_rewrite", "headers", "load_balancer_group"} {
+			// Current qURL Desktop writes this authenticated API value into YAML,
+			// but the Connector rehydrates it through device state before every
+			// admission. Accept it only as a noisy compatibility input.
+			if line, ok := yamlFieldLine(route, "knock_resource_id"); ok {
+				fmt.Fprintf(os.Stderr, "warning: config field routes[%d].knock_resource_id at line %d is ignored; authenticated resource hydration supplies the NHP admission target\n", i, line)
+				dropped = dropYAMLField(route, "knock_resource_id") || dropped
+			}
+			for _, key := range []string{"custom_domains", "remote_port", "host_rewrite", "headers"} {
 				if line, ok := yamlFieldLine(route, key); ok {
 					errs = append(errs, fmt.Errorf("config field routes[%d].%s at line %d was removed; delete it because managed routes use connector_routing_id and local_ip/local_port", i, key, line))
 				}

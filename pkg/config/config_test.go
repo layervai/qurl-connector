@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -26,6 +27,29 @@ func writeConfig(t *testing.T, content string) string {
 		t.Fatalf("writing temp config: %v", err)
 	}
 	return p
+}
+
+func captureStderr(t *testing.T, fn func()) string {
+	t.Helper()
+	original := os.Stderr
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stderr = w
+	t.Cleanup(func() {
+		os.Stderr = original
+		_ = r.Close()
+		_ = w.Close()
+	})
+	fn()
+	_ = w.Close()
+	os.Stderr = original
+	out, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(out)
 }
 
 func TestLoadAcceptsAndDropsRetiredGeneratedFields(t *testing.T) {
@@ -57,6 +81,7 @@ routes:
     type: http
     local_port: 8080
     subdomain: %s
+    load_balancer_group: %s
     resource_id: %s
     connector_routing_id: %s
     knock_resource_id: cell-resource
@@ -64,10 +89,15 @@ routes:
     type: http
     local_ip: 127.0.0.2
     local_port: 8443
-`, testRoutingA, testPublicResourceA, testRoutingA))
-	cfg, err := Load(path)
+`, testRoutingA, testRoutingA, testPublicResourceA, testRoutingA))
+	var cfg *Config
+	var err error
+	stderr := captureStderr(t, func() { cfg, err = Load(path) })
 	if err != nil {
 		t.Fatal(err)
+	}
+	if !strings.Contains(stderr, "knock_resource_id") || !strings.Contains(stderr, "ignored") {
+		t.Fatalf("missing compatibility warning: %q", stderr)
 	}
 	if cfg.Server.Addr != "frp.example" || cfg.Server.Port != 7000 || cfg.Server.Protocol != "websocket" ||
 		!cfg.NHP.Enabled || cfg.NHP.MachineID != "machine-1" || cfg.QURL.APIURL != "https://api.example/v1" ||
@@ -84,7 +114,8 @@ routes:
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(string(raw), "public_domain:") || strings.Contains(string(raw), "subdomain:") || strings.Contains(string(raw), "knock_resource_id:") {
+	if strings.Contains(string(raw), "public_domain:") || strings.Contains(string(raw), "subdomain:") ||
+		strings.Contains(string(raw), "load_balancer_group:") || strings.Contains(string(raw), "knock_resource_id:") {
 		t.Fatalf("Save retained retired generated fields:\n%s", raw)
 	}
 	if !strings.Contains(string(raw), "admin:") {

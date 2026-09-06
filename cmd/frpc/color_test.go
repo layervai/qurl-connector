@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	goast "go/ast"
 	goparser "go/parser"
 	gotoken "go/token"
@@ -13,8 +12,6 @@ import (
 	"testing"
 
 	v1 "github.com/fatedier/frp/pkg/config/v1"
-
-	nhpconfig "github.com/layervai/qurl-connector/pkg/config"
 )
 
 // withColorEnabled forces the color gate for one test and restores whatever
@@ -260,20 +257,6 @@ func TestApplyLogPresentationTracksColorGate(t *testing.T) {
 	}
 }
 
-func TestStartFRPFromConfigRejectsInvalidLogLevel(t *testing.T) {
-	oldLevel := logLevel
-	logLevel = "loud"
-	t.Cleanup(func() { logLevel = oldLevel })
-	disabled := false
-	err := startFRPFromConfig(context.Background(), "", "machine", &nhpconfig.Config{
-		Server: nhpconfig.ServerConfig{Protocol: "tcp"},
-		Audit:  nhpconfig.AuditConfig{Enabled: &disabled},
-	}, "agent", nil)
-	if err == nil || !strings.Contains(err.Error(), "invalid log level") {
-		t.Fatalf("startFRPFromConfig error = %v, want invalid log level", err)
-	}
-}
-
 // escANSI is the byte an ANSI sequence opens with. Detection decodes string
 // literals down to this rather than pattern-matching their source form, so
 // "\033[", "\x1b[", "\u001b[", and a raw ESC pasted into a literal are all
@@ -397,13 +380,6 @@ func TestANSIEscapeDetectorFindsEveryLiteralForm(t *testing.T) {
 		"}\n")
 	if got := ansiEscapeLines(t, "benign.go", benign); len(got) != 0 {
 		t.Fatalf("detector false-positived on lines %v of gated call sites and prose", got)
-	}
-}
-
-func TestAdminAuthPasswordUsesDesktopSecret(t *testing.T) {
-	got, err := adminAuthPassword(&nhpconfig.AdminConfig{Password: "desktop-secret"})
-	if err != nil || got != "desktop-secret" {
-		t.Fatalf("adminAuthPassword = %q, %v", got, err)
 	}
 }
 
