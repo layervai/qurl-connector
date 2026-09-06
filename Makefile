@@ -1,7 +1,7 @@
 export PATH := $(PATH):$(shell go env GOPATH)/bin
 export GO111MODULE=on
 PYTHON ?= python3
-PYTHON_LINT_FILES := .github/scripts/prepare-headless-enrollment.py .github/scripts/prepare_headless_enrollment_test.py
+PYTHON_LINT_FILES := $(wildcard .github/scripts/*.py)
 
 # Version info injected at build time
 BASE_VERSION ?= $(shell git describe --tags --abbrev=0 2>/dev/null || echo "0.1.0")

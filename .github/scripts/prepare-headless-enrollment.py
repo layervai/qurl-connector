@@ -68,7 +68,9 @@ AWS_REJECTED_ERROR_CODES = {
 MAX_RESPONSE_BYTES = 64 * 1024
 API_TIMEOUT_SECONDS = 10
 AWS_TIMEOUT_SECONDS = 30
-SHARING_POLL_ATTEMPTS = 6
+# Allow up to two minutes for an off-to-on serving epoch to propagate. Each API
+# call has its own timeout, and the protected workflow has a 12-minute hard cap.
+SHARING_POLL_ATTEMPTS = 13
 SHARING_POLL_SECONDS = 10
 RETRY_SECONDS = 2
 MAX_RETRY_AFTER_SECONDS = 30

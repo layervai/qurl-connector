@@ -181,11 +181,7 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
         )
         self.assertIn("ruff check --no-cache $(PYTHON_LINT_FILES)", makefile)
         self.assertIn("ruff format --check --no-cache $(PYTHON_LINT_FILES)", makefile)
-        self.assertIn(
-            "PYTHON_LINT_FILES := .github/scripts/prepare-headless-enrollment.py "
-            ".github/scripts/prepare_headless_enrollment_test.py",
-            makefile,
-        )
+        self.assertIn("PYTHON_LINT_FILES := $(wildcard .github/scripts/*.py)", makefile)
         requirements = (SCRIPT.parent / "requirements-lint.txt").read_text()
         self.assertRegex(
             requirements, r"ruff==0\.15\.8.*\\\n\s+--hash=sha256:[0-9a-f]{64}"
