@@ -19,15 +19,27 @@ func withCapturedStdout(t *testing.T, fn func() error) (string, error) {
 		t.Fatalf("pipe: %v", err)
 	}
 	os.Stdout = w
-	t.Cleanup(func() {
-		os.Stdout = orig
-		_ = w.Close()
-		_ = r.Close()
-	})
-	runErr := fn()
-	_ = w.Close()
-	buf, _ := io.ReadAll(r)
-	return string(buf), runErr
+	done := make(chan string, 1)
+	go func() {
+		buf, _ := io.ReadAll(r)
+		done <- string(buf)
+	}()
+	var runErr error
+	var panicked any
+	func() {
+		defer func() {
+			panicked = recover()
+			_ = w.Close()
+			os.Stdout = orig
+		}()
+		runErr = fn()
+	}()
+	out := <-done
+	_ = r.Close()
+	if panicked != nil {
+		panic(panicked)
+	}
+	return out, runErr
 }
 
 func TestRunListEmptyPromptSaysConfigure(t *testing.T) {

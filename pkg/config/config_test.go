@@ -34,22 +34,29 @@ func captureStderr(t *testing.T, fn func()) string {
 	original := os.Stderr
 	r, w, err := os.Pipe()
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("os.Pipe: %v", err)
 	}
 	os.Stderr = w
-	t.Cleanup(func() {
-		os.Stderr = original
-		_ = r.Close()
-		_ = w.Close()
-	})
-	fn()
-	_ = w.Close()
-	os.Stderr = original
-	out, err := io.ReadAll(r)
-	if err != nil {
-		t.Fatal(err)
+	done := make(chan string, 1)
+	go func() {
+		out, _ := io.ReadAll(r)
+		done <- string(out)
+	}()
+	var panicked any
+	func() {
+		defer func() {
+			panicked = recover()
+			_ = w.Close()
+			os.Stderr = original
+		}()
+		fn()
+	}()
+	out := <-done
+	_ = r.Close()
+	if panicked != nil {
+		panic(panicked)
 	}
-	return string(out)
+	return out
 }
 
 func TestLoadAcceptsAndDropsRetiredGeneratedFields(t *testing.T) {
@@ -97,7 +104,7 @@ routes:
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(stderr, "knock_resource_id") || !strings.Contains(stderr, "ignored") {
+	if !strings.Contains(stderr, "replica_discriminator") || !strings.Contains(stderr, "knock_resource_id") || !strings.Contains(stderr, "ignored") {
 		t.Fatalf("missing compatibility warning: %q", stderr)
 	}
 	if cfg.Server.Addr != "frp.example" || cfg.Server.Port != 7000 || cfg.Server.Protocol != "websocket" ||
@@ -137,22 +144,24 @@ func TestStripRetiredGeneratedFieldsPreservesCleanBytes(t *testing.T) {
 
 func TestLoadRejectsOtherRetiredFRPFields(t *testing.T) {
 	tests := []struct {
-		name string
-		path string
-		yaml string
+		name     string
+		path     string
+		yaml     string
+		wantLine string
 	}{
-		{"server token", "server.token", "server:\n  token: old\n"},
-		{"subdomain", "routes[0].subdomain", "routes:\n  - id: web\n    type: http\n    local_port: 8080\n    subdomain: old\n"},
-		{"custom domains", "routes[0].custom_domains", "routes:\n  - id: web\n    type: http\n    local_port: 8080\n    custom_domains: [old.example]\n"},
-		{"remote port", "routes[0].remote_port", "routes:\n  - id: web\n    type: http\n    local_port: 8080\n    remote_port: 7001\n"},
-		{"host rewrite", "routes[0].host_rewrite", "routes:\n  - id: web\n    type: http\n    local_port: 8080\n    host_rewrite: old.example\n"},
-		{"headers", "routes[0].headers", "routes:\n  - id: web\n    type: http\n    local_port: 8080\n    headers: {X-Test: value}\n"},
-		{"load balancer group", "routes[0].load_balancer_group", "routes:\n  - id: web\n    type: http\n    local_port: 8080\n    load_balancer_group: old\n"},
+		{name: "server token", path: "server.token", yaml: "server:\n  token: old\n"},
+		{name: "subdomain", path: "routes[0].subdomain", yaml: "routes:\n  - id: web\n    type: http\n    local_port: 8080\n    subdomain:\n      old\n", wantLine: "at line 5"},
+		{name: "custom domains", path: "routes[0].custom_domains", yaml: "routes:\n  - id: web\n    type: http\n    local_port: 8080\n    custom_domains: [old.example]\n"},
+		{name: "remote port", path: "routes[0].remote_port", yaml: "routes:\n  - id: web\n    type: http\n    local_port: 8080\n    remote_port: 7001\n"},
+		{name: "host rewrite", path: "routes[0].host_rewrite", yaml: "routes:\n  - id: web\n    type: http\n    local_port: 8080\n    host_rewrite: old.example\n"},
+		{name: "headers", path: "routes[0].headers", yaml: "routes:\n  - id: web\n    type: http\n    local_port: 8080\n    headers: {X-Test: value}\n"},
+		{name: "load balancer group", path: "routes[0].load_balancer_group", yaml: "routes:\n  - id: web\n    type: http\n    local_port: 8080\n    load_balancer_group: old\n"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			_, err := Load(writeConfig(t, tt.yaml))
-			if err == nil || !strings.Contains(err.Error(), "config field "+tt.path) || !strings.Contains(err.Error(), "was removed; delete it") {
+			if err == nil || !strings.Contains(err.Error(), "config field "+tt.path) || !strings.Contains(err.Error(), "was removed; delete it") ||
+				(tt.wantLine != "" && !strings.Contains(err.Error(), tt.wantLine)) {
 				t.Fatalf("Load error = %v, want migration guidance for %s", err, tt.path)
 			}
 		})
@@ -822,6 +831,7 @@ routes:
     type: http
     local_port: 8080
     resource_id: %s
+    connector_routing_id: ""
     subdomain: old-managed-routing
     load_balancer_group: old-managed-routing
 `, testPublicResourceA)

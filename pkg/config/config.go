@@ -328,7 +328,10 @@ func stripRetiredGeneratedFields(data string) (string, error) {
 			errs = append(errs, fmt.Errorf("config field server.token at line %d was removed; delete it because NHP admission supplies the FRP session token", line))
 		}
 		dropped = dropYAMLField(server, "public_domain") || dropped
-		dropped = dropYAMLField(server, "replica_discriminator") || dropped
+		if line, ok := yamlFieldLine(server, "replica_discriminator"); ok {
+			fmt.Fprintf(os.Stderr, "warning: config field server.replica_discriminator at line %d is ignored; FRP proxy names now use the NHP session ID\n", line)
+			dropped = dropYAMLField(server, "replica_discriminator") || dropped
+		}
 	}
 	if routes := yamlField(root, "routes"); routes != nil && routes.Kind == yaml.SequenceNode {
 		for i, route := range routes.Content {
@@ -337,17 +340,21 @@ func stripRetiredGeneratedFields(data string) (string, error) {
 				if field == nil {
 					continue
 				}
-				routingID := yamlField(route, "connector_routing_id")
+				routingValue := ""
+				if routingID := yamlField(route, "connector_routing_id"); routingID != nil {
+					routingValue = strings.TrimSpace(routingID.Value)
+				}
 				resourceID := yamlField(route, "resource_id")
 				switch {
-				case routingID != nil && field.Value == routingID.Value:
+				case routingValue != "" && field.Value == routingValue:
 					dropped = dropYAMLField(route, key) || dropped
-				case routingID == nil && resourceID != nil && strings.TrimSpace(resourceID.Value) != "":
+				case routingValue == "" && resourceID != nil && strings.TrimSpace(resourceID.Value) != "":
 					// A pinned managed resource can load before routing hydration.
 					fmt.Fprintf(os.Stderr, "warning: config field routes[%d].%s is ignored while managed resource routing is hydrated\n", i, key)
 					dropped = dropYAMLField(route, key) || dropped
 				default:
-					errs = append(errs, fmt.Errorf("config field routes[%d].%s at line %d was removed; delete it because managed routes use connector_routing_id", i, key, field.Line))
+					line, _ := yamlFieldLine(route, key)
+					errs = append(errs, fmt.Errorf("config field routes[%d].%s at line %d was removed; delete it because managed routes use connector_routing_id", i, key, line))
 				}
 			}
 			// Current qURL Desktop writes this authenticated API value into YAML,

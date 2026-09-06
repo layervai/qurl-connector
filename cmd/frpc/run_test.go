@@ -42,6 +42,8 @@ func TestAdminAuthPassword(t *testing.T) {
 }
 
 func TestAdminDashboardRoutes404WithoutEmbeddedAssets(t *testing.T) {
+	previous := assets.FileSystem
+	t.Cleanup(func() { assets.FileSystem = previous })
 	assets.Load("")
 	recorder := httptest.NewRecorder()
 	http.FileServer(assets.FileSystem).ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/", nil))
