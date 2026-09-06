@@ -30,8 +30,12 @@ make lint
 make vet
 make verify-deps
 go test ./.github/scripts
-python3 -m ruff check .github/scripts/prepare-headless-enrollment.py .github/scripts/prepare_headless_enrollment_test.py
-python3 -m ruff format --check .github/scripts/prepare-headless-enrollment.py .github/scripts/prepare_headless_enrollment_test.py
+qurl_lint_venv=$(mktemp -d)
+trap 'rm -rf -- "$qurl_lint_venv"' EXIT
+python3 -m venv "$qurl_lint_venv"
+"$qurl_lint_venv/bin/python" -m pip install --require-hashes -r .github/scripts/requirements-lint.txt
+"$qurl_lint_venv/bin/python" -m ruff check .github/scripts/prepare-headless-enrollment.py .github/scripts/prepare_headless_enrollment_test.py
+"$qurl_lint_venv/bin/python" -m ruff format --check .github/scripts/prepare-headless-enrollment.py .github/scripts/prepare_headless_enrollment_test.py
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s .github/scripts -p 'prepare_headless_enrollment_test.py'
 ```
 

@@ -85,17 +85,17 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
         self.assertIn("needs: verify-environment", workflow)
         self.assertIn("actions: read", workflow)
         self.assertIn("exact fine-grained permission", workflow)
-        self.assertIn(
-            "GET /repos/{owner}/{repo}/environments/{environment_name}", workflow
-        )
         self.assertIn('"$GITHUB_REF" != "refs/heads/main"', workflow)
         self.assertIn(
             'gh api "repos/${GITHUB_REPOSITORY}/environments/sandbox"', workflow
         )
-        self.assertIn(".deployment_branch_policy.protected_branches == true", workflow)
+        self.assertIn(".deployment_branch_policy.protected_branches == false", workflow)
         self.assertIn(
-            ".deployment_branch_policy.custom_branch_policies == false", workflow
+            ".deployment_branch_policy.custom_branch_policies == true", workflow
         )
+        self.assertIn("/deployment-branch-policies?per_page=100", workflow)
+        self.assertIn('.branch_policies[0].name == "main"', workflow)
+        self.assertIn('.branch_policies[0].type == "branch"', workflow)
         self.assertIn('.type == "required_reviewers"', workflow)
         for name in (
             "QURL_SANDBOX_API_KEY",
@@ -236,7 +236,10 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
 
     def test_api_request_requires_exact_status_and_response_media_type(self) -> None:
         for response, message in (
-            (FakeResponse(b'{"data":{}}', status=201), "expected one of \\(200,\\)"),
+            (
+                FakeResponse(b'{"data":{}}', status=201),
+                "returned HTTP 201 for the GET request; expected one of \\(200,\\)",
+            ),
             (FakeResponse(b'{"data":{}}', content_types=[]), "Content-Type"),
             (
                 FakeResponse(
@@ -291,8 +294,9 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
             def close(self) -> None:
                 pass
 
+        resource_id = "r_private-resource-id"
         rejected = MODULE.urllib.error.HTTPError(
-            "https://api.example.com/v1/resources",
+            f"https://api.example.com/v1/resources/{resource_id}/sharing",
             403,
             "Forbidden",
             {},
@@ -300,33 +304,40 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
         )
         with mock.patch.object(MODULE.NO_REDIRECT_OPENER, "open", side_effect=rejected):
             with self.assertRaisesRegex(
-                MODULE.EnrollmentError, "rejected GET /v1/resources with HTTP 403"
-            ):
-                MODULE.api_request(
-                    "https://api.example.com", "lv_live_account-key", "/v1/resources"
-                )
-
-    def test_api_request_marks_server_error_as_unknown_outcome(self) -> None:
-        error_body = mock.Mock()
-        error_body.read.return_value = b""
-        rejected = MODULE.urllib.error.HTTPError(
-            "https://api.example.com/v1/api-keys",
-            503,
-            "Unavailable",
-            {},
-            error_body,
-        )
-        with mock.patch.object(MODULE.NO_REDIRECT_OPENER, "open", side_effect=rejected):
-            with self.assertRaisesRegex(
-                MODULE.APIRequestOutcomeUnknown,
-                "rejected POST /v1/api-keys with HTTP 503",
-            ):
+                MODULE.EnrollmentError, "rejected the GET request with HTTP 403"
+            ) as raised:
                 MODULE.api_request(
                     "https://api.example.com",
                     "lv_live_account-key",
-                    "/v1/api-keys",
-                    method="POST",
+                    f"/v1/resources/{resource_id}/sharing",
                 )
+        self.assertNotIn(resource_id, str(raised.exception))
+
+    def test_api_request_marks_retryable_status_as_unknown_outcome(self) -> None:
+        for status in (408, 429, 503):
+            with self.subTest(status=status):
+                error_body = mock.Mock()
+                error_body.read.return_value = b""
+                rejected = MODULE.urllib.error.HTTPError(
+                    "https://api.example.com/v1/api-keys",
+                    status,
+                    "Retryable",
+                    {},
+                    error_body,
+                )
+                with mock.patch.object(
+                    MODULE.NO_REDIRECT_OPENER, "open", side_effect=rejected
+                ):
+                    with self.assertRaisesRegex(
+                        MODULE.APIRequestOutcomeUnknown,
+                        f"rejected the POST request with HTTP {status}",
+                    ):
+                        MODULE.api_request(
+                            "https://api.example.com",
+                            "lv_live_account-key",
+                            "/v1/api-keys",
+                            method="POST",
+                        )
 
     def test_api_request_normalizes_protocol_failure(self) -> None:
         with mock.patch.object(
@@ -336,7 +347,7 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
         ):
             with self.assertRaisesRegex(
                 MODULE.APIRequestOutcomeUnknown,
-                "request failed for GET /v1/resources",
+                "GET request failed",
             ):
                 MODULE.api_request(
                     "https://api.example.com", "lv_live_account-key", "/v1/resources"

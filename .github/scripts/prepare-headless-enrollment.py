@@ -176,13 +176,11 @@ def api_request(
     try:
         with NO_REDIRECT_OPENER.open(request, timeout=API_TIMEOUT_SECONDS) as response:
             if response.status not in expected_statuses:
-                error_class = (
-                    APIRequestOutcomeUnknown
-                    if 200 <= response.status < 300
-                    else EnrollmentError
-                )
-                raise error_class(
-                    f"qURL API returned HTTP {response.status} for {method} {path}; expected one of {expected_statuses}"
+                # urllib raises HTTPError for non-2xx responses. Reaching this
+                # branch means a success response had an unexpected contract,
+                # so a mutation could have committed.
+                raise APIRequestOutcomeUnknown(
+                    f"qURL API returned HTTP {response.status} for the {method} request; expected one of {expected_statuses}"
                 )
             content_types = response.headers.get_all("Content-Type", [])
             if (
@@ -206,16 +204,14 @@ def api_request(
                 pass
         error_class = (
             APIRequestOutcomeUnknown
-            if exc.code == 408 or exc.code >= 500
+            if exc.code in {408, 429} or exc.code >= 500
             else EnrollmentError
         )
         raise error_class(
-            f"qURL API rejected {method} {path} with HTTP {exc.code}"
+            f"qURL API rejected the {method} request with HTTP {exc.code}"
         ) from exc
     except (OSError, http.client.HTTPException) as exc:
-        raise APIRequestOutcomeUnknown(
-            f"qURL API request failed for {method} {path}"
-        ) from exc
+        raise APIRequestOutcomeUnknown(f"qURL API {method} request failed") from exc
     if len(raw) > MAX_RESPONSE_BYTES:
         raise APIRequestOutcomeUnknown("qURL API response exceeds 64 KiB")
     try:
@@ -332,6 +328,9 @@ def prepare_enrollment(
 
     observed_epoch = serving_epoch
     if desired_state == "off":
+        # Recovery deliberately leaves the selected resource on. A fixed
+        # replica can enroll only while sharing is on, and restoring off would
+        # invalidate the enrollment that this operation prepares.
         put_failure: EnrollmentError | None = None
         try:
             api_request(

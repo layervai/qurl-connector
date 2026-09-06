@@ -39,8 +39,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 2
     # GitHub documents actions: read as the exact fine-grained permission for
-    # GET /repos/{owner}/{repo}/environments/{environment_name}. This job does
-    # not check out repository contents.
+    # these environment-policy reads. This job does not check out contents.
     permissions:
       actions: read
     steps:
@@ -56,20 +55,31 @@ jobs:
           policy=$(
             gh api "repos/${GITHUB_REPOSITORY}/environments/sandbox" --jq '
               [
-                (.deployment_branch_policy.protected_branches == true),
-                (.deployment_branch_policy.custom_branch_policies == false),
+                (.deployment_branch_policy.protected_branches == false),
+                (.deployment_branch_policy.custom_branch_policies == true),
                 (any(.protection_rules[]?; .type == "required_reviewers" and (.reviewers | length) > 0))
               ] | map(tostring) | join(" ")
             '
           )
           if [ "$policy" != "true true true" ]; then
-            echo "::error::sandbox environment must allow protected branches only and require at least one reviewer"
+            echo "::error::sandbox environment must use an exact custom branch policy and require at least one reviewer"
+            exit 1
+          fi
+          branches=$(gh api --paginate "repos/${GITHUB_REPOSITORY}/environments/sandbox/deployment-branch-policies?per_page=100")
+          if ! jq -e '
+            (.total_count | type) == "number" and .total_count == 1 and
+            (.branch_policies | type) == "array" and
+            (.branch_policies | length) == 1 and
+            .branch_policies[0].name == "main" and
+            .branch_policies[0].type == "branch"
+          ' <<<"$branches" >/dev/null; then
+            echo "::error::sandbox environment must allow only the exact main branch"
             exit 1
           fi
 
   rotate:
     name: Rotate ${{ inputs.target }}
-    # This environment must allow only protected branches and require a reviewer.
+    # This environment must allow only the exact main branch and require a reviewer.
     environment: sandbox
     needs: verify-environment
     runs-on: ubuntu-latest
