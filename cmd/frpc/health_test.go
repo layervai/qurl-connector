@@ -89,6 +89,9 @@ func TestConnectorHealthHandlerMethods(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			recorder := httptest.NewRecorder()
 			connectorHealthHandler(func() bool { return true }).ServeHTTP(recorder, httptest.NewRequest(test.method, test.path, nil))
+			if marker := recorder.Header().Get(connectorHealthHeader); marker != "1" {
+				t.Fatalf("%s = %q, want 1", connectorHealthHeader, marker)
+			}
 			if recorder.Code != test.wantStatus {
 				t.Fatalf("status = %d, want %d", recorder.Code, test.wantStatus)
 			}
@@ -167,15 +170,21 @@ func TestRunWithConnectorHealthDisabledRunsDirectly(t *testing.T) {
 
 func TestProbeConnectorHealthDistinguishesWrongEndpoint(t *testing.T) {
 	for _, test := range []struct {
-		name      string
-		status    int
-		wantError string
+		name             string
+		status           int
+		connectorRuntime bool
+		wantError        string
 	}{
-		{name: "unready runtime", status: http.StatusServiceUnavailable, wantError: "connector routes are not ready"},
-		{name: "wrong endpoint", status: http.StatusNotFound, wantError: "may not point at a qurl-connector runtime"},
+		{name: "unready runtime", status: http.StatusServiceUnavailable, connectorRuntime: true, wantError: "connector routes are not ready"},
+		{name: "foreign 404", status: http.StatusNotFound, wantError: "did not come from a qurl-connector runtime"},
+		{name: "foreign 204", status: http.StatusNoContent, wantError: "did not come from a qurl-connector runtime"},
+		{name: "foreign 503", status: http.StatusServiceUnavailable, wantError: "did not come from a qurl-connector runtime"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				if test.connectorRuntime {
+					w.Header().Set(connectorHealthHeader, "1")
+				}
 				w.WriteHeader(test.status)
 			}))
 			t.Cleanup(server.Close)

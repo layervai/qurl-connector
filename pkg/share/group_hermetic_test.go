@@ -124,6 +124,9 @@ func TestHermeticSessionGroupServesManyRoutesOnOneAdmission(t *testing.T) {
 		waitServing(routeID, 1)
 		pollHermeticRoute(t, port, "routing-"+routeID+".example.test", "echo-"+routeID, runnerResult)
 	}
+	if !runner.RoutesReady() {
+		t.Fatal("runner did not report ready from the real FRP session route state")
+	}
 	admitter.mu.Lock()
 	admissions := admitter.next
 	admitter.mu.Unlock()

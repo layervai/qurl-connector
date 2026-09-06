@@ -15,6 +15,7 @@ import (
 const (
 	envConnectorHealthAddr = "QURL_CONNECTOR_HEALTH_ADDR"
 	connectorHealthPath    = "/readyz"
+	connectorHealthHeader  = "X-Qurl-Connector-Readyz"
 	connectorHealthTimeout = 750 * time.Millisecond
 )
 
@@ -46,6 +47,7 @@ func connectorHealthAddress() (string, bool, error) {
 func connectorHealthHandler(ready func() bool) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set(connectorHealthHeader, "1")
 		if r.URL.Path != connectorHealthPath {
 			http.NotFound(w, r)
 			return
@@ -132,6 +134,10 @@ func probeConnectorHealth(ctx context.Context) error {
 		return fmt.Errorf("probe Connector readiness: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
+	if resp.Header.Get(connectorHealthHeader) != "1" {
+		return fmt.Errorf("reply from http://%s%s did not come from a qurl-connector runtime; %s may point at another local listener",
+			addr, connectorHealthPath, envConnectorHealthAddr)
+	}
 	if resp.StatusCode == http.StatusServiceUnavailable {
 		return errors.New("connector routes are not ready")
 	}
