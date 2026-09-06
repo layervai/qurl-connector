@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"maps"
 	"sort"
 	"sync"
 	"time"
@@ -539,24 +538,28 @@ func (r *SessionGroupRunner) RouteStates() map[string]RouteState {
 func (r *SessionGroupRunner) RoutesReady() bool {
 	r.mu.Lock()
 	active := r.active
-	desired := maps.Clone(r.desired)
 	r.mu.Unlock()
-	if active == nil || len(desired) == 0 || sessionEnded(active.session) {
+	if active == nil || sessionEnded(active.session) {
 		return false
 	}
 
+	// RouteStates carries each exact GroupRoute generation. ServingRouteIDs is
+	// cheaper, but it cannot distinguish an old serving generation from a
+	// pending restart or local-target change that keeps the same route ID.
 	states := active.session.RouteStates()
-	for routeID := range desired {
-		if state, ok := states[routeID]; !ok || state.Phase != RouteServing {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.active != active || len(r.desired) == 0 || sessionEnded(active.session) {
+		return false
+	}
+	for routeID, route := range r.desired {
+		state, ok := states[routeID]
+		expected := GroupRoute{LocalHTTPRoute: route, Generation: r.restarts[routeID]}
+		if !ok || state.Phase != RouteServing || state.Route != expected {
 			return false
 		}
 	}
-
-	// SetRoutes and promotion can race the session snapshot above. Return true
-	// only if both sources are still the ones that were checked.
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return r.active == active && maps.Equal(r.desired, desired) && !sessionEnded(active.session)
+	return true
 }
 
 // apply pushes the desired set to the live sessions. A session that is being

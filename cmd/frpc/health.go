@@ -85,6 +85,8 @@ func runWithConnectorHealth(ctx context.Context, ready func() bool, run func(con
 	server := &http.Server{
 		Handler:           connectorHealthHandler(ready),
 		ReadHeaderTimeout: time.Second,
+		ReadTimeout:       time.Second,
+		WriteTimeout:      time.Second,
 		IdleTimeout:       time.Second,
 	}
 	runCtx, cancel := context.WithCancelCause(ctx)

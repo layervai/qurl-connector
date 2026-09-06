@@ -335,7 +335,7 @@ func TestRunStatusReadyUsesRuntimeOwnedHealth(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				if r.URL.Path != connectorHealthPath {
-					t.Fatalf("readiness path = %q, want %q", r.URL.Path, connectorHealthPath)
+					t.Errorf("readiness path = %q, want %q", r.URL.Path, connectorHealthPath)
 				}
 				w.WriteHeader(test.status)
 			}))
