@@ -20,7 +20,14 @@ var (
 	// operational paths are reviewed for public source. References into reviewed
 	// public qurl-* repos are excluded separately after this deliberately broad
 	// match.
-	operationalPath = regexp.MustCompile(`(?i)(/qurl-[a-z0-9_.-]+(?:/[a-z0-9_.{}-]+)+)(?:[^A-Za-z0-9_.{}/-]|$)`)
+	operationalPath    = regexp.MustCompile(`(?i)(/qurl-[a-z0-9_.-]+(?:/[a-z0-9_.{}-]+)+)(?:[^A-Za-z0-9_.{}-]|$)`)
+	publicRepositories = map[string]bool{
+		"frp":                    true,
+		"ops-routines-workflows": true,
+		"qurl-conformance":       true,
+		"qurl-connector":         true,
+		"qurl-go":                true,
+	}
 )
 
 func findOperationalPaths(text string) []string {
@@ -48,17 +55,24 @@ func findOperationalPaths(text string) []string {
 func hasPublicRepositoryPrefix(text string, pathStart int) bool {
 	const prefix = "github.com/layervai"
 	prefixStart := pathStart - len(prefix)
-	if prefixStart < 0 || text[prefixStart:pathStart] != prefix {
+	if prefixStart < 0 || !strings.EqualFold(text[prefixStart:pathStart], prefix) {
 		return false
 	}
-	if prefixStart == 0 {
-		return true
+	if prefixStart > 0 {
+		preceding := text[prefixStart-1]
+		if (preceding >= 'a' && preceding <= 'z') ||
+			(preceding >= 'A' && preceding <= 'Z') ||
+			(preceding >= '0' && preceding <= '9') ||
+			preceding == '.' || preceding == '-' {
+			return false
+		}
 	}
-	preceding := text[prefixStart-1]
-	return !((preceding >= 'a' && preceding <= 'z') ||
-		(preceding >= 'A' && preceding <= 'Z') ||
-		(preceding >= '0' && preceding <= '9') ||
-		preceding == '.' || preceding == '-')
+	afterSlash := text[pathStart+1:]
+	separator := strings.IndexByte(afterSlash, '/')
+	if separator < 0 {
+		return false
+	}
+	return publicRepositories[strings.ToLower(afterSlash[:separator])]
 }
 
 func TestOperationalPathDetectorStaysBroaderThanAllowlist(t *testing.T) {
@@ -81,6 +95,10 @@ func TestOperationalPathDetectorStaysBroaderThanAllowlist(t *testing.T) {
 	dynamicPrefix := "/qurl-example-service/" + "nhp/replica-"
 	if got := findOperationalPaths(dynamicPrefix + "{slot}/bootstrap"); len(got) != 1 || got[0] != dynamicPrefix {
 		t.Fatalf("dynamic operational path did not preserve concrete prefix: %q", got)
+	}
+	trailingSlash := "/qurl-example-service/" + "nhp/replica-z/"
+	if got := findOperationalPaths(trailingSlash); len(got) != 1 || got[0] != strings.TrimSuffix(trailingSlash, "/") {
+		t.Fatalf("trailing-slash operational path was not detected: %q", got)
 	}
 	first := "/qurl-example-service/" + "nhp/replica-a/bootstrap"
 	second := "/qurl-example-service/" + "nhp/replica-b/bootstrap"
@@ -138,6 +156,7 @@ func TestOperationalPathDetectorIgnoresRepositoryReferences(t *testing.T) {
 	for _, reference := range []string{
 		"github.com/layervai/qurl-go/relayknock/nativeudp",
 		"https://github.com/layervai/qurl-connector/security/advisories/new",
+		"https://GITHUB.COM/LAYERVAI/qurl-connector/security/advisories/new",
 	} {
 		if got := findOperationalPaths(reference); len(got) != 0 {
 			t.Fatalf("findOperationalPaths(%q) = %q, want repository reference ignored", reference, got)
@@ -151,6 +170,9 @@ func TestOperationalPathDetectorIgnoresRepositoryReferences(t *testing.T) {
 	}
 	if got := findOperationalPaths("evilgithub.com/layervai" + path); len(got) != 1 || got[0] != path {
 		t.Fatalf("lookalike GitHub host bypassed operational path detection: %q", got)
+	}
+	if got := findOperationalPaths("github.com/layervai" + path); len(got) != 1 || got[0] != path {
+		t.Fatalf("unreviewed repository bypassed operational path detection: %q", got)
 	}
 }
 
@@ -193,13 +215,6 @@ func TestPublicSourceContainsNoPrivateOperationalMaterial(t *testing.T) {
 	reservedAccounts := map[string]bool{
 		"111122" + "223333": true,
 		"000000" + "000000": true,
-	}
-	publicRepositories := map[string]bool{
-		"frp":                    true,
-		"ops-routines-workflows": true,
-		"qurl-conformance":       true,
-		"qurl-connector":         true,
-		"qurl-go":                true,
 	}
 	publicHosts := map[string]bool{
 		"api." + "layerv.ai":     true,
