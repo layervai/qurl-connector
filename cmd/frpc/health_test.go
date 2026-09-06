@@ -196,3 +196,26 @@ func TestProbeConnectorHealthDistinguishesWrongEndpoint(t *testing.T) {
 		})
 	}
 }
+
+func TestProbeConnectorHealthRefusesRedirects(t *testing.T) {
+	var followed atomic.Bool
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		followed.Store(true)
+		w.Header().Set(connectorHealthHeader, "1")
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	t.Cleanup(target.Close)
+	redirect := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, target.URL, http.StatusFound)
+	}))
+	t.Cleanup(redirect.Close)
+	t.Setenv(envConnectorHealthAddr, redirect.Listener.Addr().String())
+
+	err := probeConnectorHealth(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "did not come from a qurl-connector runtime") {
+		t.Fatalf("probeConnectorHealth() error = %v, want foreign-listener error", err)
+	}
+	if followed.Load() {
+		t.Fatal("readiness probe followed a redirect away from its loopback listener")
+	}
+}

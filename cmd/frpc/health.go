@@ -129,7 +129,12 @@ func probeConnectorHealth(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("create Connector readiness request: %w", err)
 	}
-	resp, err := http.DefaultClient.Do(req)
+	client := &http.Client{
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		return fmt.Errorf("probe Connector readiness: %w", err)
 	}
