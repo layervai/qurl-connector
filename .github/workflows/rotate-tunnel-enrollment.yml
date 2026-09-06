@@ -29,9 +29,7 @@ concurrency:
   group: rotate-sandbox-tunnel-enrollment-${{ inputs.target }}
   cancel-in-progress: false
 
-permissions:
-  contents: read
-  id-token: write
+permissions: {}
 
 jobs:
   verify-environment:
@@ -87,11 +85,14 @@ jobs:
     # The job timeout is the hard wall-clock cap; socket and process timeouts
     # bound ordinary failures inside it.
     timeout-minutes: 5
+    permissions:
+      contents: read
+      id-token: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: "3.13"
 

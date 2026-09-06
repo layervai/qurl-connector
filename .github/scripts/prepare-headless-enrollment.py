@@ -23,6 +23,10 @@ KEY = re.compile(r"lv_live_[A-Za-z0-9_-]+\Z")
 GENERATION = re.compile(r"[a-z0-9][a-z0-9-]{0,63}\Z")
 SHA256_HEX = re.compile(r"[0-9a-f]{64}\Z")
 AWS_ERROR_CODE = re.compile(r"An error occurred \(([A-Za-z][A-Za-z0-9._-]{0,127})\)")
+AWS_LOCAL_ERROR_CLASSES = {
+    "Unable to locate credentials": "MissingCredentials",
+    "Could not connect to the endpoint URL": "EndpointConnection",
+}
 MAX_RESPONSE_BYTES = 64 * 1024
 API_TIMEOUT_SECONDS = 10
 AWS_TIMEOUT_SECONDS = 30
@@ -86,14 +90,20 @@ class EnrollmentError(RuntimeError):
     pass
 
 
-class APIRequestOutcomeUnknown(EnrollmentError):
-    """The origin might have accepted a request whose result was not usable."""
-
+class APIRequestRetryable(EnrollmentError):
     def __init__(
         self, message: str, *, retry_after_seconds: float | None = None
     ) -> None:
         super().__init__(message)
         self.retry_after_seconds = retry_after_seconds
+
+
+class APIRequestOutcomeUnknown(APIRequestRetryable):
+    """The origin might have accepted a request whose result was not usable."""
+
+
+class APIRequestRejectedRetryable(APIRequestRetryable):
+    """The origin rejected a request that can be retried safely."""
 
 
 class EnrollmentParameterOutcomeUnknown(EnrollmentError):
@@ -169,9 +179,10 @@ def parse_retry_after(value: Any, *, now: dt.datetime | None = None) -> float | 
     retry_after = value.strip()
     if retry_after.isascii() and retry_after.isdecimal():
         # Avoid converting an attacker-controlled integer with arbitrary size.
-        if len(retry_after) > 10:
+        significant = retry_after.lstrip("0") or "0"
+        if len(significant) > 10:
             return float(MAX_MINT_RETRY_AFTER_SECONDS)
-        return float(min(int(retry_after), MAX_MINT_RETRY_AFTER_SECONDS))
+        return float(min(int(significant), MAX_MINT_RETRY_AFTER_SECONDS))
     try:
         retry_at = email.utils.parsedate_to_datetime(retry_after)
     except (TypeError, ValueError, OverflowError):
@@ -239,7 +250,12 @@ def api_request(
             except (OSError, http.client.HTTPException):
                 pass
         message = f"qURL API rejected the {method} request with HTTP {exc.code}"
-        if exc.code in {408, 425, 429} or 500 <= exc.code <= 599:
+        if exc.code in {425, 429}:
+            raise APIRequestRejectedRetryable(
+                message,
+                retry_after_seconds=retry_after_seconds,
+            ) from exc
+        if exc.code == 408 or 500 <= exc.code <= 599:
             raise APIRequestOutcomeUnknown(
                 message,
                 retry_after_seconds=retry_after_seconds,
@@ -306,7 +322,19 @@ def put_parameter(region: str, parameter: str, token: str) -> None:
         ) from exc
     if result.returncode != 0:
         match = AWS_ERROR_CODE.search(result.stderr or "")
-        error_code = f" with {match.group(1)}" if match else ""
+        error_class = (
+            match.group(1)
+            if match
+            else next(
+                (
+                    label
+                    for signature, label in AWS_LOCAL_ERROR_CLASSES.items()
+                    if signature in (result.stderr or "")
+                ),
+                "",
+            )
+        )
+        error_code = f" with {error_class}" if error_class else ""
         raise EnrollmentError(
             f"AWS rejected the enrollment parameter update{error_code} (exit status {result.returncode})"
         )
@@ -331,11 +359,12 @@ def mint_and_install_enrollment(
         "claims": [{"type": "connector", "id": slug}],
         "expires_in": "1h",
     }
-    # The selected target, not only the shared Connector slug, is part of the
-    # idempotency key. Each fixed replica gets a distinct one-hour enrollment
-    # token even when all replicas share one route identity.
+    # POST /v1/api-keys stores each idempotency response atomically with the key
+    # for 24 hours. The selected target keeps every replica on a distinct
+    # one-hour enrollment operation even when replicas share one route.
     mint_idempotency_key = f"headless-v2-{generation}-{target}"
     mint_failure: EnrollmentError | None = None
+    mint_outcome_unknown = False
     for attempt in range(2):
         try:
             credential = api_request(
@@ -350,8 +379,11 @@ def mint_and_install_enrollment(
                 expected_status=(200, 201),
             )
             break
-        except APIRequestOutcomeUnknown as exc:
+        except APIRequestRetryable as exc:
             mint_failure = exc
+            mint_outcome_unknown = mint_outcome_unknown or isinstance(
+                exc, APIRequestOutcomeUnknown
+            )
             if attempt == 0:
                 retry_delay = (
                     exc.retry_after_seconds
@@ -360,6 +392,10 @@ def mint_and_install_enrollment(
                 )
                 time.sleep(min(max(retry_delay, 0.0), MAX_MINT_RETRY_AFTER_SECONDS))
     else:
+        if not mint_outcome_unknown:
+            raise EnrollmentError(
+                "enrollment credential request was rejected after one bounded retry"
+            ) from mint_failure
         raise EnrollmentError(
             "enrollment credential result is unknown; retry the same target and generation to recover the exact operation"
         ) from mint_failure
@@ -457,20 +493,52 @@ def prepare_enrollment(
         # replica can enroll only while sharing is on, and restoring off would
         # invalidate the enrollment that this operation prepares.
         put_failure: EnrollmentError | None = None
-        try:
-            api_request(
-                api_endpoint,
-                api_key,
-                resource_path + "/sharing",
-                method="PUT",
-                body={"desired_state": "on"},
-            )
-            sharing_enabled_by_this_run = True
-        except APIRequestOutcomeUnknown as exc:
-            # The server can apply the PUT before the response is lost. The GET
-            # below decides whether it is safe to continue and keeps retries
-            # possible when the mutation did not land.
-            put_failure = exc
+        last_put_rejection: EnrollmentError | None = None
+        for attempt in range(2):
+            try:
+                api_request(
+                    api_endpoint,
+                    api_key,
+                    resource_path + "/sharing",
+                    method="PUT",
+                    body={"desired_state": "on"},
+                )
+                sharing_enabled_by_this_run = True
+                break
+            except APIRequestOutcomeUnknown as exc:
+                # The server can apply the PUT before the response is lost. A
+                # Retry-After response permits one bounded idempotent re-PUT;
+                # the GET below resolves all other unknown outcomes.
+                put_failure = exc
+                retry_put = exc.retry_after_seconds is not None
+                retry_delay = exc.retry_after_seconds
+            except APIRequestRejectedRetryable as exc:
+                last_put_rejection = exc
+                retry_put = True
+                retry_delay = exc.retry_after_seconds
+            except EnrollmentError as exc:
+                if put_failure is None:
+                    raise
+                last_put_rejection = exc
+                break
+            if attempt == 0 and retry_put:
+                time.sleep(
+                    min(
+                        max(
+                            retry_delay
+                            if retry_delay is not None
+                            else MINT_RETRY_SECONDS,
+                            0.0,
+                        ),
+                        MAX_MINT_RETRY_AFTER_SECONDS,
+                    )
+                )
+                continue
+            break
+        if not sharing_enabled_by_this_run and put_failure is None:
+            raise EnrollmentError(
+                "sharing update was rejected after one bounded retry"
+            ) from last_put_rejection
         minimum_epoch = serving_epoch + 1
         last_poll_failure: EnrollmentError | None = None
         for attempt in range(SHARING_POLL_ATTEMPTS):

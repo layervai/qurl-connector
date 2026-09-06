@@ -14,6 +14,7 @@ from unittest import mock
 
 SCRIPT = pathlib.Path(__file__).with_name("prepare-headless-enrollment.py")
 WORKFLOW = SCRIPT.parent.parent / "workflows" / "rotate-tunnel-enrollment.yml"
+SANITIZER = SCRIPT.with_name("public_source_sanitization_test.go")
 SPEC = importlib.util.spec_from_file_location("prepare_headless_enrollment", SCRIPT)
 assert SPEC is not None and SPEC.loader is not None
 MODULE = importlib.util.module_from_spec(SPEC)
@@ -87,6 +88,12 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
         verify_permissions = workflow[verify_job:rotate_job]
         self.assertIn("permissions:\n      actions: read", verify_permissions)
         self.assertNotIn("contents: read", verify_permissions)
+        self.assertIn("permissions: {}\n\njobs:", workflow)
+        rotate_permissions = workflow[rotate_job:preflight]
+        self.assertIn(
+            "permissions:\n      contents: read\n      id-token: write",
+            rotate_permissions,
+        )
         self.assertIn('"$GITHUB_REF" != "refs/heads/main"', workflow)
         self.assertIn(
             'gh api "repos/${GITHUB_REPOSITORY}/environments/sandbox"', workflow
@@ -142,6 +149,14 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
     def test_every_target_has_a_distinct_parameter(self) -> None:
         parameters = [parameter for _slug, parameter in MODULE.TARGETS.values()]
         self.assertEqual(len(parameters), len(set(parameters)))
+
+        allowlist = re.search(
+            r"(?s)reviewedOperationalPaths := map\[string\]bool\{(.*?)\n\t\}",
+            SANITIZER.read_text(),
+        )
+        self.assertIsNotNone(allowlist)
+        reviewed = set(re.findall(r'"(/[^"]+)":\s+true', allowlist.group(1)))
+        self.assertEqual(reviewed, set(parameters))
 
     def test_inputs_allow_only_reviewed_target_generation_and_region(self) -> None:
         MODULE.validate_inputs("fileviewer-nhp-replica-a", "attempt-1", "us-east-2")
@@ -329,8 +344,10 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
                 )
         self.assertNotIn(resource_id, str(raised.exception))
 
-    def test_api_request_marks_retryable_status_as_unknown_outcome(self) -> None:
-        for status in (408, 425, 429, 503):
+    def test_api_request_distinguishes_unknown_from_retryable_rejection(
+        self,
+    ) -> None:
+        for status in (408, 503):
             with self.subTest(status=status):
                 error_body = mock.Mock()
                 error_body.read.return_value = b""
@@ -354,6 +371,30 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
                             "/v1/api-keys",
                             method="POST",
                         )
+        for status in (425, 429):
+            with self.subTest(status=status):
+                error_body = mock.Mock()
+                error_body.read.return_value = b""
+                rejected = MODULE.urllib.error.HTTPError(
+                    "https://api.example.com/v1/api-keys",
+                    status,
+                    "Retryable",
+                    {},
+                    error_body,
+                )
+                with mock.patch.object(
+                    MODULE.NO_REDIRECT_OPENER, "open", side_effect=rejected
+                ):
+                    with self.assertRaisesRegex(
+                        MODULE.APIRequestRejectedRetryable,
+                        f"rejected the POST request with HTTP {status}",
+                    ):
+                        MODULE.api_request(
+                            "https://api.example.com",
+                            "lv_live_account-key",
+                            "/v1/api-keys",
+                            method="POST",
+                        )
 
     def test_api_request_preserves_bounded_retry_after_on_unknown_outcome(
         self,
@@ -368,7 +409,7 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
             error_body,
         )
         with mock.patch.object(MODULE.NO_REDIRECT_OPENER, "open", side_effect=rejected):
-            with self.assertRaises(MODULE.APIRequestOutcomeUnknown) as raised:
+            with self.assertRaises(MODULE.APIRequestRejectedRetryable) as raised:
                 MODULE.api_request(
                     "https://api.example.com",
                     "lv_live_account-key",
@@ -399,13 +440,12 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
                             "/v1/api-keys",
                             method="POST",
                         )
-                self.assertNotIsInstance(
-                    raised.exception, MODULE.APIRequestOutcomeUnknown
-                )
+                self.assertNotIsInstance(raised.exception, MODULE.APIRequestRetryable)
 
     def test_retry_after_parser_accepts_http_date_and_bounds_wait(self) -> None:
         now = dt.datetime(2026, 9, 4, 18, 0, tzinfo=dt.timezone.utc)
         self.assertEqual(MODULE.parse_retry_after("12", now=now), 12)
+        self.assertEqual(MODULE.parse_retry_after("00000000005", now=now), 5)
         self.assertEqual(
             MODULE.parse_retry_after("999999999999999999999", now=now),
             MODULE.MAX_MINT_RETRY_AFTER_SECONDS,
@@ -774,6 +814,41 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
         self.assertNotIn("unknown", str(raised.exception))
         put.assert_not_called()
 
+    def test_mint_retryable_rejection_is_bounded_and_not_called_unknown(self) -> None:
+        responses = [
+            [
+                {
+                    "slug": "detect-sandbox",
+                    "type": "tunnel",
+                    "status": "active",
+                    "resource_id": "r_one",
+                }
+            ],
+            {"desired_state": "on", "serving_epoch": 1},
+            MODULE.APIRequestRejectedRetryable("HTTP 429"),
+            MODULE.APIRequestRejectedRetryable("HTTP 429"),
+        ]
+        with (
+            mock.patch.object(MODULE, "api_request", side_effect=responses) as request,
+            mock.patch.object(MODULE, "put_parameter") as put,
+            mock.patch.object(MODULE.time, "sleep") as sleep,
+        ):
+            with self.assertRaisesRegex(
+                MODULE.EnrollmentError, "rejected after one bounded retry"
+            ) as raised:
+                MODULE.prepare_enrollment(
+                    "https://api.example.com",
+                    "lv_live_account-key",
+                    "detect-nhp-replica-a",
+                    "attempt-1",
+                    "us-east-2",
+                    now=FIXED_NOW,
+                )
+        self.assertEqual(request.call_count, 4)
+        self.assertNotIn("unknown", str(raised.exception))
+        sleep.assert_called_once_with(MODULE.MINT_RETRY_SECONDS)
+        put.assert_not_called()
+
     def test_later_failure_reports_sharing_enabled_by_this_run(self) -> None:
         responses = [
             [
@@ -1101,6 +1176,83 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
         self.assertEqual(request.call_count, 3)
         self.assertNotIn("may have been applied", str(raised.exception))
         sleep.assert_not_called()
+        put.assert_not_called()
+
+    def test_retryable_put_rejection_retries_once_and_confirms_epoch(self) -> None:
+        responses = [
+            [
+                {
+                    "slug": "detect-sandbox",
+                    "type": "tunnel",
+                    "status": "active",
+                    "resource_id": "MFkw-resource",
+                }
+            ],
+            {"desired_state": "off", "serving_epoch": 0},
+            MODULE.APIRequestRejectedRetryable("HTTP 429", retry_after_seconds=17),
+            {"desired_state": "on", "serving_epoch": 1},
+            {"desired_state": "on", "serving_epoch": 1},
+            {
+                "kind": "enrollment_token",
+                "target": "agent",
+                "claims": [{"type": "connector", "id": "detect-sandbox"}],
+                "api_key": "lv_live_test-token",
+                "expires_at": VALID_EXPIRY,
+            },
+        ]
+        with (
+            mock.patch.object(MODULE, "api_request", side_effect=responses) as request,
+            mock.patch.object(MODULE, "put_parameter") as put,
+            mock.patch.object(MODULE.time, "sleep") as sleep,
+        ):
+            MODULE.prepare_enrollment(
+                "https://api.example.com",
+                "lv_live_account-key",
+                "detect-nhp-replica-a",
+                "attempt-1",
+                "us-east-2",
+                now=FIXED_NOW,
+            )
+        self.assertEqual(request.call_count, 6)
+        self.assertEqual(request.call_args_list[2], request.call_args_list[3])
+        sleep.assert_called_once_with(17)
+        put.assert_called_once()
+
+    def test_retryable_put_rejection_stops_after_one_retry_without_polling(
+        self,
+    ) -> None:
+        responses = [
+            [
+                {
+                    "slug": "detect-sandbox",
+                    "type": "tunnel",
+                    "status": "active",
+                    "resource_id": "MFkw-resource",
+                }
+            ],
+            {"desired_state": "off", "serving_epoch": 0},
+            MODULE.APIRequestRejectedRetryable("HTTP 429"),
+            MODULE.APIRequestRejectedRetryable("HTTP 429"),
+        ]
+        with (
+            mock.patch.object(MODULE, "api_request", side_effect=responses) as request,
+            mock.patch.object(MODULE, "put_parameter") as put,
+            mock.patch.object(MODULE.time, "sleep") as sleep,
+        ):
+            with self.assertRaisesRegex(
+                MODULE.EnrollmentError, "rejected after one bounded retry"
+            ) as raised:
+                MODULE.prepare_enrollment(
+                    "https://api.example.com",
+                    "lv_live_account-key",
+                    "detect-nhp-replica-a",
+                    "attempt-1",
+                    "us-east-2",
+                    now=FIXED_NOW,
+                )
+        self.assertEqual(request.call_count, 4)
+        self.assertNotIn("may have been applied", str(raised.exception))
+        sleep.assert_called_once_with(MODULE.MINT_RETRY_SECONDS)
         put.assert_not_called()
 
     def test_lost_put_and_poll_responses_warn_that_sharing_may_be_on(self) -> None:
@@ -1558,6 +1710,20 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
         with mock.patch.object(MODULE.subprocess, "run", return_value=completed):
             with self.assertRaisesRegex(
                 MODULE.EnrollmentError, "AccessDeniedException"
+            ) as raised:
+                MODULE.put_parameter(
+                    "us-east-2", "/reviewed/name", "lv_live_secret-token"
+                )
+        self.assertNotIn("lv_live_secret-token", str(raised.exception))
+
+    def test_put_parameter_classifies_safe_local_aws_failure(self) -> None:
+        completed = mock.Mock(
+            returncode=255,
+            stderr="Unable to locate credentials for lv_live_secret-token",
+        )
+        with mock.patch.object(MODULE.subprocess, "run", return_value=completed):
+            with self.assertRaisesRegex(
+                MODULE.EnrollmentError, "MissingCredentials"
             ) as raised:
                 MODULE.put_parameter(
                     "us-east-2", "/reviewed/name", "lv_live_secret-token"

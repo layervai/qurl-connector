@@ -156,7 +156,7 @@ func TestPublicSourceContainsNoPrivateOperationalMaterial(t *testing.T) {
 		}
 		if entry.IsDir() {
 			switch filepath.ToSlash(rel) {
-			case ".git", "bin", ".github/scripts/__pycache__", ".github/scripts/.ruff_cache":
+			case ".git", "bin", ".github/scripts/__pycache__":
 				return filepath.SkipDir
 			}
 			return nil
