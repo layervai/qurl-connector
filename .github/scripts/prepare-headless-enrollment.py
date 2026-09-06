@@ -336,6 +336,17 @@ def put_parameter(region: str, parameter: str, token: str) -> None:
     clean_env.pop("AWS_ENDPOINT_URL_SSM", None)
     clean_env.pop("AWS_ENDPOINT_URL_STS", None)
     clean_env.pop("AWS_CA_BUNDLE", None)
+    for proxy_variable in (
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "NO_PROXY",
+        "ALL_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "no_proxy",
+        "all_proxy",
+    ):
+        clean_env.pop(proxy_variable, None)
     clean_env["AWS_CONFIG_FILE"] = os.devnull
     clean_env["AWS_SHARED_CREDENTIALS_FILE"] = os.devnull
     clean_env["AWS_CLI_FILE_ENCODING"] = "utf-8"
@@ -523,6 +534,9 @@ def prepare_enrollment(
     *,
     now: dt.datetime | None = None,
 ) -> None:
+    # The caller supplies one pre-provisioned qURL API key. Reuse it for the
+    # complete bounded operation; this tool does not perform an OAuth or Auth0
+    # client-credentials exchange per request or per resource.
     slug, parameter = TARGETS[target]
     # Pre-mint reads fail immediately; rerunning them cannot create state.
     resources = api_request(
@@ -648,10 +662,8 @@ def prepare_enrollment(
             observed_epoch = (
                 sharing.get("serving_epoch") if isinstance(sharing, dict) else None
             )
-            sharing_observed_on = (
-                sharing_observed_on
-                or isinstance(sharing, dict)
-                and sharing.get("desired_state") == "on"
+            sharing_observed_on = sharing_observed_on or (
+                isinstance(sharing, dict) and sharing.get("desired_state") == "on"
             )
             if (
                 isinstance(observed_epoch, int)
@@ -702,7 +714,11 @@ def prepare_enrollment(
             ) from exc
         raise
     if mint_warning:
-        print(f"warning: {mint_warning}", file=sys.stderr)
+        print(f"::warning::{mint_warning}", file=sys.stderr)
+    if sharing_enabled_by_this_run:
+        print(
+            f"sharing for {target} was enabled by this run and was deliberately left on"
+        )
     print(
         f"prepared one-hour enrollment for {target} at serving epoch {observed_epoch}; "
         f"expires {expiry.isoformat()}"

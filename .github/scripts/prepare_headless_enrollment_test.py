@@ -91,7 +91,8 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
         self.assertLess(preflight, aws)
         self.assertLess(aws, aws_cli)
         self.assertLess(aws_cli, prepare)
-        self.assertIn("grep -Eq '^aws-cli/2\\.'", workflow)
+        self.assertIn("aws_version=$(aws --version 2>&1)", workflow)
+        self.assertIn('[[ ! "$aws_version" =~ ^aws-cli/2\\. ]]', workflow)
         self.assertIn("needs: verify-environment", workflow)
         verify_permissions = workflow[verify_job:rotate_job]
         self.assertIn("permissions:\n      actions: read", verify_permissions)
@@ -593,10 +594,22 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
             "/qurl-s3-connector/detect-nhp/replica-a/bootstrap",
             "lv_live_test-token",
         )
-        output.assert_called_once_with(
-            "prepared one-hour enrollment for detect-nhp-replica-a at serving epoch 1; "
-            "expires 2026-09-04T19:00:00+00:00"
+        self.assertEqual(
+            {call.args[1] for call in request.call_args_list},
+            {"lv_live_account-key"},
         )
+        output.assert_has_calls(
+            [
+                mock.call(
+                    "sharing for detect-nhp-replica-a was enabled by this run and was deliberately left on"
+                ),
+                mock.call(
+                    "prepared one-hour enrollment for detect-nhp-replica-a at serving epoch 1; "
+                    "expires 2026-09-04T19:00:00+00:00"
+                ),
+            ]
+        )
+        self.assertEqual(output.call_count, 2)
 
     def test_prepare_prints_possible_extra_credential_warning(self) -> None:
         responses = [
@@ -633,7 +646,7 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
         output.assert_has_calls(
             [
                 mock.call(
-                    "warning: installed credential key_abc123def456, but another may remain live",
+                    "::warning::installed credential key_abc123def456, but another may remain live",
                     file=MODULE.sys.stderr,
                 ),
                 mock.call(
@@ -642,6 +655,7 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
                 ),
             ]
         )
+        self.assertEqual(output.call_count, 2)
 
     def test_resource_resolution_guards_never_mint_or_write(self) -> None:
         cases = (
@@ -1920,6 +1934,14 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
             "AWS_ENDPOINT_URL_SSM": "https://private.example.com/ssm",
             "AWS_ENDPOINT_URL_STS": "https://private.example.com/sts",
             "AWS_CA_BUNDLE": "/tmp/private-ca.pem",
+            "HTTP_PROXY": "http://proxy.example.com",
+            "HTTPS_PROXY": "https://proxy.example.com",
+            "NO_PROXY": "localhost",
+            "ALL_PROXY": "socks5://proxy.example.com",
+            "http_proxy": "http://lower-proxy.example.com",
+            "https_proxy": "https://lower-proxy.example.com",
+            "no_proxy": "127.0.0.1",
+            "all_proxy": "socks5://lower-proxy.example.com",
             "AWS_CLI_FILE_ENCODING": "utf-16",
             "AWS_CONFIG_FILE": "/tmp/private-config",
             "AWS_SHARED_CREDENTIALS_FILE": "/tmp/private-credentials",
@@ -1945,6 +1967,17 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
         self.assertNotIn("AWS_ENDPOINT_URL_SSM", kwargs["env"])
         self.assertNotIn("AWS_ENDPOINT_URL_STS", kwargs["env"])
         self.assertNotIn("AWS_CA_BUNDLE", kwargs["env"])
+        for proxy_variable in (
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "NO_PROXY",
+            "ALL_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "no_proxy",
+            "all_proxy",
+        ):
+            self.assertNotIn(proxy_variable, kwargs["env"])
         self.assertEqual(kwargs["env"]["AWS_CONFIG_FILE"], MODULE.os.devnull)
         self.assertEqual(
             kwargs["env"]["AWS_SHARED_CREDENTIALS_FILE"], MODULE.os.devnull

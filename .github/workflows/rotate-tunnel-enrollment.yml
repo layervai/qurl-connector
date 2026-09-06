@@ -144,7 +144,8 @@ jobs:
       - name: Require tested AWS CLI major
         run: |
           set -euo pipefail
-          if ! aws --version 2>&1 | grep -Eq '^aws-cli/2\.'; then
+          aws_version=$(aws --version 2>&1)
+          if [[ ! "$aws_version" =~ ^aws-cli/2\. ]]; then
             echo "::error::enrollment recovery requires AWS CLI v2"
             exit 1
           fi
