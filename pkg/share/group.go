@@ -889,6 +889,11 @@ func (r *SessionGroupRunner) promote(ctx context.Context, cycle *groupCycle) {
 	r.rotating = false
 	r.reported = make(map[string]string)
 	r.mu.Unlock()
+	// A failed apply on the prior session can leave divergence latched while
+	// that session ends. Confirm the current desired set on the new active
+	// session before readiness can recover. This uses the existing session and
+	// does not admit, knock, or create another control session.
+	r.healDivergence(ctx)
 	if r.cfg.OnServing != nil {
 		r.cfg.OnServing(cycle.admission)
 	}

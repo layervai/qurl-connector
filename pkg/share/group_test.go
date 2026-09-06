@@ -713,6 +713,29 @@ func TestSessionGroupRunnerRoutesReadyFailsClosedUntilRemovalConverges(t *testin
 	}
 }
 
+func TestSessionGroupRunnerPromotionConfirmsPriorDivergence(t *testing.T) {
+	route := groupTestRoutes("a")[0]
+	session := &fakeGroupSession{
+		routes: map[string]RouteState{
+			"a": {Route: GroupRoute{LocalHTTPRoute: route}, ProxyName: "a-nhp2", Phase: RouteServing},
+		},
+		done: make(chan struct{}),
+	}
+	runner := &SessionGroupRunner{
+		desired:   map[string]LocalHTTPRoute{"a": route},
+		restarts:  map[string]uint64{},
+		divergent: true,
+	}
+
+	runner.promote(context.Background(), &groupCycle{session: session})
+	if !runner.RoutesReady() {
+		t.Fatal("new active session confirmed the desired set but prior divergence stayed latched")
+	}
+	if got := len(session.updates); got != 1 {
+		t.Fatalf("promotion confirmation updates = %d, want one existing-session apply", got)
+	}
+}
+
 func TestSessionGroupRunnerReturnsWhenEveryRouteIsGone(t *testing.T) {
 	h := startGroupHarness(t, time.Hour, 0, nil, "a", "b", "c")
 	h.waitServing(t, 1, "a", "b", "c")
