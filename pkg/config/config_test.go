@@ -59,6 +59,7 @@ func TestLoadAcceptsAndDropsRetiredGeneratedFields(t *testing.T) {
 server:
   addr: frp.example
   public_domain: qurl.site
+  replica_discriminator: old-replica
   port: 7000
   protocol: websocket
 nhp:
@@ -114,7 +115,7 @@ routes:
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(string(raw), "public_domain:") || strings.Contains(string(raw), "subdomain:") ||
+	if strings.Contains(string(raw), "public_domain:") || strings.Contains(string(raw), "replica_discriminator:") || strings.Contains(string(raw), "subdomain:") ||
 		strings.Contains(string(raw), "load_balancer_group:") || strings.Contains(string(raw), "knock_resource_id:") {
 		t.Fatalf("Save retained retired generated fields:\n%s", raw)
 	}
