@@ -23,7 +23,7 @@ from typing import Any
 KEY = re.compile(r"lv_live_[A-Za-z0-9_-]+\Z")
 GENERATION = re.compile(r"[a-z0-9][a-z0-9-]{0,63}\Z")
 SHA256_HEX = re.compile(r"[0-9a-f]{64}\Z")
-AWS_ERROR_CODE = re.compile(r"An error occurred \(([A-Za-z][A-Za-z0-9._-]{0,127})\)")
+AWS_ERROR_CODE = re.compile(r"An error occurred \(([A-Za-z0-9][A-Za-z0-9._-]{0,127})\)")
 AWS_LOCAL_ERROR_CLASSES = {
     "Unable to locate credentials": "MissingCredentials",
     "Could not connect to the endpoint URL": "EndpointConnection",
@@ -40,6 +40,22 @@ AWS_RETRYABLE_ERROR_CODES = {
     "TooManyUpdates",
 }
 AWS_UNKNOWN_OUTCOME_ERROR_CODES = {"InternalServerError", "ServiceUnavailable"}
+AWS_REJECTED_ERROR_CODES = {
+    "AccessDeniedException",
+    "HierarchyLevelLimitExceededException",
+    "HierarchyTypeMismatchException",
+    "IncompatiblePolicyException",
+    "InvalidAllowedPatternException",
+    "InvalidKeyId",
+    "InvalidPolicyAttributeException",
+    "InvalidPolicyTypeException",
+    "ParameterAlreadyExists",
+    "ParameterLimitExceeded",
+    "ParameterMaxVersionLimitExceeded",
+    "PoliciesLimitExceededException",
+    "UnsupportedOperationException",
+    "ValidationException",
+} | (AWS_RETRYABLE_ERROR_CODES - AWS_UNKNOWN_OUTCOME_ERROR_CODES)
 MAX_RESPONSE_BYTES = 64 * 1024
 API_TIMEOUT_SECONDS = 10
 AWS_TIMEOUT_SECONDS = 30
@@ -231,7 +247,12 @@ def parse_retry_after(value: Any, *, now: dt.datetime | None = None) -> float | 
         significant = retry_after.lstrip("0") or "0"
         if len(significant) > 10:
             return float(MAX_RETRY_AFTER_SECONDS)
-        return float(min(int(significant), MAX_RETRY_AFTER_SECONDS))
+        return float(
+            min(
+                max(int(significant), RETRY_SECONDS),
+                MAX_RETRY_AFTER_SECONDS,
+            )
+        )
     try:
         retry_at = email.utils.parsedate_to_datetime(retry_after)
     except (TypeError, ValueError, OverflowError):
@@ -240,7 +261,10 @@ def parse_retry_after(value: Any, *, now: dt.datetime | None = None) -> float | 
         return None
     current = now or dt.datetime.now(dt.timezone.utc)
     seconds = (retry_at.astimezone(dt.timezone.utc) - current).total_seconds()
-    return min(max(seconds, 0.0), float(MAX_RETRY_AFTER_SECONDS))
+    return min(
+        max(seconds, float(RETRY_SECONDS)),
+        float(MAX_RETRY_AFTER_SECONDS),
+    )
 
 
 def api_request(
@@ -444,13 +468,21 @@ def put_parameter(region: str, parameter: str, token: str) -> None:
         if attempt == 0 and error_class in AWS_RETRYABLE_ERROR_CODES:
             time.sleep(RETRY_SECONDS)
             continue
-        error_code = f" with {error_class}" if error_class else ""
         if error_class in AWS_UNKNOWN_OUTCOME_ERROR_CODES:
             raise EnrollmentParameterOutcomeUnknown(
                 f"AWS returned {error_class} after the enrollment parameter update; the update may have completed"
             )
-        raise EnrollmentError(
-            f"AWS rejected the enrollment parameter update{error_code} (exit status {result.returncode})"
+        if error_class in AWS_REJECTED_ERROR_CODES or error_class in set(
+            AWS_LOCAL_ERROR_CLASSES.values()
+        ):
+            raise EnrollmentError(
+                f"AWS rejected the enrollment parameter update with {error_class} (exit status {result.returncode})"
+            )
+        # An unclassified CLI failure can include a status-only service error,
+        # a connection reset after SSM committed, or an unparseable response.
+        # Do not expose stderr and do not tell the operator the write was rejected.
+        raise EnrollmentParameterOutcomeUnknown(
+            "AWS returned an unclassified failure after the enrollment parameter update; the update may have completed"
         )
 
 
@@ -642,6 +674,7 @@ def prepare_enrollment(
         )
 
     observed_epoch = serving_epoch
+    sharing_idempotency_key = f"headless-sharing-v2-{generation}-{target}"
     sharing_transition_observed = False
     sharing_observed_on = False
     if desired_state == "off":
@@ -663,6 +696,7 @@ def prepare_enrollment(
                     resource_path + "/sharing",
                     method="PUT",
                     body={"desired_state": "on"},
+                    idempotency_key=sharing_idempotency_key,
                 )
                 sharing_transition_observed = True
                 break

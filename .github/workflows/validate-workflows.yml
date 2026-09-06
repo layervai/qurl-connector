@@ -33,6 +33,14 @@ jobs:
         run: |
           python3 -m ruff check --no-cache .github/scripts/prepare-headless-enrollment.py .github/scripts/prepare_headless_enrollment_test.py
           python3 -m ruff format --check --no-cache .github/scripts/prepare-headless-enrollment.py .github/scripts/prepare_headless_enrollment_test.py
+      - name: Require tested AWS CLI major
+        run: |
+          set -euo pipefail
+          aws_version=$(aws --version 2>&1)
+          if [[ ! "$aws_version" =~ ^aws-cli/2\. ]]; then
+            echo "::error::enrollment recovery tests require AWS CLI v2"
+            exit 1
+          fi
       - name: Test sandbox enrollment recovery
         env:
           PYTHONDONTWRITEBYTECODE: "1"

@@ -14,6 +14,7 @@ from unittest import mock
 
 SCRIPT = pathlib.Path(__file__).with_name("prepare-headless-enrollment.py")
 WORKFLOW = SCRIPT.parent.parent / "workflows" / "rotate-tunnel-enrollment.yml"
+VALIDATE_WORKFLOW = SCRIPT.parent.parent / "workflows" / "validate-workflows.yml"
 SANITIZER = SCRIPT.with_name("public_source_sanitization_test.go")
 GITIGNORE = SCRIPT.parent.parent.parent / ".gitignore"
 SPEC = importlib.util.spec_from_file_location("prepare_headless_enrollment", SCRIPT)
@@ -144,26 +145,30 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
             workflow,
         )
         self.assertIn("mask-aws-account-id: true", workflow)
+
+    def test_validation_workflow_requires_tested_aws_cli_major(self) -> None:
+        workflow = VALIDATE_WORKFLOW.read_text()
+        require_cli = workflow.index("- name: Require tested AWS CLI major")
+        contract_test = workflow.index("- name: Test sandbox enrollment recovery")
+        self.assertLess(require_cli, contract_test)
+        self.assertIn("aws_version=$(aws --version 2>&1)", workflow)
+        self.assertIn('[[ ! "$aws_version" =~ ^aws-cli/2\\. ]]', workflow)
         self.assertGreaterEqual(workflow.count("actions/setup-python@"), 1)
         self.assertIn('python-version: "3.13"', workflow)
-
-        validation_workflow = (
-            SCRIPT.parent.parent / "workflows" / "validate-workflows.yml"
-        ).read_text()
-        self.assertIn("pip install --require-hashes", validation_workflow)
-        self.assertIn("ruff check --no-cache", validation_workflow)
-        self.assertIn("ruff format --check --no-cache", validation_workflow)
+        self.assertIn("pip install --require-hashes", workflow)
+        self.assertIn("ruff check --no-cache", workflow)
+        self.assertIn("ruff format --check --no-cache", workflow)
         self.assertIn(
             "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1\n"
             "        with:\n"
             "          persist-credentials: false",
-            validation_workflow,
+            workflow,
         )
         self.assertIn(
             "run: python3 .github/scripts/prepare_headless_enrollment_test.py",
-            validation_workflow,
+            workflow,
         )
-        self.assertNotIn("unittest discover", validation_workflow)
+        self.assertNotIn("unittest discover", workflow)
         requirements = (SCRIPT.parent / "requirements-lint.txt").read_text()
         self.assertRegex(
             requirements, r"ruff==0\.15\.8.*\\\n\s+--hash=sha256:[0-9a-f]{64}"
@@ -523,8 +528,9 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
         )
         self.assertEqual(
             MODULE.parse_retry_after("Fri, 04 Sep 2026 17:59:59 GMT", now=now),
-            0,
+            MODULE.RETRY_SECONDS,
         )
+        self.assertEqual(MODULE.parse_retry_after("0", now=now), MODULE.RETRY_SECONDS)
         for value in (None, "", "1.5", "not-a-date"):
             with self.subTest(value=value):
                 self.assertIsNone(MODULE.parse_retry_after(value, now=now))
@@ -593,6 +599,10 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
         self.assertEqual(request.call_count, 5)
         self.assertEqual(
             request.call_args_list[2].kwargs["body"], {"desired_state": "on"}
+        )
+        self.assertEqual(
+            request.call_args_list[2].kwargs["idempotency_key"],
+            "headless-sharing-v2-attempt-1-detect-nhp-replica-a",
         )
         self.assertEqual(
             request.call_args_list[3].args[2], "/v1/resources/MFkw-resource/sharing"
@@ -2333,20 +2343,27 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
                 self.assertNotIn("lv_live_secret-token", rendered)
                 self.assertNotIn("private.example.com", rendered)
 
-    def test_put_parameter_discards_unclassified_aws_stderr(self) -> None:
-        completed = mock.Mock(
-            returncode=255,
-            stderr="unknown failure at private.example.com with lv_live_secret-token",
-        )
-        with mock.patch.object(MODULE.subprocess, "run", return_value=completed):
-            with self.assertRaises(MODULE.EnrollmentError) as raised:
-                MODULE.put_parameter(
-                    "us-east-2", "/reviewed/name", "lv_live_secret-token"
-                )
-        self.assertEqual(
-            str(raised.exception),
-            "AWS rejected the enrollment parameter update (exit status 255)",
-        )
+    def test_put_parameter_preserves_unclassified_aws_outcome(self) -> None:
+        for stderr in (
+            "An error occurred (500) when calling the PutParameter operation",
+            "Connection was closed before we received a valid response from endpoint URL: private.example.com with lv_live_secret-token",
+            "unknown failure at private.example.com with lv_live_secret-token",
+        ):
+            with self.subTest(stderr=stderr):
+                completed = mock.Mock(returncode=255, stderr=stderr)
+                with mock.patch.object(
+                    MODULE.subprocess, "run", return_value=completed
+                ):
+                    with self.assertRaisesRegex(
+                        MODULE.EnrollmentParameterOutcomeUnknown,
+                        "unclassified failure.*may have completed",
+                    ) as raised:
+                        MODULE.put_parameter(
+                            "us-east-2", "/reviewed/name", "lv_live_secret-token"
+                        )
+                rendered = str(raised.exception)
+                self.assertNotIn("lv_live_secret-token", rendered)
+                self.assertNotIn("private.example.com", rendered)
 
     def test_fixed_replicas_share_route_slug_but_not_token_or_parameter(self) -> None:
         resource = [
