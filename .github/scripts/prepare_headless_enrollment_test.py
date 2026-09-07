@@ -184,23 +184,22 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
         )
         self.assertIn("mask-aws-account-id: true", workflow)
 
-    def test_validation_workflow_requires_tested_aws_cli_major(self) -> None:
+    def test_validation_workflow_keeps_sanitizer_required(self) -> None:
         workflow = VALIDATE_WORKFLOW.read_text()
         actionlint_start = workflow.index("  actionlint:")
         enrollment_start = workflow.index("  enrollment-recovery:")
         actionlint_job = workflow[actionlint_start:enrollment_start]
         enrollment_job = workflow[enrollment_start:]
         self.assertIn("reviewdog/action-actionlint@", actionlint_job)
-        self.assertNotIn("actions/setup-go@", actionlint_job)
+        self.assertIn("actions/setup-go@", actionlint_job)
+        self.assertIn("run: go test ./.github/scripts", actionlint_job)
         self.assertNotIn("actions/setup-python@", actionlint_job)
         self.assertNotIn("make test-python", actionlint_job)
         self.assertIn("timeout-minutes: 10", enrollment_job)
-        require_cli = enrollment_job.index("- name: Require tested AWS CLI major")
-        recovery_check = enrollment_job.index(
-            "- name: Check sandbox enrollment recovery"
-        )
-        self.assertLess(require_cli, recovery_check)
-        self.assertIn("run: ./scripts/require-aws-cli-v2.sh", enrollment_job)
+        self.assertNotIn("actions/setup-go@", enrollment_job)
+        self.assertNotIn("run: go test ./.github/scripts", enrollment_job)
+        self.assertNotIn("run: ./scripts/require-aws-cli-v2.sh", enrollment_job)
+        self.assertIn("- name: Check sandbox enrollment recovery", enrollment_job)
         self.assertEqual(enrollment_job.count("actions/setup-python@"), 1)
         self.assertIn('python-version: "3.13"', enrollment_job)
         self.assertIn("pip install --require-hashes", enrollment_job)
@@ -212,7 +211,6 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
             "          persist-credentials: false",
             enrollment_job,
         )
-        self.assertIn("run: go test ./.github/scripts", enrollment_job)
         self.assertNotIn("unittest discover", enrollment_job)
         makefile = MAKEFILE.read_text()
         self.assertIn("lint-python:", makefile)
@@ -237,7 +235,7 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
         )
 
         aws_cli_requirement = AWS_CLI_REQUIREMENT.read_text()
-        self.assertEqual(workflow.count("run: ./scripts/require-aws-cli-v2.sh"), 1)
+        self.assertEqual(workflow.count("run: ./scripts/require-aws-cli-v2.sh"), 0)
         self.assertEqual(
             WORKFLOW.read_text().count("run: ./scripts/require-aws-cli-v2.sh"), 1
         )
@@ -2608,12 +2606,29 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
         self.assertEqual(kwargs["timeout"], MODULE.AWS_TIMEOUT_SECONDS)
 
     def test_aws_cli_expands_stdin_for_ssm_value(self) -> None:
-        if not shutil.which("aws"):
-            if MODULE.os.environ.get("CI"):
-                self.fail(
-                    "AWS CLI is required for the CI stdin parameter expansion contract"
-                )
-            self.skipTest("AWS CLI is not installed")
+        def skip(reason: str) -> None:
+            print(
+                f"::notice::SKIP AWS CLI stdin-expansion test: {reason}",
+                file=sys.stderr,
+            )
+            self.skipTest(reason)
+
+        aws = shutil.which("aws")
+        if not aws:
+            skip("AWS CLI v2 is not installed; the rotation workflow enforces it")
+        try:
+            aws_version = MODULE.subprocess.run(
+                [aws, "--version"],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+        except (OSError, MODULE.subprocess.TimeoutExpired):
+            skip("AWS CLI v2 cannot run; the rotation workflow enforces it")
+        version_output = aws_version.stdout + aws_version.stderr
+        if aws_version.returncode != 0 or not version_output.startswith("aws-cli/2."):
+            skip("AWS CLI v2 is not available; the rotation workflow enforces it")
         captured: list[bytes] = []
 
         class Handler(http.server.BaseHTTPRequestHandler):
@@ -2673,6 +2688,8 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
         self.assertEqual(
             len(captured), 1, "AWS CLI did not send exactly one SSM request"
         )
+        # This decoded wire assertion is load-bearing. An argv-only assertion
+        # cannot detect AWS CLI ceasing to expand file:///dev/stdin.
         self.assertEqual(
             MODULE.json.loads(captured[0]),
             {

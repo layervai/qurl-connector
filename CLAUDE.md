@@ -40,8 +40,10 @@ PYTHON="$qurl_lint_venv/bin/python" make check-python
 )
 ```
 
-The Python check requires Python 3.13 with `venv` support and AWS CLI v2. On
-Debian or Ubuntu, install the matching `python3.13-venv` package first.
+The Python check requires Python 3.13 with `venv` support. On Debian or Ubuntu,
+install the matching `python3.13-venv` package first. Its AWS CLI stdin test runs
+when AWS CLI v2 is available and skips explicitly otherwise; the manual rotation
+workflow always requires AWS CLI v2.
 
 Tests in this public repository are hermetic. Do not add credentials, private
 endpoints, cloud account identifiers, customer data, or live rollout evidence.

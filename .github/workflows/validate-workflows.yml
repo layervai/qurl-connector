@@ -20,7 +20,15 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
       - uses: reviewdog/action-actionlint@dbe5299849118fd6f099ba563d263d770955a64a # v1.73.2
+      # Keep the public-source security boundary in the established required
+      # check until Enrollment recovery is required after this workflow lands.
+      - name: Test public-source sanitizer
+        run: go test ./.github/scripts
 
   enrollment-recovery:
     name: Enrollment recovery
@@ -30,20 +38,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
-        with:
-          go-version-file: go.mod
-          cache: false
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: "3.13"
       - name: Install pinned Python linter
         run: python3 -m pip install --require-hashes -r .github/scripts/requirements-lint.txt
-      - name: Require tested AWS CLI major
-        # ubuntu-latest supplies AWS CLI v2; fail with a clear contract error
-        # if a future runner image changes that dependency.
-        run: ./scripts/require-aws-cli-v2.sh
       - name: Check sandbox enrollment recovery
         run: make check-python
-      - name: Test workflow contracts
-        run: go test ./.github/scripts

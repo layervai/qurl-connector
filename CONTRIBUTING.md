@@ -38,8 +38,11 @@ Use reserved example domains and documentation account IDs in tests and docs.
    make frpc
    ```
 
-   The Python tests require Python 3.13 and AWS CLI v2. On Debian or Ubuntu,
-   install the matching `python3.13-venv` package first.
+   The Python tests require Python 3.13. On Debian or Ubuntu, install the
+   matching `python3.13-venv` package first. The AWS CLI stdin-expansion test
+   runs when AWS CLI v2 is available and reports an explicit skip otherwise.
+   The manual rotation workflow always requires AWS CLI v2 before it requests
+   AWS credentials.
 
 5. Describe user-visible behavior, security impact, and validation in the pull
    request.
@@ -50,6 +53,11 @@ source repository. A manual, fail-closed recovery workflow can live here when
 it is version-bound to this module and contains only reviewed, non-secret fixed
 slot topology. It must not contain a private endpoint, credential, cloud account
 identifier, customer data, or rollout evidence.
+
+The manual recovery also requires the compiled OpenSSL CA file or directory
+from the Python runtime. A missing trust store is a hard stop before the first
+qURL API request. It reports `no compiled TLS trust store is available`, not a
+network failure.
 
 ## Commit messages
 
