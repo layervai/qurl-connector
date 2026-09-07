@@ -33,6 +33,7 @@ AWS_LOCAL_ERROR_CLASSES = {
     "SSL validation failed for": "TLSValidation",
     "usage: aws": "InvalidCLIArguments",
 }
+AWS_LOCAL_ERROR_LABELS = frozenset(AWS_LOCAL_ERROR_CLASSES.values())
 AWS_RETRYABLE_ERROR_CODES = {
     "InternalServerError",
     "RequestLimitExceeded",
@@ -521,7 +522,7 @@ def _put_parameter_command(region: str, parameter: str) -> list[str]:
     ]
 
 
-def put_parameter(region: str, parameter: str, token: str) -> None:
+def _put_parameter(region: str, parameter: str, token: str) -> None:
     clean_env = os.environ.copy()
     # main() already removes these values. Remove them again here so direct
     # library-style calls cannot pass qURL bearer material to the AWS process.
@@ -627,8 +628,9 @@ def put_parameter(region: str, parameter: str, token: str) -> None:
             raise EnrollmentError(
                 f"AWS temporarily rejected the enrollment parameter update with {error_class} after one bounded retry; retrying the same generation is safe"
             )
-        if error_class in AWS_REJECTED_ERROR_CODES or error_class in set(
-            AWS_LOCAL_ERROR_CLASSES.values()
+        if (
+            error_class in AWS_REJECTED_ERROR_CODES
+            or error_class in AWS_LOCAL_ERROR_LABELS
         ):
             raise EnrollmentError(
                 f"AWS rejected the enrollment parameter update with {error_class} (exit status {result.returncode})"
@@ -639,6 +641,18 @@ def put_parameter(region: str, parameter: str, token: str) -> None:
         raise EnrollmentParameterOutcomeUnknown(
             "AWS returned an unclassified failure after the enrollment parameter update; the update may have completed"
         )
+
+
+def put_parameter(region: str, parameter: str, token: str) -> None:
+    try:
+        _put_parameter(region, parameter, token)
+    except EnrollmentDeadlineExceeded as exc:
+        # The POSIX alarm can interrupt the AWS child, response processing, or
+        # retry delay after PutParameter starts. Keep every such outcome
+        # unknown, even when subprocess.run kills the local child.
+        raise EnrollmentParameterOutcomeUnknown(
+            "the internal deadline was reached during the enrollment parameter update; the update may have completed"
+        ) from exc
 
 
 def mint_and_install_enrollment(
@@ -687,6 +701,9 @@ def mint_and_install_enrollment(
                 method="POST",
                 body=mint_body,
                 idempotency_key=mint_idempotency_key,
+                # The outer preflight reserves the complete mint-and-install
+                # path. This request reserves its socket window; the post-mint
+                # guard decides whether SSM can still start safely.
                 # 201 is a new operation. 200 is the byte-exact result from an
                 # idempotent retry after the first response was lost.
                 expected_status=(200, 201),
@@ -1089,7 +1106,7 @@ def prepare_enrollment(
     )
 
 
-def main() -> None:
+def main(*, deadline: float | None = None) -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--target", required=True)
     parser.add_argument("--generation", required=True)
@@ -1108,7 +1125,14 @@ def main() -> None:
         api_endpoint_value, expected_sha256=expected_endpoint_sha256
     )
     validate_inputs(args.target, args.generation, args.region)
-    prepare_enrollment(api_endpoint, api_key, args.target, args.generation, args.region)
+    prepare_enrollment(
+        api_endpoint,
+        api_key,
+        args.target,
+        args.generation,
+        args.region,
+        deadline=deadline,
+    )
 
 
 def format_enrollment_error(exc: EnrollmentError) -> str:
@@ -1132,10 +1156,13 @@ def _raise_script_deadline(_signum: int, _frame: Any) -> None:
 
 
 def run() -> None:
+    # Compute the checkpoint deadline before arming the timer. It can be
+    # slightly earlier than the alarm, but never optimistically later.
+    script_deadline = time.monotonic() + SCRIPT_DEADLINE_SECONDS
     previous_alarm_handler = signal.signal(signal.SIGALRM, _raise_script_deadline)
     signal.setitimer(signal.ITIMER_REAL, SCRIPT_DEADLINE_SECONDS)
     try:
-        main()
+        main(deadline=script_deadline)
     except EnrollmentError as exc:
         print(f"error: {format_enrollment_error(exc)}", file=sys.stderr)
         raise SystemExit(1)

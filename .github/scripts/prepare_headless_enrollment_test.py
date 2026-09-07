@@ -1197,6 +1197,48 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
         self.assertIn("another one-hour credential may remain live", warning)
         put.assert_called_once()
 
+    def test_new_mint_without_safe_id_reports_possible_live_credential(self) -> None:
+        credential = {
+            "kind": "enrollment_token",
+            "target": "agent",
+            "claims": [{"type": "connector", "id": "fileviewer-sandbox"}],
+            "api_key": "lv_live_test-token",
+            "expires_at": VALID_EXPIRY,
+        }
+        attempts: list[object] = [
+            MODULE.APIRequestOutcomeUnknown("response lost"),
+            credential,
+        ]
+
+        def request(*_args: object, **kwargs: object) -> object:
+            result = attempts.pop(0)
+            if isinstance(result, Exception):
+                raise result
+            response_status = kwargs["response_status"]
+            assert isinstance(response_status, list)
+            response_status[:] = [201]
+            return result
+
+        with (
+            mock.patch.object(MODULE, "api_request", side_effect=request),
+            mock.patch.object(MODULE, "put_parameter") as put,
+            mock.patch.object(MODULE.time, "sleep"),
+        ):
+            _expiry, warning = MODULE.mint_and_install_enrollment(
+                "https://api.example.com",
+                "lv_live_account-key",
+                "fileviewer-nhp-replica-a",
+                "attempt-1",
+                "us-east-2",
+                "fileviewer-sandbox",
+                "/reviewed/name",
+                now=FIXED_NOW,
+            )
+        self.assertIn("another one-hour credential may remain live", warning)
+        self.assertIn("installed credential ID is unavailable", warning)
+        self.assertNotIn("key_", warning)
+        put.assert_called_once()
+
     def test_mint_retry_honors_server_delay_with_hard_cap(self) -> None:
         credential = {
             "kind": "enrollment_token",
@@ -1809,6 +1851,44 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
         self.assertNotIn("lv_live_valid-token", str(raised.exception))
         self.assertIn("do not assume the parameter is unchanged", str(raised.exception))
 
+    def test_ssm_alarm_reports_unknown_installation_outcome(self) -> None:
+        credential = {
+            "kind": "enrollment_token",
+            "key_id": "key_abc123def456",
+            "target": "agent",
+            "claims": [{"type": "connector", "id": "fileviewer-sandbox"}],
+            "api_key": "lv_live_valid-token",
+            "expires_at": VALID_EXPIRY,
+        }
+        with (
+            mock.patch.object(MODULE, "api_request", return_value=credential),
+            mock.patch.object(
+                MODULE.subprocess,
+                "run",
+                side_effect=MODULE.EnrollmentDeadlineExceeded("internal deadline"),
+            ),
+        ):
+            with self.assertRaisesRegex(
+                MODULE.EnrollmentError,
+                "credential key_abc123def456 was minted, but its installation outcome is unknown",
+            ) as raised:
+                MODULE.mint_and_install_enrollment(
+                    "https://api.example.com",
+                    "lv_live_account-key",
+                    "fileviewer-nhp-replica-a",
+                    "attempt-1",
+                    "us-east-2",
+                    "fileviewer-sandbox",
+                    "/reviewed/name",
+                    now=FIXED_NOW,
+                )
+        self.assertIsInstance(
+            raised.exception.__cause__, MODULE.EnrollmentParameterOutcomeUnknown
+        )
+        self.assertIn("repeat the idempotent parameter write", str(raised.exception))
+        self.assertNotIn("was minted but not installed", str(raised.exception))
+        self.assertNotIn("lv_live_valid-token", str(raised.exception))
+
     def test_invalid_on_zero_state_never_mints_or_writes(self) -> None:
         responses = [
             [
@@ -2217,6 +2297,16 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
         self.assertNotIn("left on", str(raised.exception))
         put.assert_not_called()
 
+    def test_valid_final_off_suppresses_unknown_update_suffix(self) -> None:
+        message = MODULE.sharing_failure_message(
+            "sharing did not reach the required serving epoch",
+            sharing_transition_observed=False,
+            sharing_observed_on=False,
+            update_outcome_unknown=True,
+            final_poll_state_valid=True,
+        )
+        self.assertEqual(message, "sharing did not reach the required serving epoch")
+
     def test_invalid_poll_payload_preserves_unknown_put_warning(self) -> None:
         responses = [
             [
@@ -2542,6 +2632,7 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
     def test_run_arms_and_cancels_posix_wall_clock_deadline(self) -> None:
         with (
             mock.patch.object(MODULE, "main") as main,
+            mock.patch.object(MODULE.time, "monotonic", return_value=100),
             mock.patch.object(
                 MODULE.signal,
                 "signal",
@@ -2551,7 +2642,7 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
         ):
             MODULE.run()
 
-        main.assert_called_once_with()
+        main.assert_called_once_with(deadline=100 + MODULE.SCRIPT_DEADLINE_SECONDS)
         install_handler.assert_has_calls(
             [
                 mock.call(MODULE.signal.SIGALRM, MODULE._raise_script_deadline),
@@ -2841,6 +2932,7 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
             "fileviewer-nhp-replica-a",
             "attempt-1",
             "us-east-2",
+            deadline=None,
         )
 
     def test_main_rejects_bad_api_key_before_request(self) -> None:
@@ -2926,6 +3018,23 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
                 MODULE.put_parameter(
                     "us-east-2", "/reviewed/name", "lv_live_secret-token"
                 )
+
+    def test_put_parameter_reports_wall_clock_interrupt_as_unknown(self) -> None:
+        with mock.patch.object(
+            MODULE.subprocess,
+            "run",
+            side_effect=MODULE.EnrollmentDeadlineExceeded("internal deadline"),
+        ):
+            with self.assertRaisesRegex(
+                MODULE.EnrollmentParameterOutcomeUnknown,
+                "internal deadline.*update may have completed",
+            ) as raised:
+                MODULE.put_parameter(
+                    "us-east-2", "/reviewed/name", "lv_live_secret-token"
+                )
+        self.assertIsInstance(
+            raised.exception.__cause__, MODULE.EnrollmentDeadlineExceeded
+        )
 
     def test_put_parameter_retries_one_safe_service_rejection(self) -> None:
         throttled = mock.Mock(
