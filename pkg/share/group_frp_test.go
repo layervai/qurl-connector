@@ -679,7 +679,7 @@ func TestInspectRouteStatusMapsExactRejectionTags(t *testing.T) {
 	} {
 		status := &lockedStatusMap{}
 		status.set("a", frpproxy.ProxyPhaseStartErr, test.wire)
-		_, routeErr, fatalErr := inspectRouteStatus(status, "a")
+		_, routeErr, fatalErr, _ := inspectRouteStatus(status, "a")
 		if test.transient {
 			if routeErr == nil || fatalErr != nil {
 				t.Errorf("inspectRouteStatus(%q) = route %v, fatal %v; want a transient route error", test.wire, routeErr, fatalErr)
@@ -1123,5 +1123,28 @@ func TestFRPGroupSessionCeilingAgesOutDurableStartErrors(t *testing.T) {
 	waitForRouteStates(t, session, func(s map[string]RouteState) bool { return phaseOf(s, "a") == RouteServing })
 	if !erroredAt("a").IsZero() {
 		t.Fatalf("registered proxy a still carries a hold stamp: %s", erroredAt("a"))
+	}
+}
+
+func TestFRPGroupSessionReopensAfterControlProxyTableDisappears(t *testing.T) {
+	status := &lockedStatusMap{}
+	session := startTestGroupSession(t, &recordingGroupService{}, status, groupRoutesOf(groupTestRoutes("a")))
+	// An empty initial table is normal while the first registration starts.
+	if err := session.observe(); err != nil {
+		t.Fatal(err)
+	}
+	status.set("a-nhp7", frpproxy.ProxyPhaseRunning, "")
+	waitForRouteStates(t, session, func(states map[string]RouteState) bool { return phaseOf(states, "a") == RouteServing })
+	// The real FRP Manager.Close clears this table on control disconnect.
+	status.mu.Lock()
+	delete(status.items, "a-nhp7")
+	status.mu.Unlock()
+	select {
+	case <-session.Done():
+	case <-time.After(2 * time.Second):
+		t.Fatal("lost control connection kept retrying the stale admission")
+	}
+	if !errors.Is(session.Err(), ErrSessionGroupEnded) {
+		t.Fatalf("error = %v", session.Err())
 	}
 }
