@@ -29,6 +29,10 @@ AWS_ERROR_CODE = re.compile(r"An error occurred \(([A-Za-z0-9][A-Za-z0-9._-]{0,1
 AWS_LOCAL_ERROR_CLASSES = {
     "Unable to locate credentials": "MissingCredentials",
     "Could not connect to the endpoint URL": "EndpointConnection",
+    # The AWS CLI emits this only when the endpoint handshake did not finish,
+    # before it sends the PutParameter request. A read timeout is different:
+    # it can happen after SSM commits and must remain an unknown outcome.
+    "Connect timeout on endpoint URL": "EndpointConnectTimeout",
     "Failed to connect to proxy URL": "ProxyConnection",
     "SSL validation failed for": "TLSValidation",
     "usage: aws": "InvalidCLIArguments",

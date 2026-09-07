@@ -3168,6 +3168,10 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
                 "SSL validation failed for https://private.example.com with lv_live_secret-token",
                 "TLSValidation",
             ),
+            (
+                'Connect timeout on endpoint URL: "https://private.example.com/" with lv_live_secret-token',
+                "EndpointConnectTimeout",
+            ),
         ):
             with self.subTest(expected_class=expected_class):
                 completed = mock.Mock(returncode=255, stderr=stderr)
@@ -3183,6 +3187,23 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
                 rendered = str(raised.exception)
                 self.assertNotIn("lv_live_secret-token", rendered)
                 self.assertNotIn("private.example.com", rendered)
+
+    def test_put_parameter_preserves_read_timeout_as_unknown(self) -> None:
+        completed = mock.Mock(
+            returncode=255,
+            stderr='Read timeout on endpoint URL: "https://private.example.com/" with lv_live_secret-token',
+        )
+        with (
+            mock.patch.object(MODULE.subprocess, "run", return_value=completed),
+            self.assertRaisesRegex(
+                MODULE.EnrollmentParameterOutcomeUnknown,
+                "unclassified failure.*may have completed",
+            ) as raised,
+        ):
+            MODULE.put_parameter("us-east-2", "/reviewed/name", "lv_live_secret-token")
+        rendered = str(raised.exception)
+        self.assertNotIn("lv_live_secret-token", rendered)
+        self.assertNotIn("private.example.com", rendered)
 
     def test_put_parameter_preserves_unclassified_aws_outcome(self) -> None:
         for stderr in (
