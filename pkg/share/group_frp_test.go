@@ -1126,7 +1126,15 @@ func TestFRPGroupSessionCeilingAgesOutDurableStartErrors(t *testing.T) {
 	}
 }
 
+func withControlRecoveryGrace(t *testing.T) {
+	t.Helper()
+	previous := groupControlRecoveryGrace
+	groupControlRecoveryGrace = 3 * time.Second
+	t.Cleanup(func() { groupControlRecoveryGrace = previous })
+}
+
 func TestFRPGroupSessionReopensAfterControlProxyTableDisappears(t *testing.T) {
+	withControlRecoveryGrace(t)
 	status := &lockedStatusMap{}
 	session := startTestGroupSession(t, &recordingGroupService{}, status, groupRoutesOf(groupTestRoutes("a")))
 	// An empty initial table is normal while the first registration starts.
@@ -1168,9 +1176,13 @@ func TestFRPGroupSessionLostProxyRecoveryBoundaries(t *testing.T) {
 			if err := session.observe(); err != nil {
 				t.Fatal(err)
 			}
+			status.mu.Lock()
 			delete(status.items, "a-nhp7")
+			status.mu.Unlock()
 			if scenario != "brief loss" {
-				session.routes["a"].lastObserved = time.Now().Add(-4 * time.Second)
+				session.mu.Lock()
+				session.routes["a"].lastObserved = time.Now().Add(-groupControlRecoveryGrace - time.Second)
+				session.mu.Unlock()
 			}
 			if scenario == "regenerated route" {
 				routes[0].Generation++

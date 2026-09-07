@@ -88,6 +88,11 @@ const groupReleasedPendingFactor = 2
 // groupReleasedPendingFactor.
 var groupErroredHold = 60 * time.Second
 
+// Allow one maximum FRP reconnect backoff (20s plus jitter) and a Login
+// exchange before discarding a usable admission. This delay applies only
+// while the proxy table is absent, never to serving traffic.
+var groupControlRecoveryGrace = 25 * time.Second
+
 // ErrRouteNotServing reports a route that stayed configured but did not reach
 // FRP's running phase on a replacement session before the prior admission
 // expired. The route remains in the group and inside FRP's same-session
@@ -100,7 +105,8 @@ const maxPushRetryDelay = 5 * time.Second
 
 // ErrSessionGroupEnded is returned by GroupServingSession.Update once the
 // session has stopped. SessionGroupRunner treats it as benign: the desired
-// set is authoritative and the next cycle starts from it.
+// set is authoritative and the next cycle starts from it. It also ends a
+// session whose control proxy table remains absent past the recovery grace.
 var ErrSessionGroupEnded = errors.New("FRP session group has ended")
 
 // GroupRoute is one route of a session group. Generation is the route's
@@ -634,7 +640,7 @@ func (s *frpGroupSession) observe() error {
 		if !observed.missing {
 			entry.lastObserved = now
 			anyObserved = true
-		} else if !entry.lastObserved.IsZero() && now.Sub(entry.lastObserved) >= 3*time.Second {
+		} else if !entry.lastObserved.IsZero() && now.Sub(entry.lastObserved) >= groupControlRecoveryGrace {
 			// Allow FRP's fast reconnect to repair a brief control loss. A
 			// vanished proxy that stays absent needs a fresh admission; new
 			// and regenerated names have no prior observation to expire.

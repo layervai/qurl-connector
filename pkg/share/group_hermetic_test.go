@@ -228,6 +228,7 @@ func TestHermeticSessionGroupServesManyRoutesOnOneAdmission(t *testing.T) {
 // A failed FRP control connection must return to the NHP admitter, which may
 // select a new endpoint. Retrying the old endpoint cannot recover this case.
 func TestHermeticSessionGroupRecoversLostControlOnFreshAdmission(t *testing.T) {
+	withControlRecoveryGrace(t)
 	plugin := newHermeticQRTSPlugin(t)
 	oldPort, newPort := reserveHermeticPort(t), reserveHermeticPort(t)
 	oldServer := startHermeticFRPS(t, oldPort, oldPort, "example.test", plugin.server.URL)
