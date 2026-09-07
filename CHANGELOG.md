@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.13.0](https://github.com/layervai/qurl-connector/compare/v0.12.0...v0.13.0) (2026-09-07)
+
+
+### ⚠ BREAKING CHANGES
+
+* use CRID for Connector identity and continuity ([#81](https://github.com/layervai/qurl-connector/issues/81))
+
+### Features
+
+* use CRID for Connector identity and continuity ([#81](https://github.com/layervai/qurl-connector/issues/81)) ([20a9253](https://github.com/layervai/qurl-connector/commit/20a9253dfda2e16e9270d14da7b7357d82459c83))
+
 ## [0.12.0](https://github.com/layervai/qurl-connector/compare/v0.11.5...v0.12.0) (2026-09-07)
 
 
