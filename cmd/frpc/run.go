@@ -474,10 +474,8 @@ func validateConnectorRunRoutes(cfg *nhpconfig.Config) error {
 			return fmt.Errorf("routes[%d] and routes[%d] use duplicate Connector id %q", previous, i, id)
 		}
 		seen[id] = i
-		if route.ResourcePublicKey == "" {
-			if err := nhpconfig.ValidateSlug(id); err != nil {
-				return fmt.Errorf("routes[%d] (%s): invalid Connector id before native registration: %w", i, id, err)
-			}
+		if err := nhpconfig.ValidateSlug(id); err != nil {
+			return fmt.Errorf("routes[%d] (%s): invalid Connector id before native registration: %w", i, id, err)
 		}
 	}
 	return nil
@@ -1215,11 +1213,11 @@ func (l *sharedRouteLedger) retiredRoutes() []string {
 func retireSharedRoute(ctx context.Context, ledger *sharedRouteLedger, announcer *readyAnnouncer, routeID, resourceID, reason string, err error) {
 	if !ledger.retire(routeID) {
 		slog.DebugContext(ctx, "connector: route already retired; admission-layer refusal for its resource is expected",
-			"route", routeID, "resource_id", resourceID, "reason", reason, "err", err.Error())
+			"route", routeID, "resource_public_key", resourceID, "reason", reason, "err", err.Error())
 		return
 	}
 	slog.WarnContext(ctx, "connector: route retired; its resource is permanently unavailable and the other routes keep serving",
-		"route", routeID, "resource_id", resourceID, "reason", reason, "err", err.Error())
+		"route", routeID, "resource_public_key", resourceID, "reason", reason, "err", err.Error())
 	audit.Default().Log(audit.Entry{
 		Event: audit.EventProxyDeny, Outcome: audit.OutcomeDeny, Reason: reason,
 		RouteID: routeID, ResourcePublicKey: resourceID, Error: err.Error(),

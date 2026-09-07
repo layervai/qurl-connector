@@ -45,7 +45,7 @@ func init() {
 var removeCmd = &cobra.Command{
 	Use:   "remove [id]",
 	Short: "Remove a service route",
-	Long: `Remove a service route from the configuration by route id or resource ID.
+	Long: `Remove a service route from the configuration by route id or CRID.
 
 Examples:
   qurl-connector remove my-app
@@ -425,15 +425,15 @@ func selectConnectorRemoval(cfg *nhpconfig.Config, cache *connectorIdentityCache
 			byResourceSelection, resourceFound = byID[owner], true
 		}
 		if !resourceFound {
-			return connectorRemovalSelection{}, fmt.Errorf("no route or cached Connector identity found with resource ID %q", crid)
+			return connectorRemovalSelection{}, fmt.Errorf("no route or cached Connector identity found with CRID %q", crid)
 		}
 	}
 	if id != "" && crid != "" && byIDSelection.id != byResourceSelection.id {
-		return connectorRemovalSelection{}, fmt.Errorf("route id %q and resource ID %q refer to different Connector identities", id, crid)
+		return connectorRemovalSelection{}, fmt.Errorf("route id %q and CRID %q refer to different Connector identities", id, crid)
 	}
 	if idFound {
 		if crid != "" && byIDSelection.crid != crid {
-			return connectorRemovalSelection{}, fmt.Errorf("route id %q is bound to resource ID %q, not %q", id, byIDSelection.crid, crid)
+			return connectorRemovalSelection{}, fmt.Errorf("route id %q is bound to CRID %q, not %q", id, byIDSelection.crid, crid)
 		}
 		return byIDSelection, nil
 	}

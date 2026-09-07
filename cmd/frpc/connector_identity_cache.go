@@ -589,7 +589,7 @@ func loadConnectorIdentityCacheUnlocked(txn *connectorIdentityCacheTxn) (cache *
 		return nil, fmt.Errorf("decode Connector identity cache %s: %w", path, err)
 	}
 	if envelope.Version != connectorIdentityCacheVersion {
-		return nil, fmt.Errorf("Connector identity cache %s version is %d, want %d; finish pending operations with the previous binary before upgrading; preserve agent_state.json and do not delete unresolved request state", path, envelope.Version, connectorIdentityCacheVersion)
+		return nil, fmt.Errorf("Connector identity cache %s version is %d, want %d; this binary cannot read old cache versions; use the previous binary to finish pending operations before upgrading; preserve agent_state.json and do not delete unresolved request state", path, envelope.Version, connectorIdentityCacheVersion)
 	}
 	if envelope.AgentID == nil {
 		return nil, fmt.Errorf("Connector identity cache %s is missing agent_id", path)
@@ -629,7 +629,7 @@ func loadConnectorIdentityCacheUnlocked(txn *connectorIdentityCacheTxn) (cache *
 			return nil, fmt.Errorf("Connector identity cache %s identities must be strictly sorted by id", path)
 		}
 		if owner, duplicate := resourceOwners[entry.ResourcePublicKey]; duplicate {
-			return nil, fmt.Errorf("Connector identity cache %s maps resource_id %q to both %q and %q", path, entry.ResourcePublicKey, owner, entry.ID)
+			return nil, fmt.Errorf("Connector identity cache %s maps resource_public_key %q to both %q and %q", path, entry.ResourcePublicKey, owner, entry.ID)
 		}
 		cache.byID[entry.ID] = entry
 		resourceOwners[entry.ResourcePublicKey] = entry.ID
@@ -1129,10 +1129,10 @@ func (c *connectorIdentityCache) recordResolutionLocked(txn *connectorIdentityCa
 	}
 	if existing, ok := c.byID[id]; ok {
 		if existing.ResourcePublicKey != binding.ResourcePublicKey {
-			return fmt.Errorf("Connector id %q is cached as resource_id %q, not %q", id, existing.ResourcePublicKey, binding.ResourcePublicKey)
+			return fmt.Errorf("Connector id %q is cached as resource_public_key %q, not %q", id, existing.ResourcePublicKey, binding.ResourcePublicKey)
 		}
 		if existing.ConnectorRoutingID != binding.ConnectorRoutingID || existing.KnockResourceID != binding.KnockResourceID {
-			return fmt.Errorf("Connector id %q returned a changed routing or knock binding for resource_id %q", id, binding.ResourcePublicKey)
+			return fmt.Errorf("Connector id %q returned a changed routing or knock binding for resource_public_key %q", id, binding.ResourcePublicKey)
 		}
 		if existing.CRID != binding.CRID {
 			return fmt.Errorf("Connector id %q changed CRID from %q to %q", id, existing.CRID, binding.CRID)
@@ -1148,7 +1148,7 @@ func (c *connectorIdentityCache) recordResolutionLocked(txn *connectorIdentityCa
 	}
 	for existingID, existing := range c.byID {
 		if existing.ResourcePublicKey == binding.ResourcePublicKey && existingID != id {
-			return fmt.Errorf("resource_id %q is already cached for Connector id %q, not %q", binding.ResourcePublicKey, existingID, id)
+			return fmt.Errorf("resource_public_key %q is already cached for Connector id %q, not %q", binding.ResourcePublicKey, existingID, id)
 		}
 	}
 	previous, hadBinding := c.byID[id]

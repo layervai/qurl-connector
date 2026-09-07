@@ -175,7 +175,7 @@ func TestLoadRejectsOtherRetiredFRPFields(t *testing.T) {
 	}{
 		{name: "server token", path: "server.token", yaml: "server:\n  token: {from_env: FRPS_TOKEN}\n"},
 		{name: "subdomain", path: "routes[0].subdomain", yaml: "routes:\n  - id: web\n    type: http\n    local_port: 8080\n    subdomain: {unexpected: value}\n", wantLine: "at line 5"},
-		{name: "pinned subdomain", path: "routes[0].subdomain", yaml: "routes:\n  - id: web\n    type: http\n    local_port: 8080\n    crid: MFkwEwYHKoZIzj0CAQ\n    subdomain: {unexpected: value}\n", wantLine: "at line 6"},
+		{name: "pinned subdomain", path: "routes[0].subdomain", yaml: "routes:\n  - id: web\n    type: http\n    local_port: 8080\n    crid: qgxd4jfvlumhscxrw7wwcwco2h6cda4fi5xixx43xybcfri2liym3d5gmjmq\n    subdomain: {unexpected: value}\n", wantLine: "at line 6"},
 		{name: "custom domains", path: "routes[0].custom_domains", yaml: "routes:\n  - id: web\n    type: http\n    local_port: 8080\n    custom_domains: [old.example]\n"},
 		{name: "remote port", path: "routes[0].remote_port", yaml: "routes:\n  - id: web\n    type: http\n    local_port: 8080\n    remote_port: 7001\n"},
 		{name: "host rewrite", path: "routes[0].host_rewrite", yaml: "routes:\n  - id: web\n    type: http\n    local_port: 8080\n    host_rewrite: old.example\n"},
