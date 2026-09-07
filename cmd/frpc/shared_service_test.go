@@ -72,7 +72,7 @@ func (a *fakeSharedAdmitter) Admit(ctx context.Context, knockResourceID, resourc
 		openTime = time.Hour
 	}
 	return share.Admission{
-		KnockResourceID: knockResourceID, ResourceID: resourceID,
+		KnockResourceID: knockResourceID, ResourcePublicKey: resourceID,
 		RunID: "run", RunAttempt: 1, Token: "token", ResourceHost: "frp.example:7000",
 		SessionID: sessionID,
 		SessionReceipt: qurl.NativeSessionReceipt{
@@ -408,7 +408,7 @@ func sharedServiceTestConfig(ids ...string) *nhpconfig.Config {
 	for i, id := range ids {
 		cfg.Routes = append(cfg.Routes, nhpconfig.Route{
 			ID: id, Type: nhpconfig.RouteTypeHTTP, LocalIP: "127.0.0.1", LocalPort: 3000 + i,
-			ResourceID: "resource-" + id, ConnectorRoutingID: "routing-" + id,
+			ResourcePublicKey: "resource-" + id, ConnectorRoutingID: "routing-" + id,
 		})
 		cfg.SetKnockResourceID("resource-"+id, "q_knock")
 	}
@@ -556,8 +556,8 @@ func TestSharedServiceAdmitsOnceForEveryRoute(t *testing.T) {
 		}
 		// Each proxy carries its own route's public resource identity; only
 		// the admission is shared.
-		if state.Route.ResourceID != "resource-"+id || state.Route.ConnectorRoutingID != "routing-"+id {
-			t.Errorf("route %q registered with identities %q/%q", id, state.Route.ResourceID, state.Route.ConnectorRoutingID)
+		if state.Route.ResourcePublicKey != "resource-"+id || state.Route.ConnectorRoutingID != "routing-"+id {
+			t.Errorf("route %q registered with identities %q/%q", id, state.Route.ResourcePublicKey, state.Route.ConnectorRoutingID)
 		}
 	}
 	if !strings.Contains(block, "3 route(s) live") {
@@ -604,7 +604,7 @@ func TestSharedServiceRetiresGoneRouteWithoutDisturbingSiblings(t *testing.T) {
 		t.Fatalf("admits = %d, retired = %d; retiring one route must not touch the shared admission", admits, retired)
 	}
 	entry := logger.byEvent(audit.EventProxyDeny)[0]
-	if entry.Outcome != audit.OutcomeDeny || entry.Reason != "resource_not_found" || entry.RouteID != "b" || entry.ResourceID != "resource-b" {
+	if entry.Outcome != audit.OutcomeDeny || entry.Reason != "resource_not_found" || entry.RouteID != "b" || entry.ResourcePublicKey != "resource-b" {
 		t.Errorf("retirement audit entry = %+v", entry)
 	}
 
@@ -703,7 +703,7 @@ func TestSharedServiceRendersOneSessionAndDesktopAdminListener(t *testing.T) {
 	for _, route := range cfg.Routes {
 		routes = append(routes, share.GroupRoute{LocalHTTPRoute: share.LocalHTTPRoute{
 			RouteID: route.ID, LocalIP: route.LocalIP, LocalPort: route.LocalPort,
-			ResourceID: route.ResourceID, ConnectorRoutingID: route.ConnectorRoutingID,
+			ResourcePublicKey: route.ResourcePublicKey, ConnectorRoutingID: route.ConnectorRoutingID,
 		}})
 	}
 	built, proxies, names, err := factory.BuildConfig(admission, routes)
@@ -887,7 +887,7 @@ func TestSharedServiceRetiresPrimaryRouteWhoseAdmissionIsGone(t *testing.T) {
 		t.Errorf("block routes = %v, want [b c]", got)
 	}
 	denies := logger.byEvent(audit.EventProxyDeny)
-	if len(denies) != 1 || denies[0].RouteID != "a" || denies[0].ResourceID != "resource-a" || denies[0].Reason != "admission_resource_gone" {
+	if len(denies) != 1 || denies[0].RouteID != "a" || denies[0].ResourcePublicKey != "resource-a" || denies[0].Reason != "admission_resource_gone" {
 		t.Errorf("retirement audit entries = %+v", denies)
 	}
 	states := h.session(t, 1).RouteStates()
@@ -977,8 +977,8 @@ func TestSharedServiceRetiredRoutesStayRetiredAcrossReadmission(t *testing.T) {
 	if states := second.RouteStates(); len(states) != 3 {
 		t.Errorf("second admission carries %d routes, want b, d, e: %+v", len(states), states)
 	}
-	if second.admission.ResourceID != "resource-b" {
-		t.Errorf("second admission under %q, want resource-b", second.admission.ResourceID)
+	if second.admission.ResourcePublicKey != "resource-b" {
+		t.Errorf("second admission under %q, want resource-b", second.admission.ResourcePublicKey)
 	}
 
 	// The same again one admission later: d goes per proxy, then b's
@@ -992,8 +992,8 @@ func TestSharedServiceRetiredRoutesStayRetiredAcrossReadmission(t *testing.T) {
 	if states := third.RouteStates(); len(states) != 1 {
 		t.Errorf("third admission carries %d routes, want only e: %+v", len(states), states)
 	}
-	if third.admission.ResourceID != "resource-e" {
-		t.Errorf("third admission under %q, want resource-e", third.admission.ResourceID)
+	if third.admission.ResourcePublicKey != "resource-e" {
+		t.Errorf("third admission under %q, want resource-e", third.admission.ResourcePublicKey)
 	}
 	denies := logger.byEvent(audit.EventProxyDeny)
 	var got []string
@@ -1048,8 +1048,8 @@ func TestSharedServiceRetiresPrimaryRevokedPerProxyOnce(t *testing.T) {
 
 	second := h.session(t, 2)
 	waitFor(t, 2*time.Second, func() bool { return second.RouteStates()["c"].Phase == share.RouteServing }, "siblings serving on the re-admitted session")
-	if second.admission.ResourceID != "resource-b" {
-		t.Errorf("re-admitted under %q, want resource-b", second.admission.ResourceID)
+	if second.admission.ResourcePublicKey != "resource-b" {
+		t.Errorf("re-admitted under %q, want resource-b", second.admission.ResourcePublicKey)
 	}
 	if states := second.RouteStates(); len(states) != 2 {
 		t.Errorf("re-admitted session carries %d routes, want b and c: %+v", len(states), states)

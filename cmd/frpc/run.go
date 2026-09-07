@@ -22,6 +22,7 @@ import (
 	v1 "github.com/fatedier/frp/pkg/config/v1"
 	"github.com/fatedier/frp/pkg/config/v1/validation"
 	"github.com/fatedier/frp/pkg/policy/security"
+	qurlcrid "github.com/layervai/qurl-go/crid"
 	qurl "github.com/layervai/qurl-go/qurl"
 	"github.com/spf13/cobra"
 
@@ -473,7 +474,7 @@ func validateConnectorRunRoutes(cfg *nhpconfig.Config) error {
 			return fmt.Errorf("routes[%d] and routes[%d] use duplicate Connector id %q", previous, i, id)
 		}
 		seen[id] = i
-		if route.ResourceID == "" {
+		if route.ResourcePublicKey == "" {
 			if err := nhpconfig.ValidateSlug(id); err != nil {
 				return fmt.Errorf("routes[%d] (%s): invalid Connector id before native registration: %w", i, id, err)
 			}
@@ -808,22 +809,22 @@ func validateConfiguredConnectorIdentityGraph(cfg *nhpconfig.Config, cache *conn
 			return nil, fmt.Errorf("routes[%d]: duplicate Connector id %q", i, id)
 		}
 		configuredIDs[id] = struct{}{}
-		cachedResourceID, cached := cache.resourceID(id)
-		if route.ResourceID != "" && cached && route.ResourceID != cachedResourceID {
-			return nil, fmt.Errorf("route %q: pinned resource_id %q conflicts with cached resource_id %q", id, route.ResourceID, cachedResourceID)
+		cachedCRID, cached := cache.crid(id)
+		if route.CRID != "" && cached && route.CRID != cachedCRID {
+			return nil, fmt.Errorf("route %q: pinned crid %q conflicts with cached crid %q", id, route.CRID, cachedCRID)
 		}
-		resourceID := route.ResourceID
+		resourceID := route.CRID
 		if resourceID == "" {
-			resourceID = cachedResourceID
+			resourceID = cachedCRID
 		}
 		if resourceID == "" {
 			continue
 		}
-		if err := validateCachedConnectorResourceID(resourceID); err != nil {
-			return nil, fmt.Errorf("route %q: invalid resource_id: %w", id, err)
+		if err := qurlcrid.Validate(resourceID); err != nil {
+			return nil, fmt.Errorf("route %q: invalid crid: %w", id, err)
 		}
 		if owner, duplicate := resourceOwners[resourceID]; duplicate {
-			return nil, fmt.Errorf("routes %q and %q resolve to duplicate resource_id %q", owner, id, resourceID)
+			return nil, fmt.Errorf("routes %q and %q resolve to duplicate crid %q", owner, id, resourceID)
 		}
 		resourceOwners[resourceID] = id
 	}
@@ -855,9 +856,9 @@ func resolveConnectorIdentitiesLocked(
 		return err
 	}
 	type identityResolution struct {
-		index              int
-		id                 string
-		expectedResourceID string
+		index        int
+		id           string
+		expectedCRID string
 	}
 	resolutions := make([]identityResolution, 0, len(cfg.Routes))
 	requestedResources := make(map[string]string, len(cfg.Routes))
@@ -868,7 +869,7 @@ func resolveConnectorIdentitiesLocked(
 		if strings.TrimSpace(route.ID) == "" && id != "" {
 			route.ID = id
 		}
-		if id == "" && route.ResourceID == "" {
+		if id == "" && route.CRID == "" {
 			return fmt.Errorf("routes[%d] needs id or %s", i, envConnectorID)
 		}
 		if err := nhpconfig.ValidateSlug(id); err != nil {
@@ -880,33 +881,33 @@ func resolveConnectorIdentitiesLocked(
 		seen[id] = i
 		configuredIDs[id] = struct{}{}
 
-		cachedResourceID, cached := cache.resourceID(id)
-		if route.ResourceID != "" && cached && cachedResourceID != route.ResourceID {
-			return fmt.Errorf("route %q: pinned resource_id %q conflicts with cached resource_id %q", id, route.ResourceID, cachedResourceID)
+		cachedCRID, cached := cache.crid(id)
+		if route.CRID != "" && cached && cachedCRID != route.CRID {
+			return fmt.Errorf("route %q: pinned crid %q conflicts with cached crid %q", id, route.CRID, cachedCRID)
 		}
-		expectedResourceID := route.ResourceID
-		if expectedResourceID == "" && cached {
-			expectedResourceID = cachedResourceID
+		expectedCRID := route.CRID
+		if expectedCRID == "" && cached {
+			expectedCRID = cachedCRID
 		}
-		if expectedResourceID != "" {
-			if err := validateCachedConnectorResourceID(expectedResourceID); err != nil {
-				return fmt.Errorf("route %q: invalid resource_id: %w", id, err)
+		if expectedCRID != "" {
+			if err := qurlcrid.Validate(expectedCRID); err != nil {
+				return fmt.Errorf("route %q: invalid crid: %w", id, err)
 			}
-			if owner, duplicate := requestedResources[expectedResourceID]; duplicate {
-				return fmt.Errorf("routes %q and %q assert duplicate resource_id %q before NHP resource discovery", owner, id, expectedResourceID)
+			if owner, duplicate := requestedResources[expectedCRID]; duplicate {
+				return fmt.Errorf("routes %q and %q assert duplicate crid %q before NHP resource discovery", owner, id, expectedCRID)
 			}
-			requestedResources[expectedResourceID] = id
+			requestedResources[expectedCRID] = id
 		}
 		if pending, ok := cache.pendingRequest(id); ok {
 			pendingExpected := ""
-			if pending.ExpectedResourceID != nil {
-				pendingExpected = *pending.ExpectedResourceID
+			if pending.ExpectedCRID != nil {
+				pendingExpected = *pending.ExpectedCRID
 			}
-			if pendingExpected != expectedResourceID {
-				return fmt.Errorf("route %q: durable NHP request asserts resource_id %q, but current continuity state requires %q", id, pendingExpected, expectedResourceID)
+			if pendingExpected != expectedCRID {
+				return fmt.Errorf("route %q: durable NHP request asserts crid %q, but current continuity state requires %q", id, pendingExpected, expectedCRID)
 			}
 		}
-		resolutions = append(resolutions, identityResolution{index: i, id: id, expectedResourceID: expectedResourceID})
+		resolutions = append(resolutions, identityResolution{index: i, id: id, expectedCRID: expectedCRID})
 	}
 	if err := cache.rejectOrphanIdentities(configuredIDs); err != nil {
 		return err
@@ -919,7 +920,7 @@ func resolveConnectorIdentitiesLocked(
 		configuredRoutingID := route.ConnectorRoutingID
 		configuredKnockResourceID := route.KnockResourceID
 		request, err := gateConnectorStateResult(continuity, "persist exact Connector resource LST request", func() (*qurl.NativeConnectorResourceRequest, error) {
-			return cache.ensurePendingRequestLocked(txn, resolution.id, resolution.expectedResourceID)
+			return cache.ensurePendingRequestLocked(txn, resolution.id, resolution.expectedCRID)
 		})
 		if err != nil {
 			return fmt.Errorf("route %q: persist exact NHP request before dispatch: %w", resolution.id, err)
@@ -949,8 +950,8 @@ func resolveConnectorIdentitiesLocked(
 			return fmt.Errorf("route %q: assigned cell returned no Connector resource; exact pending request is preserved", resolution.id)
 		}
 		resource := result.Resource
-		if resolution.expectedResourceID != "" && resource.ResourceID != resolution.expectedResourceID {
-			return fmt.Errorf("route %q: assigned cell returned resource_id %q for continuity assertion %q", resolution.id, resource.ResourceID, resolution.expectedResourceID)
+		if resolution.expectedCRID != "" && resource.CRID != resolution.expectedCRID {
+			return fmt.Errorf("route %q: assigned cell returned crid %q for continuity assertion %q", resolution.id, resource.CRID, resolution.expectedCRID)
 		}
 		if resource.Slug != resolution.id {
 			return fmt.Errorf("route %q: assigned cell returned mismatched Connector id %q", resolution.id, resource.Slug)
@@ -970,16 +971,17 @@ func resolveConnectorIdentitiesLocked(
 		if configuredKnockResourceID != "" && configuredKnockResourceID != resource.KnockResourceID {
 			return fmt.Errorf("route %q: configured knock_resource_id %q conflicts with authenticated producer value %q; remove knock_resource_id from the route in qurl-proxy.yaml to accept the authenticated admission target, or delete the resource (the exact resource binding is retained for explicit cleanup)", resolution.id, configuredKnockResourceID, resource.KnockResourceID)
 		}
-		if existingResourceID, existingKnockResourceID, conflict := cfg.FirstDifferentKnockResourceID(resource.ResourceID, resource.KnockResourceID); conflict {
+		if existingResourceID, existingKnockResourceID, conflict := cfg.FirstDifferentKnockResourceID(resource.ResourcePublicKey, resource.KnockResourceID); conflict {
 			overrideNote := ""
 			if strings.TrimSpace(os.Getenv(EnvKnockResourceID)) != "" {
 				overrideNote = fmt.Sprintf("; %s overrides only the runtime knock operand and does not merge qURL service-assigned admission targets", EnvKnockResourceID)
 			}
 			return fmt.Errorf("route %q: assigned cell returned knock_resource_id %q, but resource %q on this Connector session uses %q; one FRP control session cannot span NHP admission targets%s", resolution.id, resource.KnockResourceID, existingResourceID, existingKnockResourceID, overrideNote)
 		}
-		route.ResourceID = resource.ResourceID
+		route.ResourcePublicKey = resource.ResourcePublicKey
+		route.CRID = resource.CRID
 		route.ConnectorRoutingID = resource.ConnectorRoutingID
-		cfg.SetKnockResourceID(resource.ResourceID, resource.KnockResourceID)
+		cfg.SetKnockResourceID(resource.ResourcePublicKey, resource.KnockResourceID)
 	}
 	if err := nhpconfig.ValidateManagedRouteIdentities(cfg.Routes); err != nil {
 		return fmt.Errorf("assigned cell returned an invalid Connector identity graph: %w", err)
@@ -1119,7 +1121,7 @@ func runSharedService(ctx context.Context, qcfg *nhpconfig.Config, admitter shar
 		if primary == nil {
 			return err
 		}
-		retireSharedRoute(ctx, ledger, announcer, primary.ID, primary.ResourceID, "admission_resource_gone", err)
+		retireSharedRoute(ctx, ledger, announcer, primary.ID, primary.ResourcePublicKey, "admission_resource_gone", err)
 		rest = withoutRoutes(rest, ledger.retiredRoutes())
 		if len(rest) == 0 {
 			return allRoutesRetiredError(err)
@@ -1155,7 +1157,7 @@ func splitPrimaryRoute(qcfg *nhpconfig.Config) (*nhpconfig.Route, []nhpconfig.Ro
 		return nil, nil
 	}
 	for i := range qcfg.Routes {
-		if qcfg.Routes[i].ResourceID != primaryResourceID {
+		if qcfg.Routes[i].ResourcePublicKey != primaryResourceID {
 			continue
 		}
 		primary := qcfg.Routes[i]
@@ -1220,7 +1222,7 @@ func retireSharedRoute(ctx context.Context, ledger *sharedRouteLedger, announcer
 		"route", routeID, "resource_id", resourceID, "reason", reason, "err", err.Error())
 	audit.Default().Log(audit.Entry{
 		Event: audit.EventProxyDeny, Outcome: audit.OutcomeDeny, Reason: reason,
-		RouteID: routeID, ResourceID: resourceID, Error: err.Error(),
+		RouteID: routeID, ResourcePublicKey: resourceID, Error: err.Error(),
 	})
 	announcer.routeRetired(routeID)
 }
@@ -1263,20 +1265,20 @@ func newSharedServiceRunner(ctx context.Context, qcfg *nhpconfig.Config, admitte
 	for _, route := range qcfg.Routes {
 		// An empty knock resource is a route that was never hydrated, which is
 		// a different problem from two routes on different admission targets.
-		switch routeKnock := knockResourceIDOrEmpty(qcfg, route.ResourceID); {
+		switch routeKnock := knockResourceIDOrEmpty(qcfg, route.ResourcePublicKey); {
 		case routeKnock == "":
-			return nil, fmt.Errorf("route %q: missing NHP knock resource for qURL Connector %q", route.ID, route.ResourceID)
+			return nil, fmt.Errorf("route %q: missing NHP knock resource for qURL Connector %q", route.ID, route.ResourcePublicKey)
 		case routeKnock != knockResourceID:
 			return nil, fmt.Errorf("route %q: NHP knock resource %q differs from the Connector session's %q (resource %q); one FRP control session cannot span NHP admission targets", route.ID, routeKnock, knockResourceID, resourceID)
 		}
 		routes = append(routes, share.LocalHTTPRoute{
 			RouteID: route.ID, LocalIP: route.LocalIP, LocalPort: route.LocalPort,
-			ResourceID: route.ResourceID, ConnectorRoutingID: route.ConnectorRoutingID,
+			ResourcePublicKey: route.ResourcePublicKey, ConnectorRoutingID: route.ConnectorRoutingID,
 		})
-		resourceIDs[route.ID] = route.ResourceID
+		resourceIDs[route.ID] = route.ResourcePublicKey
 	}
 	return share.NewSessionGroupRunner(share.SessionGroupConfig{
-		KnockResourceID: knockResourceID, ResourceID: resourceID, Routes: routes,
+		KnockResourceID: knockResourceID, ResourcePublicKey: resourceID, Routes: routes,
 		Admitter: admitter, Sessions: sessions,
 		OnServing: func(share.Admission) {
 			if err := admitter.MarkServingHealthy(); err != nil {

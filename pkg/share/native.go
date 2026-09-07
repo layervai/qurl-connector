@@ -1284,7 +1284,7 @@ func (a *NativeAdmitter) knock(ctx context.Context, knockResourceID, resourceID 
 		return Admission{}, withNativeSessionCleanupError(err, cleanupErr)
 	}
 	admission := Admission{
-		KnockResourceID: knockResourceID, ResourceID: resourceID,
+		KnockResourceID: knockResourceID, ResourcePublicKey: resourceID,
 		RunID: runID, Token: result.ACToken, ResourceHost: result.ResourceHost,
 		RunAttempt: runAttempt, SessionID: result.SessionID, SessionReceipt: result.SessionReceipt,
 		OpenTime: time.Duration(result.OpenTime) * time.Second,
@@ -1613,7 +1613,7 @@ func (a *NativeAdmitter) Retire(ctx context.Context, admission Admission) error 
 	if err := validateAdmissionReceipt(admission); err != nil {
 		return err
 	}
-	unlockResource := a.resources.lock(admission.ResourceID)
+	unlockResource := a.resources.lock(admission.ResourcePublicKey)
 	defer unlockResource()
 	a.runtimeMu.RLock()
 	defer a.runtimeMu.RUnlock()
@@ -1628,7 +1628,7 @@ func (a *NativeAdmitter) Retire(ctx context.Context, admission Admission) error 
 		a.stateMu.Unlock()
 		return nil
 	}
-	if live.resourceID != admission.ResourceID || !sameSessionReceipt(live.receipt, admission.SessionReceipt) {
+	if live.resourceID != admission.ResourcePublicKey || !sameSessionReceipt(live.receipt, admission.SessionReceipt) {
 		a.stateMu.Unlock()
 		return errors.New("retire native admission: exact-session receipt does not match the live admission")
 	}
@@ -1658,11 +1658,11 @@ func (a *NativeAdmitter) trackAdmission(admission Admission, operationID string)
 	defer a.stateMu.Unlock()
 	a.ensureAdmissionMapsLocked()
 	if existing, ok := a.live[key]; ok &&
-		(existing.resourceID != admission.ResourceID || existing.operationID != operationID ||
+		(existing.resourceID != admission.ResourcePublicKey || existing.operationID != operationID ||
 			!sameSessionReceipt(existing.receipt, admission.SessionReceipt)) {
 		return nativeAdmissionKey{}, errors.New("track native admission: exact-session identity conflicts with a live admission")
 	}
-	a.live[key] = nativeLiveAdmission{resourceID: admission.ResourceID, operationID: operationID, receipt: admission.SessionReceipt}
+	a.live[key] = nativeLiveAdmission{resourceID: admission.ResourcePublicKey, operationID: operationID, receipt: admission.SessionReceipt}
 	return key, nil
 }
 

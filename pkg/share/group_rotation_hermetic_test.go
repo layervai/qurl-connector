@@ -101,14 +101,14 @@ func startSlowServerHarness(t *testing.T, admissions []Admission, slowRunID stri
 	}
 	resourceHost := net.JoinHostPort("127.0.0.1", strconv.Itoa(h.port))
 	for i := range admissions {
-		admissions[i].KnockResourceID, admissions[i].ResourceID = knockResourceID, groupResourceID
+		admissions[i].KnockResourceID, admissions[i].ResourcePublicKey = knockResourceID, groupResourceID
 		admissions[i].ResourceHost = resourceHost
 	}
 	h.plugin.delayNewProxy(slowRunID, slowServiceMin, slowServiceMax)
 	h.admitter = &hermeticAdmitter{admissions: admissions}
 
 	h.runner, err = NewSessionGroupRunner(SessionGroupConfig{
-		KnockResourceID: knockResourceID, ResourceID: groupResourceID, Routes: localRoutes(h.routes),
+		KnockResourceID: knockResourceID, ResourcePublicKey: groupResourceID, Routes: localRoutes(h.routes),
 		Admitter: h.admitter, Sessions: factory,
 		MinBackoff: 10 * time.Millisecond, MaxBackoff: 25 * time.Millisecond,
 		RotationLead: rotationLead, StopTimeout: 10 * time.Second,

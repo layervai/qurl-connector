@@ -30,7 +30,7 @@ func testConnectorResourceBinding(id, resourceID string) *qurl.ConnectorResource
 		routingID = testConnectorRoutingID2
 	}
 	return &qurl.ConnectorResource{
-		ResourceID: resourceID, ConnectorRoutingID: routingID,
+		ResourcePublicKey: resourceID, CRID: testCRIDForKey(resourceID), ConnectorRoutingID: routingID,
 		KnockResourceID: "cell-resource", Slug: id,
 	}
 }
@@ -40,7 +40,7 @@ func recordTestConnectorBindingLocked(cache *connectorIdentityCache, txn *connec
 }
 
 func markTestConnectorRequestLocked(cache *connectorIdentityCache, txn *connectorIdentityCacheTxn, id string) error {
-	expected, _ := cache.resourceID(id)
+	expected, _ := cache.crid(id)
 	_, err := cache.ensurePendingRequestLocked(txn, id, expected)
 	return err
 }
@@ -173,8 +173,8 @@ func resolveConnectorIdentitiesWithManagementFixture(ctx context.Context, cfg *n
 	resolve := func(ctx context.Context, _ *qurl.AgentRuntimeBinding, request *qurl.NativeConnectorResourceRequest, _ ...qurl.AgentRuntimeUDPOption) (*qurl.ConnectorResourceResolution, error) {
 		var resource *qurl.ConnectorResource
 		var err error
-		if request.ExpectedResourceID != "" {
-			resource, err = client.GetConnectorResource(ctx, request.ExpectedResourceID)
+		if request.ExpectedCRID != "" {
+			resource, err = client.GetConnectorResource(ctx, request.ExpectedCRID)
 		} else {
 			resource, err = client.GetConnectorResourceBySlug(ctx, request.ConnectorID)
 			if errors.Is(err, qurl.ErrConnectorResourceNotFound) {
@@ -236,7 +236,7 @@ func TestConnectorIdentityCacheRejectsChangedAuthenticatedBinding(t *testing.T) 
 			}
 			binding, ok := cache.binding("web")
 			if !ok || binding != (connectorIdentityCacheEntry{
-				ID: "web", ResourceID: testPublicResourceID,
+				ID: "web", ResourcePublicKey: testPublicResourceID, CRID: testCRIDForKey(testPublicResourceID),
 				ConnectorRoutingID: testConnectorRoutingID, KnockResourceID: "cell-resource",
 			}) {
 				t.Fatalf("durable binding changed after rejection: %#v", binding)
@@ -248,7 +248,7 @@ func TestConnectorIdentityCacheRejectsChangedAuthenticatedBinding(t *testing.T) 
 func TestPrepareConnectorRunRejectsBoundEmptyCacheBeforeRuntimeOpen(t *testing.T) {
 	dir := newIdentityCacheTestDir(t)
 	t.Setenv(agentstate.EnvStateDirPrimary, dir)
-	writeIdentityCacheRaw(t, dir, `{"version":2,"agent_id":"`+testConnectorCacheAgentID+`","identities":[],"pending_requests":[]}`)
+	writeIdentityCacheRaw(t, dir, `{"version":3,"agent_id":"`+testConnectorCacheAgentID+`","identities":[],"pending_requests":[]}`)
 
 	configPath := filepath.Join(t.TempDir(), "qurl-proxy.yaml")
 	cfg := nhpconfig.NewDefaulted()
@@ -324,14 +324,14 @@ func TestHydrateConnectorResourceIDsReadOnlyToleratesOrphanCacheEntries(t *testi
 	if err := hydrateConnectorResourceIDsReadOnlyContext(context.Background(), cfg); err != nil {
 		t.Fatalf("read-only hydration rejected stale orphan: %v", err)
 	}
-	if got := cfg.Routes[0].ResourceID; got != testPublicResourceID {
+	if got := cfg.Routes[0].ResourcePublicKey; got != testPublicResourceID {
 		t.Fatalf("hydrated resource_id = %q, want %q", got, testPublicResourceID)
 	}
 	cache, err := loadConnectorIdentityCache(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got, ok := cache.resourceID("removed-route"); !ok || got != testPublicResourceID2 {
+	if got, ok := cache.crid("removed-route"); !ok || got != testCRIDForKey(testPublicResourceID2) {
 		t.Fatalf("read-only hydration mutated orphan = %q, %v", got, ok)
 	}
 }
@@ -341,32 +341,32 @@ func TestConnectorIdentityCacheStrictSchema(t *testing.T) {
 		raw  string
 		want string
 	}{
-		"unknown envelope field":      {`{"version":2,"agent_id":"agent-remove","identities":[],"pending_requests":[],"extra":true}`, `unknown field "extra"`},
-		"noncanonical envelope case":  {`{"version":2,"Agent_ID":"agent-remove","identities":[],"pending_requests":[]}`, `unknown field "Agent_ID"`},
-		"missing agent id":            {`{"version":2,"identities":[],"pending_requests":[]}`, "missing agent_id"},
-		"null agent id":               {`{"version":2,"agent_id":null,"identities":[],"pending_requests":[]}`, "missing agent_id"},
-		"oversized agent id":          {`{"version":2,"agent_id":"` + strings.Repeat("a", 257) + `","identities":[],"pending_requests":[]}`, "exceeds 256 bytes"},
-		"unknown entry field":         {`{"version":2,"agent_id":"agent-remove","identities":[{"id":"web","resource_id":"` + testPublicResourceID + `","extra":true}],"pending_requests":[]}`, `unknown field "extra"`},
-		"noncanonical entry case":     {`{"version":2,"agent_id":"agent-remove","identities":[{"ID":"web","resource_id":"` + testPublicResourceID + `"}],"pending_requests":[]}`, `unknown field "ID"`},
-		"duplicate envelope field":    {`{"version":2,"agent_id":"agent-remove","identities":[],"identities":[{"id":"web","resource_id":"` + testPublicResourceID + `"}],"pending_requests":[]}`, `duplicate field "identities"`},
-		"duplicate entry field":       {`{"version":2,"agent_id":"agent-remove","identities":[{"id":"web","id":"api","resource_id":"` + testPublicResourceID + `"}],"pending_requests":[]}`, `duplicate field "id"`},
-		"wrong version":               {`{"version":3,"agent_id":"agent-remove","identities":[],"pending_requests":[]}`, "version is 3, want 2"},
-		"missing identities":          {`{"version":2,"agent_id":"agent-remove","pending_requests":[]}`, "missing identities"},
-		"null identities":             {`{"version":2,"agent_id":"agent-remove","identities":null,"pending_requests":[]}`, "missing identities"},
-		"missing pending":             {`{"version":2,"agent_id":"agent-remove","identities":[]}`, "missing pending_requests"},
-		"null pending":                {`{"version":2,"agent_id":"agent-remove","identities":[],"pending_requests":null}`, "missing pending_requests"},
-		"trailing JSON":               {`{"version":2,"agent_id":"agent-remove","identities":[],"pending_requests":[]} {}`, "multiple JSON values"},
-		"duplicate id":                {`{"version":2,"agent_id":"agent-remove","identities":[{"id":"web","resource_id":"` + testPublicResourceID + `","connector_routing_id":"` + testConnectorRoutingID + `","knock_resource_id":"cell-resource"},{"id":"web","resource_id":"` + testPublicResourceID2 + `","connector_routing_id":"` + testConnectorRoutingID2 + `","knock_resource_id":"cell-resource"}],"pending_requests":[]}`, `duplicate id "web"`},
-		"duplicate resource":          {`{"version":2,"agent_id":"agent-remove","identities":[{"id":"api","resource_id":"` + testPublicResourceID + `","connector_routing_id":"` + testConnectorRoutingID + `","knock_resource_id":"cell-resource"},{"id":"web","resource_id":"` + testPublicResourceID + `","connector_routing_id":"` + testConnectorRoutingID2 + `","knock_resource_id":"cell-resource"}],"pending_requests":[]}`, "maps resource_id"},
-		"bad slug":                    {`{"version":2,"agent_id":"agent-remove","identities":[{"id":"Bad Slug","resource_id":"` + testPublicResourceID + `"}],"pending_requests":[]}`, "does not match required format"},
-		"bad public key":              {`{"version":2,"agent_id":"agent-remove","identities":[{"id":"web","resource_id":"not-a-public-key"}],"pending_requests":[]}`, "P-256 DER SPKI"},
-		"missing routing id":          {`{"version":2,"agent_id":"agent-remove","identities":[{"id":"web","resource_id":"` + testPublicResourceID + `","knock_resource_id":"cell-resource"}],"pending_requests":[]}`, "connector_routing_id"},
-		"oversized knock id":          {`{"version":2,"agent_id":"agent-remove","identities":[{"id":"web","resource_id":"` + testPublicResourceID + `","connector_routing_id":"` + testConnectorRoutingID + `","knock_resource_id":"` + strings.Repeat("k", 65) + `"}],"pending_requests":[]}`, "exceeds 64 bytes"},
-		"null crid":                   {`{"version":2,"agent_id":"agent-remove","identities":[{"id":"web","resource_id":"` + testPublicResourceID + `","connector_routing_id":"` + testConnectorRoutingID + `","knock_resource_id":"cell-resource","crid":null}],"pending_requests":[]}`, "crid must be absent rather than null"},
-		"pending continuity mismatch": {`{"version":2,"agent_id":"agent-remove","identities":[{"id":"web","resource_id":"` + testPublicResourceID + `","connector_routing_id":"` + testConnectorRoutingID + `","knock_resource_id":"cell-resource"}],"pending_requests":[{"id":"web","request_nonce":"` + testConnectorRequestNonce + `","expected_resource_id":"` + testPublicResourceID2 + `"}]}`, "does not assert its exact cached resource_id"},
-		"null pending expected id":    {`{"version":2,"agent_id":"agent-remove","identities":[],"pending_requests":[{"id":"web","request_nonce":"` + testConnectorRequestNonce + `","expected_resource_id":null}]}`, "expected_resource_id must be absent rather than null"},
-		"unsorted identities":         {`{"version":2,"agent_id":"agent-remove","identities":[{"id":"web","resource_id":"` + testPublicResourceID + `","connector_routing_id":"` + testConnectorRoutingID + `","knock_resource_id":"cell-resource"},{"id":"api","resource_id":"` + testPublicResourceID2 + `","connector_routing_id":"` + testConnectorRoutingID2 + `","knock_resource_id":"cell-resource"}],"pending_requests":[]}`, "strictly sorted by id"},
-		"unsorted pending":            {`{"version":2,"agent_id":"agent-remove","identities":[],"pending_requests":[{"id":"web","request_nonce":"` + testConnectorRequestNonce + `"},{"id":"api","request_nonce":"` + testConnectorRequestNonce + `"}]}`, "strictly sorted"},
+		"unknown envelope field":      {`{"version":3,"agent_id":"agent-remove","identities":[],"pending_requests":[],"extra":true}`, `unknown field "extra"`},
+		"noncanonical envelope case":  {`{"version":3,"Agent_ID":"agent-remove","identities":[],"pending_requests":[]}`, `unknown field "Agent_ID"`},
+		"missing agent id":            {`{"version":3,"identities":[],"pending_requests":[]}`, "missing agent_id"},
+		"null agent id":               {`{"version":3,"agent_id":null,"identities":[],"pending_requests":[]}`, "missing agent_id"},
+		"oversized agent id":          {`{"version":3,"agent_id":"` + strings.Repeat("a", 257) + `","identities":[],"pending_requests":[]}`, "exceeds 256 bytes"},
+		"unknown entry field":         {`{"version":3,"agent_id":"agent-remove","identities":[{"id":"web","resource_public_key":"` + testPublicResourceID + `","crid":"` + testCRIDForKey(testPublicResourceID) + `","extra":true}],"pending_requests":[]}`, `unknown field "extra"`},
+		"noncanonical entry case":     {`{"version":3,"agent_id":"agent-remove","identities":[{"ID":"web","resource_public_key":"` + testPublicResourceID + `","crid":"` + testCRIDForKey(testPublicResourceID) + `"}],"pending_requests":[]}`, `unknown field "ID"`},
+		"duplicate envelope field":    {`{"version":3,"agent_id":"agent-remove","identities":[],"identities":[{"id":"web","resource_public_key":"` + testPublicResourceID + `","crid":"` + testCRIDForKey(testPublicResourceID) + `"}],"pending_requests":[]}`, `duplicate field "identities"`},
+		"duplicate entry field":       {`{"version":3,"agent_id":"agent-remove","identities":[{"id":"web","id":"api","resource_public_key":"` + testPublicResourceID + `","crid":"` + testCRIDForKey(testPublicResourceID) + `"}],"pending_requests":[]}`, `duplicate field "id"`},
+		"wrong version":               {`{"version":2,"agent_id":"agent-remove","identities":[],"pending_requests":[]}`, "version is 2, want 3"},
+		"missing identities":          {`{"version":3,"agent_id":"agent-remove","pending_requests":[]}`, "missing identities"},
+		"null identities":             {`{"version":3,"agent_id":"agent-remove","identities":null,"pending_requests":[]}`, "missing identities"},
+		"missing pending":             {`{"version":3,"agent_id":"agent-remove","identities":[]}`, "missing pending_requests"},
+		"null pending":                {`{"version":3,"agent_id":"agent-remove","identities":[],"pending_requests":null}`, "missing pending_requests"},
+		"trailing JSON":               {`{"version":3,"agent_id":"agent-remove","identities":[],"pending_requests":[]} {}`, "multiple JSON values"},
+		"duplicate id":                {`{"version":3,"agent_id":"agent-remove","identities":[{"id":"web","resource_public_key":"` + testPublicResourceID + `","crid":"` + testCRIDForKey(testPublicResourceID) + `","connector_routing_id":"` + testConnectorRoutingID + `","knock_resource_id":"cell-resource"},{"id":"web","resource_public_key":"` + testPublicResourceID2 + `","crid":"` + testCRIDForKey(testPublicResourceID2) + `","connector_routing_id":"` + testConnectorRoutingID2 + `","knock_resource_id":"cell-resource"}],"pending_requests":[]}`, `duplicate id "web"`},
+		"duplicate resource":          {`{"version":3,"agent_id":"agent-remove","identities":[{"id":"api","resource_public_key":"` + testPublicResourceID + `","crid":"` + testCRIDForKey(testPublicResourceID) + `","connector_routing_id":"` + testConnectorRoutingID + `","knock_resource_id":"cell-resource"},{"id":"web","resource_public_key":"` + testPublicResourceID + `","crid":"` + testCRIDForKey(testPublicResourceID) + `","connector_routing_id":"` + testConnectorRoutingID2 + `","knock_resource_id":"cell-resource"}],"pending_requests":[]}`, "maps resource_id"},
+		"bad slug":                    {`{"version":3,"agent_id":"agent-remove","identities":[{"id":"Bad Slug","resource_public_key":"` + testPublicResourceID + `","crid":"` + testCRIDForKey(testPublicResourceID) + `"}],"pending_requests":[]}`, "does not match required format"},
+		"bad public key":              {`{"version":3,"agent_id":"agent-remove","identities":[{"id":"web","resource_public_key":"not-a-public-key"}],"pending_requests":[]}`, "P-256 DER SPKI"},
+		"missing routing id":          {`{"version":3,"agent_id":"agent-remove","identities":[{"id":"web","resource_public_key":"` + testPublicResourceID + `","crid":"` + testCRIDForKey(testPublicResourceID) + `","knock_resource_id":"cell-resource"}],"pending_requests":[]}`, "connector_routing_id"},
+		"oversized knock id":          {`{"version":3,"agent_id":"agent-remove","identities":[{"id":"web","resource_public_key":"` + testPublicResourceID + `","crid":"` + testCRIDForKey(testPublicResourceID) + `","connector_routing_id":"` + testConnectorRoutingID + `","knock_resource_id":"` + strings.Repeat("k", 65) + `"}],"pending_requests":[]}`, "exceeds 64 bytes"},
+		"null crid":                   {`{"version":3,"agent_id":"agent-remove","identities":[{"id":"web","resource_public_key":"` + testPublicResourceID + `","connector_routing_id":"` + testConnectorRoutingID + `","knock_resource_id":"cell-resource","crid":null}],"pending_requests":[]}`, "crid must be absent rather than null"},
+		"pending continuity mismatch": {`{"version":3,"agent_id":"agent-remove","identities":[{"id":"web","resource_public_key":"` + testPublicResourceID + `","crid":"` + testCRIDForKey(testPublicResourceID) + `","connector_routing_id":"` + testConnectorRoutingID + `","knock_resource_id":"cell-resource"}],"pending_requests":[{"id":"web","request_nonce":"` + testConnectorRequestNonce + `","expected_crid":"` + testCRIDForKey(testPublicResourceID2) + `"}]}`, "does not assert its exact cached CRID"},
+		"null pending expected id":    {`{"version":3,"agent_id":"agent-remove","identities":[],"pending_requests":[{"id":"web","request_nonce":"` + testConnectorRequestNonce + `","expected_crid":null}]}`, "expected_crid must be absent rather than null"},
+		"unsorted identities":         {`{"version":3,"agent_id":"agent-remove","identities":[{"id":"web","resource_public_key":"` + testPublicResourceID + `","crid":"` + testCRIDForKey(testPublicResourceID) + `","connector_routing_id":"` + testConnectorRoutingID + `","knock_resource_id":"cell-resource"},{"id":"api","resource_public_key":"` + testPublicResourceID2 + `","crid":"` + testCRIDForKey(testPublicResourceID2) + `","connector_routing_id":"` + testConnectorRoutingID2 + `","knock_resource_id":"cell-resource"}],"pending_requests":[]}`, "strictly sorted by id"},
+		"unsorted pending":            {`{"version":3,"agent_id":"agent-remove","identities":[],"pending_requests":[{"id":"web","request_nonce":"` + testConnectorRequestNonce + `"},{"id":"api","request_nonce":"` + testConnectorRequestNonce + `"}]}`, "strictly sorted"},
 	}
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -380,7 +380,7 @@ func TestConnectorIdentityCacheStrictSchema(t *testing.T) {
 }
 
 func TestConnectorIdentityCacheRejectsLossyUnicodeInputs(t *testing.T) {
-	validPrefix := []byte(`{"version":2,"agent_id":"agent-`)
+	validPrefix := []byte(`{"version":3,"agent_id":"agent-`)
 	validSuffix := []byte(`","identities":[],"pending_requests":[]}`)
 	tests := map[string]struct {
 		raw  []byte
@@ -391,11 +391,11 @@ func TestConnectorIdentityCacheRejectsLossyUnicodeInputs(t *testing.T) {
 			want: "not valid UTF-8",
 		},
 		"unpaired surrogate escape": {
-			raw:  []byte(`{"version":2,"agent_id":"agent-\ud800","identities":[],"pending_requests":[]}`),
+			raw:  []byte(`{"version":3,"agent_id":"agent-\ud800","identities":[],"pending_requests":[]}`),
 			want: "UTF-16 surrogate escape",
 		},
 		"paired surrogate escapes": {
-			raw:  []byte(`{"version":2,"agent_id":"agent-\ud83d\ude00","identities":[],"pending_requests":[]}`),
+			raw:  []byte(`{"version":3,"agent_id":"agent-\ud83d\ude00","identities":[],"pending_requests":[]}`),
 			want: "UTF-16 surrogate escape",
 		},
 	}
@@ -505,7 +505,7 @@ func TestConnectorIdentityCacheRejectsInsecureFileAndDirectory(t *testing.T) {
 	})
 	t.Run("cache mode", func(t *testing.T) {
 		dir := newIdentityCacheTestDir(t)
-		writeIdentityCacheRaw(t, dir, `{"version":2,"identities":[],"pending_requests":[]}`)
+		writeIdentityCacheRaw(t, dir, `{"version":3,"identities":[],"pending_requests":[]}`)
 		if err := os.Chmod(filepath.Join(dir, connectorIdentityCacheFile), 0o644); err != nil {
 			t.Fatal(err)
 		}
@@ -516,7 +516,7 @@ func TestConnectorIdentityCacheRejectsInsecureFileAndDirectory(t *testing.T) {
 	t.Run("symlink", func(t *testing.T) {
 		dir := newIdentityCacheTestDir(t)
 		target := filepath.Join(t.TempDir(), "target")
-		if err := os.WriteFile(target, []byte(`{"version":2,"identities":[],"pending_requests":[]}`), 0o600); err != nil {
+		if err := os.WriteFile(target, []byte(`{"version":3,"identities":[],"pending_requests":[]}`), 0o600); err != nil {
 			t.Fatal(err)
 		}
 		if err := os.Symlink(target, filepath.Join(dir, connectorIdentityCacheFile)); err != nil {
@@ -588,13 +588,13 @@ func TestResolveConnectorIdentitiesColdThenWarmUsesDurableExactID(t *testing.T) 
 			pendingRaw, readErr := os.ReadFile(filepath.Join(dir, connectorIdentityCacheFile))
 			pendingObserved.Store(readErr == nil && strings.Contains(string(pendingRaw), `"pending_requests":[{"id":"web","request_nonce":`))
 			w.WriteHeader(http.StatusCreated)
-			_, _ = fmt.Fprintf(w, `{"data":{"resource_id":%q,"connector_routing_id":%q,"knock_resource_id":"cell-resource","type":"tunnel","status":"active","slug":"web"},"meta":{"found_existing":false}}`, testPublicResourceID, testConnectorRoutingID)
+			_, _ = fmt.Fprintf(w, `{"data":{"resource_id":%q,"crid":%q,"connector_routing_id":%q,"knock_resource_id":"cell-resource","type":"tunnel","status":"active","slug":"web"},"meta":{"found_existing":false}}`, testPublicResourceID, testCRIDForKey(testPublicResourceID), testConnectorRoutingID)
 		case r.Method == http.MethodGet && r.URL.Path == "/v1/resources" && r.URL.Query().Get("slug") == "web":
 			gets.Add(1)
 			_, _ = fmt.Fprint(w, `{"data":[]}`)
-		case r.Method == http.MethodGet && r.URL.Path == "/v1/resources/"+testPublicResourceID:
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/resources/"+testCRIDForKey(testPublicResourceID):
 			gets.Add(1)
-			_, _ = fmt.Fprintf(w, `{"data":{"resource":{"resource_id":%q,"connector_routing_id":%q,"knock_resource_id":"cell-resource","type":"tunnel","status":"active","slug":"web"}}}`, testPublicResourceID, testConnectorRoutingID)
+			_, _ = fmt.Fprintf(w, `{"data":{"resource":{"resource_id":%q,"crid":%q,"connector_routing_id":%q,"knock_resource_id":"cell-resource","type":"tunnel","status":"active","slug":"web"}}}`, testPublicResourceID, testCRIDForKey(testPublicResourceID), testConnectorRoutingID)
 		default:
 			http.Error(w, "unexpected request", http.StatusBadRequest)
 		}
@@ -644,7 +644,7 @@ func TestResolveConnectorIdentitiesColdThenWarmUsesDurableExactID(t *testing.T) 
 	if !pendingObserved.Load() {
 		t.Fatal("Ensure was dispatched before its durable pending journal entry")
 	}
-	if warm.Routes[0].ResourceID != testPublicResourceID || warm.Routes[0].ConnectorRoutingID != testConnectorRoutingID {
+	if warm.Routes[0].ResourcePublicKey != testPublicResourceID || warm.Routes[0].ConnectorRoutingID != testConnectorRoutingID {
 		t.Fatalf("warm route = %#v", warm.Routes[0])
 	}
 	raw, err := os.ReadFile(filepath.Join(dir, connectorIdentityCacheFile))
@@ -677,7 +677,7 @@ func TestResolveConnectorIdentitiesRetainsPendingWhenContinuityFailsAfterAuthent
 		case r.Method == http.MethodPost && r.URL.Path == "/v1/resources":
 			posts.Add(1)
 			w.WriteHeader(http.StatusCreated)
-			_, _ = fmt.Fprintf(w, `{"data":{"resource_id":%q,"connector_routing_id":%q,"knock_resource_id":"cell-resource","type":"tunnel","status":"active","slug":"web"},"meta":{"found_existing":false}}`, testPublicResourceID, testConnectorRoutingID)
+			_, _ = fmt.Fprintf(w, `{"data":{"resource_id":%q,"crid":%q,"connector_routing_id":%q,"knock_resource_id":"cell-resource","type":"tunnel","status":"active","slug":"web"},"meta":{"found_existing":false}}`, testPublicResourceID, testCRIDForKey(testPublicResourceID), testConnectorRoutingID)
 		default:
 			http.Error(w, "unexpected request", http.StatusBadRequest)
 		}
@@ -706,10 +706,10 @@ func TestResolveConnectorIdentitiesRetainsPendingWhenContinuityFailsAfterAuthent
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, resolved := cache.resourceID("web"); resolved || !cache.isPending("web") {
+	if _, resolved := cache.crid("web"); resolved || !cache.isPending("web") {
 		t.Fatalf("cache after continuity loss = %#v, want unresolved pending web", cache)
 	}
-	if cfg.Routes[0].ResourceID != "" || cfg.Routes[0].ConnectorRoutingID != "" {
+	if cfg.Routes[0].ResourcePublicKey != "" || cfg.Routes[0].ConnectorRoutingID != "" {
 		t.Fatalf("in-memory route committed after continuity loss: %#v", cfg.Routes[0])
 	}
 }
@@ -728,7 +728,7 @@ func TestResolveConnectorIdentitiesColdPreexistingSlugNeverEnsures(t *testing.T)
 			return
 		}
 		gets.Add(1)
-		_, _ = fmt.Fprintf(w, `{"data":[{"resource_id":%q,"connector_routing_id":%q,"knock_resource_id":"cell-resource","type":"tunnel","status":"active","slug":"web"}]}`, testPublicResourceID, testConnectorRoutingID)
+		_, _ = fmt.Fprintf(w, `{"data":[{"resource_id":%q,"crid":%q,"connector_routing_id":%q,"knock_resource_id":"cell-resource","type":"tunnel","status":"active","slug":"web"}]}`, testPublicResourceID, testCRIDForKey(testPublicResourceID), testConnectorRoutingID)
 	}))
 	t.Cleanup(server.Close)
 	client, err := qurl.NewClient(qurl.BearerToken("device-token"), qurl.WithBaseURL(server.URL))
@@ -747,7 +747,7 @@ func TestResolveConnectorIdentitiesColdPreexistingSlugNeverEnsures(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got, ok := cache.resourceID("web"); !ok || got != testPublicResourceID || cache.isPending("web") {
+	if got, ok := cache.crid("web"); !ok || got != testCRIDForKey(testPublicResourceID) || cache.isPending("web") {
 		t.Fatalf("adopted mapping = %q present=%v pending=%v", got, ok, cache.isPending("web"))
 	}
 }
@@ -822,9 +822,9 @@ func TestResolveConnectorIdentitiesRejectsChangedContinuityBeforeNativeIO(t *tes
 		return nil, errors.New("native resolver must not be called")
 	}
 	cfg := nhpconfig.NewDefaulted()
-	cfg.Routes = []nhpconfig.Route{{ID: "web", Type: nhpconfig.RouteTypeHTTP, LocalIP: "127.0.0.1", LocalPort: 8080, ResourceID: testPublicResourceID}}
+	cfg.Routes = []nhpconfig.Route{{ID: "web", Type: nhpconfig.RouteTypeHTTP, LocalIP: "127.0.0.1", LocalPort: 8080, ResourcePublicKey: testPublicResourceID, CRID: testCRIDForKey(testPublicResourceID)}}
 	err := resolveConnectorIdentities(context.Background(), cfg, &qurl.AgentRuntimeBinding{}, nil, dir, testConnectorCacheAgentID, nil, resolve)
-	if err == nil || !strings.Contains(err.Error(), `durable NHP request asserts resource_id ""`) {
+	if err == nil || !strings.Contains(err.Error(), `durable NHP request asserts crid ""`) {
 		t.Fatalf("resolve error = %v, want durable continuity conflict", err)
 	}
 	if calls.Load() != 0 {
@@ -866,7 +866,7 @@ func TestResolveConnectorIdentitiesPreservesUnknownOutcomeWithoutHTTPReconciliat
 			if posts.Load() == 0 {
 				_, _ = fmt.Fprint(w, `{"data":[]}`)
 			} else {
-				_, _ = fmt.Fprintf(w, `{"data":[{"resource_id":%q,"connector_routing_id":%q,"knock_resource_id":"cell-resource","type":"tunnel","status":"active","slug":"web"}]}`, testPublicResourceID, testConnectorRoutingID)
+				_, _ = fmt.Fprintf(w, `{"data":[{"resource_id":%q,"crid":%q,"connector_routing_id":%q,"knock_resource_id":"cell-resource","type":"tunnel","status":"active","slug":"web"}]}`, testPublicResourceID, testCRIDForKey(testPublicResourceID), testConnectorRoutingID)
 			}
 		}
 	}))
@@ -888,7 +888,7 @@ func TestResolveConnectorIdentitiesPreservesUnknownOutcomeWithoutHTTPReconciliat
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got, ok := cache.resourceID("web"); ok || !cache.isPending("web") {
+	if got, ok := cache.crid("web"); ok || !cache.isPending("web") {
 		t.Fatalf("cache id=%q present=%v pending=%v, want unresolved exact replay", got, ok, cache.isPending("web"))
 	}
 }
@@ -904,14 +904,14 @@ func TestResolveConnectorIdentitiesPreservesMalformedSuccessWithoutHTTPReconcili
 		if r.Method == http.MethodPost {
 			posts.Add(1)
 			w.WriteHeader(http.StatusCreated)
-			_, _ = fmt.Fprintf(w, `{"data":{"resource_id":%q,"connector_routing_id":%q,"knock_resource_id":"cell-resource","type":"tunnel","status":"active","slug":"web"},"meta":{}}`, testPublicResourceID, testConnectorRoutingID)
+			_, _ = fmt.Fprintf(w, `{"data":{"resource_id":%q,"crid":%q,"connector_routing_id":%q,"knock_resource_id":"cell-resource","type":"tunnel","status":"active","slug":"web"},"meta":{}}`, testPublicResourceID, testCRIDForKey(testPublicResourceID), testConnectorRoutingID)
 			return
 		}
 		gets.Add(1)
 		if posts.Load() == 0 {
 			_, _ = fmt.Fprint(w, `{"data":[]}`)
 		} else {
-			_, _ = fmt.Fprintf(w, `{"data":[{"resource_id":%q,"connector_routing_id":%q,"knock_resource_id":"cell-resource","type":"tunnel","status":"active","slug":"web"}]}`, testPublicResourceID, testConnectorRoutingID)
+			_, _ = fmt.Fprintf(w, `{"data":[{"resource_id":%q,"crid":%q,"connector_routing_id":%q,"knock_resource_id":"cell-resource","type":"tunnel","status":"active","slug":"web"}]}`, testPublicResourceID, testCRIDForKey(testPublicResourceID), testConnectorRoutingID)
 		}
 	}))
 	t.Cleanup(server.Close)
@@ -981,7 +981,7 @@ func TestResolveConnectorIdentitiesClearsOnlyAuthenticatedTerminalNHPRejections(
 
 func TestResolveConnectorIdentitiesRejectsOrphanBeforeResourceNetwork(t *testing.T) {
 	dir := newIdentityCacheTestDir(t)
-	writeIdentityCacheRaw(t, dir, `{"version":2,"agent_id":"`+testConnectorCacheAgentID+`","identities":[{"id":"old-web","resource_id":"`+testPublicResourceID+`","connector_routing_id":"`+testConnectorRoutingID+`","knock_resource_id":"cell-resource"}],"pending_requests":[]}`)
+	writeIdentityCacheRaw(t, dir, `{"version":3,"agent_id":"`+testConnectorCacheAgentID+`","identities":[{"id":"old-web","resource_public_key":"`+testPublicResourceID+`","crid":"`+testCRIDForKey(testPublicResourceID)+`","connector_routing_id":"`+testConnectorRoutingID+`","knock_resource_id":"cell-resource"}],"pending_requests":[]}`)
 	var calls atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		calls.Add(1)
@@ -1022,5 +1022,16 @@ func TestConnectorIdentityCacheContinuityGuardsRejectNilReceiver(t *testing.T) {
 			}()
 			run()
 		})
+	}
+}
+
+func testCRIDForKey(key string) string {
+	switch key {
+	case "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE2vPoafaVb5Lue-bfcCuoL-_CnVBKf8YvV94G8ozebA6RHEQUPsnguSt1yx2mTzDSogBmb9WYEVBDgX7vc2NKTg":
+		return "qgxd4jfvlumhscxrw7wwcwco2h6cda4fi5xixx43xybcfri2liym3d5gmjmq"
+	case "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEcOtuxu2qhc3gt1E7BiEU0CLqEDlXDwzZq0JnESgMAwERX6y_XXF5Cn5SKITWIZQmUhCZ0pHHlVn7SmFUTAnTGQ":
+		return "qe4jqpd7eaoslq7jinmjv4yikgzmcxgpjfsuobiniqnko32lpw742pueoujq"
+	default:
+		panic("unknown test public key")
 	}
 }

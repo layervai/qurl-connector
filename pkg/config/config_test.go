@@ -14,8 +14,8 @@ const (
 	testRoutingB        = "c-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbq"
 	testRoutingC        = "c-ccccccccccccccccccccccccccccccccccccccccccccccccccca"
 	testRoutingZ        = "c-zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzq"
-	testPublicResourceA = "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE2vPoafaVb5Lue-bfcCuoL-_CnVBKf8YvV94G8ozebA6RHEQUPsnguSt1yx2mTzDSogBmb9WYEVBDgX7vc2NKTg"
-	testPublicResourceB = "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEcOtuxu2qhc3gt1E7BiEU0CLqEDlXDwzZq0JnESgMAwERX6y_XXF5Cn5SKITWIZQmUhCZ0pHHlVn7SmFUTAnTGQ"
+	testPublicResourceA = "qgxd4jfvlumhscxrw7wwcwco2h6cda4fi5xixx43xybcfri2liym3d5gmjmq"
+	testPublicResourceB = "qe4jqpd7eaoslq7jinmjv4yikgzmcxgpjfsuobiniqnko32lpw742pueoujq"
 )
 
 // writeConfig writes YAML content to a temporary file and returns its path.
@@ -91,7 +91,7 @@ routes:
     local_port: 8080
     subdomain: "%s "
     load_balancer_group: %s
-    resource_id: %s
+    crid: %s
     connector_routing_id: %s
     knock_resource_id: cell-resource
   - id: api
@@ -175,7 +175,7 @@ func TestLoadRejectsOtherRetiredFRPFields(t *testing.T) {
 	}{
 		{name: "server token", path: "server.token", yaml: "server:\n  token: {from_env: FRPS_TOKEN}\n"},
 		{name: "subdomain", path: "routes[0].subdomain", yaml: "routes:\n  - id: web\n    type: http\n    local_port: 8080\n    subdomain: {unexpected: value}\n", wantLine: "at line 5"},
-		{name: "pinned subdomain", path: "routes[0].subdomain", yaml: "routes:\n  - id: web\n    type: http\n    local_port: 8080\n    resource_id: MFkwEwYHKoZIzj0CAQ\n    subdomain: {unexpected: value}\n", wantLine: "at line 6"},
+		{name: "pinned subdomain", path: "routes[0].subdomain", yaml: "routes:\n  - id: web\n    type: http\n    local_port: 8080\n    crid: MFkwEwYHKoZIzj0CAQ\n    subdomain: {unexpected: value}\n", wantLine: "at line 6"},
 		{name: "custom domains", path: "routes[0].custom_domains", yaml: "routes:\n  - id: web\n    type: http\n    local_port: 8080\n    custom_domains: [old.example]\n"},
 		{name: "remote port", path: "routes[0].remote_port", yaml: "routes:\n  - id: web\n    type: http\n    local_port: 8080\n    remote_port: 7001\n"},
 		{name: "host rewrite", path: "routes[0].host_rewrite", yaml: "routes:\n  - id: web\n    type: http\n    local_port: 8080\n    host_rewrite: old.example\n"},
@@ -463,7 +463,7 @@ routes:
   - id: "My App"
     type: http
     local_port: 80
-    resource_id: %s
+    crid: %s
     connector_routing_id: c-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 `, testPublicResourceA),
 			want: "My App",
@@ -511,11 +511,11 @@ routes:
   - id: "My App"
     type: http
     local_port: 80
-    resource_id: r_first000000
+    crid: r_first000000
   - id: "My App"
     type: http
     local_port: 81
-    resource_id: r_second00000
+    crid: r_second00000
 `
 	_, err := Load(writeConfig(t, yaml))
 	if err == nil {
@@ -842,13 +842,13 @@ func TestNewDefaulted(t *testing.T) {
 
 func TestConfig_RoutingAndPublicIdentityStaySeparate(t *testing.T) {
 	cfg := &Config{Routes: []Route{{
-		ID: "managed", ResourceID: testPublicResourceA, ConnectorRoutingID: testRoutingA,
+		ID: "managed", CRID: testPublicResourceA, ConnectorRoutingID: testRoutingA,
 	}}}
-	if got := cfg.PrimaryResourceID(); got != testPublicResourceA {
+	if got := cfg.Routes[0].CRID; got != testPublicResourceA {
 		t.Fatalf("PrimaryResourceID = %q, want public identity", got)
 	}
 	cfg.SetKnockResourceID(testPublicResourceA, "qurl-tunnel-server")
-	if got := cfg.KnockResourceID(cfg.PrimaryResourceID()); got != "qurl-tunnel-server" {
+	if got := cfg.KnockResourceID(cfg.Routes[0].CRID); got != "qurl-tunnel-server" {
 		t.Fatalf("KnockResourceID(public identity) = %q", got)
 	}
 }
@@ -859,7 +859,7 @@ routes:
   - id: pinned
     type: http
     local_port: 8080
-    resource_id: %s
+    crid: %s
     connector_routing_id: ""
     subdomain: old-managed-routing
     load_balancer_group: old-managed-routing
@@ -873,7 +873,7 @@ routes:
 	if stderr != "" {
 		t.Fatalf("pending managed hydration produced repeated command noise: %q", stderr)
 	}
-	if cfg.Routes[0].ResourceID != testPublicResourceA || cfg.Routes[0].ConnectorRoutingID != "" {
+	if cfg.Routes[0].CRID != testPublicResourceA || cfg.Routes[0].ConnectorRoutingID != "" {
 		t.Fatalf("Load altered incomplete managed identity: %+v", cfg.Routes[0])
 	}
 }
@@ -918,7 +918,7 @@ func TestConfigFirstDifferentKnockResourceIDDeterministic(t *testing.T) {
 	sameOnly := &Config{}
 	sameOnly.SetKnockResourceID("r_same", "qurl-tunnel-server-b")
 	if _, _, ok := sameOnly.FirstDifferentKnockResourceID("r_same", "qurl-tunnel-server-b"); ok {
-		t.Fatal("same resource_id must not conflict with itself")
+		t.Fatal("same crid must not conflict with itself")
 	}
 	if _, _, ok := cfg.FirstDifferentKnockResourceID("r_new", "qurl-tunnel-server-a"); !ok {
 		t.Fatal("different existing resource with a different knock_resource_id should conflict")

@@ -19,25 +19,25 @@ var ErrResourceGone = errors.New("qURL share resource is permanently unavailable
 
 // Admission is one resource-bound NHP authorization. KnockResourceID is the
 // q_ catalog key used to select ACTokens and ResourceHost from the ACK, while
-// ResourceID is the public management resource sent in FRP metadata. They are
+// ResourcePublicKey is the public management resource sent in FRP metadata. They are
 // intentionally separate identities.
 type Admission struct {
-	KnockResourceID string
-	ResourceID      string
-	RunID           string
-	RunAttempt      uint64
-	Token           string
-	ResourceHost    string
-	SessionID       uint64
-	SessionReceipt  qurl.NativeSessionReceipt
-	OpenTime        time.Duration
+	KnockResourceID   string
+	ResourcePublicKey string
+	RunID             string
+	RunAttempt        uint64
+	Token             string
+	ResourceHost      string
+	SessionID         uint64
+	SessionReceipt    qurl.NativeSessionReceipt
+	OpenTime          time.Duration
 }
 
 // String keeps the bearer AC token out of logs, assertions, and diagnostics.
 // The remaining fields identify the exact session without granting access.
 func (a Admission) String() string {
-	return fmt.Sprintf("share.Admission{KnockResourceID:%q, ResourceID:%q, RunID:%q, RunAttempt:%d, Token:[REDACTED], ResourceHost:%q, SessionID:%d, SessionReceipt:{CellID:%q, SessionID:%d, SessionIssuedAtMillis:%d, RunID:%q, RunAttempt:%d}, OpenTime:%s}",
-		a.KnockResourceID, a.ResourceID, a.RunID, a.RunAttempt, a.ResourceHost, a.SessionID,
+	return fmt.Sprintf("share.Admission{KnockResourceID:%q, ResourcePublicKey:%q, RunID:%q, RunAttempt:%d, Token:[REDACTED], ResourceHost:%q, SessionID:%d, SessionReceipt:{CellID:%q, SessionID:%d, SessionIssuedAtMillis:%d, RunID:%q, RunAttempt:%d}, OpenTime:%s}",
+		a.KnockResourceID, a.ResourcePublicKey, a.RunID, a.RunAttempt, a.ResourceHost, a.SessionID,
 		a.SessionReceipt.CellID, a.SessionReceipt.SessionID, a.SessionReceipt.SessionIssuedAtMillis,
 		a.SessionReceipt.RunID, a.SessionReceipt.RunAttempt, a.OpenTime)
 }
@@ -167,8 +167,8 @@ func validateAdmission(a Admission, knockResourceID, resourceID string) error {
 	if a.KnockResourceID != knockResourceID {
 		return fmt.Errorf("NHP admission knock resource %q does not match requested %q", a.KnockResourceID, knockResourceID)
 	}
-	if a.ResourceID != resourceID {
-		return fmt.Errorf("NHP admission public resource %q does not match requested %q", a.ResourceID, resourceID)
+	if a.ResourcePublicKey != resourceID {
+		return fmt.Errorf("NHP admission public resource %q does not match requested %q", a.ResourcePublicKey, resourceID)
 	}
 	if a.RunID == "" || a.Token == "" {
 		return errors.New("NHP admission is missing run ID or token")

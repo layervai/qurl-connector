@@ -338,7 +338,7 @@ func startGroupHarness(t *testing.T, openTime, rotationLead time.Duration, hold 
 	}
 	onServing, onRouteServing, onRouteFailed, onRetry := h.events.callbacks()
 	runner, err := NewSessionGroupRunner(SessionGroupConfig{
-		KnockResourceID: "q_catalog_key", ResourceID: "group-resource",
+		KnockResourceID: "q_catalog_key", ResourcePublicKey: "group-resource",
 		Routes: groupTestRoutes(routes...), Admitter: h.admitter, Sessions: h.factory,
 		MinBackoff: time.Millisecond, MaxBackoff: 2 * time.Millisecond,
 		RotationLead: rotationLead, StopTimeout: time.Second,
@@ -523,7 +523,7 @@ func TestSessionGroupRunnerRegeneratesChangedTargetAndRejectsIdentityChange(t *t
 
 	// Resource identities are immutable in place.
 	for name, mutate := range map[string]func(*LocalHTTPRoute){
-		"resource ID": func(r *LocalHTTPRoute) { r.ResourceID = "resource-other" },
+		"resource ID": func(r *LocalHTTPRoute) { r.ResourcePublicKey = "resource-other" },
 		"routing ID":  func(r *LocalHTTPRoute) { r.ConnectorRoutingID = "routing-other" },
 	} {
 		changed := groupTestRoutes("a", "b")
@@ -946,7 +946,7 @@ func TestSessionGroupRunnerSetRoutesToleratesRetiringSession(t *testing.T) {
 
 func TestNewSessionGroupRunnerRejectsInvalidGroups(t *testing.T) {
 	valid := SessionGroupConfig{
-		KnockResourceID: "q_catalog_key", ResourceID: "group-resource",
+		KnockResourceID: "q_catalog_key", ResourcePublicKey: "group-resource",
 		Routes: groupTestRoutes("a", "b"), Admitter: &rotatingAdmitter{openTime: time.Minute}, Sessions: &fakeGroupFactory{},
 	}
 	if _, err := NewSessionGroupRunner(valid); err != nil {
@@ -954,7 +954,7 @@ func TestNewSessionGroupRunnerRejectsInvalidGroups(t *testing.T) {
 	}
 	cases := map[string]func(*SessionGroupConfig){
 		"no knock resource": func(c *SessionGroupConfig) { c.KnockResourceID = "" },
-		"no group resource": func(c *SessionGroupConfig) { c.ResourceID = "" },
+		"no group resource": func(c *SessionGroupConfig) { c.ResourcePublicKey = "" },
 		"no admitter":       func(c *SessionGroupConfig) { c.Admitter = nil },
 		"no factory":        func(c *SessionGroupConfig) { c.Sessions = nil },
 		"no routes":         func(c *SessionGroupConfig) { c.Routes = nil },
@@ -974,7 +974,7 @@ func TestNewSessionGroupRunnerRejectsInvalidGroups(t *testing.T) {
 		})
 	}
 	if _, err := NewSessionGroupRunner(SessionGroupConfig{
-		KnockResourceID: "q_catalog_key", ResourceID: "group-resource",
+		KnockResourceID: "q_catalog_key", ResourcePublicKey: "group-resource",
 		Routes: thousandRoutes(MaxGroupRoutes), Admitter: &rotatingAdmitter{openTime: time.Minute}, Sessions: &fakeGroupFactory{},
 	}); err != nil {
 		t.Fatalf("group at the bound was rejected: %v", err)
@@ -991,7 +991,7 @@ func (goneGroupAdmitter) Retire(context.Context, Admission) error { return nil }
 
 func TestSessionGroupRunnerReturnsWhenGroupAdmissionIsGone(t *testing.T) {
 	runner, err := NewSessionGroupRunner(SessionGroupConfig{
-		KnockResourceID: "q_catalog_key", ResourceID: "group-resource",
+		KnockResourceID: "q_catalog_key", ResourcePublicKey: "group-resource",
 		Routes: groupTestRoutes("a"), Admitter: goneGroupAdmitter{}, Sessions: &fakeGroupFactory{},
 	})
 	if err != nil {
@@ -1101,7 +1101,7 @@ func TestSessionGroupRunnerRotationLeadIgnoresRoutesAddedAfterStart(t *testing.T
 
 func TestSessionGroupRunnerSingleRouteCycleKeepsPriorMeasurement(t *testing.T) {
 	runner, err := NewSessionGroupRunner(SessionGroupConfig{
-		KnockResourceID: "q_catalog_key", ResourceID: "group-resource",
+		KnockResourceID: "q_catalog_key", ResourcePublicKey: "group-resource",
 		Routes: groupTestRoutes("a"), Admitter: &rotatingAdmitter{openTime: time.Hour}, Sessions: &fakeGroupFactory{},
 	})
 	if err != nil {

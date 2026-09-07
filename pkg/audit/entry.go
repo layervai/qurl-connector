@@ -142,10 +142,10 @@ type Entry struct {
 	// without parsing Error free-text. Empty for success/allow.
 	Reason string `json:"reason,omitempty"`
 
-	SessionID  string `json:"session_id,omitempty"`
-	ResourceID string `json:"resource_id,omitempty"`
-	RouteID    string `json:"route_id,omitempty"`
-	Subject    string `json:"subject,omitempty"`
+	SessionID         string `json:"session_id,omitempty"`
+	ResourcePublicKey string `json:"resource_id,omitempty"`
+	RouteID           string `json:"route_id,omitempty"`
+	Subject           string `json:"subject,omitempty"`
 
 	// SourceIP is the source of the operation. For outbound knock /
 	// native registration this is the agent's egress IP (best-effort; may be

@@ -1741,7 +1741,7 @@ func TestNativeAdmitterRecoversSustainedStaleAssignmentWithoutOperatorInput(t *t
 	if err != nil {
 		t.Fatal(err)
 	}
-	if admission.SessionID != 77 || admission.KnockResourceID != "q_catalog_key" || admission.ResourceID != "public-resource" {
+	if admission.SessionID != 77 || admission.KnockResourceID != "q_catalog_key" || admission.ResourcePublicKey != "public-resource" {
 		t.Fatalf("recovered admission = %+v", admission)
 	}
 	if refreshes != 3 || store.marks != 3 || knocks != 8 {
@@ -2933,7 +2933,7 @@ func TestNativeAdmitterUDPOptionsReachRestartRecoveryAndRetirement(t *testing.T)
 		t.Fatal(err)
 	}
 	admission := Admission{
-		ResourceID: "retire-resource", RunID: receipt.RunID, RunAttempt: receipt.RunAttempt,
+		ResourcePublicKey: "retire-resource", RunID: receipt.RunID, RunAttempt: receipt.RunAttempt,
 		SessionID: receipt.SessionID, SessionReceipt: receipt,
 	}
 	if err := admitter.Retire(context.Background(), admission); err != nil {
@@ -3151,7 +3151,7 @@ func TestNativeAdmitterCanceledRetireWakesBoundedResourceRecovery(t *testing.T) 
 	retired := make(chan error, 1)
 	go func() {
 		retired <- admitter.Retire(retireCtx, Admission{
-			ResourceID: mapped.Operation.ProtectedResourceID, RunID: receipt.RunID, RunAttempt: receipt.RunAttempt,
+			ResourcePublicKey: mapped.Operation.ProtectedResourceID, RunID: receipt.RunID, RunAttempt: receipt.RunAttempt,
 			SessionID: receipt.SessionID, SessionReceipt: receipt,
 		})
 	}()
@@ -3249,7 +3249,7 @@ func TestNativeAdmitterCloseCancelsQueuedRetirementRecovery(t *testing.T) {
 	}
 	admitter.startRecoveryWorkers()
 	if err := admitter.Retire(context.Background(), Admission{
-		ResourceID: "resource-one", RunID: "run-one", RunAttempt: 1,
+		ResourcePublicKey: "resource-one", RunID: "run-one", RunAttempt: 1,
 		SessionID: 1, SessionReceipt: receipt,
 	}); !errors.Is(err, nativeudp.ErrNoReply) {
 		t.Fatalf("Retire() = %v, want no-reply failure", err)
@@ -3434,7 +3434,7 @@ func TestNativeAdmitterRetiresOnlyExactLiveSessions(t *testing.T) {
 		pending: make(map[nativeAdmissionKey]bool),
 	}
 	admission1 := Admission{
-		ResourceID: "resource-one", RunID: "run-one", RunAttempt: 1, Token: "token",
+		ResourcePublicKey: "resource-one", RunID: "run-one", RunAttempt: 1, Token: "token",
 		ResourceHost: "127.0.0.1:7000", SessionID: 1, SessionReceipt: receipt1, OpenTime: time.Minute,
 	}
 	if err := admitter.Retire(context.Background(), admission1); err != nil {
@@ -3669,7 +3669,7 @@ func TestNativeAdmitterRetriesFailedRetirementBeforeSameResourceReplacement(t *t
 
 	receipt := testSessionReceipt(1, "run-one", 1)
 	admission := Admission{
-		ResourceID: "resource-one", RunID: "run-one", RunAttempt: 1,
+		ResourcePublicKey: "resource-one", RunID: "run-one", RunAttempt: 1,
 		SessionID: 1, SessionReceipt: receipt,
 	}
 	admitter := &NativeAdmitter{
@@ -3784,10 +3784,10 @@ func TestNativeAdmitterFencesServingReplacementUntilDurableRetirementTerminal(t 
 	factory := &fakeGroupFactory{}
 	serving := make(chan Admission, 1)
 	runner, err := NewSessionGroupRunner(SessionGroupConfig{
-		KnockResourceID: "resource-b", ResourceID: testProtectedResourceID,
+		KnockResourceID: "resource-b", ResourcePublicKey: testProtectedResourceID,
 		Routes: []LocalHTTPRoute{{
 			RouteID: "route-b", LocalIP: "127.0.0.1", LocalPort: 8080,
-			ResourceID: testProtectedResourceID, ConnectorRoutingID: "route-b",
+			ResourcePublicKey: testProtectedResourceID, ConnectorRoutingID: "route-b",
 		}},
 		Admitter: admitter, Sessions: factory, OnServing: func(admission Admission) { serving <- admission },
 	})

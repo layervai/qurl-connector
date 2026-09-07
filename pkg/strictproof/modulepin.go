@@ -18,10 +18,10 @@ import (
 const (
 	QurlGoModulePath        = "github.com/layervai/qurl-go"
 	QurlGoRepoURL           = "https://github.com/layervai/qurl-go"
-	QurlGoSelectedCommitSHA = "8d89993a36a1f79dd51a3040a8bba4b43f1a9d7d"
-	QurlGoSelectedVersion   = "v0.11.0"
-	QurlGoSelectedSum       = "h1:Ksmyoc+oObXmDQk+h6/hLBrvzgjl++0FK9NyOUPJXks="
-	QurlGoSelectedGoModSum  = "h1:zujbZnolKJzJEDyKwgUqulhHSi0sZeU2w1x+nle/yeM="
+	QurlGoSelectedCommitSHA = "be974ded8f9c848846a211bfc4d4b06e0b86aa52"
+	QurlGoSelectedVersion   = "v0.12.1-0.20260907211030-be974ded8f9c"
+	QurlGoSelectedSum       = "h1:idaGIk7/foQZdaFmNwV5El7KRBTvS+2o8X+cs2+ObVQ="
+	QurlGoSelectedGoModSum  = "h1:RzV0C7ELzGuiBSfyMTHCcPuBVwNEKlP1X+1k2vCV5FQ="
 )
 
 // Accepted versions are either a canonical release tag or Go's canonical

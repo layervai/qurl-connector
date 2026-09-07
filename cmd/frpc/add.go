@@ -132,7 +132,7 @@ func addRouteToConfig(ctx context.Context, cfgPath string, route nhpconfig.Route
 			if existingID == route.ID {
 				return fmt.Errorf("a route with id %q already exists", route.ID)
 			}
-			if existing.ID == "" && existing.ResourceID == "" {
+			if existing.ID == "" && existing.ResourcePublicKey == "" {
 				if existingID != "" {
 					return fmt.Errorf("routes[%d] uses %s=%q as its single-route fallback id; set route id: %q in YAML before adding another route", i, envConnectorID, existingID, existingID)
 				}

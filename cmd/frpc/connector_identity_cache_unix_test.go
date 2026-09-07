@@ -104,7 +104,7 @@ func TestConnectorIdentityCacheDirectorySyncFailureLeavesCommittedMapping(t *tes
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got, ok := cache.resourceID("web"); !ok || got != testPublicResourceID || cache.isPending("web") {
+	if got, ok := cache.crid("web"); !ok || got != testCRIDForKey(testPublicResourceID) || cache.isPending("web") {
 		t.Fatalf("committed mapping = %q, present=%v pending=%v", got, ok, cache.isPending("web"))
 	}
 }
@@ -178,7 +178,7 @@ func TestConnectorIdentityCacheRetryBarrierPrecedesPruneAfterSyncFailure(t *test
 		if err != nil {
 			return err
 		}
-		if got, ok := cache.resourceID("web"); !ok || got != testPublicResourceID || cache.isPending("web") {
+		if got, ok := cache.crid("web"); !ok || got != testCRIDForKey(testPublicResourceID) || cache.isPending("web") {
 			t.Fatalf("visible retry state = %q present=%v pending=%v", got, ok, cache.isPending("web"))
 		}
 		return cache.removeLocked(txn, "web")

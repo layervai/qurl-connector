@@ -103,11 +103,11 @@ func activeConnectorResourceResponse(resourceID, slug string) string {
 }
 
 func connectorResourceDetailResponse(resourceID, slug, status string) string {
-	return fmt.Sprintf(`{"data":{"resource":{"resource_id":%q,"connector_routing_id":%q,"knock_resource_id":"cell-resource","type":"tunnel","status":%q,"slug":%q}}}`, resourceID, testConnectorRoutingID, status, slug)
+	return fmt.Sprintf(`{"data":{"resource":{"resource_id":%q,"crid":%q,"connector_routing_id":%q,"knock_resource_id":"cell-resource","type":"tunnel","status":%q,"slug":%q}}}`, resourceID, testCRIDForKey(resourceID), testConnectorRoutingID, status, slug)
 }
 
 func ensureConnectorResourceResponse(resourceID, slug string) string {
-	return fmt.Sprintf(`{"data":{"resource_id":%q,"connector_routing_id":%q,"knock_resource_id":"cell-resource","type":"tunnel","status":"active","slug":%q},"meta":{"found_existing":true}}`, resourceID, testConnectorRoutingID, slug)
+	return fmt.Sprintf(`{"data":{"resource_id":%q,"crid":%q,"connector_routing_id":%q,"knock_resource_id":"cell-resource","type":"tunnel","status":"active","slug":%q},"meta":{"found_existing":true}}`, resourceID, testCRIDForKey(resourceID), testConnectorRoutingID, slug)
 }
 
 func seedRemoveSagaCache(t *testing.T, stateDir, id string, pending bool) {
@@ -138,20 +138,20 @@ func configureRemoveCommandTest(t *testing.T, cfgPath, stateDir, apiURL string) 
 	t.Setenv(agentstate.EnvStateDirPrimary, stateDir)
 	t.Setenv(agentstate.EnvKeyProvider, agentstate.KeyProviderFile)
 	t.Setenv("QURL_API_URL", apiURL+"/v1")
-	oldConfig, oldResourceID := cfgFile, removeResourceID
-	cfgFile, removeResourceID = cfgPath, ""
+	oldConfig, oldResourceID := cfgFile, removeCRID
+	cfgFile, removeCRID = cfgPath, ""
 	t.Cleanup(func() {
-		cfgFile, removeResourceID = oldConfig, oldResourceID
+		cfgFile, removeCRID = oldConfig, oldResourceID
 	})
 }
 
 func TestRunRemovePendingRouteNeedsNoCredential(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv(agentstate.EnvStateDirPrimary, filepath.Join(dir, "state"))
-	oldConfig, oldResourceID := cfgFile, removeResourceID
-	t.Cleanup(func() { cfgFile, removeResourceID = oldConfig, oldResourceID })
+	oldConfig, oldResourceID := cfgFile, removeCRID
+	t.Cleanup(func() { cfgFile, removeCRID = oldConfig, oldResourceID })
 	cfgFile = filepath.Join(dir, "qurl-proxy.yaml")
-	removeResourceID = ""
+	removeCRID = ""
 	cfg := nhpconfig.NewDefaulted()
 	cfg.Routes = []nhpconfig.Route{{ID: "customer-web", Type: nhpconfig.RouteTypeHTTP, LocalIP: "127.0.0.1", LocalPort: 8080}}
 	if err := nhpconfig.Save(cfg, cfgFile); err != nil {
@@ -171,16 +171,16 @@ func TestRunRemovePendingRouteNeedsNoCredential(t *testing.T) {
 
 func TestRunRemoveManagedRoutePreservesConfigWithoutDeviceState(t *testing.T) {
 	dir := t.TempDir()
-	oldConfig, oldResourceID := cfgFile, removeResourceID
-	t.Cleanup(func() { cfgFile, removeResourceID = oldConfig, oldResourceID })
+	oldConfig, oldResourceID := cfgFile, removeCRID
+	t.Cleanup(func() { cfgFile, removeCRID = oldConfig, oldResourceID })
 	cfgFile = filepath.Join(dir, "qurl-proxy.yaml")
-	removeResourceID = ""
+	removeCRID = ""
 	t.Setenv(agentstate.EnvStateDirPrimary, filepath.Join(dir, "missing-state"))
 	cfg := nhpconfig.NewDefaulted()
 	cfg.Routes = []nhpconfig.Route{{
 		ID: "customer-web", Type: nhpconfig.RouteTypeHTTP,
 		LocalIP: "127.0.0.1", LocalPort: 8080,
-		ResourceID: testPublicResourceID, ConnectorRoutingID: testConnectorRoutingID,
+		ResourcePublicKey: testPublicResourceID, CRID: testCRIDForKey(testPublicResourceID), ConnectorRoutingID: testConnectorRoutingID,
 	}}
 	if err := nhpconfig.Save(cfg, cfgFile); err != nil {
 		t.Fatal(err)
@@ -194,7 +194,7 @@ func TestRunRemoveManagedRoutePreservesConfigWithoutDeviceState(t *testing.T) {
 	if loadErr != nil {
 		t.Fatal(loadErr)
 	}
-	if len(got.Routes) != 1 || got.Routes[0].ResourceID != testPublicResourceID {
+	if len(got.Routes) != 1 || got.Routes[0].CRID != testCRIDForKey(testPublicResourceID) {
 		t.Fatalf("managed route was removed after failed remote revoke: %#v", got.Routes)
 	}
 }
@@ -216,10 +216,10 @@ func TestRunRemoveBindsTrulyEmptyCacheBeforeExactRemoteDelete(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls.Add(1)
 		switch {
-		case r.Method == http.MethodGet && r.URL.Path == "/v1/resources/"+testPublicResourceID:
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/resources/"+testCRIDForKey(testPublicResourceID):
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = fmt.Fprint(w, activeConnectorResourceResponse(testPublicResourceID, "customer-web"))
-		case r.Method == http.MethodDelete && r.URL.Path == "/v1/resources/"+testPublicResourceID:
+		case r.Method == http.MethodDelete && r.URL.Path == "/v1/resources/"+testCRIDForKey(testPublicResourceID):
 			w.WriteHeader(http.StatusNoContent)
 		default:
 			http.Error(w, "unexpected request", http.StatusBadRequest)
@@ -234,7 +234,7 @@ func TestRunRemoveBindsTrulyEmptyCacheBeforeExactRemoteDelete(t *testing.T) {
 		{
 			ID: "customer-web", Type: nhpconfig.RouteTypeHTTP,
 			LocalIP: "127.0.0.1", LocalPort: 8080,
-			ResourceID: testPublicResourceID, ConnectorRoutingID: testConnectorRoutingID,
+			ResourcePublicKey: testPublicResourceID, CRID: testCRIDForKey(testPublicResourceID), ConnectorRoutingID: testConnectorRoutingID,
 		},
 		{
 			ID: "customer-api", Type: nhpconfig.RouteTypeHTTP,
@@ -244,9 +244,9 @@ func TestRunRemoveBindsTrulyEmptyCacheBeforeExactRemoteDelete(t *testing.T) {
 	if err := nhpconfig.Save(cfg, cfgPath); err != nil {
 		t.Fatal(err)
 	}
-	oldConfig, oldResourceID := cfgFile, removeResourceID
-	cfgFile, removeResourceID = cfgPath, ""
-	t.Cleanup(func() { cfgFile, removeResourceID = oldConfig, oldResourceID })
+	oldConfig, oldResourceID := cfgFile, removeCRID
+	cfgFile, removeCRID = cfgPath, ""
+	t.Cleanup(func() { cfgFile, removeCRID = oldConfig, oldResourceID })
 
 	if err := runRemove(nil, []string{"customer-web"}); err != nil {
 		t.Fatal(err)
@@ -387,8 +387,8 @@ func TestRunRemovePendingSagaRetainsOrCommitsExactFence(t *testing.T) {
 				w.Header().Set("Content-Type", "application/json")
 				switch {
 				case r.Method == http.MethodGet && r.URL.Path == "/v1/resources" && r.URL.Query().Get("slug") == "customer-web":
-					_, _ = fmt.Fprintf(w, `{"data":[{"resource_id":%q,"connector_routing_id":%q,"knock_resource_id":"cell-resource","type":"tunnel","status":"active","slug":"customer-web"}]}`, testPublicResourceID, testConnectorRoutingID)
-				case r.Method == http.MethodDelete && r.URL.Path == "/v1/resources/"+testPublicResourceID:
+					_, _ = fmt.Fprintf(w, `{"data":[{"resource_id":%q,"crid":%q,"connector_routing_id":%q,"knock_resource_id":"cell-resource","type":"tunnel","status":"active","slug":"customer-web"}]}`, testPublicResourceID, testCRIDForKey(testPublicResourceID), testConnectorRoutingID)
+				case r.Method == http.MethodDelete && r.URL.Path == "/v1/resources/"+testCRIDForKey(testPublicResourceID):
 					w.WriteHeader(http.StatusNoContent)
 				default:
 					http.Error(w, "unexpected request", http.StatusBadRequest)
@@ -413,7 +413,7 @@ func TestRunRemovePendingSagaRetainsOrCommitsExactFence(t *testing.T) {
 			handler: func(w http.ResponseWriter, r *http.Request) {
 				w.Header().Set("Content-Type", "application/json")
 				if r.Method == http.MethodGet && r.URL.Path == "/v1/resources" && r.URL.Query().Get("slug") == "customer-web" {
-					_, _ = fmt.Fprintf(w, `{"data":[{"resource_id":%q,"connector_routing_id":%q,"knock_resource_id":"cell-resource","type":"tunnel","status":"active","slug":"other-web"}]}`, testPublicResourceID, testConnectorRoutingID)
+					_, _ = fmt.Fprintf(w, `{"data":[{"resource_id":%q,"crid":%q,"connector_routing_id":%q,"knock_resource_id":"cell-resource","type":"tunnel","status":"active","slug":"other-web"}]}`, testPublicResourceID, testCRIDForKey(testPublicResourceID), testConnectorRoutingID)
 					return
 				}
 				http.Error(w, "unexpected request", http.StatusBadRequest)
@@ -470,7 +470,7 @@ func TestRunRemovePendingSagaRetainsOrCommitsExactFence(t *testing.T) {
 			if loadErr != nil {
 				t.Fatal(loadErr)
 			}
-			_, resolved := cache.resourceID("customer-web")
+			_, resolved := cache.crid("customer-web")
 			if cache.isPending("customer-web") != tt.wantPending || resolved != tt.wantResolved {
 				t.Fatalf("cache after pending remove: pending=%v resolved=%v, want pending=%v resolved=%v", cache.isPending("customer-web"), resolved, tt.wantPending, tt.wantResolved)
 			}
@@ -490,7 +490,7 @@ func TestRunRemoveExactPredeleteMismatchSendsNoDelete(t *testing.T) {
 	cfg.Routes = []nhpconfig.Route{{
 		ID: "customer-web", Type: nhpconfig.RouteTypeHTTP,
 		LocalIP: "127.0.0.1", LocalPort: 8080,
-		ResourceID: testPublicResourceID, ConnectorRoutingID: testConnectorRoutingID,
+		ResourcePublicKey: testPublicResourceID, CRID: testCRIDForKey(testPublicResourceID), ConnectorRoutingID: testConnectorRoutingID,
 	}}
 	if err := nhpconfig.Save(cfg, cfgPath); err != nil {
 		t.Fatal(err)
@@ -520,7 +520,7 @@ func TestRunRemoveExactPredeleteMismatchSendsNoDelete(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got, ok := cache.resourceID("customer-web"); !ok || got != testPublicResourceID {
+	if got, ok := cache.crid("customer-web"); !ok || got != testCRIDForKey(testPublicResourceID) {
 		t.Fatalf("exact cache fence was lost: %q present=%v", got, ok)
 	}
 }
@@ -541,7 +541,7 @@ func TestRunRemoveDeleteThenYAMLSaveFailureRetainsExactRetryFence(t *testing.T) 
 	cfg.Routes = []nhpconfig.Route{{
 		ID: "customer-web", Type: nhpconfig.RouteTypeHTTP,
 		LocalIP: "127.0.0.1", LocalPort: 8080,
-		ResourceID: testPublicResourceID, ConnectorRoutingID: testConnectorRoutingID,
+		ResourcePublicKey: testPublicResourceID, CRID: testCRIDForKey(testPublicResourceID), ConnectorRoutingID: testConnectorRoutingID,
 	}}
 	if err := nhpconfig.Save(cfg, cfgPath); err != nil {
 		t.Fatal(err)
@@ -552,13 +552,13 @@ func TestRunRemoveDeleteThenYAMLSaveFailureRetainsExactRetryFence(t *testing.T) 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch {
-		case r.Method == http.MethodGet && r.URL.Path == "/v1/resources/"+testPublicResourceID:
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/resources/"+testCRIDForKey(testPublicResourceID):
 			status := "active"
 			if revoked.Load() {
 				status = "revoked"
 			}
 			_, _ = fmt.Fprint(w, connectorResourceDetailResponse(testPublicResourceID, "customer-web", status))
-		case r.Method == http.MethodDelete && r.URL.Path == "/v1/resources/"+testPublicResourceID:
+		case r.Method == http.MethodDelete && r.URL.Path == "/v1/resources/"+testCRIDForKey(testPublicResourceID):
 			deletes.Add(1)
 			revoked.Store(true)
 			if err := os.Chmod(configDir, 0o500); err != nil {
@@ -591,7 +591,7 @@ func TestRunRemoveDeleteThenYAMLSaveFailureRetainsExactRetryFence(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got, ok := cache.resourceID("customer-web"); !ok || got != testPublicResourceID {
+	if got, ok := cache.crid("customer-web"); !ok || got != testCRIDForKey(testPublicResourceID) {
 		t.Fatalf("exact retry fence after YAML failure = %q present=%v", got, ok)
 	}
 
@@ -615,7 +615,7 @@ func TestRunRemoveYAMLCommitThenCachePruneSyncFailureConvergesCachedOnly(t *test
 	cfg.Routes = []nhpconfig.Route{{
 		ID: "customer-web", Type: nhpconfig.RouteTypeHTTP,
 		LocalIP: "127.0.0.1", LocalPort: 8080,
-		ResourceID: testPublicResourceID, ConnectorRoutingID: testConnectorRoutingID,
+		ResourcePublicKey: testPublicResourceID, CRID: testCRIDForKey(testPublicResourceID), ConnectorRoutingID: testConnectorRoutingID,
 	}}
 	if err := nhpconfig.Save(cfg, cfgPath); err != nil {
 		t.Fatal(err)
@@ -626,13 +626,13 @@ func TestRunRemoveYAMLCommitThenCachePruneSyncFailureConvergesCachedOnly(t *test
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch {
-		case r.Method == http.MethodGet && r.URL.Path == "/v1/resources/"+testPublicResourceID:
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/resources/"+testCRIDForKey(testPublicResourceID):
 			status := "active"
 			if revoked.Load() {
 				status = "revoked"
 			}
 			_, _ = fmt.Fprint(w, connectorResourceDetailResponse(testPublicResourceID, "customer-web", status))
-		case r.Method == http.MethodDelete && r.URL.Path == "/v1/resources/"+testPublicResourceID:
+		case r.Method == http.MethodDelete && r.URL.Path == "/v1/resources/"+testCRIDForKey(testPublicResourceID):
 			deletes.Add(1)
 			revoked.Store(true)
 			w.WriteHeader(http.StatusNoContent)
@@ -669,7 +669,7 @@ func TestRunRemoveYAMLCommitThenCachePruneSyncFailureConvergesCachedOnly(t *test
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got, ok := cache.resourceID("customer-web"); !ok || got != testPublicResourceID {
+	if got, ok := cache.crid("customer-web"); !ok || got != testCRIDForKey(testPublicResourceID) {
 		t.Fatalf("cache-only retry fence after prune failure = %q present=%v", got, ok)
 	}
 
@@ -683,7 +683,7 @@ func TestRunRemoveYAMLCommitThenCachePruneSyncFailureConvergesCachedOnly(t *test
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := cache.resourceID("customer-web"); ok {
+	if _, ok := cache.crid("customer-web"); ok {
 		t.Fatal("cached-only retry did not prune exact identity")
 	}
 }
@@ -693,7 +693,7 @@ func TestRemoveReadOnlyConfiguredRouteStopsBeforeNetwork(t *testing.T) {
 	cfg.Routes = []nhpconfig.Route{{
 		ID: "customer-web", Type: nhpconfig.RouteTypeHTTP,
 		LocalIP: "127.0.0.1", LocalPort: 8080,
-		ResourceID: testPublicResourceID, ConnectorRoutingID: testConnectorRoutingID,
+		ResourcePublicKey: testPublicResourceID, CRID: testCRIDForKey(testPublicResourceID), ConnectorRoutingID: testConnectorRoutingID,
 	}}
 	readOnlyErr := errors.New("read-only source mount")
 	err := removeConnectorSelection(context.Background(), cfg, nil, nil, "customer-web", "", readOnlyErr)
@@ -716,7 +716,7 @@ func TestRunRemoveReadOnlyConfiguredRouteRequiresHostEditBeforeNetwork(t *testin
 	cfg.Routes = []nhpconfig.Route{{
 		ID: "customer-web", Type: nhpconfig.RouteTypeHTTP,
 		LocalIP: "127.0.0.1", LocalPort: 8080,
-		ResourceID: testPublicResourceID, ConnectorRoutingID: testConnectorRoutingID,
+		ResourcePublicKey: testPublicResourceID, CRID: testCRIDForKey(testPublicResourceID), ConnectorRoutingID: testConnectorRoutingID,
 	}}
 	if err := nhpconfig.Save(cfg, cfgPath); err != nil {
 		t.Fatal(err)
@@ -785,7 +785,7 @@ func TestRunRemoveReadOnlyCachedOnlyRecoveryCreatesNoConfigLock(t *testing.T) {
 	t.Cleanup(func() { _ = os.Chmod(configDir, 0o700) })
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet || r.URL.Path != "/v1/resources/"+testPublicResourceID {
+		if r.Method != http.MethodGet || r.URL.Path != "/v1/resources/"+testCRIDForKey(testPublicResourceID) {
 			http.Error(w, "unexpected mutation", http.StatusInternalServerError)
 			return
 		}
@@ -805,7 +805,7 @@ func TestRunRemoveReadOnlyCachedOnlyRecoveryCreatesNoConfigLock(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := cache.resourceID("customer-web"); ok {
+	if _, ok := cache.crid("customer-web"); ok {
 		t.Fatal("read-only cached-only recovery did not prune retained identity")
 	}
 }
@@ -822,7 +822,7 @@ func TestRunRemoveStateNamespaceReplacementAfterExactReadStopsBeforeDelete(t *te
 	cfg.Routes = []nhpconfig.Route{{
 		ID: "customer-web", Type: nhpconfig.RouteTypeHTTP,
 		LocalIP: "127.0.0.1", LocalPort: 8080,
-		ResourceID: testPublicResourceID, ConnectorRoutingID: testConnectorRoutingID,
+		ResourcePublicKey: testPublicResourceID, CRID: testCRIDForKey(testPublicResourceID), ConnectorRoutingID: testConnectorRoutingID,
 	}}
 	if err := nhpconfig.Save(cfg, cfgPath); err != nil {
 		t.Fatal(err)
@@ -871,10 +871,10 @@ func TestRunRemoveStateNamespaceReplacementAfterExactReadStopsBeforeDelete(t *te
 
 func TestValidateConnectorDeletionTargetRejectsCrossIDResource(t *testing.T) {
 	resource := &qurl.ConnectorResource{
-		ResourceID: testPublicResourceID,
-		Slug:       "other-web",
+		ResourcePublicKey: testPublicResourceID, CRID: testCRIDForKey(testPublicResourceID),
+		Slug: "other-web",
 	}
-	err := validateConnectorDeletionTarget(resource, "customer-web", testPublicResourceID)
+	err := validateConnectorDeletionTarget(resource, "customer-web", testCRIDForKey(testPublicResourceID))
 	if err == nil || !strings.Contains(err.Error(), "other-web") || !strings.Contains(err.Error(), "refusing deletion") {
 		t.Fatalf("validation error = %v, want cross-id deletion refusal", err)
 	}
@@ -885,13 +885,13 @@ func TestReconcileConnectorDeletionProvesOutcomeUnknownCommit(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch {
-		case r.Method == http.MethodGet && r.URL.Path == "/v1/resources/"+testPublicResourceID:
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/resources/"+testCRIDForKey(testPublicResourceID):
 			if gets.Add(1) == 1 {
-				_, _ = fmt.Fprintf(w, `{"data":{"resource":{"resource_id":%q,"connector_routing_id":%q,"knock_resource_id":"cell-resource","type":"tunnel","status":"active","slug":"customer-web"}}}`, testPublicResourceID, testConnectorRoutingID)
+				_, _ = fmt.Fprintf(w, `{"data":{"resource":{"resource_id":%q,"crid":%q,"connector_routing_id":%q,"knock_resource_id":"cell-resource","type":"tunnel","status":"active","slug":"customer-web"}}}`, testPublicResourceID, testCRIDForKey(testPublicResourceID), testConnectorRoutingID)
 				return
 			}
-			_, _ = fmt.Fprintf(w, `{"data":{"resource":{"resource_id":%q,"connector_routing_id":%q,"knock_resource_id":"cell-resource","type":"tunnel","status":"revoked","slug":"customer-web"}}}`, testPublicResourceID, testConnectorRoutingID)
-		case r.Method == http.MethodDelete && r.URL.Path == "/v1/resources/"+testPublicResourceID:
+			_, _ = fmt.Fprintf(w, `{"data":{"resource":{"resource_id":%q,"crid":%q,"connector_routing_id":%q,"knock_resource_id":"cell-resource","type":"tunnel","status":"revoked","slug":"customer-web"}}}`, testPublicResourceID, testCRIDForKey(testPublicResourceID), testConnectorRoutingID)
+		case r.Method == http.MethodDelete && r.URL.Path == "/v1/resources/"+testCRIDForKey(testPublicResourceID):
 			deletes.Add(1)
 			w.WriteHeader(http.StatusInternalServerError)
 			_, _ = fmt.Fprint(w, `{"error":{"code":"internal_error","detail":"reply lost after revoke"}}`)
@@ -905,7 +905,7 @@ func TestReconcileConnectorDeletionProvesOutcomeUnknownCommit(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	deleted, err := reconcileConnectorResourceDeletion(context.Background(), client, "customer-web", testPublicResourceID, false)
+	deleted, err := reconcileConnectorResourceDeletion(context.Background(), client, "customer-web", testCRIDForKey(testPublicResourceID), false)
 	if err != nil || !deleted {
 		t.Fatalf("reconcile outcome-unknown delete = deleted %v, err %v", deleted, err)
 	}
@@ -917,7 +917,7 @@ func TestReconcileConnectorDeletionProvesOutcomeUnknownCommit(t *testing.T) {
 func TestReconcileConnectorDeletionNotFoundPreservesExactRetryIdentity(t *testing.T) {
 	var deletes atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodGet && r.URL.Path == "/v1/resources/"+testPublicResourceID {
+		if r.Method == http.MethodGet && r.URL.Path == "/v1/resources/"+testCRIDForKey(testPublicResourceID) {
 			http.Error(w, `{"error":{"code":"not_found"}}`, http.StatusNotFound)
 			return
 		}
@@ -930,7 +930,7 @@ func TestReconcileConnectorDeletionNotFoundPreservesExactRetryIdentity(t *testin
 		t.Fatal(err)
 	}
 
-	deleted, err := reconcileConnectorResourceDeletion(context.Background(), client, "customer-web", testPublicResourceID, false)
+	deleted, err := reconcileConnectorResourceDeletion(context.Background(), client, "customer-web", testCRIDForKey(testPublicResourceID), false)
 	if err == nil || deleted || !errors.Is(err, qurl.ErrConnectorResourceNotFound) {
 		t.Fatalf("not-found reconciliation = deleted %v, err %v; want fail-closed exact retry", deleted, err)
 	}

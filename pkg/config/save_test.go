@@ -24,7 +24,7 @@ func TestSaveAndLoadRoundTrip(t *testing.T) {
 				Type:               RouteTypeHTTP,
 				LocalIP:            "127.0.0.1",
 				LocalPort:          8080,
-				ResourceID:         testPublicResourceA,
+				CRID:               testPublicResourceA,
 				ConnectorRoutingID: testRoutingA,
 				TargetURL:          "http://localhost:8080",
 			},
@@ -33,7 +33,7 @@ func TestSaveAndLoadRoundTrip(t *testing.T) {
 				Type:               RouteTypeHTTP,
 				LocalIP:            "127.0.0.1",
 				LocalPort:          8081,
-				ResourceID:         testPublicResourceB,
+				CRID:               testPublicResourceB,
 				ConnectorRoutingID: testRoutingB,
 				TargetURL:          "http://localhost:8081",
 			},
@@ -71,8 +71,8 @@ func TestSaveAndLoadRoundTrip(t *testing.T) {
 		if got.LocalPort != want.LocalPort {
 			t.Errorf("route %d LocalPort: got %d, want %d", i, got.LocalPort, want.LocalPort)
 		}
-		if got.ResourceID != want.ResourceID {
-			t.Errorf("route %d ResourceID: got %q, want %q", i, got.ResourceID, want.ResourceID)
+		if got.CRID != want.CRID {
+			t.Errorf("route %d CRID: got %q, want %q", i, got.CRID, want.CRID)
 		}
 		if got.ConnectorRoutingID != want.ConnectorRoutingID {
 			t.Errorf("route %d ConnectorRoutingID: got %q, want %q", i, got.ConnectorRoutingID, want.ConnectorRoutingID)

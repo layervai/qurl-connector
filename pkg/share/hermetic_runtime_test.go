@@ -402,7 +402,7 @@ func TestHermeticSessionGroupRecoversFromQRTSSessionLoss(t *testing.T) {
 	}
 	route := LocalHTTPRoute{
 		RouteID: "hermetic", LocalIP: "127.0.0.1", LocalPort: echoPort,
-		ResourceID: resourceID, ConnectorRoutingID: "hermetic",
+		ResourcePublicKey: resourceID, ConnectorRoutingID: "hermetic",
 	}
 	factory, err := NewFRPSessionGroupFactory(FRPGroupFactoryConfig{
 		Common:        common,
@@ -414,13 +414,13 @@ func TestHermeticSessionGroupRecoversFromQRTSSessionLoss(t *testing.T) {
 	resourceHost := forwarder.addr()
 	admitter := &hermeticAdmitter{admissions: []Admission{
 		{
-			KnockResourceID: knockResourceID, ResourceID: resourceID,
+			KnockResourceID: knockResourceID, ResourcePublicKey: resourceID,
 			RunID: "1111111111111111", RunAttempt: 1, Token: "token-one",
 			ResourceHost: resourceHost, SessionID: 101,
 			SessionReceipt: testSessionReceipt(101, "1111111111111111", 1), OpenTime: 5 * time.Minute,
 		},
 		{
-			KnockResourceID: knockResourceID, ResourceID: resourceID,
+			KnockResourceID: knockResourceID, ResourcePublicKey: resourceID,
 			RunID: "2222222222222222", RunAttempt: 2, Token: "token-two",
 			ResourceHost: resourceHost, SessionID: 102,
 			SessionReceipt: testSessionReceipt(102, "2222222222222222", 2), OpenTime: 5 * time.Minute,
@@ -428,7 +428,7 @@ func TestHermeticSessionGroupRecoversFromQRTSSessionLoss(t *testing.T) {
 	}}
 	serving := make(chan Admission, 2)
 	runner, err := NewSessionGroupRunner(SessionGroupConfig{
-		KnockResourceID: knockResourceID, ResourceID: resourceID,
+		KnockResourceID: knockResourceID, ResourcePublicKey: resourceID,
 		Routes: []LocalHTTPRoute{route}, Admitter: admitter, Sessions: factory,
 		MinBackoff: 10 * time.Millisecond, MaxBackoff: 25 * time.Millisecond,
 		RotationLead: time.Minute, StopTimeout: 5 * time.Second,

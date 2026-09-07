@@ -467,15 +467,15 @@ func TestJSONLLogger_NewFieldsRoundTrip(t *testing.T) {
 	}
 
 	in := Entry{
-		Event:      EventLoginDeny,
-		Outcome:    OutcomeDeny,
-		Actor:      "agent-7f",
-		TraceID:    "run_abc123",
-		RunID:      "0123456789abcdef",
-		Reason:     "knock_token_invalid",
-		ResourceID: "r_xyz",
-		SourceIP:   "10.0.0.1",
-		Error:      "login to the server failed: knock_invalid: knock token rejected",
+		Event:             EventLoginDeny,
+		Outcome:           OutcomeDeny,
+		Actor:             "agent-7f",
+		TraceID:           "run_abc123",
+		RunID:             "0123456789abcdef",
+		Reason:            "knock_token_invalid",
+		ResourcePublicKey: "r_xyz",
+		SourceIP:          "10.0.0.1",
+		Error:             "login to the server failed: knock_invalid: knock token rejected",
 	}
 	l.Log(in)
 	if err := l.Close(); err != nil {
@@ -508,8 +508,8 @@ func TestJSONLLogger_NewFieldsRoundTrip(t *testing.T) {
 	if out.Reason != in.Reason {
 		t.Errorf("reason = %q, want %q", out.Reason, in.Reason)
 	}
-	if out.ResourceID != in.ResourceID {
-		t.Errorf("resource_id = %q, want %q", out.ResourceID, in.ResourceID)
+	if out.ResourcePublicKey != in.ResourcePublicKey {
+		t.Errorf("resource_id = %q, want %q", out.ResourcePublicKey, in.ResourcePublicKey)
 	}
 	if out.Error != in.Error {
 		t.Errorf("error = %q, want %q", out.Error, in.Error)
@@ -551,8 +551,8 @@ func TestJSONLLogger_MirrorSlog_Enabled(t *testing.T) {
 
 	entries := []Entry{
 		{Event: EventBootstrapSuccess, Outcome: OutcomeSuccess, Actor: "a1"},
-		{Event: EventKnockSuccess, Outcome: OutcomeSuccess, ResourceID: "r_xyz"},
-		{Event: EventTeardown, Outcome: OutcomeSuccess, ResourceID: "r_xyz"},
+		{Event: EventKnockSuccess, Outcome: OutcomeSuccess, ResourcePublicKey: "r_xyz"},
+		{Event: EventTeardown, Outcome: OutcomeSuccess, ResourcePublicKey: "r_xyz"},
 	}
 	for _, e := range entries {
 		l.Log(e)

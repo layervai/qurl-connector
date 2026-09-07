@@ -96,7 +96,7 @@ func proofRouteAt(i int, backends []int) proofRoute {
 	return proofRoute{
 		LocalHTTPRoute: LocalHTTPRoute{
 			RouteID: id, LocalIP: "127.0.0.1", LocalPort: backends[i%len(backends)],
-			ResourceID: "res-" + id, ConnectorRoutingID: "rt-" + id,
+			ResourcePublicKey: "res-" + id, ConnectorRoutingID: "rt-" + id,
 		},
 		host: host, body: strconv.Itoa(i%len(backends)) + "|" + host,
 	}
@@ -676,13 +676,13 @@ func TestHermeticSessionGroupServes1000Routes(t *testing.T) {
 	window := 12*time.Second + time.Duration(routeCount)*20*time.Millisecond
 	resourceHost := net.JoinHostPort("127.0.0.1", strconv.Itoa(port))
 	first := Admission{
-		KnockResourceID: knockResourceID, ResourceID: groupResourceID,
+		KnockResourceID: knockResourceID, ResourcePublicKey: groupResourceID,
 		RunID: "1111111111111111", RunAttempt: 1, Token: "token-one",
 		ResourceHost: resourceHost, SessionID: 101,
 		SessionReceipt: testSessionReceipt(101, "1111111111111111", 1), OpenTime: 2 * window,
 	}
 	second := Admission{
-		KnockResourceID: knockResourceID, ResourceID: groupResourceID,
+		KnockResourceID: knockResourceID, ResourcePublicKey: groupResourceID,
 		RunID: "2222222222222222", RunAttempt: 2, Token: "token-two",
 		ResourceHost: resourceHost, SessionID: 102,
 		SessionReceipt: testSessionReceipt(102, "2222222222222222", 2), OpenTime: 10 * time.Minute,
@@ -710,7 +710,7 @@ func TestHermeticSessionGroupServes1000Routes(t *testing.T) {
 	events := &proofEvents{serving: make(map[uint64]int)}
 	var runner *SessionGroupRunner
 	runner, err = NewSessionGroupRunner(SessionGroupConfig{
-		KnockResourceID: knockResourceID, ResourceID: groupResourceID, Routes: localRoutes(initial),
+		KnockResourceID: knockResourceID, ResourcePublicKey: groupResourceID, Routes: localRoutes(initial),
 		Admitter: admitter, Sessions: factory,
 		MinBackoff: 10 * time.Millisecond, MaxBackoff: 25 * time.Millisecond,
 		StopTimeout: 10 * time.Second,

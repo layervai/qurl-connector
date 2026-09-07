@@ -30,7 +30,7 @@ func hermeticGroupRoute(t *testing.T, routeID string) LocalHTTPRoute {
 	t.Helper()
 	return LocalHTTPRoute{
 		RouteID: routeID, LocalIP: "127.0.0.1", LocalPort: newHermeticEcho(t, "echo-"+routeID),
-		ResourceID: "resource-" + routeID, ConnectorRoutingID: "routing-" + routeID,
+		ResourcePublicKey: "resource-" + routeID, ConnectorRoutingID: "routing-" + routeID,
 	}
 }
 
@@ -60,7 +60,7 @@ func TestHermeticSessionGroupServesManyRoutesOnOneAdmission(t *testing.T) {
 		t.Fatal(err)
 	}
 	admission := Admission{
-		KnockResourceID: knockResourceID, ResourceID: "group-resource",
+		KnockResourceID: knockResourceID, ResourcePublicKey: "group-resource",
 		RunID: "1111111111111111", RunAttempt: 1, Token: "token-one",
 		ResourceHost: net.JoinHostPort("127.0.0.1", strconv.Itoa(port)), SessionID: 101,
 		SessionReceipt: testSessionReceipt(101, "1111111111111111", 1), OpenTime: 5 * time.Minute,
@@ -82,7 +82,7 @@ func TestHermeticSessionGroupServesManyRoutesOnOneAdmission(t *testing.T) {
 	}
 	routes := []LocalHTTPRoute{hermeticGroupRoute(t, "a"), hermeticGroupRoute(t, "b"), hermeticGroupRoute(t, "c")}
 	runner, err := NewSessionGroupRunner(SessionGroupConfig{
-		KnockResourceID: knockResourceID, ResourceID: "group-resource", Routes: routes,
+		KnockResourceID: knockResourceID, ResourcePublicKey: "group-resource", Routes: routes,
 		Admitter: admitter, Sessions: factory,
 		MinBackoff: 10 * time.Millisecond, MaxBackoff: 25 * time.Millisecond,
 		RotationLead: time.Minute, StopTimeout: 5 * time.Second,

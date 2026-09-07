@@ -61,10 +61,10 @@ func runList(cmd *cobra.Command, _ []string) error {
 
 	// Table output
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(w, "ID\tTYPE\tTARGET\tRESOURCE ID")
+	fmt.Fprintln(w, "ID\tTYPE\tTARGET\tCRID")
 	for _, r := range routes {
 		target := fmt.Sprintf("%s:%d", r.LocalIP, r.LocalPort)
-		resID := r.ResourceID
+		resID := r.CRID
 		if resID == "" {
 			resID = "-"
 		}

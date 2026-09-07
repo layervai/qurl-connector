@@ -199,14 +199,14 @@ func validateGroupRouteIdentities(count int, at func(int) LocalHTTPRoute) error 
 		if first, ok := routeIDs[route.RouteID]; ok {
 			return fmt.Errorf("routes[%d]: route ID %q is already used by routes[%d]", i, route.RouteID, first)
 		}
-		if first, ok := resourceIDs[route.ResourceID]; ok {
-			return fmt.Errorf("routes[%d] (%s): resource ID %q is already used by routes[%d]", i, route.RouteID, route.ResourceID, first)
+		if first, ok := resourceIDs[route.ResourcePublicKey]; ok {
+			return fmt.Errorf("routes[%d] (%s): resource ID %q is already used by routes[%d]", i, route.RouteID, route.ResourcePublicKey, first)
 		}
 		if first, ok := routingIDs[route.ConnectorRoutingID]; ok {
 			return fmt.Errorf("routes[%d] (%s): connector routing ID %q is already used by routes[%d]", i, route.RouteID, route.ConnectorRoutingID, first)
 		}
 		routeIDs[route.RouteID] = i
-		resourceIDs[route.ResourceID] = i
+		resourceIDs[route.ResourcePublicKey] = i
 		routingIDs[route.ConnectorRoutingID] = i
 	}
 	return nil
@@ -264,7 +264,7 @@ func NewFRPSessionGroupFactory(cfg FRPGroupFactoryConfig) (*FRPSessionGroupFacto
 // Proxy names change with the NHP SessionID and the route generation; every
 // other per-route identity is stable across cycles.
 func (f *FRPSessionGroupFactory) BuildConfig(admission Admission, routes []GroupRoute) (*v1.ClientCommonConfig, []v1.ProxyConfigurer, []string, error) {
-	if err := validateAdmission(admission, admission.KnockResourceID, admission.ResourceID); err != nil {
+	if err := validateAdmission(admission, admission.KnockResourceID, admission.ResourcePublicKey); err != nil {
 		return nil, nil, nil, err
 	}
 	if err := validateGroupRouteSet(routes); err != nil {
