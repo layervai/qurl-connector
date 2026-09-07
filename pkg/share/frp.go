@@ -15,18 +15,18 @@ import (
 )
 
 // LocalHTTPRoute is the exact local and platform identity of one managed HTTP
-// share. Public ResourceID is authorization metadata; ConnectorRoutingID is
+// share. Public ResourcePublicKey is authorization metadata; ConnectorRoutingID is
 // the stable subdomain/load-balancer identity.
 type LocalHTTPRoute struct {
 	RouteID            string
 	LocalIP            string
 	LocalPort          int
-	ResourceID         string
+	ResourcePublicKey  string
 	ConnectorRoutingID string
 }
 
 func validateLocalHTTPRoute(route LocalHTTPRoute) error {
-	if route.RouteID == "" || route.ResourceID == "" || route.ConnectorRoutingID == "" {
+	if route.RouteID == "" || route.ResourcePublicKey == "" || route.ConnectorRoutingID == "" {
 		return errors.New("route identities are incomplete")
 	}
 	if route.LocalIP == "" || route.LocalPort < 1 || route.LocalPort > 65535 {
@@ -79,7 +79,7 @@ func buildRouteProxy(route LocalHTTPRoute, proxyName string) *v1.HTTPProxyConfig
 	proxy.SubDomain = route.ConnectorRoutingID
 	proxy.LoadBalancer.Group = route.ConnectorRoutingID
 	proxy.LoadBalancer.GroupKey = route.ConnectorRoutingID
-	proxy.Metadatas = map[string]string{nhpconfig.MetaResourceID: route.ResourceID}
+	proxy.Metadatas = map[string]string{nhpconfig.MetaResourceID: route.ResourcePublicKey}
 	return proxy
 }
 

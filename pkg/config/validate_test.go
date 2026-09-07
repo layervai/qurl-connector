@@ -90,9 +90,9 @@ func TestValidate_RejectsTransportHostilePublicResourceID(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			cfg := &Config{Routes: []Route{{
 				ID: "managed", Type: RouteTypeHTTP, LocalIP: "127.0.0.1", LocalPort: 8080,
-				ResourceID: resourceID, ConnectorRoutingID: testRoutingA,
+				CRID: resourceID, ConnectorRoutingID: testRoutingA,
 			}}}
-			if err := Validate(cfg); err == nil || !strings.Contains(err.Error(), "resource_id") {
+			if err := Validate(cfg); err == nil || !strings.Contains(err.Error(), "crid") {
 				t.Fatalf("Validate error = %v, want exact public resource-id rejection", err)
 			}
 		})
@@ -102,7 +102,7 @@ func TestValidate_RejectsTransportHostilePublicResourceID(t *testing.T) {
 func TestValidateRejectsTransportHostileKnockResourceID(t *testing.T) {
 	cfg := &Config{Routes: []Route{{
 		ID: "managed", Type: RouteTypeHTTP, LocalIP: "127.0.0.1", LocalPort: 8080,
-		ResourceID: testPublicResourceA, ConnectorRoutingID: testRoutingA, KnockResourceID: " cell-resource",
+		CRID: testPublicResourceA, ConnectorRoutingID: testRoutingA, KnockResourceID: " cell-resource",
 	}}}
 	if err := validateStartupInput(cfg); err == nil || !strings.Contains(err.Error(), "knock_resource_id must not contain leading or trailing whitespace") {
 		t.Fatalf("validateStartupInput error = %v, want local knock-resource rejection", err)
@@ -284,7 +284,7 @@ func TestValidate_RejectsInvalidRouteID(t *testing.T) {
 func TestValidate_BootstrapInputAllowsPinnedResourcePendingHydration(t *testing.T) {
 	cfg := &Config{Routes: []Route{{
 		ID: "pinned", Type: RouteTypeHTTP, LocalIP: "127.0.0.1", LocalPort: 8080,
-		ResourceID: testPublicResourceA,
+		CRID: testPublicResourceA,
 	}}}
 	if err := validateStartupInput(cfg); err != nil {
 		t.Fatalf("startup-input validation blocked pinned hydration: %v", err)
@@ -302,19 +302,19 @@ func TestValidate_AllowsCompleteManagedIdentity(t *testing.T) {
 			Type:               RouteTypeHTTP,
 			LocalIP:            "127.0.0.1",
 			LocalPort:          8080,
-			ResourceID:         testPublicResourceA,
+			CRID:               testPublicResourceA,
 			ConnectorRoutingID: testRoutingA,
 		}},
 	}
 	if err := Validate(cfg); err != nil {
-		t.Errorf("Validate rejected a slug-less but resource_id-pinned route: %v", err)
+		t.Errorf("Validate rejected a slug-less but crid-pinned route: %v", err)
 	}
 }
 
 func TestValidate_AllowsDistinctManagedIdentityPairs(t *testing.T) {
 	cfg := &Config{Routes: []Route{
-		{ID: "alpha", Type: RouteTypeHTTP, LocalIP: "127.0.0.1", LocalPort: 8080, ResourceID: testPublicResourceA, ConnectorRoutingID: testRoutingA},
-		{ID: "bravo", Type: RouteTypeHTTP, LocalIP: "127.0.0.1", LocalPort: 9000, ResourceID: testPublicResourceB, ConnectorRoutingID: testRoutingB},
+		{ID: "alpha", Type: RouteTypeHTTP, LocalIP: "127.0.0.1", LocalPort: 8080, CRID: testPublicResourceA, ConnectorRoutingID: testRoutingA},
+		{ID: "bravo", Type: RouteTypeHTTP, LocalIP: "127.0.0.1", LocalPort: 9000, CRID: testPublicResourceB, ConnectorRoutingID: testRoutingB},
 	}}
 	if err := Validate(cfg); err != nil {
 		t.Fatalf("Validate rejected distinct managed identities: %v", err)
@@ -323,33 +323,33 @@ func TestValidate_AllowsDistinctManagedIdentityPairs(t *testing.T) {
 
 func TestValidate_RejectsDuplicateManagedResourceID(t *testing.T) {
 	cfg := &Config{Routes: []Route{
-		{ID: "alpha", Type: RouteTypeHTTP, LocalIP: "127.0.0.1", LocalPort: 8080, ResourceID: testPublicResourceA, ConnectorRoutingID: testRoutingA},
-		{ID: "bravo", Type: RouteTypeHTTP, LocalIP: "127.0.0.1", LocalPort: 9000, ResourceID: testPublicResourceA, ConnectorRoutingID: testRoutingA},
+		{ID: "alpha", Type: RouteTypeHTTP, LocalIP: "127.0.0.1", LocalPort: 8080, CRID: testPublicResourceA, ConnectorRoutingID: testRoutingA},
+		{ID: "bravo", Type: RouteTypeHTTP, LocalIP: "127.0.0.1", LocalPort: 9000, CRID: testPublicResourceA, ConnectorRoutingID: testRoutingA},
 	}}
 	err := Validate(cfg)
-	if err == nil || !strings.Contains(err.Error(), "duplicate resource_id") {
+	if err == nil || !strings.Contains(err.Error(), "duplicate crid") {
 		t.Fatalf("Validate error = %v, want duplicate public resource rejection", err)
 	}
 }
 
 func TestValidate_RejectsRoutingIDBoundToDifferentResources(t *testing.T) {
 	cfg := &Config{Routes: []Route{
-		{ID: "alpha", Type: RouteTypeHTTP, LocalIP: "127.0.0.1", LocalPort: 8080, ResourceID: testPublicResourceA, ConnectorRoutingID: testRoutingA},
-		{ID: "bravo", Type: RouteTypeHTTP, LocalIP: "127.0.0.1", LocalPort: 9000, ResourceID: testPublicResourceB, ConnectorRoutingID: testRoutingA},
+		{ID: "alpha", Type: RouteTypeHTTP, LocalIP: "127.0.0.1", LocalPort: 8080, CRID: testPublicResourceA, ConnectorRoutingID: testRoutingA},
+		{ID: "bravo", Type: RouteTypeHTTP, LocalIP: "127.0.0.1", LocalPort: 9000, CRID: testPublicResourceB, ConnectorRoutingID: testRoutingA},
 	}}
 	err := Validate(cfg)
-	if err == nil || !strings.Contains(err.Error(), "already bound to resource_id") {
+	if err == nil || !strings.Contains(err.Error(), "already bound to crid") {
 		t.Fatalf("Validate error = %v, want routing/public identity collision rejection", err)
 	}
 }
 
 func TestValidate_BootstrapInputRejectsDuplicatePinnedResourceID(t *testing.T) {
 	cfg := &Config{Routes: []Route{
-		{ID: "alpha", Type: RouteTypeHTTP, LocalIP: "127.0.0.1", LocalPort: 8080, ResourceID: testPublicResourceA},
-		{ID: "bravo", Type: RouteTypeHTTP, LocalIP: "127.0.0.1", LocalPort: 9000, ResourceID: testPublicResourceA},
+		{ID: "alpha", Type: RouteTypeHTTP, LocalIP: "127.0.0.1", LocalPort: 8080, CRID: testPublicResourceA},
+		{ID: "bravo", Type: RouteTypeHTTP, LocalIP: "127.0.0.1", LocalPort: 9000, CRID: testPublicResourceA},
 	}}
 	err := validateStartupInput(cfg)
-	if err == nil || !strings.Contains(err.Error(), "duplicate resource_id") {
+	if err == nil || !strings.Contains(err.Error(), "duplicate crid") {
 		t.Fatalf("startup-input error = %v, want duplicate pinned resource rejection", err)
 	}
 }

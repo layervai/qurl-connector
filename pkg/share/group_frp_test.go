@@ -22,7 +22,7 @@ func groupTestRoutes(ids ...string) []LocalHTTPRoute {
 	for i, id := range ids {
 		routes = append(routes, LocalHTTPRoute{
 			RouteID: id, LocalIP: "127.0.0.1", LocalPort: 3000 + i,
-			ResourceID: "resource-" + id, ConnectorRoutingID: "routing-" + id,
+			ResourcePublicKey: "resource-" + id, ConnectorRoutingID: "routing-" + id,
 		})
 	}
 	return routes
@@ -38,7 +38,7 @@ func groupRoutesOf(routes []LocalHTTPRoute) []GroupRoute {
 
 func groupTestAdmission(sessionID uint64) Admission {
 	return Admission{
-		KnockResourceID: "q_catalog_key", ResourceID: "group-resource",
+		KnockResourceID: "q_catalog_key", ResourcePublicKey: "group-resource",
 		RunID: "run", RunAttempt: 1, Token: "token", ResourceHost: "frp.example:7000",
 		SessionID: sessionID, SessionReceipt: testSessionReceipt(sessionID, "run", 1), OpenTime: 5 * time.Minute,
 	}
@@ -92,8 +92,8 @@ func TestFRPSessionGroupFactoryBuildsOneSessionForManyRoutes(t *testing.T) {
 		if proxy.LocalIP != route.LocalIP || proxy.LocalPort != route.LocalPort {
 			t.Errorf("proxy[%d] target = %s:%d", i, proxy.LocalIP, proxy.LocalPort)
 		}
-		if got := proxy.Metadatas[nhpconfig.MetaResourceID]; got != route.ResourceID {
-			t.Errorf("proxy[%d] public resource metadata = %q, want %q", i, got, route.ResourceID)
+		if got := proxy.Metadatas[nhpconfig.MetaResourceID]; got != route.ResourcePublicKey {
+			t.Errorf("proxy[%d] public resource metadata = %q, want %q", i, got, route.ResourcePublicKey)
 		}
 	}
 }
@@ -228,7 +228,7 @@ func TestValidateGroupRoutes(t *testing.T) {
 	tooMany := make([]LocalHTTPRoute, 0, MaxGroupRoutes+1)
 	for i := 0; i <= MaxGroupRoutes; i++ {
 		id := "r" + strconv.Itoa(i)
-		tooMany = append(tooMany, LocalHTTPRoute{RouteID: id, LocalIP: "127.0.0.1", LocalPort: 1 + i%60000, ResourceID: "res-" + id, ConnectorRoutingID: "rt-" + id})
+		tooMany = append(tooMany, LocalHTTPRoute{RouteID: id, LocalIP: "127.0.0.1", LocalPort: 1 + i%60000, ResourcePublicKey: "res-" + id, ConnectorRoutingID: "rt-" + id})
 	}
 	tests := []struct {
 		name   string
@@ -239,9 +239,9 @@ func TestValidateGroupRoutes(t *testing.T) {
 		{name: "empty", routes: nil, want: "no routes"},
 		{name: "over bound", routes: tooMany, want: "at most 2000"},
 		{name: "duplicate route ID", routes: mutate(func(r []LocalHTTPRoute) { r[2].RouteID = "a" }), want: `route ID "a" is already used by routes[0]`},
-		{name: "duplicate resource ID", routes: mutate(func(r []LocalHTTPRoute) { r[1].ResourceID = "resource-c" }), want: `routes[2] (c): resource ID "resource-c" is already used by routes[1]`},
+		{name: "duplicate resource ID", routes: mutate(func(r []LocalHTTPRoute) { r[1].ResourcePublicKey = "resource-c" }), want: `routes[2] (c): resource ID "resource-c" is already used by routes[1]`},
 		{name: "duplicate routing ID", routes: mutate(func(r []LocalHTTPRoute) { r[0].ConnectorRoutingID = "routing-b" }), want: `connector routing ID "routing-b" is already used by routes[0]`},
-		{name: "missing identity", routes: mutate(func(r []LocalHTTPRoute) { r[1].ResourceID = "" }), want: "routes[1] (b): route identities are incomplete"},
+		{name: "missing identity", routes: mutate(func(r []LocalHTTPRoute) { r[1].ResourcePublicKey = "" }), want: "routes[1] (b): route identities are incomplete"},
 		{name: "bad target", routes: mutate(func(r []LocalHTTPRoute) { r[2].LocalPort = 70000 }), want: "routes[2] (c): local target is invalid"},
 	}
 	for _, test := range tests {
@@ -267,7 +267,7 @@ func thousandRoutes(n int) []LocalHTTPRoute {
 	routes := make([]LocalHTTPRoute, 0, n)
 	for i := 0; i < n; i++ {
 		id := "crid-" + strconv.Itoa(i)
-		routes = append(routes, LocalHTTPRoute{RouteID: id, LocalIP: "127.0.0.1", LocalPort: 1 + i%60000, ResourceID: "res-" + id, ConnectorRoutingID: "rt-" + id})
+		routes = append(routes, LocalHTTPRoute{RouteID: id, LocalIP: "127.0.0.1", LocalPort: 1 + i%60000, ResourcePublicKey: "res-" + id, ConnectorRoutingID: "rt-" + id})
 	}
 	return routes
 }

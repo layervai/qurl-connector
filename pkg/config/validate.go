@@ -9,6 +9,8 @@ import (
 	"strings"
 	"unicode"
 	"unicode/utf8"
+
+	qurlcrid "github.com/layervai/qurl-go/crid"
 )
 
 // slugPattern mirrors the qURL control plane's CreateResourceRequest.slug
@@ -42,7 +44,7 @@ func ValidateSlug(s string) error {
 // label shape returned by the qURL control plane. Decoding validates the producer's
 // lowercase, unpadded RFC 4648 base32 wire format; exact re-encoding rejects
 // non-zero trailing bits. This validates an opaque value and never derives it
-// from resource_id. Producer source of truth:
+// from crid. Producer source of truth:
 // the qURL control plane's ConnectorRoutingIDPrefix,
 // ConnectorRoutingIDLength, and DeriveConnectorRoutingID.
 func ValidateConnectorRoutingID(s string) error {
@@ -60,8 +62,7 @@ func ValidateConnectorRoutingID(s string) error {
 }
 
 // validateExactOpaqueIdentifier rejects transport-hostile spellings without
-// inventing semantics for a producer-owned identifier. Resource IDs are public
-// keys, but canonical key parsing remains owned by qurl-go; this package only
+// inventing semantics for the producer-owned knock resource identifier. It only
 // guarantees that the exact value is non-empty, valid UTF-8, unpadded by
 // surrounding whitespace, and free of control characters before it enters FRP
 // metadata or config comparisons.
@@ -86,14 +87,14 @@ func validateExactOpaqueIdentifier(field, value string) error {
 // Validate checks a fully resolved cfg for structural correctness and returns
 // a combined error listing every violation found. Managed routes must already
 // carry their server-issued ConnectorRoutingID. Load uses the less-strict
-// startup-input phase so a pinned ResourceID can still be hydrated from
+// startup-input phase so a pinned CRID can still be hydrated from
 // the qURL control plane before this final validation boundary.
 func Validate(cfg *Config) error {
 	return validate(cfg, true)
 }
 
 // validateStartupInput accepts the one intentionally incomplete managed
-// shape needed by startup: ResourceID is pinned but ConnectorRoutingID has not
+// shape needed by startup: CRID is pinned but ConnectorRoutingID has not
 // yet been hydrated. FRP generation independently fails closed if startup
 // cannot complete that pair.
 func validateStartupInput(cfg *Config) error {
@@ -165,27 +166,22 @@ func validate(cfg *Config, requireManagedRouting bool) error {
 		prefix := fmt.Sprintf("routes[%d]", i)
 
 		if r.ID == "" {
-			if r.ResourceID != "" {
-				errs = append(errs, fmt.Errorf("%s: id is required even when resource_id is pinned (id is also used as the local FRP proxy-name base)", prefix))
+			if r.CRID != "" {
+				errs = append(errs, fmt.Errorf("%s: id is required even when crid is pinned (id is also used as the local FRP proxy-name base)", prefix))
 			} else if len(cfg.Routes) != 1 {
 				errs = append(errs, fmt.Errorf("%s: id is required", prefix))
 			}
 		} else {
 			checkDuplicateRouteID := true
-			if r.ResourceID == "" {
-				if err := ValidateSlug(r.ID); err != nil {
-					errs = append(errs, routeIDFormatError(prefix, r, err))
-					// Prefer fixing the API-slug shape before reporting
-					// duplicates among malformed ids; once the operator
-					// fixes the format, duplicate detection runs normally.
-					checkDuplicateRouteID = false
-				}
+			if err := ValidateSlug(r.ID); err != nil {
+				errs = append(errs, routeIDFormatError(prefix, r, err))
+				// Prefer fixing the API-slug shape before reporting
+				// duplicates among malformed ids; once the operator
+				// fixes the format, duplicate detection runs normally.
+				checkDuplicateRouteID = false
 			}
 			if checkDuplicateRouteID {
-				// Deliberately byte-exact: unpinned/API-slug ids are already
-				// lowercase via ValidateSlug above, while pinned legacy routes
-				// may preserve FRP proxy-name bases that differ only by case.
-				// FRP also indexes rendered proxy names by exact string.
+				// Slugs are canonical lowercase, and FRP indexes exact names.
 				if seenRouteIDs[r.ID] {
 					errs = append(errs, fmt.Errorf("%s: duplicate route id %q (check id and migrated legacy name/slug fields)", prefix, r.ID))
 				} else {
@@ -201,11 +197,11 @@ func validate(cfg *Config, requireManagedRouting bool) error {
 		if r.LocalPort < 1 || r.LocalPort > 65535 {
 			errs = append(errs, fmt.Errorf("%s (%s): local_port must be 1-65535, got %d", prefix, r.ID, r.LocalPort))
 		}
-		if requireManagedRouting && r.ResourceID != "" && r.ConnectorRoutingID == "" {
-			errs = append(errs, fmt.Errorf("%s (%s): managed resource_id requires the paired server-issued connector_routing_id", prefix, r.ID))
+		if requireManagedRouting && r.CRID != "" && r.ConnectorRoutingID == "" {
+			errs = append(errs, fmt.Errorf("%s (%s): managed crid requires the paired server-issued connector_routing_id", prefix, r.ID))
 		}
-		if r.ResourceID != "" {
-			if err := validateExactOpaqueIdentifier("resource_id", r.ResourceID); err != nil {
+		if r.CRID != "" {
+			if err := qurlcrid.Validate(r.CRID); err != nil {
 				errs = append(errs, fmt.Errorf("%s (%s): %w", prefix, r.ID, err))
 			}
 		}
@@ -215,8 +211,8 @@ func validate(cfg *Config, requireManagedRouting bool) error {
 			}
 		}
 		if r.ConnectorRoutingID != "" {
-			if r.ResourceID == "" {
-				errs = append(errs, fmt.Errorf("%s (%s): connector_routing_id requires the paired public resource_id", prefix, r.ID))
+			if r.CRID == "" {
+				errs = append(errs, fmt.Errorf("%s (%s): connector_routing_id requires the paired public crid", prefix, r.ID))
 			}
 			if err := ValidateConnectorRoutingID(r.ConnectorRoutingID); err != nil {
 				errs = append(errs, fmt.Errorf("%s (%s): %w", prefix, r.ID, err))
@@ -250,22 +246,22 @@ func ValidateManagedRouteIdentities(routes []Route) error {
 	routing := make(map[string]seenIdentity, len(routes))
 	var errs []error
 	for i, route := range routes {
-		if route.ResourceID != "" {
-			if first, duplicate := resources[route.ResourceID]; duplicate {
-				errs = append(errs, fmt.Errorf("routes[%d] (%s): duplicate resource_id %q is already used by routes[%d] (%s); one managed resource may target only one local route per Connector config", i, route.ID, route.ResourceID, first.index, first.routeID))
+		if route.CRID != "" {
+			if first, duplicate := resources[route.CRID]; duplicate {
+				errs = append(errs, fmt.Errorf("routes[%d] (%s): duplicate crid %q is already used by routes[%d] (%s); one managed resource may target only one local route per Connector config", i, route.ID, route.CRID, first.index, first.routeID))
 			} else {
-				resources[route.ResourceID] = seenIdentity{index: i, routeID: route.ID, resourceID: route.ResourceID}
+				resources[route.CRID] = seenIdentity{index: i, routeID: route.ID, resourceID: route.CRID}
 			}
 		}
-		if route.ConnectorRoutingID == "" || route.ResourceID == "" {
+		if route.ConnectorRoutingID == "" || route.CRID == "" {
 			continue
 		}
 		if first, duplicate := routing[route.ConnectorRoutingID]; duplicate {
-			if first.resourceID != route.ResourceID {
-				errs = append(errs, fmt.Errorf("routes[%d] (%s): connector_routing_id %q is already bound to resource_id %q by routes[%d] (%s), not %q; refusing a producer collision or cross-wired identity", i, route.ID, route.ConnectorRoutingID, first.resourceID, first.index, first.routeID, route.ResourceID))
+			if first.resourceID != route.CRID {
+				errs = append(errs, fmt.Errorf("routes[%d] (%s): connector_routing_id %q is already bound to crid %q by routes[%d] (%s), not %q; refusing a producer collision or cross-wired identity", i, route.ID, route.ConnectorRoutingID, first.resourceID, first.index, first.routeID, route.CRID))
 			}
 		} else {
-			routing[route.ConnectorRoutingID] = seenIdentity{index: i, routeID: route.ID, resourceID: route.ResourceID}
+			routing[route.ConnectorRoutingID] = seenIdentity{index: i, routeID: route.ID, resourceID: route.CRID}
 		}
 	}
 	return errors.Join(errs...)

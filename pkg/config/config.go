@@ -144,26 +144,27 @@ type QURLConfig struct {
 
 // Route describes a single proxy route.
 //
-// Managed routes consume three separately carried producer values: ResourceID
-// is the public qURL identity, ConnectorRoutingID is the FRP/HRW routing label,
+// CRID is the public resource locator. ResourcePublicKey is verification data,
+// ConnectorRoutingID is the FRP/HRW routing label,
 // and KnockResourceID is the persisted admission-target continuity assertion.
 // Runtime.KnockResourceIDs holds the authenticated NHP admission target used at
 // runtime, keyed by the public identity.
 type Route struct {
 	// ID is the customer-facing route identifier. For Connector resources,
 	// the registered-device qurl-go client sends this value verbatim as the
-	// qURL resource slug when ResourceID is empty. The JSON tag intentionally omits
+	// qURL resource slug when ResourcePublicKey is empty. The JSON tag intentionally omits
 	// `omitempty` so list --json pollers always see a stable id key,
 	// including the single-route env-fallback shape before resolution.
-	ID         string    `yaml:"id,omitempty" json:"id"`
-	Type       RouteType `yaml:"type" json:"type"`
-	LocalIP    string    `yaml:"local_ip,omitempty" json:"local_ip,omitempty"`
-	LocalPort  int       `yaml:"local_port" json:"local_port"`
-	ResourceID string    `yaml:"resource_id,omitempty" json:"resource_id,omitempty"`
+	ID                string    `yaml:"id,omitempty" json:"id"`
+	Type              RouteType `yaml:"type" json:"type"`
+	LocalIP           string    `yaml:"local_ip,omitempty" json:"local_ip,omitempty"`
+	LocalPort         int       `yaml:"local_port" json:"local_port"`
+	CRID              string    `yaml:"crid,omitempty" json:"crid,omitempty"`
+	ResourcePublicKey string    `yaml:"-" json:"-"`
 	// ConnectorRoutingID is returned by the qURL control plane and used verbatim for
 	// FRP SubDomain and load-balancer grouping. NHP placement comes from the
 	// authenticated ACK instead. This value must never
-	// be client-derived from or normalized against ResourceID; the control plane owns
+	// be client-derived from or normalized against ResourcePublicKey; the control plane owns
 	// the producer-side calculation.
 	ConnectorRoutingID string `yaml:"connector_routing_id,omitempty" json:"connector_routing_id,omitempty"`
 	// KnockResourceID is written by qURL Desktop and checked against authenticated
@@ -176,7 +177,7 @@ type Route struct {
 // It is used for resource-indexed NHP metadata, never for routing.
 func (c *Config) PrimaryResourceID() string {
 	if r := c.primaryRoutingRoute(); r != nil {
-		return r.ResourceID
+		return r.ResourcePublicKey
 	}
 	return ""
 }
@@ -345,6 +346,9 @@ func stripRetiredGeneratedFields(data string) (string, error) {
 	}
 	if routes := yamlField(root, "routes"); routes != nil && routes.Kind == yaml.SequenceNode {
 		for i, route := range routes.Content {
+			if line, ok := yamlFieldLine(route, "resource_id"); ok {
+				errs = append(errs, fmt.Errorf("config field routes[%d].resource_id at line %d was removed; delete it and use crid with the issued CRID", i, line))
+			}
 			for _, key := range []string{"subdomain", "load_balancer_group"} {
 				field := yamlField(route, key)
 				if field == nil {
@@ -354,7 +358,7 @@ func stripRetiredGeneratedFields(data string) (string, error) {
 				if routingID := yamlField(route, "connector_routing_id"); routingID != nil {
 					routingValue = strings.TrimSpace(routingID.Value)
 				}
-				resourceID := yamlField(route, "resource_id")
+				resourceID := yamlField(route, "crid")
 				switch {
 				case field.Kind == yaml.ScalarNode && strings.TrimSpace(field.Value) == "":
 					// An explicitly empty generated field carries no operator intent.

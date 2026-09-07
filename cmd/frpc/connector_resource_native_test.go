@@ -48,7 +48,7 @@ func assertNativeRequestWasDurableBeforeDispatch(t *testing.T, stateDir string, 
 			t.Fatalf("native request was dispatched before %s was durable: %s", want, raw)
 		}
 	}
-	if request.ExpectedResourceID != "" && !strings.Contains(string(raw), `"expected_resource_id":"`+request.ExpectedResourceID+`"`) {
+	if request.ExpectedCRID != "" && !strings.Contains(string(raw), `"expected_crid":"`+request.ExpectedCRID+`"`) {
 		t.Fatalf("native continuity assertion was not durable before dispatch: %s", raw)
 	}
 }
@@ -103,7 +103,7 @@ func TestNativeConnectorResolutionReplaysExactRequestAfterLostResponse(t *testin
 	if !present || cache.isPending("web") {
 		t.Fatalf("completed replay cache binding=%#v present=%v pending=%v", binding, present, cache.isPending("web"))
 	}
-	if restarted.Routes[0].ResourceID != testPublicResourceID || restarted.Routes[0].ConnectorRoutingID != testConnectorRoutingID {
+	if restarted.Routes[0].ResourcePublicKey != testPublicResourceID || restarted.Routes[0].ConnectorRoutingID != testConnectorRoutingID {
 		t.Fatalf("restarted route binding = %#v", restarted.Routes[0])
 	}
 }
@@ -133,16 +133,16 @@ func TestNativeConnectorWarmContinuityUsesFreshNonceAndExactResource(t *testing.
 	if len(requests) != 2 {
 		t.Fatalf("native requests = %d, want 2", len(requests))
 	}
-	if requests[0].ExpectedResourceID != "" {
-		t.Fatalf("cold request expected_resource_id = %q, want absent", requests[0].ExpectedResourceID)
+	if requests[0].ExpectedCRID != "" {
+		t.Fatalf("cold request expected_crid = %q, want absent", requests[0].ExpectedCRID)
 	}
-	if requests[1].ExpectedResourceID != testPublicResourceID {
-		t.Fatalf("warm request expected_resource_id = %q", requests[1].ExpectedResourceID)
+	if requests[1].ExpectedCRID != testCRIDForKey(testPublicResourceID) {
+		t.Fatalf("warm request expected_crid = %q", requests[1].ExpectedCRID)
 	}
 	if requests[0].RequestNonce == requests[1].RequestNonce {
 		t.Fatal("a completed operation reused its nonce for a fresh continuity read")
 	}
-	if warm.Routes[0].ResourceID != testPublicResourceID || warm.Routes[0].ConnectorRoutingID != testConnectorRoutingID {
+	if warm.Routes[0].ResourcePublicKey != testPublicResourceID || warm.Routes[0].ConnectorRoutingID != testConnectorRoutingID {
 		t.Fatalf("warm route = %#v", warm.Routes[0])
 	}
 	if got := warm.KnockResourceID(testPublicResourceID); got != "cell-resource" {

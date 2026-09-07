@@ -29,15 +29,15 @@ func (a *rotatingAdmitter) Admit(_ context.Context, knockResourceID, resourceID 
 	defer a.mu.Unlock()
 	a.next++
 	return Admission{
-		KnockResourceID: knockResourceID,
-		ResourceID:      resourceID,
-		RunID:           "run",
-		RunAttempt:      1,
-		Token:           "token",
-		ResourceHost:    "127.0.0.1:7000",
-		SessionID:       a.next,
-		SessionReceipt:  testSessionReceipt(a.next, "run", 1),
-		OpenTime:        a.openTime,
+		KnockResourceID:   knockResourceID,
+		ResourcePublicKey: resourceID,
+		RunID:             "run",
+		RunAttempt:        1,
+		Token:             "token",
+		ResourceHost:      "127.0.0.1:7000",
+		SessionID:         a.next,
+		SessionReceipt:    testSessionReceipt(a.next, "run", 1),
+		OpenTime:          a.openTime,
 	}, nil
 }
 
@@ -57,7 +57,7 @@ func testSessionReceipt(sessionID uint64, runID string, runAttempt uint64) qurl.
 
 func TestAdmissionFormattingRedactsBearerToken(t *testing.T) {
 	admission := Admission{
-		KnockResourceID: "q_catalog", ResourceID: "resource-public", RunID: "run-one", RunAttempt: 3,
+		KnockResourceID: "q_catalog", ResourcePublicKey: "resource-public", RunID: "run-one", RunAttempt: 3,
 		Token: "bearer-must-never-appear", ResourceHost: "frp.example:7000", SessionID: 42,
 		SessionReceipt: qurl.NativeSessionReceipt{
 			CellID: "cell0", SessionID: 42, SessionIssuedAtMillis: 1234, RunID: "run-one", RunAttempt: 3,
@@ -69,7 +69,7 @@ func TestAdmissionFormattingRedactsBearerToken(t *testing.T) {
 		if strings.Contains(formatted, admission.Token) || !strings.Contains(formatted, "Token:[REDACTED]") {
 			t.Fatalf("format %q leaked or omitted redaction: %s", format, formatted)
 		}
-		for _, useful := range []string{admission.ResourceID, admission.RunID, admission.ResourceHost, "cell0"} {
+		for _, useful := range []string{admission.ResourcePublicKey, admission.RunID, admission.ResourceHost, "cell0"} {
 			if !strings.Contains(formatted, useful) {
 				t.Fatalf("format %q omitted non-secret identity %q: %s", format, useful, formatted)
 			}

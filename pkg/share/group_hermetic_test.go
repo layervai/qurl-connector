@@ -30,7 +30,7 @@ func hermeticGroupRoute(t *testing.T, routeID string) LocalHTTPRoute {
 	t.Helper()
 	return LocalHTTPRoute{
 		RouteID: routeID, LocalIP: "127.0.0.1", LocalPort: newHermeticEcho(t, "echo-"+routeID),
-		ResourceID: "resource-" + routeID, ConnectorRoutingID: "routing-" + routeID,
+		ResourcePublicKey: "resource-" + routeID, ConnectorRoutingID: "routing-" + routeID,
 	}
 }
 
@@ -60,7 +60,7 @@ func TestHermeticSessionGroupServesManyRoutesOnOneAdmission(t *testing.T) {
 		t.Fatal(err)
 	}
 	admission := Admission{
-		KnockResourceID: knockResourceID, ResourceID: "group-resource",
+		KnockResourceID: knockResourceID, ResourcePublicKey: "group-resource",
 		RunID: "1111111111111111", RunAttempt: 1, Token: "token-one",
 		ResourceHost: net.JoinHostPort("127.0.0.1", strconv.Itoa(port)), SessionID: 101,
 		SessionReceipt: testSessionReceipt(101, "1111111111111111", 1), OpenTime: 5 * time.Minute,
@@ -82,7 +82,7 @@ func TestHermeticSessionGroupServesManyRoutesOnOneAdmission(t *testing.T) {
 	}
 	routes := []LocalHTTPRoute{hermeticGroupRoute(t, "a"), hermeticGroupRoute(t, "b"), hermeticGroupRoute(t, "c")}
 	runner, err := NewSessionGroupRunner(SessionGroupConfig{
-		KnockResourceID: knockResourceID, ResourceID: "group-resource", Routes: routes,
+		KnockResourceID: knockResourceID, ResourcePublicKey: "group-resource", Routes: routes,
 		Admitter: admitter, Sessions: factory,
 		MinBackoff: 10 * time.Millisecond, MaxBackoff: 25 * time.Millisecond,
 		RotationLead: time.Minute, StopTimeout: 5 * time.Second,
@@ -244,7 +244,7 @@ func TestHermeticSessionGroupRecoversLostControlOnFreshAdmission(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	old := Admission{KnockResourceID: "knock", ResourceID: "group", RunID: "1111111111111111", RunAttempt: 1,
+	old := Admission{KnockResourceID: "knock", ResourcePublicKey: "group", RunID: "1111111111111111", RunAttempt: 1,
 		Token: "first", ResourceHost: net.JoinHostPort("127.0.0.1", strconv.Itoa(oldPort)), SessionID: 101,
 		SessionReceipt: testSessionReceipt(101, "1111111111111111", 1), OpenTime: time.Hour}
 	next := old
@@ -252,7 +252,7 @@ func TestHermeticSessionGroupRecoversLostControlOnFreshAdmission(t *testing.T) {
 	next.SessionReceipt = testSessionReceipt(102, next.RunID, 1)
 	next.ResourceHost = net.JoinHostPort("127.0.0.1", strconv.Itoa(newPort))
 	admitter := &hermeticAdmitter{admissions: []Admission{old, next}}
-	runner, err := NewSessionGroupRunner(SessionGroupConfig{KnockResourceID: "knock", ResourceID: "group",
+	runner, err := NewSessionGroupRunner(SessionGroupConfig{KnockResourceID: "knock", ResourcePublicKey: "group",
 		Routes: []LocalHTTPRoute{hermeticGroupRoute(t, "a")}, Admitter: admitter, Sessions: factory,
 		MinBackoff: time.Millisecond, MaxBackoff: 10 * time.Millisecond, StopTimeout: time.Second})
 	if err != nil {

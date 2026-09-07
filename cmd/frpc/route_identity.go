@@ -15,7 +15,7 @@ func routeIDWithFallback(cfg *nhpconfig.Config, route nhpconfig.Route, fallbackI
 	if route.ID != "" {
 		return route.ID
 	}
-	if cfg != nil && len(cfg.Routes) == 1 && route.ResourceID == "" {
+	if cfg != nil && len(cfg.Routes) == 1 && route.CRID == "" {
 		return fallbackID
 	}
 	return ""

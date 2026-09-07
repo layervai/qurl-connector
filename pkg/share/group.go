@@ -22,19 +22,19 @@ var ErrGroupEmpty = errors.New("qURL share session group has no routes left")
 // hold a lock of its own that the runner is queried under. Callbacks run on
 // the runner's Run goroutine and must return promptly.
 //
-// KnockResourceID and ResourceID identify the single NHP admission the whole
+// KnockResourceID and ResourcePublicKey identify the single NHP admission the whole
 // group shares: every Connector route is protected by the same knock resource,
 // so one knock legitimately authorizes every proxy, and the durable
 // session-operation journal records one operation per admission (the group),
-// never one per route. ResourceID is the protected resource identity bound to
-// that admission; each route's own public ResourceID travels in its proxy's
+// never one per route. ResourcePublicKey is the protected resource identity bound to
+// that admission; each route's own public ResourcePublicKey travels in its proxy's
 // FRP metadata.
 type SessionGroupConfig struct {
-	KnockResourceID string
-	ResourceID      string
-	Routes          []LocalHTTPRoute
-	Admitter        Admitter
-	Sessions        SessionGroupFactory
+	KnockResourceID   string
+	ResourcePublicKey string
+	Routes            []LocalHTTPRoute
+	Admitter          Admitter
+	Sessions          SessionGroupFactory
 
 	MinBackoff time.Duration
 	MaxBackoff time.Duration
@@ -145,7 +145,7 @@ func NewSessionGroupRunner(cfg SessionGroupConfig) (*SessionGroupRunner, error) 
 	if cfg.KnockResourceID == "" {
 		return nil, errors.New("build session group: knock resource ID is empty")
 	}
-	if cfg.ResourceID == "" {
+	if cfg.ResourcePublicKey == "" {
 		return nil, errors.New("build session group: protected resource ID is empty")
 	}
 	if cfg.Admitter == nil {
@@ -440,10 +440,10 @@ func (r *SessionGroupRunner) SetRoutes(ctx context.Context, routes []LocalHTTPRo
 		if !exists || current == route {
 			continue
 		}
-		if current.ResourceID != route.ResourceID || current.ConnectorRoutingID != route.ConnectorRoutingID {
+		if current.ResourcePublicKey != route.ResourcePublicKey || current.ConnectorRoutingID != route.ConnectorRoutingID {
 			r.mu.Unlock()
 			return fmt.Errorf("set session group routes: route %q changes its resource identity in place (resource %q to %q, routing %q to %q); remove the route and add it again",
-				route.RouteID, current.ResourceID, route.ResourceID, current.ConnectorRoutingID, route.ConnectorRoutingID)
+				route.RouteID, current.ResourcePublicKey, route.ResourcePublicKey, current.ConnectorRoutingID, route.ConnectorRoutingID)
 		}
 	}
 	for routeID, current := range r.desired {
@@ -641,11 +641,11 @@ func (r *SessionGroupRunner) startCycleAttempt(ctx context.Context, old *groupCy
 		return nil, ErrGroupEmpty
 	}
 	started := time.Now()
-	admission, err := r.cfg.Admitter.Admit(attemptCtx, r.cfg.KnockResourceID, r.cfg.ResourceID)
+	admission, err := r.cfg.Admitter.Admit(attemptCtx, r.cfg.KnockResourceID, r.cfg.ResourcePublicKey)
 	if err != nil {
 		return nil, err
 	}
-	if err := validateAdmission(admission, r.cfg.KnockResourceID, r.cfg.ResourceID); err != nil {
+	if err := validateAdmission(admission, r.cfg.KnockResourceID, r.cfg.ResourcePublicKey); err != nil {
 		return nil, errors.Join(err, r.retireAdmission(admission))
 	}
 	routes := r.desiredRoutes()

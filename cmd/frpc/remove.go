@@ -8,6 +8,8 @@ import (
 	"os"
 	"strings"
 
+	qurlcrid "github.com/layervai/qurl-go/crid"
+
 	qurl "github.com/layervai/qurl-go/qurl"
 	"github.com/spf13/cobra"
 
@@ -15,7 +17,7 @@ import (
 	nhpconfig "github.com/layervai/qurl-connector/pkg/config"
 )
 
-var removeResourceID string
+var removeCRID string
 
 func getResourceSDKOrigin(versionedBase string) (string, error) {
 	u, err := url.Parse(versionedBase)
@@ -37,17 +39,17 @@ func getResourceSDKOrigin(versionedBase string) (string, error) {
 }
 
 func init() {
-	removeCmd.Flags().StringVar(&removeResourceID, "resource-id", "", "remove the route with this qURL resource_id instead of the positional route id")
+	removeCmd.Flags().StringVar(&removeCRID, "crid", "", "remove the route with this qURL CRID instead of the positional route id")
 }
 
 var removeCmd = &cobra.Command{
 	Use:   "remove [id]",
 	Short: "Remove a service route",
-	Long: `Remove a service route from the configuration by route id or resource ID.
+	Long: `Remove a service route from the configuration by route id or CRID.
 
 Examples:
   qurl-connector remove my-app
-  qurl-connector remove --resource-id "$RESOURCE_PUBLIC_KEY"`,
+  qurl-connector remove --crid "$CRID"`,
 	Args: cobra.MaximumNArgs(1),
 	RunE: runRemove,
 }
@@ -58,8 +60,8 @@ func runRemove(cmd *cobra.Command, args []string) error {
 		id = args[0]
 	}
 
-	if id == "" && removeResourceID == "" {
-		return fmt.Errorf("provide a route id as argument or use --resource-id flag")
+	if id == "" && removeCRID == "" {
+		return fmt.Errorf("provide a route id as argument or use --crid flag")
 	}
 
 	cfgPath, discoverErr := nhpconfig.Discover(cfgFile)
@@ -90,7 +92,7 @@ func runRemove(cmd *cobra.Command, args []string) error {
 				return fmt.Errorf("release immutable config after state-lock handoff: %w", err)
 			}
 		}
-		return removeConnectorSelection(txnCtx, cfg, configTxn, txn, id, removeResourceID, configAccess.writeErr)
+		return removeConnectorSelection(txnCtx, cfg, configTxn, txn, id, removeCRID, configAccess.writeErr)
 	})
 	return errors.Join(removeErr, configAccess.Close())
 }
@@ -111,7 +113,7 @@ func withRemoveConnectorIdentityCache(ctx context.Context, stateDir string, fn f
 	}
 }
 
-func removeConnectorSelection(ctx context.Context, cfg *nhpconfig.Config, configTxn *nhpconfig.FileTransaction, txn *connectorIdentityCacheTxn, id, resourceID string, configWriteErr error) error {
+func removeConnectorSelection(ctx context.Context, cfg *nhpconfig.Config, configTxn *nhpconfig.FileTransaction, txn *connectorIdentityCacheTxn, id, crid string, configWriteErr error) error {
 	cache := &connectorIdentityCache{
 		byID: make(map[string]connectorIdentityCacheEntry), pending: make(map[string]connectorIdentityPendingRequest),
 	}
@@ -125,7 +127,7 @@ func removeConnectorSelection(ctx context.Context, cfg *nhpconfig.Config, config
 			return err
 		}
 	}
-	selection, err := selectConnectorRemoval(cfg, cache, id, resourceID)
+	selection, err := selectConnectorRemoval(cfg, cache, id, crid)
 	if err != nil {
 		return err
 	}
@@ -133,7 +135,7 @@ func removeConnectorSelection(ctx context.Context, cfg *nhpconfig.Config, config
 		return fmt.Errorf("config is not writable; no qURL resource was changed: edit the host-side YAML to remove Connector id %q, then rerun `qurl-connector remove %s` to revoke its retained cached identity: %w", selection.id, selection.id, configWriteErr)
 	}
 
-	needsRemoteRemoval := selection.resourceID != "" || selection.pending
+	needsRemoteRemoval := selection.crid != "" || selection.pending
 	if needsRemoteRemoval {
 		if txn == nil {
 			return fmt.Errorf("Connector id %q has a resource identity but native device state is absent; local route is preserved", selection.id)
@@ -141,7 +143,7 @@ func removeConnectorSelection(ctx context.Context, cfg *nhpconfig.Config, config
 		remoteErr := withRegisteredConnectorResourceClient(ctx, cfg.QURL.APIURL, txn, cache, func(client *qurl.Client, continuity connectorStateContinuity) error {
 			transactionContinuity := connectorIdentityTransactionContinuity{sdk: continuity, txn: txn}
 			resourceVerified := false
-			if selection.pending && selection.resourceID == "" {
+			if selection.pending && selection.crid == "" {
 				resource, lookupErr := gateConnectorStateResult(transactionContinuity, "inspect pending Connector resource by id before removal", func() (*qurl.ConnectorResource, error) {
 					return client.GetConnectorResourceBySlug(ctx, selection.id)
 				})
@@ -154,7 +156,7 @@ func removeConnectorSelection(ctx context.Context, cfg *nhpconfig.Config, config
 				if resource == nil || resource.Slug != selection.id {
 					return fmt.Errorf("pending Connector id %q returned an inconsistent management binding; exact NHP retry state preserved", selection.id)
 				}
-				selection.resourceID = resource.ResourceID
+				selection.crid = resource.CRID
 				resourceVerified = true
 				if err := gateConnectorStateContinuity(transactionContinuity, "persist reconciled Connector identity before removal", func() error {
 					return cache.recordResolutionLocked(txn, selection.id, resource)
@@ -162,21 +164,21 @@ func removeConnectorSelection(ctx context.Context, cfg *nhpconfig.Config, config
 					return fmt.Errorf("persist reconciled Connector identity before remote deletion: %w", err)
 				}
 			}
-			if selection.resourceID == "" {
+			if selection.crid == "" {
 				return nil
 			}
 			if !resourceVerified {
 				resource, lookupErr := gateConnectorStateResult(transactionContinuity, "inspect exact Connector resource before deletion", func() (*qurl.ConnectorResource, error) {
-					return client.GetConnectorResource(ctx, selection.resourceID)
+					return client.GetConnectorResource(ctx, selection.crid)
 				})
 				if connectorResourceReadProvesDeletion(lookupErr) {
-					fmt.Printf("qURL resource already absent (resource_id: %s)\n", selection.resourceID)
+					fmt.Printf("qURL resource already absent (crid: %s)\n", selection.crid)
 					return nil
 				}
 				if lookupErr != nil {
-					return fmt.Errorf("inspect qURL resource %s before deletion: %w", selection.resourceID, lookupErr)
+					return fmt.Errorf("inspect qURL resource %s before deletion: %w", selection.crid, lookupErr)
 				}
-				if err := validateConnectorDeletionTarget(resource, selection.id, selection.resourceID); err != nil {
+				if err := validateConnectorDeletionTarget(resource, selection.id, selection.crid); err != nil {
 					return err
 				}
 				if err := gateConnectorStateContinuity(transactionContinuity, "persist exact management binding before removal", func() error {
@@ -187,15 +189,15 @@ func removeConnectorSelection(ctx context.Context, cfg *nhpconfig.Config, config
 				resourceVerified = true
 			}
 			deletedNow, apiErr := gateConnectorStateResult(transactionContinuity, "delete exact Connector resource", func() (bool, error) {
-				return reconcileConnectorResourceDeletion(ctx, client, selection.id, selection.resourceID, resourceVerified)
+				return reconcileConnectorResourceDeletion(ctx, client, selection.id, selection.crid, resourceVerified)
 			})
 			if apiErr != nil {
-				return fmt.Errorf("delete qURL resource %s; exact identity retained for safe retry: %w", selection.resourceID, apiErr)
+				return fmt.Errorf("delete qURL resource %s; exact identity retained for safe retry: %w", selection.crid, apiErr)
 			}
 			if deletedNow {
-				fmt.Printf("Deleted from qURL API (resource_id: %s)\n", selection.resourceID)
+				fmt.Printf("Deleted from qURL API (crid: %s)\n", selection.crid)
 			} else {
-				fmt.Printf("qURL resource already absent (resource_id: %s)\n", selection.resourceID)
+				fmt.Printf("qURL resource already absent (crid: %s)\n", selection.crid)
 			}
 			return nil
 		})
@@ -334,12 +336,12 @@ func withRegisteredConnectorResourceState(
 
 type connectorRemovalSelection struct {
 	id         string
-	resourceID string
+	crid       string
 	routeIndex int
 	pending    bool
 }
 
-func selectConnectorRemoval(cfg *nhpconfig.Config, cache *connectorIdentityCache, id, resourceID string) (connectorRemovalSelection, error) {
+func selectConnectorRemoval(cfg *nhpconfig.Config, cache *connectorIdentityCache, id, crid string) (connectorRemovalSelection, error) {
 	if cfg == nil || cache == nil {
 		return connectorRemovalSelection{}, errors.New("Connector removal state is incomplete")
 	}
@@ -348,9 +350,9 @@ func selectConnectorRemoval(cfg *nhpconfig.Config, cache *connectorIdentityCache
 			return connectorRemovalSelection{}, fmt.Errorf("invalid Connector id: %w", err)
 		}
 	}
-	if resourceID != "" {
-		if err := validateCachedConnectorResourceID(resourceID); err != nil {
-			return connectorRemovalSelection{}, fmt.Errorf("invalid --resource-id: %w", err)
+	if crid != "" {
+		if err := qurlcrid.Validate(crid); err != nil {
+			return connectorRemovalSelection{}, fmt.Errorf("invalid --crid: %w", err)
 		}
 	}
 
@@ -366,38 +368,38 @@ func selectConnectorRemoval(cfg *nhpconfig.Config, cache *connectorIdentityCache
 		if _, duplicate := byID[routeID]; duplicate {
 			return connectorRemovalSelection{}, fmt.Errorf("duplicate Connector id %q", routeID)
 		}
-		cachedResourceID, cached := cache.resourceID(routeID)
-		if route.ResourceID != "" && cached && route.ResourceID != cachedResourceID {
-			return connectorRemovalSelection{}, fmt.Errorf("route %q: pinned resource_id %q conflicts with cached resource_id %q", routeID, route.ResourceID, cachedResourceID)
+		cachedCRID, cached := cache.crid(routeID)
+		if route.CRID != "" && cached && route.CRID != cachedCRID {
+			return connectorRemovalSelection{}, fmt.Errorf("route %q: pinned crid %q conflicts with cached crid %q", routeID, route.CRID, cachedCRID)
 		}
-		effectiveResourceID := route.ResourceID
-		if effectiveResourceID == "" {
-			effectiveResourceID = cachedResourceID
+		effectiveCRID := route.CRID
+		if effectiveCRID == "" {
+			effectiveCRID = cachedCRID
 		}
-		if effectiveResourceID != "" {
-			if err := validateCachedConnectorResourceID(effectiveResourceID); err != nil {
-				return connectorRemovalSelection{}, fmt.Errorf("route %q: invalid resource_id: %w", routeID, err)
+		if effectiveCRID != "" {
+			if err := qurlcrid.Validate(effectiveCRID); err != nil {
+				return connectorRemovalSelection{}, fmt.Errorf("route %q: invalid crid: %w", routeID, err)
 			}
 		}
-		selection := connectorRemovalSelection{id: routeID, resourceID: effectiveResourceID, routeIndex: i, pending: cache.isPending(routeID)}
+		selection := connectorRemovalSelection{id: routeID, crid: effectiveCRID, routeIndex: i, pending: cache.isPending(routeID)}
 		byID[routeID] = selection
-		if effectiveResourceID != "" {
-			if owner, duplicate := byResource[effectiveResourceID]; duplicate {
-				return connectorRemovalSelection{}, fmt.Errorf("Connector ids %q and %q resolve to duplicate resource_id %q", owner, routeID, effectiveResourceID)
+		if effectiveCRID != "" {
+			if owner, duplicate := byResource[effectiveCRID]; duplicate {
+				return connectorRemovalSelection{}, fmt.Errorf("Connector ids %q and %q resolve to duplicate crid %q", owner, routeID, effectiveCRID)
 			}
-			byResource[effectiveResourceID] = routeID
+			byResource[effectiveCRID] = routeID
 		}
 	}
 	for cachedID, binding := range cache.byID {
 		if _, configured := byID[cachedID]; configured {
 			continue
 		}
-		cachedResourceID := binding.ResourceID
-		if owner, duplicate := byResource[cachedResourceID]; duplicate {
-			return connectorRemovalSelection{}, fmt.Errorf("Connector ids %q and %q resolve to duplicate resource_id %q", owner, cachedID, cachedResourceID)
+		cachedCRID := binding.CRID
+		if owner, duplicate := byResource[cachedCRID]; duplicate {
+			return connectorRemovalSelection{}, fmt.Errorf("Connector ids %q and %q resolve to duplicate crid %q", owner, cachedID, cachedCRID)
 		}
-		byID[cachedID] = connectorRemovalSelection{id: cachedID, resourceID: cachedResourceID, routeIndex: -1}
-		byResource[cachedResourceID] = cachedID
+		byID[cachedID] = connectorRemovalSelection{id: cachedID, crid: cachedCRID, routeIndex: -1}
+		byResource[cachedCRID] = cachedID
 	}
 	for pendingID := range cache.pending {
 		if selection, configured := byID[pendingID]; configured {
@@ -418,20 +420,20 @@ func selectConnectorRemoval(cfg *nhpconfig.Config, cache *connectorIdentityCache
 	}
 	var byResourceSelection connectorRemovalSelection
 	resourceFound := false
-	if resourceID != "" {
-		if owner, ok := byResource[resourceID]; ok {
+	if crid != "" {
+		if owner, ok := byResource[crid]; ok {
 			byResourceSelection, resourceFound = byID[owner], true
 		}
 		if !resourceFound {
-			return connectorRemovalSelection{}, fmt.Errorf("no route or cached Connector identity found with resource ID %q", resourceID)
+			return connectorRemovalSelection{}, fmt.Errorf("no route or cached Connector identity found with CRID %q", crid)
 		}
 	}
-	if id != "" && resourceID != "" && byIDSelection.id != byResourceSelection.id {
-		return connectorRemovalSelection{}, fmt.Errorf("route id %q and resource ID %q refer to different Connector identities", id, resourceID)
+	if id != "" && crid != "" && byIDSelection.id != byResourceSelection.id {
+		return connectorRemovalSelection{}, fmt.Errorf("route id %q and CRID %q refer to different Connector identities", id, crid)
 	}
 	if idFound {
-		if resourceID != "" && byIDSelection.resourceID != resourceID {
-			return connectorRemovalSelection{}, fmt.Errorf("route id %q is bound to resource ID %q, not %q", id, byIDSelection.resourceID, resourceID)
+		if crid != "" && byIDSelection.crid != crid {
+			return connectorRemovalSelection{}, fmt.Errorf("route id %q is bound to CRID %q, not %q", id, byIDSelection.crid, crid)
 		}
 		return byIDSelection, nil
 	}

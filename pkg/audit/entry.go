@@ -106,8 +106,8 @@ const (
 // Field naming: JSON tags use snake_case; ts is short to keep the most-
 // frequent field compact on disk. New fields land at the end of the
 // JSON object on the wire — readers MUST tolerate unknown fields
-// (encoding/json does so by default) so the taxonomy can ratchet
-// forward without breaking existing consumers.
+// (encoding/json does so by default). Breaking releases can rename fields;
+// the CRID release renamed resource_id to resource_public_key.
 type Entry struct {
 	Timestamp time.Time `json:"ts"`
 	Event     string    `json:"event"`
@@ -142,10 +142,10 @@ type Entry struct {
 	// without parsing Error free-text. Empty for success/allow.
 	Reason string `json:"reason,omitempty"`
 
-	SessionID  string `json:"session_id,omitempty"`
-	ResourceID string `json:"resource_id,omitempty"`
-	RouteID    string `json:"route_id,omitempty"`
-	Subject    string `json:"subject,omitempty"`
+	SessionID         string `json:"session_id,omitempty"`
+	ResourcePublicKey string `json:"resource_public_key,omitempty"`
+	RouteID           string `json:"route_id,omitempty"`
+	Subject           string `json:"subject,omitempty"`
 
 	// SourceIP is the source of the operation. For outbound knock /
 	// native registration this is the agent's egress IP (best-effort; may be

@@ -473,8 +473,8 @@ func mirrorToSlog(entry Entry) {
 	if entry.Reason != "" {
 		attrs = append(attrs, slog.String("reason", entry.Reason))
 	}
-	if entry.ResourceID != "" {
-		attrs = append(attrs, slog.String("resource_id", entry.ResourceID))
+	if entry.ResourcePublicKey != "" {
+		attrs = append(attrs, slog.String("resource_public_key", entry.ResourcePublicKey))
 	}
 	if entry.RouteID != "" {
 		attrs = append(attrs, slog.String("route_id", entry.RouteID))

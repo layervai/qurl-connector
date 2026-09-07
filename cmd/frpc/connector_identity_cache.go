@@ -32,7 +32,7 @@ const (
 	connectorIdentityCacheFile     = "connector_identities.json"
 	connectorIdentityCacheLockFile = ".connector_identities.lock"
 	legacyConnectorIdentityFile    = "tunnel_identities.json"
-	connectorIdentityCacheVersion  = 2
+	connectorIdentityCacheVersion  = 3
 	connectorIdentityCacheMaxBytes = 1 << 20
 	connectorIdentityCacheMode     = 0o600
 	connectorIdentityAgentIDMaxLen = 256
@@ -43,16 +43,16 @@ var connectorIdentityLockWaitTimeout = connectorIdentityLockTimeout
 
 type connectorIdentityCacheEntry struct {
 	ID                 string `json:"id"`
-	ResourceID         string `json:"resource_id"`
-	CRID               string `json:"crid,omitempty"`
+	ResourcePublicKey  string `json:"resource_public_key"`
+	CRID               string `json:"crid"`
 	ConnectorRoutingID string `json:"connector_routing_id"`
 	KnockResourceID    string `json:"knock_resource_id"`
 }
 
 type connectorIdentityPendingRequest struct {
-	ID                 string  `json:"id"`
-	RequestNonce       string  `json:"request_nonce"`
-	ExpectedResourceID *string `json:"expected_resource_id,omitempty"`
+	ID           string  `json:"id"`
+	RequestNonce string  `json:"request_nonce"`
+	ExpectedCRID *string `json:"expected_crid,omitempty"`
 }
 
 type connectorIdentityCacheEnvelope struct {
@@ -349,14 +349,17 @@ func hydrateConnectorResourceIDsReadOnlyContext(ctx context.Context, cfg *nhpcon
 		}
 		fallbackID := routeIDEnvFallback()
 		for i := range cfg.Routes {
-			if cfg.Routes[i].ResourceID != "" {
+			// Configured CRID/routing pins were checked against the cache above.
+			// A pinned CRID still needs its runtime-only verification key.
+			if cfg.Routes[i].ResourcePublicKey != "" {
 				continue
 			}
 			id := routeIDWithFallback(cfg, cfg.Routes[i], fallbackID)
 			if binding, ok := cache.binding(id); ok {
-				cfg.Routes[i].ResourceID = binding.ResourceID
+				cfg.Routes[i].ResourcePublicKey = binding.ResourcePublicKey
+				cfg.Routes[i].CRID = binding.CRID
 				cfg.Routes[i].ConnectorRoutingID = binding.ConnectorRoutingID
-				cfg.SetKnockResourceID(binding.ResourceID, binding.KnockResourceID)
+				cfg.SetKnockResourceID(binding.ResourcePublicKey, binding.KnockResourceID)
 			}
 		}
 		return nil
@@ -586,7 +589,7 @@ func loadConnectorIdentityCacheUnlocked(txn *connectorIdentityCacheTxn) (cache *
 		return nil, fmt.Errorf("decode Connector identity cache %s: %w", path, err)
 	}
 	if envelope.Version != connectorIdentityCacheVersion {
-		return nil, fmt.Errorf("Connector identity cache %s version is %d, want %d", path, envelope.Version, connectorIdentityCacheVersion)
+		return nil, fmt.Errorf("Connector identity cache %s version is %d, want %d; this binary cannot read old cache versions; use the previous binary to finish pending operations before upgrading; preserve agent_state.json and do not delete unresolved request state", path, envelope.Version, connectorIdentityCacheVersion)
 	}
 	if envelope.AgentID == nil {
 		return nil, fmt.Errorf("Connector identity cache %s is missing agent_id", path)
@@ -613,7 +616,7 @@ func loadConnectorIdentityCacheUnlocked(txn *connectorIdentityCacheTxn) (cache *
 		if err := nhpconfig.ValidateSlug(entry.ID); err != nil {
 			return nil, fmt.Errorf("Connector identity cache %s identities[%d]: %w", path, i, err)
 		}
-		if err := validateCachedConnectorResourceID(entry.ResourceID); err != nil {
+		if err := validateCachedResourcePublicKey(entry.ResourcePublicKey); err != nil {
 			return nil, fmt.Errorf("Connector identity cache %s identities[%d]: %w", path, i, err)
 		}
 		if err := validateCachedConnectorBinding(entry); err != nil {
@@ -625,11 +628,11 @@ func loadConnectorIdentityCacheUnlocked(txn *connectorIdentityCacheTxn) (cache *
 		if i > 0 && (*envelope.Identities)[i-1].ID >= entry.ID {
 			return nil, fmt.Errorf("Connector identity cache %s identities must be strictly sorted by id", path)
 		}
-		if owner, duplicate := resourceOwners[entry.ResourceID]; duplicate {
-			return nil, fmt.Errorf("Connector identity cache %s maps resource_id %q to both %q and %q", path, entry.ResourceID, owner, entry.ID)
+		if owner, duplicate := resourceOwners[entry.ResourcePublicKey]; duplicate {
+			return nil, fmt.Errorf("Connector identity cache %s maps resource_public_key %q to both %q and %q", path, entry.ResourcePublicKey, owner, entry.ID)
 		}
 		cache.byID[entry.ID] = entry
-		resourceOwners[entry.ResourceID] = entry.ID
+		resourceOwners[entry.ResourcePublicKey] = entry.ID
 	}
 	for i, request := range *envelope.PendingRequests {
 		if err := validateCachedConnectorRequest(request); err != nil {
@@ -642,8 +645,8 @@ func loadConnectorIdentityCacheUnlocked(txn *connectorIdentityCacheTxn) (cache *
 			return nil, fmt.Errorf("Connector identity cache %s pending_requests must be strictly sorted by id", path)
 		}
 		if binding, resolved := cache.byID[request.ID]; resolved {
-			if request.ExpectedResourceID == nil || *request.ExpectedResourceID != binding.ResourceID {
-				return nil, fmt.Errorf("Connector identity cache %s pending request %q does not assert its exact cached resource_id", path, request.ID)
+			if request.ExpectedCRID == nil || *request.ExpectedCRID != binding.CRID {
+				return nil, fmt.Errorf("Connector identity cache %s pending request %q does not assert its exact cached CRID", path, request.ID)
 			}
 		}
 		cache.pending[request.ID] = request
@@ -820,13 +823,13 @@ func rejectNonCanonicalConnectorIdentityCacheKeys(raw []byte) error {
 		}
 		for key := range entry {
 			switch key {
-			case "id", "resource_id", "crid", "connector_routing_id", "knock_resource_id":
+			case "id", "resource_public_key", "crid", "connector_routing_id", "knock_resource_id":
 			default:
 				return fmt.Errorf("identities[%d]: unknown field %q", i, key)
 			}
 		}
 		if value, present := entry["crid"]; present && bytes.Equal(bytes.TrimSpace(value), []byte("null")) {
-			return fmt.Errorf("identities[%d]: crid must be absent rather than null", i)
+			return fmt.Errorf("identities[%d]: crid must not be null", i)
 		}
 	}
 	pendingRaw, ok := envelope["pending_requests"]
@@ -844,13 +847,13 @@ func rejectNonCanonicalConnectorIdentityCacheKeys(raw []byte) error {
 		}
 		for key := range request {
 			switch key {
-			case "id", "request_nonce", "expected_resource_id":
+			case "id", "request_nonce", "expected_crid":
 			default:
 				return fmt.Errorf("pending_requests[%d]: unknown field %q", i, key)
 			}
 		}
-		if value, present := request["expected_resource_id"]; present && bytes.Equal(bytes.TrimSpace(value), []byte("null")) {
-			return fmt.Errorf("pending_requests[%d]: expected_resource_id must be absent rather than null", i)
+		if value, present := request["expected_crid"]; present && bytes.Equal(bytes.TrimSpace(value), []byte("null")) {
+			return fmt.Errorf("pending_requests[%d]: expected_crid must not be null", i)
 		}
 	}
 	return nil
@@ -883,21 +886,21 @@ func cachedAgentIDFingerprint(agentID string) string {
 	return fmt.Sprintf("sha256:%x", digest[:8])
 }
 
-func validateCachedConnectorResourceID(resourceID string) error {
-	if err := validateCachedIdentityString("resource_id", resourceID); err != nil {
+func validateCachedResourcePublicKey(resourceID string) error {
+	if err := validateCachedIdentityString("resource_public_key", resourceID); err != nil {
 		return err
 	}
 	der, err := base64.RawURLEncoding.Strict().DecodeString(resourceID)
 	if err != nil || base64.RawURLEncoding.EncodeToString(der) != resourceID {
-		return errors.New("resource_id must be canonical unpadded base64url")
+		return errors.New("resource_public_key must be canonical unpadded base64url")
 	}
 	publicKey, err := qurl.ParseP256PublicKeyDER(der)
 	if err != nil {
-		return fmt.Errorf("resource_id must encode a P-256 DER SPKI public key: %w", err)
+		return fmt.Errorf("resource_public_key must encode a P-256 DER SPKI public key: %w", err)
 	}
 	canonical, err := x509.MarshalPKIXPublicKey(publicKey)
 	if err != nil || !bytes.Equal(canonical, der) {
-		return errors.New("resource_id must use canonical P-256 DER SPKI encoding")
+		return errors.New("resource_public_key must use canonical P-256 DER SPKI encoding")
 	}
 	return nil
 }
@@ -906,7 +909,7 @@ func validateCachedConnectorBinding(binding connectorIdentityCacheEntry) error {
 	if err := nhpconfig.ValidateSlug(binding.ID); err != nil {
 		return err
 	}
-	if err := validateCachedConnectorResourceID(binding.ResourceID); err != nil {
+	if err := validateCachedResourcePublicKey(binding.ResourcePublicKey); err != nil {
 		return err
 	}
 	if err := nhpconfig.ValidateConnectorRoutingID(binding.ConnectorRoutingID); err != nil {
@@ -915,18 +918,19 @@ func validateCachedConnectorBinding(binding connectorIdentityCacheEntry) error {
 	if err := validateCachedKnockResourceID(binding.KnockResourceID); err != nil {
 		return err
 	}
-	if binding.ResourceID == binding.KnockResourceID || binding.ConnectorRoutingID == binding.KnockResourceID {
-		return errors.New("resource_id, connector_routing_id, and knock_resource_id must be distinct")
+	if binding.ResourcePublicKey == binding.KnockResourceID || binding.ConnectorRoutingID == binding.KnockResourceID || binding.CRID == binding.KnockResourceID {
+		return errors.New("crid, resource_public_key, connector_routing_id, and knock_resource_id must be distinct")
 	}
-	if binding.CRID != "" {
-		der, err := base64.RawURLEncoding.Strict().DecodeString(binding.ResourceID)
-		if err != nil {
-			return errors.New("resource_id must be canonical before CRID validation")
-		}
-		matched, err := qurlcrid.KeyMatches(binding.CRID, der)
-		if err != nil || !matched {
-			return errors.New("crid must cryptographically match resource_id")
-		}
+	if binding.CRID == "" {
+		return errors.New("crid is required")
+	}
+	der, err := base64.RawURLEncoding.Strict().DecodeString(binding.ResourcePublicKey)
+	if err != nil {
+		return errors.New("resource_public_key must be canonical before CRID validation")
+	}
+	matched, err := qurlcrid.KeyMatches(binding.CRID, der)
+	if err != nil || !matched {
+		return errors.New("crid must cryptographically match resource_public_key")
 	}
 	return nil
 }
@@ -949,23 +953,23 @@ func validateCachedConnectorRequest(request connectorIdentityPendingRequest) err
 	if err != nil || len(nonce) != 32 || base64.RawURLEncoding.EncodeToString(nonce) != request.RequestNonce {
 		return errors.New("request_nonce must be canonical unpadded base64url of 32 bytes")
 	}
-	if request.ExpectedResourceID != nil {
-		if *request.ExpectedResourceID == "" {
-			return errors.New("expected_resource_id must be absent rather than empty")
+	if request.ExpectedCRID != nil {
+		if *request.ExpectedCRID == "" {
+			return errors.New("expected_crid must be absent rather than empty")
 		}
-		if err := validateCachedConnectorResourceID(*request.ExpectedResourceID); err != nil {
-			return fmt.Errorf("expected_resource_id: %w", err)
+		if err := qurlcrid.Validate(*request.ExpectedCRID); err != nil {
+			return fmt.Errorf("expected_crid: %w", err)
 		}
 	}
 	return nil
 }
 
-func (c *connectorIdentityCache) resourceID(id string) (string, bool) {
+func (c *connectorIdentityCache) crid(id string) (string, bool) {
 	if c == nil {
 		return "", false
 	}
 	binding, ok := c.byID[id]
-	return binding.ResourceID, ok
+	return binding.CRID, ok
 }
 
 func (c *connectorIdentityCache) binding(id string) (connectorIdentityCacheEntry, bool) {
@@ -1042,7 +1046,7 @@ func (c *connectorIdentityCache) bindAgentIDLocked(txn *connectorIdentityCacheTx
 	return nil
 }
 
-func (c *connectorIdentityCache) ensurePendingRequestLocked(txn *connectorIdentityCacheTxn, id, expectedResourceID string) (*qurl.NativeConnectorResourceRequest, error) {
+func (c *connectorIdentityCache) ensurePendingRequestLocked(txn *connectorIdentityCacheTxn, id, expectedCRID string) (*qurl.NativeConnectorResourceRequest, error) {
 	if c == nil {
 		return nil, errors.New("Connector identity cache is nil")
 	}
@@ -1057,27 +1061,27 @@ func (c *connectorIdentityCache) ensurePendingRequestLocked(txn *connectorIdenti
 	}
 	if pending, present := c.pending[id]; present {
 		gotExpected := ""
-		if pending.ExpectedResourceID != nil {
-			gotExpected = *pending.ExpectedResourceID
+		if pending.ExpectedCRID != nil {
+			gotExpected = *pending.ExpectedCRID
 		}
-		if gotExpected != expectedResourceID {
-			return nil, fmt.Errorf("Connector id %q pending request expected resource_id %q, not %q", id, gotExpected, expectedResourceID)
+		if gotExpected != expectedCRID {
+			return nil, fmt.Errorf("Connector id %q pending request expected CRID %q, not %q", id, gotExpected, expectedCRID)
 		}
 		return &qurl.NativeConnectorResourceRequest{
-			ConnectorID: id, ExpectedResourceID: gotExpected, RequestNonce: pending.RequestNonce,
+			ConnectorID: id, ExpectedCRID: gotExpected, RequestNonce: pending.RequestNonce,
 		}, nil
 	}
-	if binding, resolved := c.byID[id]; resolved && expectedResourceID != binding.ResourceID {
-		return nil, fmt.Errorf("Connector id %q pending continuity request must assert cached resource_id %q, not %q", id, binding.ResourceID, expectedResourceID)
+	if binding, resolved := c.byID[id]; resolved && expectedCRID != binding.CRID {
+		return nil, fmt.Errorf("Connector id %q pending continuity request must assert cached CRID %q, not %q", id, binding.CRID, expectedCRID)
 	}
-	request, err := qurl.NewNativeConnectorResourceRequest(id, expectedResourceID)
+	request, err := qurl.NewNativeConnectorResourceRequest(id, expectedCRID)
 	if err != nil {
 		return nil, err
 	}
 	pending := connectorIdentityPendingRequest{ID: id, RequestNonce: request.RequestNonce}
-	if expectedResourceID != "" {
-		expected := expectedResourceID
-		pending.ExpectedResourceID = &expected
+	if expectedCRID != "" {
+		expected := expectedCRID
+		pending.ExpectedCRID = &expected
 	}
 	c.pending[id] = pending
 	if err := saveConnectorIdentityCacheUnlocked(txn, c); err != nil {
@@ -1117,27 +1121,23 @@ func (c *connectorIdentityCache) recordResolutionLocked(txn *connectorIdentityCa
 		return fmt.Errorf("Connector id %q cannot record resource binding for %q", id, resource.Slug)
 	}
 	binding := connectorIdentityCacheEntry{
-		ID: id, ResourceID: resource.ResourceID, CRID: resource.CRID,
+		ID: id, ResourcePublicKey: resource.ResourcePublicKey, CRID: resource.CRID,
 		ConnectorRoutingID: resource.ConnectorRoutingID, KnockResourceID: resource.KnockResourceID,
 	}
 	if err := validateCachedConnectorBinding(binding); err != nil {
 		return err
 	}
 	if existing, ok := c.byID[id]; ok {
-		if existing.ResourceID != binding.ResourceID {
-			return fmt.Errorf("Connector id %q is cached as resource_id %q, not %q", id, existing.ResourceID, binding.ResourceID)
+		if existing.ResourcePublicKey != binding.ResourcePublicKey {
+			return fmt.Errorf("Connector id %q is cached as resource_public_key %q, not %q", id, existing.ResourcePublicKey, binding.ResourcePublicKey)
 		}
 		if existing.ConnectorRoutingID != binding.ConnectorRoutingID || existing.KnockResourceID != binding.KnockResourceID {
-			return fmt.Errorf("Connector id %q returned a changed routing or knock binding for resource_id %q", id, binding.ResourceID)
+			return fmt.Errorf("Connector id %q returned a changed routing or knock binding for resource_public_key %q", id, binding.ResourcePublicKey)
 		}
-		switch {
-		case existing.CRID != "" && binding.CRID == "":
-			// CRID is optional on the wire. Never erase a previously verified
-			// key-matching value merely because a later response omitted it.
-			binding.CRID = existing.CRID
-		case existing.CRID != "" && binding.CRID != existing.CRID:
-			return fmt.Errorf("Connector id %q returned a changed CRID for resource_id %q", id, binding.ResourceID)
+		if existing.CRID != binding.CRID {
+			return fmt.Errorf("Connector id %q changed CRID from %q to %q", id, existing.CRID, binding.CRID)
 		}
+
 		// A warm-start continuity check that returns the exact binding is a
 		// logical no-op. Avoid rewriting already-durable state: besides reducing
 		// flash churn, this keeps a later config-prune failure attributable to
@@ -1147,8 +1147,8 @@ func (c *connectorIdentityCache) recordResolutionLocked(txn *connectorIdentityCa
 		}
 	}
 	for existingID, existing := range c.byID {
-		if existing.ResourceID == binding.ResourceID && existingID != id {
-			return fmt.Errorf("resource_id %q is already cached for Connector id %q, not %q", binding.ResourceID, existingID, id)
+		if existing.ResourcePublicKey == binding.ResourcePublicKey && existingID != id {
+			return fmt.Errorf("resource_public_key %q is already cached for Connector id %q, not %q", binding.ResourcePublicKey, existingID, id)
 		}
 	}
 	previous, hadBinding := c.byID[id]
@@ -1232,8 +1232,8 @@ func saveConnectorIdentityCacheUnlocked(txn *connectorIdentityCacheTxn, cache *c
 		if err := validateCachedConnectorRequest(request); err != nil {
 			return err
 		}
-		if binding, resolved := cache.byID[id]; resolved && (request.ExpectedResourceID == nil || *request.ExpectedResourceID != binding.ResourceID) {
-			return fmt.Errorf("Connector id %q pending request must assert exact cached resource_id", id)
+		if binding, resolved := cache.byID[id]; resolved && (request.ExpectedCRID == nil || *request.ExpectedCRID != binding.CRID) {
+			return fmt.Errorf("Connector id %q pending request must assert exact cached CRID", id)
 		}
 		pending = append(pending, request)
 	}

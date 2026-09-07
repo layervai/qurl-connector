@@ -33,7 +33,7 @@ func TestRunAddIsLocalAndDefersResourceProvisioning(t *testing.T) {
 	if len(cfg.Routes) != 1 || cfg.Routes[0].ID != addID {
 		t.Fatalf("routes = %#v", cfg.Routes)
 	}
-	if cfg.Routes[0].ResourceID != "" || cfg.Routes[0].ConnectorRoutingID != "" {
+	if cfg.Routes[0].CRID != "" || cfg.Routes[0].ConnectorRoutingID != "" {
 		t.Fatalf("add provisioned remote identity before native registration: %#v", cfg.Routes[0])
 	}
 	if _, err := os.Stat(filepath.Join(dir, "agent_state.json")); !os.IsNotExist(err) {

@@ -77,8 +77,8 @@ func TestRunListHumanHydratesCachedResourceIDReadOnly(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(out, testPublicResourceID) {
-		t.Fatalf("human list omitted cached resource_id:\n%s", out)
+	if !strings.Contains(out, testCRIDForKey(testPublicResourceID)) {
+		t.Fatalf("human list omitted cached crid:\n%s", out)
 	}
 	after, err := os.ReadFile(cfgPath)
 	if err != nil {
@@ -103,7 +103,7 @@ routes:
     type: http
     local_ip: 127.0.0.1
     local_port: 8080
-    resource_id: `+testPublicResourceID+`
+    crid: `+testCRIDForKey(testPublicResourceID)+`
     connector_routing_id: c-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
     target_url: http://127.0.0.1:8080
 `), 0o600); err != nil {
@@ -134,7 +134,7 @@ routes:
 		t.Fatalf("routes length = %d, want 1", len(routes))
 	}
 	got := routes[0]
-	for _, key := range []string{"id", "type", "local_ip", "local_port", "resource_id", "connector_routing_id", "target_url"} {
+	for _, key := range []string{"id", "type", "local_ip", "local_port", "crid", "connector_routing_id", "target_url"} {
 		if _, ok := got[key]; !ok {
 			t.Fatalf("list --json missing lower-snake key %q in %#v", key, got)
 		}
@@ -142,7 +142,7 @@ routes:
 	if _, ok := got["subdomain"]; ok {
 		t.Fatalf("canonical managed route must not synthesize a legacy subdomain in list --json: %#v", got)
 	}
-	for _, key := range []string{"Name", "ID", "Type", "LocalIP", "LocalPort", "Subdomain", "ResourceID", "TargetURL"} {
+	for _, key := range []string{"Name", "ID", "Type", "LocalIP", "LocalPort", "Subdomain", "ResourcePublicKey", "TargetURL"} {
 		if _, ok := got[key]; ok {
 			t.Fatalf("list --json emitted legacy/PascalCase key %q in %#v", key, got)
 		}
