@@ -111,42 +111,6 @@ TARGETS = {
         "fileviewer-sandbox",
         "/qurl-s3-connector/fileviewer-nhp/replica-c/bootstrap",
     ),
-    "uploader-nhp-replica-a": (
-        "uploader-sandbox",
-        "/qurl-s3-connector/uploader-nhp/replica-a/bootstrap",
-    ),
-    "uploader-nhp-replica-b": (
-        "uploader-sandbox",
-        "/qurl-s3-connector/uploader-nhp/replica-b/bootstrap",
-    ),
-    "uploader-nhp-replica-c": (
-        "uploader-sandbox",
-        "/qurl-s3-connector/uploader-nhp/replica-c/bootstrap",
-    ),
-    "detect-nhp-replica-a": (
-        "detect-sandbox",
-        "/qurl-s3-connector/detect-nhp/replica-a/bootstrap",
-    ),
-    "detect-nhp-replica-b": (
-        "detect-sandbox",
-        "/qurl-s3-connector/detect-nhp/replica-b/bootstrap",
-    ),
-    "detect-nhp-replica-c": (
-        "detect-sandbox",
-        "/qurl-s3-connector/detect-nhp/replica-c/bootstrap",
-    ),
-    "watermark-nhp-replica-a": (
-        "watermark-sandbox",
-        "/qurl-watermark-service/nhp/replica-a/bootstrap",
-    ),
-    "watermark-nhp-replica-b": (
-        "watermark-sandbox",
-        "/qurl-watermark-service/nhp/replica-b/bootstrap",
-    ),
-    "watermark-nhp-replica-c": (
-        "watermark-sandbox",
-        "/qurl-watermark-service/nhp/replica-c/bootstrap",
-    ),
 }
 
 

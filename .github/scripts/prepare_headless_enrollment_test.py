@@ -250,11 +250,10 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
 
     def test_inputs_allow_only_reviewed_target_generation_and_region(self) -> None:
         MODULE.validate_inputs("fileviewer-nhp-replica-a", "attempt-1", "us-east-2")
-        MODULE.validate_inputs("uploader-nhp-replica-b", "attempt-1", "us-east-2")
-        MODULE.validate_inputs("detect-nhp-replica-a", "attempt-1", "us-east-2")
-        MODULE.validate_inputs("watermark-nhp-replica-c", "attempt-1", "us-east-2")
+        MODULE.validate_inputs("fileviewer-nhp-replica-b", "attempt-1", "us-east-2")
+        MODULE.validate_inputs("fileviewer-nhp-replica-c", "attempt-1", "us-east-2")
         with self.assertRaisesRegex(MODULE.EnrollmentError, "target"):
-            MODULE.validate_inputs("other-sandbox", "attempt-1", "us-east-2")
+            MODULE.validate_inputs("other-nhp-replica-a", "attempt-1", "us-east-2")
         with self.assertRaisesRegex(MODULE.EnrollmentError, "generation"):
             MODULE.validate_inputs("fileviewer-nhp-replica-a", "Attempt_1", "us-east-2")
         with self.assertRaisesRegex(MODULE.EnrollmentError, "us-east-2"):
@@ -668,7 +667,7 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
     def test_initial_resource_read_retries_once_before_any_mutation(self) -> None:
         resource = [
             {
-                "slug": "detect-sandbox",
+                "slug": "fileviewer-sandbox",
                 "type": "tunnel",
                 "status": "active",
                 "resource_id": "r_one",
@@ -678,7 +677,7 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
         credential = {
             "kind": "enrollment_token",
             "target": "agent",
-            "claims": [{"type": "connector", "id": "detect-sandbox"}],
+            "claims": [{"type": "connector", "id": "fileviewer-sandbox"}],
             "api_key": "lv_live_test-token",
             "expires_at": VALID_EXPIRY,
         }
@@ -696,7 +695,7 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
             MODULE.prepare_enrollment(
                 "https://api.example.com",
                 "lv_live_account-key",
-                "detect-nhp-replica-a",
+                "fileviewer-nhp-replica-a",
                 "attempt-1",
                 "us-east-2",
                 now=FIXED_NOW,
@@ -708,7 +707,7 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
     def test_initial_sharing_read_retries_once_before_any_mutation(self) -> None:
         resource = [
             {
-                "slug": "detect-sandbox",
+                "slug": "fileviewer-sandbox",
                 "type": "tunnel",
                 "status": "active",
                 "resource_id": "r_one",
@@ -718,7 +717,7 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
         credential = {
             "kind": "enrollment_token",
             "target": "agent",
-            "claims": [{"type": "connector", "id": "detect-sandbox"}],
+            "claims": [{"type": "connector", "id": "fileviewer-sandbox"}],
             "api_key": "lv_live_test-token",
             "expires_at": VALID_EXPIRY,
         }
@@ -738,7 +737,7 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
             MODULE.prepare_enrollment(
                 "https://api.example.com",
                 "lv_live_account-key",
-                "detect-nhp-replica-a",
+                "fileviewer-nhp-replica-a",
                 "attempt-1",
                 "us-east-2",
                 now=FIXED_NOW,
@@ -763,7 +762,7 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
             MODULE.prepare_enrollment(
                 "https://api.example.com",
                 "lv_live_account-key",
-                "detect-nhp-replica-a",
+                "fileviewer-nhp-replica-a",
                 "attempt-1",
                 "us-east-2",
                 now=FIXED_NOW,
@@ -789,7 +788,7 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
         responses = [
             [
                 {
-                    "slug": "detect-sandbox",
+                    "slug": "fileviewer-sandbox",
                     "type": "tunnel",
                     "status": "active",
                     "resource_id": resource_id,
@@ -802,7 +801,7 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
                 "kind": "enrollment_token",
                 "key_id": "key_abc123def456",
                 "target": "agent",
-                "claims": [{"type": "connector", "id": "detect-sandbox"}],
+                "claims": [{"type": "connector", "id": "fileviewer-sandbox"}],
                 "api_key": "lv_live_test-token",
                 "expires_at": VALID_EXPIRY,
             },
@@ -815,7 +814,7 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
             MODULE.prepare_enrollment(
                 "https://api.example.com",
                 "lv_live_account-key",
-                "detect-nhp-replica-a",
+                "fileviewer-nhp-replica-a",
                 "attempt-1",
                 "us-east-2",
                 now=FIXED_NOW,
@@ -826,21 +825,21 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
         )
         self.assertEqual(
             request.call_args_list[2].kwargs["idempotency_key"],
-            "headless-sharing-v2-attempt-1-detect-nhp-replica-a-0",
+            "headless-sharing-v2-attempt-1-fileviewer-nhp-replica-a-0",
         )
         self.assertEqual(
             request.call_args_list[3].args[2], "/v1/resources/MFkw-resource/sharing"
         )
         self.assertEqual(
             request.call_args_list[4].kwargs["idempotency_key"],
-            "headless-v2-attempt-1-detect-nhp-replica-a",
+            "headless-v2-attempt-1-fileviewer-nhp-replica-a",
         )
         self.assertEqual(
             request.call_args_list[4].kwargs["expected_status"], (200, 201)
         )
         put.assert_called_once_with(
             "us-east-2",
-            "/qurl-s3-connector/detect-nhp/replica-a/bootstrap",
+            "/qurl-s3-connector/fileviewer-nhp/replica-a/bootstrap",
             "lv_live_test-token",
         )
         self.assertEqual(
@@ -850,11 +849,11 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
         output.assert_has_calls(
             [
                 mock.call(
-                    "::notice::sharing for detect-nhp-replica-a changed from off to on during this run and was deliberately left on",
+                    "::notice::sharing for fileviewer-nhp-replica-a changed from off to on during this run and was deliberately left on",
                     file=MODULE.sys.stderr,
                 ),
                 mock.call(
-                    "prepared one-hour enrollment for detect-nhp-replica-a at serving epoch 1; "
+                    "prepared one-hour enrollment for fileviewer-nhp-replica-a at serving epoch 1; "
                     "expires 2026-09-04T19:00:00+00:00"
                 ),
             ]
@@ -865,7 +864,7 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
         responses = [
             [
                 {
-                    "slug": "detect-sandbox",
+                    "slug": "fileviewer-sandbox",
                     "type": "tunnel",
                     "status": "active",
                     "resource_id": "MFkw-resource",
@@ -888,7 +887,7 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
             MODULE.prepare_enrollment(
                 "https://api.example.com",
                 "lv_live_account-key",
-                "detect-nhp-replica-a",
+                "fileviewer-nhp-replica-a",
                 "attempt-1",
                 "us-east-2",
                 now=FIXED_NOW,
@@ -900,7 +899,7 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
                     file=MODULE.sys.stderr,
                 ),
                 mock.call(
-                    "prepared one-hour enrollment for detect-nhp-replica-a at serving epoch 1; "
+                    "prepared one-hour enrollment for fileviewer-nhp-replica-a at serving epoch 1; "
                     "expires 2026-09-04T19:00:00+00:00"
                 ),
             ]
@@ -913,13 +912,13 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
             (
                 [
                     {
-                        "slug": "detect-sandbox",
+                        "slug": "fileviewer-sandbox",
                         "type": "tunnel",
                         "status": "active",
                         "resource_id": "r_one",
                     },
                     {
-                        "slug": "detect-sandbox",
+                        "slug": "fileviewer-sandbox",
                         "type": "tunnel",
                         "status": "active",
                         "resource_id": "r_two",
@@ -930,7 +929,7 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
             (
                 [
                     {
-                        "slug": "detect-sandbox",
+                        "slug": "fileviewer-sandbox",
                         "type": "file",
                         "status": "active",
                         "resource_id": "r_one",
@@ -941,7 +940,7 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
             (
                 [
                     {
-                        "slug": "detect-sandbox",
+                        "slug": "fileviewer-sandbox",
                         "type": "tunnel",
                         "status": "closed",
                         "resource_id": "r_one",
@@ -950,13 +949,13 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
                 "one active tunnel",
             ),
             (
-                [{"slug": "detect-sandbox", "type": "tunnel", "status": "active"}],
+                [{"slug": "fileviewer-sandbox", "type": "tunnel", "status": "active"}],
                 "no resource ID",
             ),
             (
                 [
                     {
-                        "slug": "detect-sandbox",
+                        "slug": "fileviewer-sandbox",
                         "type": "tunnel",
                         "status": "active",
                         "resource_id": 7,
@@ -977,7 +976,7 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
                     MODULE.prepare_enrollment(
                         "https://api.example.com",
                         "lv_live_account-key",
-                        "detect-nhp-replica-a",
+                        "fileviewer-nhp-replica-a",
                         "attempt-1",
                         "us-east-2",
                     )
@@ -988,7 +987,7 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
         responses = [
             [
                 {
-                    "slug": "detect-sandbox",
+                    "slug": "fileviewer-sandbox",
                     "type": "tunnel",
                     "status": "active",
                     "resource_id": "MFkw-resource",
@@ -1015,7 +1014,7 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
                 MODULE.prepare_enrollment(
                     "https://api.example.com",
                     "lv_live_account-key",
-                    "detect-nhp-replica-a",
+                    "fileviewer-nhp-replica-a",
                     "attempt-1",
                     "us-east-2",
                     now=FIXED_NOW,
@@ -1027,14 +1026,14 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
             "kind": "enrollment_token",
             "key_id": "key_abc123def456",
             "target": "agent",
-            "claims": [{"type": "connector", "id": "detect-sandbox"}],
+            "claims": [{"type": "connector", "id": "fileviewer-sandbox"}],
             "api_key": "lv_live_test-token",
             "expires_at": VALID_EXPIRY,
         }
         responses = [
             [
                 {
-                    "slug": "detect-sandbox",
+                    "slug": "fileviewer-sandbox",
                     "type": "tunnel",
                     "status": "active",
                     "resource_id": "r_one",
@@ -1052,7 +1051,7 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
             MODULE.prepare_enrollment(
                 "https://api.example.com",
                 "lv_live_account-key",
-                "detect-nhp-replica-a",
+                "fileviewer-nhp-replica-a",
                 "attempt-1",
                 "us-east-2",
                 now=FIXED_NOW,
@@ -1071,7 +1070,7 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
             "kind": "enrollment_token",
             "key_id": "key_abc123def456",
             "target": "agent",
-            "claims": [{"type": "connector", "id": "detect-sandbox"}],
+            "claims": [{"type": "connector", "id": "fileviewer-sandbox"}],
             "api_key": "lv_live_test-token",
             "expires_at": VALID_EXPIRY,
         }
@@ -1097,10 +1096,10 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
             expiry, warning = MODULE.mint_and_install_enrollment(
                 "https://api.example.com",
                 "lv_live_account-key",
-                "detect-nhp-replica-a",
+                "fileviewer-nhp-replica-a",
                 "attempt-1",
                 "us-east-2",
-                "detect-sandbox",
+                "fileviewer-sandbox",
                 "/reviewed/name",
                 now=FIXED_NOW,
             )
@@ -1113,7 +1112,7 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
         credential = {
             "kind": "enrollment_token",
             "target": "agent",
-            "claims": [{"type": "connector", "id": "detect-sandbox"}],
+            "claims": [{"type": "connector", "id": "fileviewer-sandbox"}],
             "api_key": "lv_live_test-token",
             "expires_at": VALID_EXPIRY,
         }
@@ -1125,7 +1124,7 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
             responses = [
                 [
                     {
-                        "slug": "detect-sandbox",
+                        "slug": "fileviewer-sandbox",
                         "type": "tunnel",
                         "status": "active",
                         "resource_id": "r_one",
@@ -1146,7 +1145,7 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
                 MODULE.prepare_enrollment(
                     "https://api.example.com",
                     "lv_live_account-key",
-                    "detect-nhp-replica-a",
+                    "fileviewer-nhp-replica-a",
                     "attempt-1",
                     "us-east-2",
                     now=FIXED_NOW,
@@ -1157,7 +1156,7 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
         responses = [
             [
                 {
-                    "slug": "detect-sandbox",
+                    "slug": "fileviewer-sandbox",
                     "type": "tunnel",
                     "status": "active",
                     "resource_id": "r_one",
@@ -1178,7 +1177,7 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
                 MODULE.prepare_enrollment(
                     "https://api.example.com",
                     "lv_live_account-key",
-                    "detect-nhp-replica-a",
+                    "fileviewer-nhp-replica-a",
                     "attempt-1",
                     "us-east-2",
                     now=FIXED_NOW,
@@ -1204,10 +1203,10 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
                 MODULE.mint_and_install_enrollment(
                     "https://api.example.com",
                     "lv_live_account-key",
-                    "detect-nhp-replica-a",
+                    "fileviewer-nhp-replica-a",
                     "attempt-1",
                     "us-east-2",
-                    "detect-sandbox",
+                    "fileviewer-sandbox",
                     "/reviewed/name",
                     now=FIXED_NOW,
                     deadline=100,
@@ -1230,10 +1229,10 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
                 MODULE.mint_and_install_enrollment(
                     "https://api.example.com",
                     "lv_live_account-key",
-                    "detect-nhp-replica-a",
+                    "fileviewer-nhp-replica-a",
                     "attempt-1",
                     "us-east-2",
-                    "detect-sandbox",
+                    "fileviewer-sandbox",
                     "/reviewed/name",
                     now=FIXED_NOW,
                     deadline=100,
@@ -1248,7 +1247,7 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
             "kind": "enrollment_token",
             "key_id": "key_abc123def456",
             "target": "agent",
-            "claims": [{"type": "connector", "id": "detect-sandbox"}],
+            "claims": [{"type": "connector", "id": "fileviewer-sandbox"}],
             "api_key": "lv_live_test-token",
             "expires_at": VALID_EXPIRY,
         }
@@ -1264,10 +1263,10 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
                 MODULE.mint_and_install_enrollment(
                     "https://api.example.com",
                     "lv_live_account-key",
-                    "detect-nhp-replica-a",
+                    "fileviewer-nhp-replica-a",
                     "attempt-1",
                     "us-east-2",
-                    "detect-sandbox",
+                    "fileviewer-sandbox",
                     "/reviewed/name",
                     now=FIXED_NOW,
                     deadline=100,
@@ -1281,7 +1280,7 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
         responses = [
             [
                 {
-                    "slug": "detect-sandbox",
+                    "slug": "fileviewer-sandbox",
                     "type": "tunnel",
                     "status": "active",
                     "resource_id": "r_one",
@@ -1302,7 +1301,7 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
                 MODULE.prepare_enrollment(
                     "https://api.example.com",
                     "lv_live_account-key",
-                    "detect-nhp-replica-a",
+                    "fileviewer-nhp-replica-a",
                     "attempt-1",
                     "us-east-2",
                     now=FIXED_NOW,
@@ -1314,7 +1313,7 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
         responses = [
             [
                 {
-                    "slug": "detect-sandbox",
+                    "slug": "fileviewer-sandbox",
                     "type": "tunnel",
                     "status": "active",
                     "resource_id": "r_one",
@@ -1333,7 +1332,7 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
                 MODULE.prepare_enrollment(
                     "https://api.example.com",
                     "lv_live_account-key",
-                    "detect-nhp-replica-a",
+                    "fileviewer-nhp-replica-a",
                     "attempt-1",
                     "us-east-2",
                     now=FIXED_NOW,
@@ -1346,7 +1345,7 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
         responses = [
             [
                 {
-                    "slug": "detect-sandbox",
+                    "slug": "fileviewer-sandbox",
                     "type": "tunnel",
                     "status": "active",
                     "resource_id": "r_one",
@@ -1367,7 +1366,7 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
                 MODULE.prepare_enrollment(
                     "https://api.example.com",
                     "lv_live_account-key",
-                    "detect-nhp-replica-a",
+                    "fileviewer-nhp-replica-a",
                     "attempt-1",
                     "us-east-2",
                     now=FIXED_NOW,
@@ -1384,7 +1383,7 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
             "kind": "enrollment_token",
             "key_id": "key_abc123def456",
             "target": "agent",
-            "claims": [{"type": "connector", "id": "detect-sandbox"}],
+            "claims": [{"type": "connector", "id": "fileviewer-sandbox"}],
             "api_key": "lv_live_test-token",
             "expires_at": VALID_EXPIRY,
         }
@@ -1410,10 +1409,10 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
             _expiry, warning = MODULE.mint_and_install_enrollment(
                 "https://api.example.com",
                 "lv_live_account-key",
-                "detect-nhp-replica-a",
+                "fileviewer-nhp-replica-a",
                 "attempt-1",
                 "us-east-2",
-                "detect-sandbox",
+                "fileviewer-sandbox",
                 "/reviewed/name",
                 now=FIXED_NOW,
             )
@@ -1425,7 +1424,7 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
         responses = [
             [
                 {
-                    "slug": "detect-sandbox",
+                    "slug": "fileviewer-sandbox",
                     "type": "tunnel",
                     "status": "active",
                     "resource_id": "r_one",
@@ -1447,7 +1446,7 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
                 MODULE.prepare_enrollment(
                     "https://api.example.com",
                     "lv_live_account-key",
-                    "detect-nhp-replica-a",
+                    "fileviewer-nhp-replica-a",
                     "attempt-1",
                     "us-east-2",
                     now=FIXED_NOW,
@@ -1460,7 +1459,7 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
         responses = [
             [
                 {
-                    "slug": "detect-sandbox",
+                    "slug": "fileviewer-sandbox",
                     "type": "tunnel",
                     "status": "active",
                     "resource_id": "r_one",
@@ -1477,7 +1476,7 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
                 MODULE.prepare_enrollment(
                     "https://api.example.com",
                     "lv_live_account-key",
-                    "detect-nhp-replica-a",
+                    "fileviewer-nhp-replica-a",
                     "attempt-1",
                     "us-east-2",
                     now=FIXED_NOW,
@@ -1490,7 +1489,7 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
             "kind": "enrollment_token",
             "key_id": "key_abcdefghijklmnop",
             "target": "agent",
-            "claims": [{"type": "connector", "id": "detect-sandbox"}],
+            "claims": [{"type": "connector", "id": "fileviewer-sandbox"}],
             "api_key": "lv_live_valid-token",
             "expires_at": VALID_EXPIRY,
         }
@@ -1499,7 +1498,7 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
             responses = [
                 [
                     {
-                        "slug": "detect-sandbox",
+                        "slug": "fileviewer-sandbox",
                         "type": "tunnel",
                         "status": "active",
                         "resource_id": "r_one",
@@ -1520,7 +1519,7 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
                     MODULE.prepare_enrollment(
                         "https://api.example.com",
                         "lv_live_account-key",
-                        "detect-nhp-replica-a",
+                        "fileviewer-nhp-replica-a",
                         "attempt-1",
                         "us-east-2",
                         now=FIXED_NOW,
@@ -1531,7 +1530,7 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
         responses = [
             [
                 {
-                    "slug": "detect-sandbox",
+                    "slug": "fileviewer-sandbox",
                     "type": "tunnel",
                     "status": "active",
                     "resource_id": "r_one",
@@ -1558,7 +1557,7 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
                 MODULE.prepare_enrollment(
                     "https://api.example.com",
                     "lv_live_account-key",
-                    "detect-nhp-replica-a",
+                    "fileviewer-nhp-replica-a",
                     "attempt-1",
                     "us-east-2",
                     now=FIXED_NOW,
@@ -1571,7 +1570,7 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
         responses = [
             [
                 {
-                    "slug": "detect-sandbox",
+                    "slug": "fileviewer-sandbox",
                     "type": "tunnel",
                     "status": "active",
                     "resource_id": "r_one",
@@ -1582,7 +1581,7 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
                 "kind": "enrollment_token",
                 "key_id": "key_abc123def456",
                 "target": "agent",
-                "claims": [{"type": "connector", "id": "detect-sandbox"}],
+                "claims": [{"type": "connector", "id": "fileviewer-sandbox"}],
                 "api_key": "lv_live_valid-token",
                 "expires_at": VALID_EXPIRY,
             },
@@ -1602,7 +1601,7 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
                 MODULE.prepare_enrollment(
                     "https://api.example.com",
                     "lv_live_account-key",
-                    "detect-nhp-replica-a",
+                    "fileviewer-nhp-replica-a",
                     "attempt-1",
                     "us-east-2",
                     now=FIXED_NOW,
@@ -1621,7 +1620,7 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
                 "kind": "enrollment_token",
                 "key_id": "key_abc123def456",
                 "target": "agent",
-                "claims": [{"type": "connector", "id": "detect-sandbox"}],
+                "claims": [{"type": "connector", "id": "fileviewer-sandbox"}],
                 "api_key": "lv_live_valid-token",
                 "expires_at": VALID_EXPIRY,
             }
@@ -1641,10 +1640,10 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
                 MODULE.mint_and_install_enrollment(
                     "https://api.example.com",
                     "lv_live_account-key",
-                    "detect-nhp-replica-a",
+                    "fileviewer-nhp-replica-a",
                     "attempt-1",
                     "us-east-2",
-                    "detect-sandbox",
+                    "fileviewer-sandbox",
                     "/reviewed/name",
                     now=FIXED_NOW,
                 )
@@ -1661,7 +1660,7 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
                 "kind": "enrollment_token",
                 "key_id": "unsafe/private-id",
                 "target": "agent",
-                "claims": [{"type": "connector", "id": "detect-sandbox"}],
+                "claims": [{"type": "connector", "id": "fileviewer-sandbox"}],
                 "api_key": "lv_live_valid-token",
                 "expires_at": VALID_EXPIRY,
             }
@@ -1681,10 +1680,10 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
                 MODULE.mint_and_install_enrollment(
                     "https://api.example.com",
                     "lv_live_account-key",
-                    "detect-nhp-replica-a",
+                    "fileviewer-nhp-replica-a",
                     "attempt-1",
                     "us-east-2",
-                    "detect-sandbox",
+                    "fileviewer-sandbox",
                     "/reviewed/name",
                     now=FIXED_NOW,
                 )
@@ -1699,7 +1698,7 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
         responses = [
             [
                 {
-                    "slug": "detect-sandbox",
+                    "slug": "fileviewer-sandbox",
                     "type": "tunnel",
                     "status": "active",
                     "resource_id": "MFkw-resource",
@@ -1717,7 +1716,7 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
                 MODULE.prepare_enrollment(
                     "https://api.example.com",
                     "lv_live_account-key",
-                    "detect-nhp-replica-a",
+                    "fileviewer-nhp-replica-a",
                     "attempt-1",
                     "us-east-2",
                 )
@@ -1728,7 +1727,7 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
         responses = [
             [
                 {
-                    "slug": "detect-sandbox",
+                    "slug": "fileviewer-sandbox",
                     "type": "tunnel",
                     "status": "active",
                     "resource_id": "MFkw-resource",
@@ -1738,7 +1737,7 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
             {
                 "kind": "enrollment_token",
                 "target": "agent",
-                "claims": [{"type": "connector", "id": "detect-sandbox"}],
+                "claims": [{"type": "connector", "id": "fileviewer-sandbox"}],
                 "api_key": "lv_live_test-token",
                 "expires_at": VALID_EXPIRY,
             },
@@ -1750,7 +1749,7 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
             MODULE.prepare_enrollment(
                 "https://api.example.com",
                 "lv_live_account-key",
-                "detect-nhp-replica-a",
+                "fileviewer-nhp-replica-a",
                 "attempt-2",
                 "us-east-2",
                 now=FIXED_NOW,
@@ -1759,7 +1758,7 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
         self.assertEqual(request.call_args_list[2].args[2], "/v1/api-keys")
         self.assertEqual(
             request.call_args_list[2].kwargs["idempotency_key"],
-            "headless-v2-attempt-2-detect-nhp-replica-a",
+            "headless-v2-attempt-2-fileviewer-nhp-replica-a",
         )
         put.assert_called_once()
 
@@ -1767,7 +1766,7 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
         responses = [
             [
                 {
-                    "slug": "detect-sandbox",
+                    "slug": "fileviewer-sandbox",
                     "type": "tunnel",
                     "status": "active",
                     "resource_id": "MFkw-resource",
@@ -1779,7 +1778,7 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
             {
                 "kind": "enrollment_token",
                 "target": "agent",
-                "claims": [{"type": "connector", "id": "detect-sandbox"}],
+                "claims": [{"type": "connector", "id": "fileviewer-sandbox"}],
                 "api_key": "lv_live_test-token",
                 "expires_at": VALID_EXPIRY,
             },
@@ -1791,7 +1790,7 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
             MODULE.prepare_enrollment(
                 "https://api.example.com",
                 "lv_live_account-key",
-                "detect-nhp-replica-a",
+                "fileviewer-nhp-replica-a",
                 "attempt-1",
                 "us-east-2",
                 now=FIXED_NOW,
@@ -1802,7 +1801,7 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
         responses = [
             [
                 {
-                    "slug": "detect-sandbox",
+                    "slug": "fileviewer-sandbox",
                     "type": "tunnel",
                     "status": "active",
                     "resource_id": "MFkw-resource",
@@ -1820,7 +1819,7 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
                 MODULE.prepare_enrollment(
                     "https://api.example.com",
                     "lv_live_account-key",
-                    "detect-nhp-replica-a",
+                    "fileviewer-nhp-replica-a",
                     "attempt-1",
                     "us-east-2",
                     now=FIXED_NOW,
@@ -1834,7 +1833,7 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
         responses = [
             [
                 {
-                    "slug": "detect-sandbox",
+                    "slug": "fileviewer-sandbox",
                     "type": "tunnel",
                     "status": "active",
                     "resource_id": "MFkw-resource",
@@ -1847,7 +1846,7 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
             {
                 "kind": "enrollment_token",
                 "target": "agent",
-                "claims": [{"type": "connector", "id": "detect-sandbox"}],
+                "claims": [{"type": "connector", "id": "fileviewer-sandbox"}],
                 "api_key": "lv_live_test-token",
                 "expires_at": VALID_EXPIRY,
             },
@@ -1860,7 +1859,7 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
             MODULE.prepare_enrollment(
                 "https://api.example.com",
                 "lv_live_account-key",
-                "detect-nhp-replica-a",
+                "fileviewer-nhp-replica-a",
                 "attempt-1",
                 "us-east-2",
                 now=FIXED_NOW,
@@ -1876,7 +1875,7 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
         responses = [
             [
                 {
-                    "slug": "detect-sandbox",
+                    "slug": "fileviewer-sandbox",
                     "type": "tunnel",
                     "status": "active",
                     "resource_id": "MFkw-resource",
@@ -1897,7 +1896,7 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
                 MODULE.prepare_enrollment(
                     "https://api.example.com",
                     "lv_live_account-key",
-                    "detect-nhp-replica-a",
+                    "fileviewer-nhp-replica-a",
                     "attempt-1",
                     "us-east-2",
                     now=FIXED_NOW,
@@ -1911,7 +1910,7 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
         responses = [
             [
                 {
-                    "slug": "detect-sandbox",
+                    "slug": "fileviewer-sandbox",
                     "type": "tunnel",
                     "status": "active",
                     "resource_id": "MFkw-resource",
@@ -1934,7 +1933,7 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
                 MODULE.prepare_enrollment(
                     "https://api.example.com",
                     "lv_live_account-key",
-                    "detect-nhp-replica-a",
+                    "fileviewer-nhp-replica-a",
                     "attempt-1",
                     "us-east-2",
                     now=FIXED_NOW,
@@ -1945,7 +1944,7 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
         responses = [
             [
                 {
-                    "slug": "detect-sandbox",
+                    "slug": "fileviewer-sandbox",
                     "type": "tunnel",
                     "status": "active",
                     "resource_id": "MFkw-resource",
@@ -1958,7 +1957,7 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
             {
                 "kind": "enrollment_token",
                 "target": "agent",
-                "claims": [{"type": "connector", "id": "detect-sandbox"}],
+                "claims": [{"type": "connector", "id": "fileviewer-sandbox"}],
                 "api_key": "lv_live_test-token",
                 "expires_at": VALID_EXPIRY,
             },
@@ -1976,7 +1975,7 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
             MODULE.prepare_enrollment(
                 "https://api.example.com",
                 "lv_live_account-key",
-                "detect-nhp-replica-a",
+                "fileviewer-nhp-replica-a",
                 "attempt-3",
                 "us-east-2",
                 now=FIXED_NOW,
@@ -1992,7 +1991,7 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
         responses = [
             [
                 {
-                    "slug": "detect-sandbox",
+                    "slug": "fileviewer-sandbox",
                     "type": "tunnel",
                     "status": "active",
                     "resource_id": "MFkw-resource",
@@ -2005,7 +2004,7 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
             {
                 "kind": "enrollment_token",
                 "target": "agent",
-                "claims": [{"type": "connector", "id": "detect-sandbox"}],
+                "claims": [{"type": "connector", "id": "fileviewer-sandbox"}],
                 "api_key": "lv_live_test-token",
                 "expires_at": VALID_EXPIRY,
             },
@@ -2018,7 +2017,7 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
             MODULE.prepare_enrollment(
                 "https://api.example.com",
                 "lv_live_account-key",
-                "detect-nhp-replica-a",
+                "fileviewer-nhp-replica-a",
                 "attempt-3",
                 "us-east-2",
                 now=FIXED_NOW,
@@ -2030,7 +2029,7 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
         responses = [
             [
                 {
-                    "slug": "detect-sandbox",
+                    "slug": "fileviewer-sandbox",
                     "type": "tunnel",
                     "status": "active",
                     "resource_id": "MFkw-resource",
@@ -2053,7 +2052,7 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
                 MODULE.prepare_enrollment(
                     "https://api.example.com",
                     "lv_live_account-key",
-                    "detect-nhp-replica-a",
+                    "fileviewer-nhp-replica-a",
                     "attempt-1",
                     "us-east-2",
                     now=FIXED_NOW,
@@ -2066,7 +2065,7 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
         responses = [
             [
                 {
-                    "slug": "detect-sandbox",
+                    "slug": "fileviewer-sandbox",
                     "type": "tunnel",
                     "status": "active",
                     "resource_id": "MFkw-resource",
@@ -2088,7 +2087,7 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
                 MODULE.prepare_enrollment(
                     "https://api.example.com",
                     "lv_live_account-key",
-                    "detect-nhp-replica-a",
+                    "fileviewer-nhp-replica-a",
                     "attempt-1",
                     "us-east-2",
                     now=FIXED_NOW,
@@ -2106,7 +2105,7 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
         responses = [
             [
                 {
-                    "slug": "detect-sandbox",
+                    "slug": "fileviewer-sandbox",
                     "type": "tunnel",
                     "status": "active",
                     "resource_id": "MFkw-resource",
@@ -2128,7 +2127,7 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
                 MODULE.prepare_enrollment(
                     "https://api.example.com",
                     "lv_live_account-key",
-                    "detect-nhp-replica-a",
+                    "fileviewer-nhp-replica-a",
                     "attempt-1",
                     "us-east-2",
                     now=FIXED_NOW,
@@ -2142,7 +2141,7 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
         responses = [
             [
                 {
-                    "slug": "detect-sandbox",
+                    "slug": "fileviewer-sandbox",
                     "type": "tunnel",
                     "status": "active",
                     "resource_id": "MFkw-resource",
@@ -2165,7 +2164,7 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
                 MODULE.prepare_enrollment(
                     "https://api.example.com",
                     "lv_live_account-key",
-                    "detect-nhp-replica-a",
+                    "fileviewer-nhp-replica-a",
                     "attempt-1",
                     "us-east-2",
                     now=FIXED_NOW,
@@ -2176,7 +2175,7 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
         responses = [
             [
                 {
-                    "slug": "detect-sandbox",
+                    "slug": "fileviewer-sandbox",
                     "type": "tunnel",
                     "status": "active",
                     "resource_id": "MFkw-resource",
@@ -2202,7 +2201,7 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
                 MODULE.prepare_enrollment(
                     "https://api.example.com",
                     "lv_live_account-key",
-                    "detect-nhp-replica-a",
+                    "fileviewer-nhp-replica-a",
                     "attempt-1",
                     "us-east-2",
                     now=FIXED_NOW,
@@ -2214,7 +2213,7 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
         responses = [
             [
                 {
-                    "slug": "detect-sandbox",
+                    "slug": "fileviewer-sandbox",
                     "type": "tunnel",
                     "status": "active",
                     "resource_id": "MFkw-resource",
@@ -2236,7 +2235,7 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
                 MODULE.prepare_enrollment(
                     "https://api.example.com",
                     "lv_live_account-key",
-                    "detect-nhp-replica-a",
+                    "fileviewer-nhp-replica-a",
                     "attempt-1",
                     "us-east-2",
                     now=FIXED_NOW,
@@ -2251,7 +2250,7 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
         responses = [
             [
                 {
-                    "slug": "detect-sandbox",
+                    "slug": "fileviewer-sandbox",
                     "type": "tunnel",
                     "status": "active",
                     "resource_id": "MFkw-resource",
@@ -2273,7 +2272,7 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
                 MODULE.prepare_enrollment(
                     "https://api.example.com",
                     "lv_live_account-key",
-                    "detect-nhp-replica-a",
+                    "fileviewer-nhp-replica-a",
                     "attempt-1",
                     "us-east-2",
                     now=FIXED_NOW,
@@ -2288,7 +2287,7 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
         responses = [
             [
                 {
-                    "slug": "detect-sandbox",
+                    "slug": "fileviewer-sandbox",
                     "type": "tunnel",
                     "status": "active",
                     "resource_id": "MFkw-resource",
@@ -2310,7 +2309,7 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
                 MODULE.prepare_enrollment(
                     "https://api.example.com",
                     "lv_live_account-key",
-                    "detect-nhp-replica-a",
+                    "fileviewer-nhp-replica-a",
                     "attempt-1",
                     "us-east-2",
                     now=FIXED_NOW,
@@ -2321,7 +2320,7 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
         responses = [
             [
                 {
-                    "slug": "detect-sandbox",
+                    "slug": "fileviewer-sandbox",
                     "type": "tunnel",
                     "status": "active",
                     "resource_id": "MFkw-resource",
@@ -2344,7 +2343,7 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
                 MODULE.prepare_enrollment(
                     "https://api.example.com",
                     "lv_live_account-key",
-                    "detect-nhp-replica-a",
+                    "fileviewer-nhp-replica-a",
                     "attempt-1",
                     "us-east-2",
                     now=FIXED_NOW,
@@ -2581,7 +2580,7 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
         argv = [
             "prepare-headless-enrollment.py",
             "--target",
-            "detect-nhp-replica-a",
+            "fileviewer-nhp-replica-a",
             "--generation",
             "attempt-1",
             "--region",
@@ -2609,7 +2608,7 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
         prepare.assert_called_once_with(
             "https://api.example.com",
             "lv_live_account-key",
-            "detect-nhp-replica-a",
+            "fileviewer-nhp-replica-a",
             "attempt-1",
             "us-east-2",
         )
@@ -2618,7 +2617,7 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
         argv = [
             "prepare-headless-enrollment.py",
             "--target",
-            "detect-nhp-replica-a",
+            "fileviewer-nhp-replica-a",
             "--generation",
             "attempt-1",
             "--region",
@@ -2649,7 +2648,7 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
         argv = [
             "prepare-headless-enrollment.py",
             "--target",
-            "detect-nhp-replica-a",
+            "fileviewer-nhp-replica-a",
             "--generation",
             "attempt-1",
             "--region",
@@ -2916,141 +2915,6 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
                     + f"fileviewer-nhp/replica-{replica}/bootstrap",
                     "lv_live_replica-token",
                 )
-
-    def test_uploader_target_has_exact_slug_and_parameter(self) -> None:
-        target = "uploader-nhp-replica-c"
-        responses = [
-            [
-                {
-                    "slug": "uploader-sandbox",
-                    "type": "tunnel",
-                    "status": "active",
-                    "resource_id": "MFkw-resource",
-                }
-            ],
-            {"desired_state": "on", "serving_epoch": 2},
-            {
-                "kind": "enrollment_token",
-                "target": "agent",
-                "claims": [{"type": "connector", "id": "uploader-sandbox"}],
-                "api_key": "lv_live_uploader-token",
-                "expires_at": VALID_EXPIRY,
-            },
-        ]
-        with (
-            mock.patch.object(MODULE, "api_request", side_effect=responses) as request,
-            mock.patch.object(MODULE, "put_parameter") as put,
-        ):
-            MODULE.prepare_enrollment(
-                "https://api.example.com",
-                "lv_live_account-key",
-                target,
-                "attempt-5",
-                "us-east-2",
-                now=FIXED_NOW,
-            )
-        self.assertEqual(
-            request.call_args_list[0].args[2], "/v1/resources?slug=uploader-sandbox"
-        )
-        self.assertEqual(
-            request.call_args_list[2].kwargs["idempotency_key"],
-            "headless-v2-attempt-5-uploader-nhp-replica-c",
-        )
-        put.assert_called_once_with(
-            "us-east-2",
-            "/qurl-s3-connector/uploader-nhp/replica-c/bootstrap",
-            "lv_live_uploader-token",
-        )
-
-    def test_detect_fixed_target_has_shared_slug_and_distinct_parameter(self) -> None:
-        target = "detect-nhp-replica-b"
-        responses = [
-            [
-                {
-                    "slug": "detect-sandbox",
-                    "type": "tunnel",
-                    "status": "active",
-                    "resource_id": "MFkw-resource",
-                }
-            ],
-            {"desired_state": "on", "serving_epoch": 5},
-            {
-                "kind": "enrollment_token",
-                "target": "agent",
-                "claims": [{"type": "connector", "id": "detect-sandbox"}],
-                "api_key": "lv_live_detect-token",
-                "expires_at": VALID_EXPIRY,
-            },
-        ]
-        with (
-            mock.patch.object(MODULE, "api_request", side_effect=responses) as request,
-            mock.patch.object(MODULE, "put_parameter") as put,
-        ):
-            MODULE.prepare_enrollment(
-                "https://api.example.com",
-                "lv_live_account-key",
-                target,
-                "attempt-6",
-                "us-east-2",
-                now=FIXED_NOW,
-            )
-        self.assertEqual(
-            request.call_args_list[0].args[2], "/v1/resources?slug=detect-sandbox"
-        )
-        self.assertEqual(
-            request.call_args_list[2].kwargs["idempotency_key"],
-            "headless-v2-attempt-6-detect-nhp-replica-b",
-        )
-        put.assert_called_once_with(
-            "us-east-2",
-            "/qurl-s3-connector/detect-nhp/replica-b/bootstrap",
-            "lv_live_detect-token",
-        )
-
-    def test_watermark_target_has_exact_slug_and_parameter(self) -> None:
-        target = "watermark-nhp-replica-b"
-        responses = [
-            [
-                {
-                    "slug": "watermark-sandbox",
-                    "type": "tunnel",
-                    "status": "active",
-                    "resource_id": "MFkw-resource",
-                }
-            ],
-            {"desired_state": "on", "serving_epoch": 2},
-            {
-                "kind": "enrollment_token",
-                "target": "agent",
-                "claims": [{"type": "connector", "id": "watermark-sandbox"}],
-                "api_key": "lv_live_watermark-token",
-                "expires_at": VALID_EXPIRY,
-            },
-        ]
-        with (
-            mock.patch.object(MODULE, "api_request", side_effect=responses) as request,
-            mock.patch.object(MODULE, "put_parameter") as put,
-        ):
-            MODULE.prepare_enrollment(
-                "https://api.example.com",
-                "lv_live_account-key",
-                target,
-                "attempt-4",
-                "us-east-2",
-                now=FIXED_NOW,
-            )
-        self.assertEqual(
-            request.call_args_list[0].args[2], "/v1/resources?slug=watermark-sandbox"
-        )
-        self.assertEqual(
-            request.call_args_list[2].kwargs["idempotency_key"],
-            "headless-v2-attempt-4-watermark-nhp-replica-b",
-        )
-        put.assert_called_once_with(
-            "us-east-2",
-            "/qurl-watermark-service/nhp/replica-b/bootstrap",
-            "lv_live_watermark-token",
-        )
 
 
 if __name__ == "__main__":

@@ -13,15 +13,6 @@ on:
           - fileviewer-nhp-replica-a
           - fileviewer-nhp-replica-b
           - fileviewer-nhp-replica-c
-          - uploader-nhp-replica-a
-          - uploader-nhp-replica-b
-          - uploader-nhp-replica-c
-          - detect-nhp-replica-a
-          - detect-nhp-replica-b
-          - detect-nhp-replica-c
-          - watermark-nhp-replica-a
-          - watermark-nhp-replica-b
-          - watermark-nhp-replica-c
       generation:
         description: Unique lowercase letters, digits, and hyphens; reuse for immediate retries, but use a new value if the token has less than 45 minutes left
         required: true

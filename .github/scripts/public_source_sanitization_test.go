@@ -264,15 +264,6 @@ func TestPublicSourceContainsNoPrivateOperationalMaterial(t *testing.T) {
 		"/qurl-s3-connector/fileviewer-nhp/replica-a/bootstrap": true,
 		"/qurl-s3-connector/fileviewer-nhp/replica-b/bootstrap": true,
 		"/qurl-s3-connector/fileviewer-nhp/replica-c/bootstrap": true,
-		"/qurl-s3-connector/uploader-nhp/replica-a/bootstrap":   true,
-		"/qurl-s3-connector/uploader-nhp/replica-b/bootstrap":   true,
-		"/qurl-s3-connector/uploader-nhp/replica-c/bootstrap":   true,
-		"/qurl-s3-connector/detect-nhp/replica-a/bootstrap":     true,
-		"/qurl-s3-connector/detect-nhp/replica-b/bootstrap":     true,
-		"/qurl-s3-connector/detect-nhp/replica-c/bootstrap":     true,
-		"/qurl-watermark-service/nhp/replica-a/bootstrap":       true,
-		"/qurl-watermark-service/nhp/replica-b/bootstrap":       true,
-		"/qurl-watermark-service/nhp/replica-c/bootstrap":       true,
 	}
 
 	err := filepath.WalkDir(repoRoot, func(path string, entry fs.DirEntry, err error) error {
