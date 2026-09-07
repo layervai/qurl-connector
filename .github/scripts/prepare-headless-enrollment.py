@@ -40,7 +40,15 @@ AWS_RETRYABLE_ERROR_CODES = {
     "ThrottlingException",
     "TooManyUpdates",
 }
-AWS_UNKNOWN_OUTCOME_ERROR_CODES = {"InternalServerError", "ServiceUnavailable"}
+# These service errors can arrive after a write committed. Keep their result
+# unknown unless reconciliation proves the stored value.
+AWS_UNKNOWN_OUTCOME_ERROR_CODES = {
+    "InternalServerError",
+    "KMSInternalException",
+    "ServiceUnavailable",
+}
+# These named failures prove that SSM rejected the PutParameter request before
+# it committed. Keep unknown and future AWS error codes out of this allowlist.
 AWS_REJECTED_ERROR_CODES = {
     "AccessDeniedException",
     "ExpiredToken",
@@ -55,14 +63,22 @@ AWS_REJECTED_ERROR_CODES = {
     "InvalidKeyId",
     "InvalidPolicyAttributeException",
     "InvalidPolicyTypeException",
+    "InvalidResourceId",
     "InvalidSignatureException",
+    "KMSAccessDeniedException",
+    "KMSInvalidStateException",
+    "KMSKeyNotFound",
+    "ParameterAlreadyExists",
     "ParameterLimitExceeded",
     "ParameterMaxVersionLimitExceeded",
+    "ParameterNotFound",
+    "ParameterPatternMismatchException",
     "PoliciesLimitExceededException",
     "RequestExpired",
     "SignatureDoesNotMatch",
     "UnrecognizedClientException",
     "UnsupportedOperationException",
+    "UnsupportedParameterType",
     "ValidationException",
 } | (AWS_RETRYABLE_ERROR_CODES - AWS_UNKNOWN_OUTCOME_ERROR_CODES)
 MAX_RESPONSE_BYTES = 64 * 1024
@@ -499,6 +515,8 @@ def put_parameter(region: str, parameter: str, token: str) -> None:
     clean_env.pop("AWS_ENDPOINT_URL_SSM", None)
     clean_env.pop("AWS_ENDPOINT_URL_STS", None)
     clean_env.pop("AWS_CA_BUNDLE", None)
+    clean_env.pop("SSL_CERT_FILE", None)
+    clean_env.pop("SSL_CERT_DIR", None)
     clean_env.pop("AWS_DATA_PATH", None)
     for credential_variable in (
         "AWS_CONTAINER_CREDENTIALS_FULL_URI",
@@ -809,7 +827,12 @@ def prepare_enrollment(
         )
 
     observed_epoch = serving_epoch
-    sharing_idempotency_key = f"headless-sharing-v2-{generation}-{target}"
+    # Include the observed epoch so an off -> on recovery after a later off
+    # transition cannot replay the response from an older sharing lifecycle.
+    # Immediate retries still reuse the same key and start state.
+    sharing_idempotency_key = (
+        f"headless-sharing-v2-{generation}-{target}-{serving_epoch}"
+    )
     sharing_transition_observed = False
     sharing_observed_on = False
     if desired_state == "off":

@@ -67,10 +67,11 @@ func hasPublicRepositoryPrefix(text string, pathStart int) bool {
 	}
 	if prefixStart > 0 {
 		preceding := text[prefixStart-1]
-		if (preceding >= 'a' && preceding <= 'z') ||
-			(preceding >= 'A' && preceding <= 'Z') ||
-			(preceding >= '0' && preceding <= '9') ||
-			preceding == '.' || preceding == '-' {
+		// Use a closed separator allowlist. Unknown punctuation can be part of a
+		// lookalike hostname and must not exempt an operational path.
+		switch preceding {
+		case '/', '"', '\'', '`', '(', '[', '<', ' ', '\t', '\n', '\r', ',', ';':
+		default:
 			return false
 		}
 	}
@@ -185,6 +186,13 @@ func TestOperationalPathDetectorIgnoresRepositoryReferences(t *testing.T) {
 	}
 	if got := findOperationalPaths("evilgithub.com/layervai" + path); len(got) != 1 || got[0] != path {
 		t.Fatalf("lookalike GitHub host bypassed operational path detection: %q", got)
+	}
+	repositoryPath := "/qurl-go/" + "relayknock/nativeudp"
+	for _, separator := range []string{"_", "~", "+", "%", ":"} {
+		lookalike := "evil" + separator + "github.com/layervai" + repositoryPath
+		if got := findOperationalPaths(lookalike); len(got) != 1 || got[0] != repositoryPath {
+			t.Fatalf("lookalike GitHub host %q bypassed operational path detection: %q", lookalike, got)
+		}
 	}
 	if got := findOperationalPaths("github.com/layervai" + path); len(got) != 1 || got[0] != path {
 		t.Fatalf("unreviewed repository bypassed operational path detection: %q", got)

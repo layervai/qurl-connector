@@ -2,6 +2,7 @@ export PATH := $(PATH):$(shell go env GOPATH)/bin
 export GO111MODULE=on
 PYTHON ?= python3
 PYTHON_LINT_FILES := $(wildcard .github/scripts/*.py)
+PYTHON_TEST_FILES := $(wildcard .github/scripts/*_test.py)
 
 # Version info injected at build time
 BASE_VERSION ?= $(shell git describe --tags --abbrev=0 2>/dev/null || echo "0.1.0")
@@ -66,7 +67,8 @@ test-race:
 	CGO_ENABLED=1 go test -race -count=1 ./pkg/... ./cmd/... ./internal/...
 
 test-python:
-	PYTHONDONTWRITEBYTECODE=1 $(PYTHON) .github/scripts/prepare_headless_enrollment_test.py
+	@test -n "$(PYTHON_TEST_FILES)" || { echo "no Python tests found under .github/scripts" >&2; exit 1; }
+	cd .github/scripts && PYTHONDONTWRITEBYTECODE=1 $(PYTHON) -m unittest $(notdir $(PYTHON_TEST_FILES))
 
 vet:
 	go vet ./...

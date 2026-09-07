@@ -100,6 +100,12 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
         self.assertLess(preflight, aws_cli)
         self.assertLess(aws_cli, aws)
         self.assertLess(aws, prepare)
+        self.assertIn(
+            "- name: Prepare reviewed enrollment tokens\n"
+            "        timeout-minutes: 9\n"
+            "        env:",
+            workflow,
+        )
         self.assertIn("if ! aws_version=$(aws --version 2>&1); then", workflow)
         self.assertIn("AWS CLI v2, but aws is unavailable", workflow)
         self.assertIn('[[ ! "$aws_version" =~ ^aws-cli/2\\. ]]', workflow)
@@ -176,14 +182,18 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
         self.assertIn("lint-python:", makefile)
         self.assertIn("test-python:", makefile)
         self.assertIn(
-            "PYTHONDONTWRITEBYTECODE=1 $(PYTHON) "
-            ".github/scripts/prepare_headless_enrollment_test.py",
+            "cd .github/scripts && PYTHONDONTWRITEBYTECODE=1 $(PYTHON) "
+            "-m unittest $(notdir $(PYTHON_TEST_FILES))",
             makefile,
         )
         self.assertIn("ruff check --no-cache $(PYTHON_LINT_FILES)", makefile)
         self.assertIn("ruff format --check --no-cache $(PYTHON_LINT_FILES)", makefile)
         self.assertIn('test -n "$(PYTHON_LINT_FILES)"', makefile)
         self.assertIn("PYTHON_LINT_FILES := $(wildcard .github/scripts/*.py)", makefile)
+        self.assertIn('test -n "$(PYTHON_TEST_FILES)"', makefile)
+        self.assertIn(
+            "PYTHON_TEST_FILES := $(wildcard .github/scripts/*_test.py)", makefile
+        )
         requirements = (SCRIPT.parent / "requirements-lint.txt").read_text()
         self.assertRegex(
             requirements, r"ruff==0\.15\.8.*\\\n\s+--hash=sha256:[0-9a-f]{64}"
@@ -779,7 +789,7 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
         )
         self.assertEqual(
             request.call_args_list[2].kwargs["idempotency_key"],
-            "headless-sharing-v2-attempt-1-detect-nhp-replica-a",
+            "headless-sharing-v2-attempt-1-detect-nhp-replica-a-0",
         )
         self.assertEqual(
             request.call_args_list[3].args[2], "/v1/resources/MFkw-resource/sharing"
@@ -2284,6 +2294,8 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
             "AWS_ENDPOINT_URL_SSM": "https://private.example.com/ssm",
             "AWS_ENDPOINT_URL_STS": "https://private.example.com/sts",
             "AWS_CA_BUNDLE": "/tmp/private-ca.pem",
+            "SSL_CERT_FILE": "/tmp/private-ssl-cert.pem",
+            "SSL_CERT_DIR": "/tmp/private-ssl-certs",
             "AWS_DATA_PATH": "/tmp/private-service-models",
             "AWS_CONTAINER_CREDENTIALS_FULL_URI": "https://private.example.com/credentials",
             "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI": "/private-credentials",
@@ -2331,6 +2343,8 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
         self.assertNotIn("AWS_ENDPOINT_URL_SSM", kwargs["env"])
         self.assertNotIn("AWS_ENDPOINT_URL_STS", kwargs["env"])
         self.assertNotIn("AWS_CA_BUNDLE", kwargs["env"])
+        self.assertNotIn("SSL_CERT_FILE", kwargs["env"])
+        self.assertNotIn("SSL_CERT_DIR", kwargs["env"])
         self.assertNotIn("AWS_DATA_PATH", kwargs["env"])
         for credential_variable in (
             "AWS_CONTAINER_CREDENTIALS_FULL_URI",
@@ -2646,13 +2660,21 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
             "AccessDeniedException",
             "ExpiredToken",
             "ExpiredTokenException",
+            "InvalidResourceId",
             "IncompleteSignature",
             "IncompleteSignatureException",
             "InvalidClientTokenId",
+            "KMSAccessDeniedException",
+            "KMSInvalidStateException",
+            "KMSKeyNotFound",
             "InvalidSignatureException",
+            "ParameterAlreadyExists",
+            "ParameterNotFound",
+            "ParameterPatternMismatchException",
             "RequestExpired",
             "SignatureDoesNotMatch",
             "UnrecognizedClientException",
+            "UnsupportedParameterType",
         ):
             with self.subTest(error_code=error_code):
                 completed = mock.Mock(
@@ -2672,6 +2694,21 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
                     raised.exception, MODULE.EnrollmentParameterOutcomeUnknown
                 )
                 self.assertNotIn("lv_live_secret-token", str(raised.exception))
+
+    def test_put_parameter_preserves_unknown_kms_internal_outcome(self) -> None:
+        completed = mock.Mock(
+            returncode=255,
+            stderr="An error occurred (KMSInternalException) while writing lv_live_secret-token",
+        )
+        with (
+            mock.patch.object(MODULE.subprocess, "run", return_value=completed),
+            self.assertRaisesRegex(
+                MODULE.EnrollmentParameterOutcomeUnknown,
+                "KMSInternalException.*may have completed",
+            ) as raised,
+        ):
+            MODULE.put_parameter("us-east-2", "/reviewed/name", "lv_live_secret-token")
+        self.assertNotIn("lv_live_secret-token", str(raised.exception))
 
     def test_put_parameter_classifies_safe_local_aws_failure(self) -> None:
         for stderr, expected_class in (

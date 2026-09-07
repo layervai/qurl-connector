@@ -167,6 +167,7 @@ jobs:
           mask-aws-account-id: true
 
       - name: Prepare reviewed enrollment tokens
+        timeout-minutes: 9
         env:
           QURL_SANDBOX_API_KEY: ${{ secrets.QURL_SANDBOX_API_KEY }}
           QURL_SANDBOX_API_ENDPOINT: ${{ secrets.QURL_SANDBOX_API_ENDPOINT }}
