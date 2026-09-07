@@ -1,5 +1,31 @@
 # Changelog
 
+## [0.13.0](https://github.com/layervai/qurl-connector/compare/v0.12.0...v0.13.0) (2026-09-07)
+
+
+### ⚠ BREAKING CHANGES
+
+* use CRID for Connector identity and continuity ([#81](https://github.com/layervai/qurl-connector/issues/81))
+
+  Config uses `crid` and removal uses `--crid`. Public-key resource locators
+  and the old native protocol are rejected. The public key remains runtime
+  verification data and is omitted from list JSON. Audit JSON uses
+  `resource_public_key` in place of `resource_id`. All route IDs must meet
+  the slug format, including pinned routes.
+
+  Identity cache version 3 requires the exact issued CRID and verifies its
+  public-key binding. Cache version 2 is not converted. Finish unresolved
+  operations with the previous binary before upgrading; preserve enrollment
+  and pending request state. Obtain the issued CRID from the resource API;
+  do not substitute a public key or derive a replacement locator.
+
+  This is a Go module source release pinned to qurl-go v0.14.0. Installable
+  customer binaries are released from qurl-integrations.
+
+### Features
+
+* use CRID for Connector identity and continuity ([#81](https://github.com/layervai/qurl-connector/issues/81)) ([20a9253](https://github.com/layervai/qurl-connector/commit/20a9253dfda2e16e9270d14da7b7357d82459c83))
+
 ## [0.12.0](https://github.com/layervai/qurl-connector/compare/v0.11.5...v0.12.0) (2026-09-07)
 
 
