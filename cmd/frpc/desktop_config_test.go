@@ -20,7 +20,16 @@ admin:
   addr: 127.0.0.1
   port: 7400
   password: test-only-admin-password
-routes: []
+routes:
+  - id: web
+    type: http
+    local_ip: 127.0.0.1
+    local_port: 8080
+    subdomain: c-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+    resource_id: MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE2vPoafaVb5Lue-bfcCuoL-_CnVBKf8YvV94G8ozebA6RHEQUPsnguSt1yx2mTzDSogBmb9WYEVBDgX7vc2NKTg
+    connector_routing_id: c-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+    knock_resource_id: cell-resource
+    target_url: http://127.0.0.1:8080
 `
 
 func TestReplaceDesktopConfigCreatesContinuityState(t *testing.T) {
@@ -42,8 +51,11 @@ func TestReplaceDesktopConfigCreatesContinuityState(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !cfg.Admin.Enabled || cfg.Admin.Password == "" {
+	if !cfg.Admin.Enabled || cfg.Admin.Password != "test-only-admin-password" {
 		t.Fatalf("Desktop admin config not preserved: %+v", cfg.Admin)
+	}
+	if len(cfg.Routes) != 1 || cfg.Routes[0].ConnectorRoutingID != testConnectorRoutingID || cfg.Routes[0].KnockResourceID != "cell-resource" {
+		t.Fatalf("Desktop route config not preserved: %+v", cfg.Routes)
 	}
 }
 

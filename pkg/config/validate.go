@@ -109,9 +109,6 @@ func validate(cfg *Config, requireManagedRouting bool) error {
 	if serverAddrSet != serverPortSet {
 		errs = append(errs, fmt.Errorf("server.addr and server.port must be set together for static FRP boundary config, or both omitted so the NHP ACK supplies the dial target"))
 	}
-	if strings.TrimSpace(cfg.Server.Token) != "" && !serverAddrSet {
-		errs = append(errs, fmt.Errorf("server.token requires server.addr/server.port for static FRP boundary config; omit server.token when the NHP ACK supplies the dial target"))
-	}
 	if cfg.Server.Port != 0 && (cfg.Server.Port < 1 || cfg.Server.Port > 65535) {
 		errs = append(errs, fmt.Errorf("server.port must be 1-65535, got %d", cfg.Server.Port))
 	}
@@ -123,7 +120,7 @@ func validate(cfg *Config, requireManagedRouting bool) error {
 			errs = append(errs, fmt.Errorf("server.egress_local_ip must be a non-loopback, non-link-local unicast IPv4 or IPv6 address, got %q", cfg.Server.EgressLocalIP))
 		}
 	}
-	// Server.Protocol is handed to FRP verbatim (frpgen.go), so an
+	// Server.Protocol is handed to FRP verbatim by the runtime common config, so an
 	// unsupported value would otherwise surface only at runtime, deep inside
 	// FRP, with an FRP-shaped error. The allowed set mirrors the vendored FRP
 	// v1 validator's SupportedTransportProtocols (pkg/config/v1/validation),
@@ -150,44 +147,15 @@ func validate(cfg *Config, requireManagedRouting bool) error {
 		errs = append(errs, fmt.Errorf("server.protocol %q is not a supported FRP transport; use one of tcp, kcp, quic, websocket, wss (exact lowercase), or omit it for the tcp default", cfg.Server.Protocol))
 	}
 
-	// Admin validation (only when opted in — a stale Port or Addr set
-	// in YAML while Enabled=false is harmless since the listener won't
-	// bind).
 	if cfg.Admin.Enabled {
 		if cfg.Admin.Port < 1 || cfg.Admin.Port > 65535 {
-			errs = append(errs, fmt.Errorf("admin.port=%d invalid (must be 1-65535); check qurl-proxy.yaml or unset QURL_ADMIN_ENABLED if you didn't mean to enable the admin API", cfg.Admin.Port))
+			errs = append(errs, fmt.Errorf("admin.port=%d invalid (must be 1-65535); check qurl-proxy.yaml or unset QURL_ADMIN_ENABLED if you did not mean to enable the admin API", cfg.Admin.Port))
 		}
-		// Two-step opt-in for off-host reachability. AdminBindLooksRoutable
-		// catches IP literals outside the loopback range (127.0.0.0/8,
-		// ::1) AND treats every non-"localhost" hostname as routable
-		// (we don't issue DNS at Load time, so an operator deviating
-		// from the IP-literal default must accept the off-host gate).
-		// Without this gate, a single edit of admin.addr — to
-		// 0.0.0.0, to a public hostname, or to host.docker.internal —
-		// would silently expose the admin API. The "localhost" carve-
-		// out remains because it's structurally ambiguous-but-always-
-		// local in every reasonable resolver.
 		if AdminBindLooksRoutable(cfg) && !cfg.Admin.AllowRemote {
 			errs = append(errs, fmt.Errorf("admin.addr=%q is non-loopback but admin.allow_remote is not set; either revert to a loopback address (any 127.0.0.0/8 IPv4, ::1, or localhost) or add `admin.allow_remote: true` to confirm you want the local status/reload API reachable off-host", cfg.Admin.Addr))
 		}
-
-		// The explicit AllowRemote capability REQUIRES a Password even
-		// when the current Addr is loopback. The flag authorizes a later
-		// off-host address change; keying the credential gate to the
-		// current bind would let that one edit silently expose the
-		// machineID fallback. That fallback is host-stable and partly
-		// inferable — fine only while AllowRemote remains false and any
-		// caller is already on the host.
-		//
-		// Doesn't gate AllowRemote=false (loopback): the machineID
-		// fallback stays available on the established loopback path
-		// when the runtime can resolve a real machine ID. A loopback
-		// bind with no Password either uses machineID-as-password or
-		// fails closed at daemon startup if the runtime only has the
-		// sentinel "unknown". Any AllowRemote=true configuration with
-		// no Password fails Validate before binding.
 		if cfg.Admin.AllowRemote && cfg.Admin.Password == "" {
-			errs = append(errs, fmt.Errorf("admin.allow_remote=true requires an explicit admin.password even when admin.addr is currently loopback; the flag authorizes off-host exposure, where the host-stable, partly inferable machineID fallback is indefensible. Set admin.password to a strong random secret (e.g. `openssl rand -hex 32`) or revert admin.allow_remote to false"))
+			errs = append(errs, errors.New("admin.allow_remote=true requires an explicit admin.password even when admin.addr is currently loopback; the flag authorizes off-host exposure, where the host-stable, partly inferable machineID fallback is indefensible. Set admin.password to a strong random secret (e.g. `openssl rand -hex 32`) or revert admin.allow_remote to false"))
 		}
 	}
 
@@ -226,23 +194,8 @@ func validate(cfg *Config, requireManagedRouting bool) error {
 			}
 		}
 
-		switch r.Type {
-		case RouteTypeHTTP:
-			if r.ResourceID != "" && r.ConnectorRoutingID != "" && r.Subdomain != "" && r.Subdomain != r.ConnectorRoutingID {
-				errs = append(errs, fmt.Errorf("%s (%s): subdomain %q must be absent or exactly match connector_routing_id %q", prefix, r.ID, r.Subdomain, r.ConnectorRoutingID))
-			}
-		case RouteTypeTCP:
-			if r.ResourceID != "" || r.ConnectorRoutingID != "" {
-				errs = append(errs, fmt.Errorf("%s (%s): managed qURL Connector routes require type: http; the protected Connector server path does not accept TCP proxies", prefix, r.ID))
-			}
-			// remote_port for low-level ResourceID-free custom FRP routes is
-			// validated at run time (it may be server-assigned).
-		default:
-			if replacement := internalRouteTypeReplacement(r.Type); replacement != "" {
-				errs = append(errs, fmt.Errorf("%s (%s): unsupported route type %q; use type: %s", prefix, r.ID, r.Type, replacement))
-			} else {
-				errs = append(errs, fmt.Errorf("%s (%s): unsupported route type %q", prefix, r.ID, r.Type))
-			}
+		if r.Type != RouteTypeHTTP {
+			errs = append(errs, fmt.Errorf("%s (%s): unsupported route type %q; use type: http", prefix, r.ID, r.Type))
 		}
 
 		if r.LocalPort < 1 || r.LocalPort > 65535 {
@@ -255,8 +208,10 @@ func validate(cfg *Config, requireManagedRouting bool) error {
 			if err := validateExactOpaqueIdentifier("resource_id", r.ResourceID); err != nil {
 				errs = append(errs, fmt.Errorf("%s (%s): %w", prefix, r.ID, err))
 			}
-			if len(r.CustomDomains) > 0 {
-				errs = append(errs, fmt.Errorf("%s (%s): managed qURL Connector routes cannot set custom_domains; the protected server authorizes only the exact producer-issued connector_routing_id", prefix, r.ID))
+		}
+		if r.KnockResourceID != "" {
+			if err := validateExactOpaqueIdentifier("knock_resource_id", r.KnockResourceID); err != nil {
+				errs = append(errs, fmt.Errorf("%s (%s): %w", prefix, r.ID, err))
 			}
 		}
 		if r.ConnectorRoutingID != "" {
@@ -266,9 +221,6 @@ func validate(cfg *Config, requireManagedRouting bool) error {
 			if err := ValidateConnectorRoutingID(r.ConnectorRoutingID); err != nil {
 				errs = append(errs, fmt.Errorf("%s (%s): %w", prefix, r.ID, err))
 			}
-		}
-		if r.ResourceID != "" && r.ConnectorRoutingID != "" && r.LoadBalancerGroup != "" && r.LoadBalancerGroup != r.ConnectorRoutingID {
-			errs = append(errs, fmt.Errorf("%s (%s): load_balancer_group %q must be absent or exactly match connector_routing_id %q", prefix, r.ID, r.LoadBalancerGroup, r.ConnectorRoutingID))
 		}
 	}
 	if err := ValidateManagedRouteIdentities(cfg.Routes); err != nil {
@@ -321,15 +273,4 @@ func ValidateManagedRouteIdentities(routes []Route) error {
 
 func routeIDFormatError(prefix string, r Route, err error) error {
 	return fmt.Errorf("%s (%s): %w", prefix, r.ID, err)
-}
-
-func internalRouteTypeReplacement(t RouteType) string {
-	switch t {
-	case "frp_http":
-		return string(RouteTypeHTTP)
-	case "frp_tcp":
-		return string(RouteTypeTCP)
-	default:
-		return ""
-	}
 }

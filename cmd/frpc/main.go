@@ -14,11 +14,7 @@
 
 package main
 
-import (
-	"github.com/fatedier/frp/pkg/util/system"
-
-	_ "github.com/layervai/qurl-connector/web/frpc"
-)
+import "github.com/fatedier/frp/pkg/util/system"
 
 func main() {
 	system.EnableCompatibilityMode()

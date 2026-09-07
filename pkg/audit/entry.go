@@ -166,9 +166,8 @@ type Entry struct {
 	// NewCycleRunID; 16 lowercase hex) the emitting managed session cycle
 	// presented on its KNK and first FRP Login. Stamped on every
 	// knock.* / login.* / proxy.* / teardown entry so one cycle's
-	// admission chain can be grouped, and scanned by the strict-proof
-	// run_id_cycle_binding scenario (pkg/strictproof). TraceID carries
-	// the same value at those sites and stays for existing consumers;
+	// admission chain can be grouped. TraceID carries the same value at
+	// those sites and stays for existing consumers;
 	// run_id is the explicit, additive name. Empty on bootstrap.*
 	// entries — native registration precedes any cycle.
 	RunID string `json:"run_id,omitempty"`

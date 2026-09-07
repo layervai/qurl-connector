@@ -69,11 +69,11 @@ type SessionGroupConfig struct {
 }
 
 // SessionGroupRunner serves many routes on one NHP admission and one FRP
-// control session. Compared with one ResourceRunner per route, a group costs
+// control session. A group costs
 // one knock, one Login, and one heartbeat stream for the whole set; only the
 // per-proxy NewProxy authorizations scale with the route count.
 //
-// Renewal is make-before-break exactly as in ResourceRunner: the replacement
+// Renewal is make-before-break: the replacement
 // admission and session are built while the old one keeps serving, and the
 // old session is drained only after every route the old session was serving
 // is running on the replacement (or, if some never come up, at the old

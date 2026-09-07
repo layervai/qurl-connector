@@ -53,33 +53,6 @@ type Admitter interface {
 	Retire(context.Context, Admission) error
 }
 
-// SerialAdmitter protects native runtimes whose binding cannot safely execute
-// concurrent knocks. The lock covers both admission and local retirement, but
-// never the lifetime of the resulting FRP session.
-type SerialAdmitter struct {
-	inner Admitter
-	mu    sync.Mutex
-}
-
-func NewSerialAdmitter(inner Admitter) (*SerialAdmitter, error) {
-	if inner == nil {
-		return nil, errors.New("build serialized NHP admitter: admitter is nil")
-	}
-	return &SerialAdmitter{inner: inner}, nil
-}
-
-func (a *SerialAdmitter) Admit(ctx context.Context, knockResourceID, resourceID string) (Admission, error) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	return a.inner.Admit(ctx, knockResourceID, resourceID)
-}
-
-func (a *SerialAdmitter) Retire(ctx context.Context, admission Admission) error {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	return a.inner.Retire(ctx, admission)
-}
-
 // ServingSession is one FRP control session for one Admission. Ready closes
 // only after every configured proxy reaches FRP's running phase, which occurs
 // after NewProxy admission and RegisterProxy success.
@@ -91,163 +64,13 @@ type ServingSession interface {
 }
 
 // drainingSession is implemented by sessions that can stop accepting new
-// work while allowing an already-started request to finish. ResourceRunner
-// uses it only after a replacement has reached serving.
+// work while allowing an already-started request to finish.
 type drainingSession interface {
 	Drain(context.Context) error
 }
 
-// SessionFactory starts an FRP session from one immutable admission. The
-// context bounds construction and readiness setup; a returned session owns
-// its serving lifetime until Stop or Drain. A factory must stamp
-// Admission.ResourceID into FRP metadata and use the token, run ID, session
-// ID, and ResourceHost from that same Admission.
-type SessionFactory interface {
-	Start(context.Context, Admission) (ServingSession, error)
-}
-
-type ResourceConfig struct {
-	KnockResourceID string
-	ResourceID      string
-	Admitter        Admitter
-	Sessions        SessionFactory
-
-	MinBackoff   time.Duration
-	MaxBackoff   time.Duration
-	RotationLead time.Duration
-	StopTimeout  time.Duration
-	OnServing    func(Admission)
-	// OnRetry reports a failed admission or connection attempt and the
-	// bounded delay before the next attempt. The error may come from the
-	// configured Admitter or SessionFactory, connector-side validation, cleanup,
-	// or deadline handling; it is not guaranteed to be safe for persistent logs.
-	// It does not report terminal rotation expiry or a serving session exit. The
-	// callback must return promptly.
-	OnRetry func(error, time.Duration)
-}
-
-// ResourceRunner maintains one resource-bound NHP/FRP route. Renewal is
-// make-before-break: a replacement must become serving before the prior FRP
-// session is retired.
-type ResourceRunner struct {
-	cfg ResourceConfig
-}
-
-func NewResourceRunner(cfg ResourceConfig) (*ResourceRunner, error) {
-	if cfg.KnockResourceID == "" {
-		return nil, errors.New("build resource session: knock resource ID is empty")
-	}
-	if cfg.ResourceID == "" {
-		return nil, errors.New("build resource session: public resource ID is empty")
-	}
-	if cfg.Admitter == nil {
-		return nil, errors.New("build resource session: admitter is nil")
-	}
-	if cfg.Sessions == nil {
-		return nil, errors.New("build resource session: session factory is nil")
-	}
-	if cfg.MinBackoff < 0 || cfg.MaxBackoff < 0 || cfg.RotationLead < 0 || cfg.StopTimeout < 0 {
-		return nil, errors.New("build resource session: durations cannot be negative")
-	}
-	if cfg.MinBackoff == 0 {
-		cfg.MinBackoff = time.Second
-	}
-	if cfg.MaxBackoff == 0 {
-		cfg.MaxBackoff = 30 * time.Second
-	}
-	if cfg.MaxBackoff < cfg.MinBackoff {
-		return nil, errors.New("build resource session: max backoff is below min backoff")
-	}
-	if cfg.StopTimeout == 0 {
-		cfg.StopTimeout = 5 * time.Second
-	}
-	return &ResourceRunner{cfg: cfg}, nil
-}
-
-// Run serves until ctx ends. Admission and connection failures retry forever
-// with bounded jitter so sleep, wake, and transient network loss require no
-// operator action.
-func (r *ResourceRunner) Run(ctx context.Context) (retErr error) {
-	if ctx == nil {
-		return errors.New("run resource session: context is nil")
-	}
-	var active *resourceCycle
-	var drains cycleDrainSet
-	backoff := r.cfg.MinBackoff
-	defer drains.stopAndWait(r.cfg.StopTimeout)
-	defer func() { retErr = errors.Join(retErr, r.stopCycle(active)) }()
-
-	for {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		if active == nil {
-			cycle, err := r.startReadyCycle(ctx, nil)
-			if err != nil {
-				if errors.Is(err, ErrResourceGone) {
-					return err
-				}
-				wait := jitter(backoff)
-				if retryErr := r.waitToRetry(ctx, err, wait); retryErr != nil {
-					return retryErr
-				}
-				backoff = nextBackoff(backoff, r.cfg.MaxBackoff)
-				continue
-			}
-			active = cycle
-			backoff = r.cfg.MinBackoff
-			if r.cfg.OnServing != nil {
-				r.cfg.OnServing(active.admission)
-			}
-		}
-
-		rotate := time.NewTimer(time.Until(active.rotateAt))
-		select {
-		case <-ctx.Done():
-			stopTimer(rotate)
-			return ctx.Err()
-		case <-active.session.Done():
-			stopTimer(rotate)
-			sessionErr := active.session.Err()
-			retireErr := r.stopCycle(active)
-			active = nil
-			if errors.Is(sessionErr, ErrResourceGone) {
-				return errors.Join(sessionErr, retireErr)
-			}
-			if retireErr != nil {
-				return errors.Join(sessionErr, retireErr)
-			}
-		case <-rotate.C:
-			replacement, err := r.startReadyCycle(ctx, active)
-			if err != nil {
-				if errors.Is(err, ErrResourceGone) {
-					return err
-				}
-				// Keep the old serving session while a replacement is still
-				// possible. startReadyCycle already bounds its attempt by the
-				// old authorization deadline.
-				if time.Now().Before(active.expiresAt) {
-					continue
-				}
-				if retireErr := r.stopCycle(active); retireErr != nil {
-					return errors.Join(err, retireErr)
-				}
-				active = nil
-				continue
-			}
-			old := active
-			active = replacement
-			if r.cfg.OnServing != nil {
-				r.cfg.OnServing(active.admission)
-			}
-			drains.start(old.session, r.cfg.StopTimeout, func() { _ = r.retireAdmission(old.admission) })
-		}
-	}
-}
-
-// cycleDrainSet tracks retired cycles that are still draining. It is shared
-// by ResourceRunner and SessionGroupRunner; a drain retires the cycle's
-// admission only after the session itself exits or the cleanup budget ends.
+// cycleDrainSet tracks retired cycles that are still draining. A drain retires
+// the cycle's admission only after the session exits or the cleanup budget ends.
 type cycleDrainSet struct {
 	mu     sync.Mutex
 	cycles map[*cycleDrain]struct{}
@@ -324,42 +147,6 @@ func (d *cycleDrainSet) stopAndWait(timeout time.Duration) {
 	}
 }
 
-type resourceCycle struct {
-	admission Admission
-	session   ServingSession
-	expiresAt time.Time
-	rotateAt  time.Time
-}
-
-func (r *ResourceRunner) startReadyCycle(ctx context.Context, old *resourceCycle) (*resourceCycle, error) {
-	backoff := r.cfg.MinBackoff
-	for {
-		cycle, err := r.startCycleAttempt(ctx, old)
-		if err == nil || old == nil {
-			return cycle, err
-		}
-		if errors.Is(err, ErrResourceGone) {
-			return nil, err
-		}
-		remaining := time.Until(old.expiresAt)
-		if remaining <= 0 {
-			return nil, err
-		}
-		wait := jitter(backoff)
-		if wait > remaining {
-			wait = remaining
-		}
-		if retryErr := r.waitToRetry(ctx, err, wait); retryErr != nil {
-			return nil, retryErr
-		}
-		backoff = nextBackoff(backoff, r.cfg.MaxBackoff)
-	}
-}
-
-func (r *ResourceRunner) waitToRetry(ctx context.Context, attemptErr error, wait time.Duration) error {
-	return retryAfter(ctx, r.cfg.OnRetry, attemptErr, wait)
-}
-
 // retryAfter reports one failed attempt and sleeps the bounded delay. Time the
 // callback consumes counts against the delay, and a canceled attempt is never
 // reported as a retry.
@@ -374,75 +161,6 @@ func retryAfter(ctx context.Context, onRetry func(error, time.Duration), attempt
 		return ctx.Err()
 	}
 	return sleepWithContext(ctx, remaining)
-}
-
-func (r *ResourceRunner) startCycleAttempt(ctx context.Context, old *resourceCycle) (*resourceCycle, error) {
-	attemptCtx := ctx
-	cancelAttempt := func() {}
-	if old != nil {
-		attemptCtx, cancelAttempt = context.WithDeadline(ctx, old.expiresAt)
-	}
-	defer cancelAttempt()
-
-	started := time.Now()
-	admission, err := r.cfg.Admitter.Admit(attemptCtx, r.cfg.KnockResourceID, r.cfg.ResourceID)
-	if err != nil {
-		return nil, err
-	}
-	if err := validateAdmission(admission, r.cfg.KnockResourceID, r.cfg.ResourceID); err != nil {
-		return nil, errors.Join(err, r.retireAdmission(admission))
-	}
-	expiresAt := started.Add(admission.OpenTime)
-	lead := rotationLead(admission.OpenTime, r.cfg.RotationLead)
-	rotateAt := expiresAt.Add(-lead)
-	session, err := r.cfg.Sessions.Start(attemptCtx, admission)
-	if err != nil {
-		return nil, errors.Join(err, r.retireAdmission(admission))
-	}
-
-	readyDeadline := expiresAt
-	if old != nil && old.expiresAt.Before(readyDeadline) {
-		readyDeadline = old.expiresAt
-	}
-	readyCtx, cancel := context.WithDeadline(attemptCtx, readyDeadline)
-	defer cancel()
-	select {
-	case <-session.Done():
-		err := session.Err()
-		r.stopSession(session)
-		err = errors.Join(err, r.retireAdmission(admission))
-		if err == nil {
-			err = errors.New("FRP session ended before serving")
-		}
-		return nil, err
-	default:
-	}
-	select {
-	case <-readyCtx.Done():
-		r.stopSession(session)
-		return nil, errors.Join(readyCtx.Err(), r.retireAdmission(admission))
-	case <-session.Done():
-		err := session.Err()
-		r.stopSession(session)
-		err = errors.Join(err, r.retireAdmission(admission))
-		if err == nil {
-			err = errors.New("FRP session ended before serving")
-		}
-		return nil, err
-	case <-session.Ready():
-		select {
-		case <-session.Done():
-			err := session.Err()
-			r.stopSession(session)
-			err = errors.Join(err, r.retireAdmission(admission))
-			if err == nil {
-				err = errors.New("FRP session ended while reporting serving")
-			}
-			return nil, err
-		default:
-		}
-		return &resourceCycle{admission: admission, session: session, expiresAt: expiresAt, rotateAt: rotateAt}, nil
-	}
 }
 
 func validateAdmission(a Admission, knockResourceID, resourceID string) error {
@@ -498,22 +216,6 @@ func rotationLead(openTime, configured time.Duration) time.Duration {
 		lead = openTime / 2
 	}
 	return lead
-}
-
-func (r *ResourceRunner) stopCycle(cycle *resourceCycle) error {
-	if cycle == nil {
-		return nil
-	}
-	r.stopSession(cycle.session)
-	return r.retireAdmission(cycle.admission)
-}
-
-func (r *ResourceRunner) retireAdmission(admission Admission) error {
-	return retireAdmission(r.cfg.Admitter, admission, r.cfg.StopTimeout)
-}
-
-func (r *ResourceRunner) stopSession(session ServingSession) {
-	stopServingSession(session, r.cfg.StopTimeout)
 }
 
 func retireAdmission(admitter Admitter, admission Admission, timeout time.Duration) error {

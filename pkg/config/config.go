@@ -4,12 +4,12 @@
 package config
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"os"
 	"regexp"
 	"sort"
-	"strconv"
 	"strings"
 
 	"gopkg.in/yaml.v3"
@@ -98,61 +98,21 @@ type RuntimeConfig struct {
 	KnockResourceIDs map[string]string
 }
 
-// AdminConfig gates FRP's built-in HTTP admin API (status + live reload).
-// Default is OFF: the Docker install has no in-container caller for it,
-// and shipping it always-on leaves an authenticated-but-machine-id-keyed
-// surface that defeats the "every reachable path goes through NHP"
-// posture. Operators must opt in explicitly.
-//
-// Addr/Port have non-zero defaults applied in applyDefaults so an
-// operator who opts in only needs to set Enabled.
-//
-// AllowRemote is a SECOND opt-in required when Addr is non-loopback
-// (`0.0.0.0`, a RFC1918 IP, a public IP, etc). Without it, Validate
-// rejects the config — a single misedited Addr can't silently expose
-// the admin API to any peer that can route to the host. The whole
-// point of the gate is "no off-host reachability without two
-// deliberate YAML changes."
-//
-// Password is the FRP admin API basic-auth password. When unset, the
-// admin listener may use getMachineID() as a loopback-only fallback,
-// but only if the runtime can resolve a real protected machine ID.
-// Minimal containers often cannot, and the daemon fails closed rather
-// than accepting the sentinel "unknown" password. AllowRemote=true
-// (off-host exposure) REQUIRES an explicit Password — Validate
-// rejects the config otherwise. The machineID fallback is host-stable
-// and partly inferable; allowing it on an off-host listener would
-// mean a remote attacker who can guess the machineID gets admin
-// access. Requiring an explicit password forces operators opting into
-// off-host to provide real credentials. #190 tracks dropping admin
-// API entirely in favor of stdio-pipe IPC, which obsoletes this
-// entire surface; until then this gate closes the obvious hole.
+// AdminConfig gates FRP's local status and reload API. It is off by default.
+// A non-loopback bind needs both AllowRemote and an explicit password.
 type AdminConfig struct {
 	Enabled     bool   `yaml:"enabled"`
 	Addr        string `yaml:"addr,omitempty"`
 	Port        int    `yaml:"port,omitempty"`
 	AllowRemote bool   `yaml:"allow_remote,omitempty"`
-	// Password IS a secret by design — gosec G117 flags any exported
-	// struct field whose name matches a secret pattern, but this
-	// field exists exactly to carry the FRP admin basic-auth
-	// credential from YAML into run.go (where it's set on
-	// common.WebServer.Password). The YAML file holding it is
-	// expected to be 0600 by the surrounding install story; the
-	// struct doesn't get serialized to any log/wire path. Renaming
-	// to obscure intent would hurt readability; a custom redact-on-
-	// print type is a future hardening (issue #190 obsoletes the
-	// surface entirely). Per-line suppression with rationale per
-	// repo policy on lint dodges.
-	Password string `yaml:"password,omitempty"` //nolint:gosec // G117 - field name "Password" matches secret pattern by design; see comment above
+	Password    string `yaml:"password,omitempty"` //nolint:gosec // operator-supplied FRP basic-auth credential
 }
 
 // ServerConfig holds connection details for the FRP server.
 type ServerConfig struct {
-	Addr         string `yaml:"addr,omitempty"`
-	Port         int    `yaml:"port,omitempty"`
-	Token        string `yaml:"token,omitempty"`
-	Protocol     string `yaml:"protocol,omitempty"`      // tcp, kcp, quic, websocket, wss
-	PublicDomain string `yaml:"public_domain,omitempty"` // vhost domain for public URLs (e.g., qurl.site)
+	Addr     string `yaml:"addr,omitempty"`
+	Port     int    `yaml:"port,omitempty"`
+	Protocol string `yaml:"protocol,omitempty"` // tcp, kcp, quic, websocket, wss
 
 	// EgressLocalIP binds both the native NHP UDP socket and FRP's TCP/
 	// websocket connection to one local source address. Multi-homed hosts must
@@ -168,28 +128,6 @@ type ServerConfig struct {
 	Keepalive     int   `yaml:"keepalive,omitempty"`       // TCP keepalive probe interval in seconds (default: 60)
 	DialTimeout   int   `yaml:"dial_timeout,omitempty"`    // Server connection timeout in seconds (default: 10)
 	LoginFailExit *bool `yaml:"login_fail_exit,omitempty"` // Exit on initial login failure (default: false)
-
-	// ReplicaDiscriminator is the explicit per-process salt appended
-	// to FRP proxy names (`<route.ID>-<discriminator>`) so multiple
-	// replicas sharing a LoadBalancerGroup can register without
-	// colliding on FRP's per-server-instance name uniqueness check
-	// (server/control.go:484 emits `proxy [<name>] already exists`;
-	// server/proxy/proxy.go:529 emits `proxy name [<name>] is
-	// already in use`). The canonical resolution chain lives in
-	// pkg/replica.Resolver — the YAML field here is the explicit
-	// escape hatch for operators who want to set the salt from
-	// outside the resolver (deterministic tests, bare-metal deploys
-	// with a fixed-replica taxonomy). When set non-empty, run.go
-	// bypasses the resolver chain. Empty (the headless default) →
-	// resolver chain picks the salt at boot.
-	//
-	// The runtime path normally resolves a salt even for single-replica
-	// deploys. If both this field AND the resolver return empty (today
-	// only possible if a future CONFIG_REQUIRE_STABLE_DISCRIMINATOR
-	// hard-fail mode is wired AND the operator declines all sources),
-	// frpgen.go emits the raw route.ID as the proxy name for direct
-	// config-generation compatibility.
-	ReplicaDiscriminator string `yaml:"replica_discriminator,omitempty"`
 }
 
 // NHPConfig holds Network Hiding Protocol settings.
@@ -208,41 +146,30 @@ type QURLConfig struct {
 //
 // Managed routes consume three separately carried producer values: ResourceID
 // is the public qURL identity, ConnectorRoutingID is the FRP/HRW routing label,
-// and Runtime.KnockResourceIDs holds the NHP admission target keyed by the
-// public identity. Subdomain and LoadBalancerGroup are optional compatibility
-// inputs only; when present on a managed route they must equal the opaque
-// ConnectorRoutingID exactly.
+// and KnockResourceID is the persisted admission-target continuity assertion.
+// Runtime.KnockResourceIDs holds the authenticated NHP admission target used at
+// runtime, keyed by the public identity.
 type Route struct {
 	// ID is the customer-facing route identifier. For Connector resources,
 	// the registered-device qurl-go client sends this value verbatim as the
 	// qURL resource slug when ResourceID is empty. The JSON tag intentionally omits
 	// `omitempty` so list --json pollers always see a stable id key,
 	// including the single-route env-fallback shape before resolution.
-	ID            string            `yaml:"id,omitempty" json:"id"`
-	Type          RouteType         `yaml:"type" json:"type"`
-	LocalIP       string            `yaml:"local_ip,omitempty" json:"local_ip,omitempty"`
-	LocalPort     int               `yaml:"local_port" json:"local_port"`
-	RemotePort    int               `yaml:"remote_port,omitempty" json:"remote_port,omitempty"`
-	Subdomain     string            `yaml:"subdomain,omitempty" json:"subdomain,omitempty"`
-	CustomDomains []string          `yaml:"custom_domains,omitempty" json:"custom_domains,omitempty"`
-	HostRewrite   string            `yaml:"host_rewrite,omitempty" json:"host_rewrite,omitempty"`
-	Headers       map[string]string `yaml:"headers,omitempty" json:"headers,omitempty"`
-	ResourceID    string            `yaml:"resource_id,omitempty" json:"resource_id,omitempty"`
+	ID         string    `yaml:"id,omitempty" json:"id"`
+	Type       RouteType `yaml:"type" json:"type"`
+	LocalIP    string    `yaml:"local_ip,omitempty" json:"local_ip,omitempty"`
+	LocalPort  int       `yaml:"local_port" json:"local_port"`
+	ResourceID string    `yaml:"resource_id,omitempty" json:"resource_id,omitempty"`
 	// ConnectorRoutingID is returned by the qURL control plane and used verbatim for
 	// FRP SubDomain and load-balancer grouping. NHP placement comes from the
 	// authenticated ACK instead. This value must never
 	// be client-derived from or normalized against ResourceID; the control plane owns
 	// the producer-side calculation.
 	ConnectorRoutingID string `yaml:"connector_routing_id,omitempty" json:"connector_routing_id,omitempty"`
-	TargetURL          string `yaml:"target_url,omitempty" json:"target_url,omitempty"`
-
-	// LoadBalancerGroup wires FRP's HTTP/TCP loadBalancer.group +
-	// groupKey so multiple sidecar replicas with the same slug register
-	// under one routing key — FRPS load-balances requests across the
-	// live replicas. Managed routes use ConnectorRoutingID as the one
-	// authoritative value; this field may be omitted or must match it exactly.
-	// Unmanaged/custom FRP routes retain the explicit field as before.
-	LoadBalancerGroup string `yaml:"load_balancer_group,omitempty" json:"load_balancer_group,omitempty"`
+	// KnockResourceID is written by qURL Desktop and checked against authenticated
+	// resource hydration. Runtime code must use Runtime.KnockResourceIDs instead.
+	KnockResourceID string `yaml:"knock_resource_id,omitempty" json:"-"`
+	TargetURL       string `yaml:"target_url,omitempty" json:"target_url,omitempty"`
 }
 
 // PrimaryResourceID returns the first managed route's public resource identity.
@@ -324,8 +251,6 @@ type RouteType string
 const (
 	// RouteTypeHTTP proxies HTTP traffic.
 	RouteTypeHTTP RouteType = "http"
-	// RouteTypeTCP proxies raw TCP traffic.
-	RouteTypeTCP RouteType = "tcp"
 )
 
 // envVarPattern matches ${VAR} and ${VAR:-default} patterns.
@@ -362,12 +287,20 @@ func Load(path string) (*Config, error) {
 
 func decodeConfig(data []byte, path string) (*Config, error) {
 	resolved := resolveEnvVars(string(data))
+	stripped, err := stripRetiredGeneratedFields(resolved)
+	if err != nil {
+		return nil, fmt.Errorf("parsing retired config fields in %s: %w", path, err)
+	}
+	lineContext := ""
+	if stripped != resolved {
+		lineContext = " (line numbers refer to the config after retired generated fields were dropped)"
+	}
 
 	var cfg Config
-	dec := yaml.NewDecoder(strings.NewReader(resolved))
+	dec := yaml.NewDecoder(strings.NewReader(stripped))
 	dec.KnownFields(true)
 	if err := dec.Decode(&cfg); err != nil {
-		return nil, fmt.Errorf("parsing config file %s: %w", path, err)
+		return nil, fmt.Errorf("parsing config file %s%s: %w", path, lineContext, err)
 	}
 
 	applyDefaults(&cfg)
@@ -385,11 +318,118 @@ func decodeConfig(data []byte, path string) (*Config, error) {
 	return &cfg, nil
 }
 
+// stripRetiredGeneratedFields keeps files written by older connector clients
+// readable. A later Save omits these redundant fields. Other retired custom-
+// FRP fields fail with migration guidance. When fields are dropped, later YAML
+// decoder line numbers refer to the normalized document.
+func stripRetiredGeneratedFields(data string) (string, error) {
+	var document yaml.Node
+	if err := yaml.Unmarshal([]byte(data), &document); err != nil || len(document.Content) == 0 {
+		return data, nil
+	}
+	root := document.Content[0]
+	dropped := false
+	var errs []error
+	if server := yamlField(root, "server"); server != nil {
+		if token := yamlField(server, "token"); token != nil {
+			if token.Kind != yaml.ScalarNode || (token.Tag != "!!null" && strings.TrimSpace(token.Value) != "") {
+				line, _ := yamlFieldLine(server, "token")
+				errs = append(errs, fmt.Errorf("config field server.token at line %d was removed; delete it because NHP admission supplies the FRP session token", line))
+			} else {
+				// An explicitly empty or null token carries no operator intent.
+				dropped = dropYAMLField(server, "token") || dropped
+			}
+		}
+		dropped = dropYAMLField(server, "public_domain") || dropped
+		dropped = dropYAMLField(server, "replica_discriminator") || dropped
+	}
+	if routes := yamlField(root, "routes"); routes != nil && routes.Kind == yaml.SequenceNode {
+		for i, route := range routes.Content {
+			for _, key := range []string{"subdomain", "load_balancer_group"} {
+				field := yamlField(route, key)
+				if field == nil {
+					continue
+				}
+				routingValue := ""
+				if routingID := yamlField(route, "connector_routing_id"); routingID != nil {
+					routingValue = strings.TrimSpace(routingID.Value)
+				}
+				resourceID := yamlField(route, "resource_id")
+				switch {
+				case field.Kind == yaml.ScalarNode && strings.TrimSpace(field.Value) == "":
+					// An explicitly empty generated field carries no operator intent.
+					dropped = dropYAMLField(route, key) || dropped
+				case routingValue != "" && strings.TrimSpace(field.Value) == routingValue:
+					dropped = dropYAMLField(route, key) || dropped
+				case field.Kind == yaml.ScalarNode && routingValue == "" && resourceID != nil && strings.TrimSpace(resourceID.Value) != "":
+					// A pinned managed resource can load before routing hydration.
+					dropped = dropYAMLField(route, key) || dropped
+				default:
+					line, _ := yamlFieldLine(route, key)
+					errs = append(errs, fmt.Errorf("config field routes[%d].%s at line %d was removed; delete it because managed routes use connector_routing_id", i, key, line))
+				}
+			}
+			for _, key := range []string{"custom_domains", "remote_port", "host_rewrite", "headers"} {
+				if line, ok := yamlFieldLine(route, key); ok {
+					errs = append(errs, fmt.Errorf("config field routes[%d].%s at line %d was removed; delete it because managed routes use connector_routing_id and local_ip/local_port", i, key, line))
+				}
+			}
+		}
+	}
+	if err := errors.Join(errs...); err != nil {
+		return data, err
+	}
+	if !dropped {
+		return data, nil
+	}
+	out, err := yaml.Marshal(&document)
+	return string(out), err
+}
+
+func yamlField(mapping *yaml.Node, key string) *yaml.Node {
+	if mapping == nil || mapping.Kind != yaml.MappingNode {
+		return nil
+	}
+	for i := 0; i+1 < len(mapping.Content); i += 2 {
+		if mapping.Content[i].Value == key {
+			return mapping.Content[i+1]
+		}
+	}
+	return nil
+}
+
+func yamlFieldLine(mapping *yaml.Node, key string) (int, bool) {
+	if mapping == nil || mapping.Kind != yaml.MappingNode {
+		return 0, false
+	}
+	for i := 0; i+1 < len(mapping.Content); i += 2 {
+		if mapping.Content[i].Value == key {
+			return mapping.Content[i].Line, true
+		}
+	}
+	return 0, false
+}
+
+func dropYAMLField(mapping *yaml.Node, key string) bool {
+	if mapping == nil || mapping.Kind != yaml.MappingNode {
+		return false
+	}
+	for i := 0; i+1 < len(mapping.Content); i += 2 {
+		// Only remove the scalar shape the old string field accepted. Leave a
+		// malformed value for strict decoding instead of silently discarding it.
+		if mapping.Content[i].Value == key && mapping.Content[i+1].Kind == yaml.ScalarNode {
+			mapping.Content = append(mapping.Content[:i], mapping.Content[i+2:]...)
+			return true
+		}
+	}
+	return false
+}
+
 // NewDefaulted returns an empty Config with the same defaults that
 // Load applies to a parsed YAML file. Use this on the fresh-config
 // path (when no YAML exists yet) so that the eventual Save writes a
-// fully-populated file rather than a sparse one missing Protocol /
-// PublicDomain / Keepalive / etc. — a sparse file is functionally
+// fully-populated file rather than a sparse one missing protocol and
+// transport defaults. A sparse file is functionally
 // fine because Load re-applies defaults, but a user opening it for
 // the first time would otherwise see a config that looks half-set.
 func NewDefaulted() *Config {
@@ -414,9 +454,6 @@ func applyDefaults(cfg *Config) {
 	if cfg.Server.Protocol == "" {
 		cfg.Server.Protocol = "tcp"
 	}
-	if cfg.Server.PublicDomain == "" {
-		cfg.Server.PublicDomain = "qurl.site"
-	}
 	// TCP keepalive: 60s detects dead servers much faster than FRP's 7200s (2hr) default.
 	if cfg.Server.Keepalive == 0 {
 		cfg.Server.Keepalive = 60
@@ -434,21 +471,6 @@ func applyDefaults(cfg *Config) {
 			cfg.Routes[i].LocalIP = "127.0.0.1"
 		}
 	}
-
-	// Admin defaults: addr/port get sensible values so an operator opting
-	// in only needs to set Enabled. Enabled stays at its zero value
-	// (false) — the whole point of this gate is that opt-in is explicit.
-	// QURL_ADMIN_ENABLED=true overrides the YAML to flip it on (Docker
-	// operators may not want to rebuild a config just for this).
-	//
-	// Seeding Addr/Port even when Enabled=false is INTENTIONAL: a
-	// later QURL_ADMIN_ENABLED=true env override (applyEnvOverrides
-	// runs after this) should produce a working config without
-	// requiring the operator to also set admin.addr/admin.port in
-	// the YAML. Gating these defaults on Enabled would force the env-
-	// override path to re-seed, doubling the surface for skew.
-	// TestLoad_AdminPortIgnoredWhenDisabled pins the "values exist
-	// but inert until Enabled flips" contract.
 	if cfg.Admin.Addr == "" {
 		cfg.Admin.Addr = DefaultAdminAddr
 	}
@@ -479,26 +501,15 @@ func applyEnvOverrides(cfg *Config) {
 	if value := strings.TrimSpace(os.Getenv("QURL_CONNECTOR_EGRESS_LOCAL_IP")); value != "" {
 		cfg.Server.EgressLocalIP = value
 	}
-	if v, ok := os.LookupEnv("QURL_ADMIN_ENABLED"); ok {
-		switch strings.ToLower(strings.TrimSpace(v)) {
+	if value, ok := os.LookupEnv("QURL_ADMIN_ENABLED"); ok {
+		switch strings.ToLower(strings.TrimSpace(value)) {
 		case "1", "true", "yes", "on":
 			cfg.Admin.Enabled = true
 		case "0", "false", "no", "off":
 			cfg.Admin.Enabled = false
 		case "":
-			// Empty string is the "exported-but-unset" shape common
-			// in CI shells (e.g. `export QURL_ADMIN_ENABLED` with
-			// no value). Treating it as a typo would spam stderr
-			// on every CLI invocation in those environments. Fall
-			// through to the YAML silently — the operator didn't
-			// actually intend to set the override.
 		default:
-			// Unrecognized value — fall through to the YAML value
-			// would silently leave the surface in its previous state.
-			// Since this env var is the documented runtime kill switch
-			// for a security surface, a typo on the way to kill it
-			// must not be silent. Warn loudly to stderr.
-			fmt.Fprintf(os.Stderr, "warning: QURL_ADMIN_ENABLED=%q not recognized (use true/false/1/0/yes/no/on/off); falling back to YAML admin.enabled=%v\n", v, cfg.Admin.Enabled)
+			fmt.Fprintf(os.Stderr, "warning: QURL_ADMIN_ENABLED=%q not recognized (use true/false/1/0/yes/no/on/off); falling back to YAML admin.enabled=%v\n", value, cfg.Admin.Enabled)
 		}
 	}
 
@@ -513,35 +524,8 @@ func applyEnvOverrides(cfg *Config) {
 
 }
 
-// AdminBindLooksRoutable reports whether cfg.Admin.Addr would bind to
-// a non-loopback address that's reachable from off-host. The result
-// is the defense-in-depth check the warning sites in cmd/frpc rely on
-// — they emit a stderr warning only when the listener is about to
-// bind (i.e., from `run`), not on every config Load. Without this
-// split, a scripted poller running `status --json` on a 5-second
-// interval would spam stderr forever for a single misconfigured
-// `admin.addr`.
-//
-// Recognized loopback forms:
-//   - IP literal whose `net.IP.IsLoopback()` is true (`127.0.0.1`,
-//     `::1`, the whole `127.0.0.0/8` block).
-//   - The literal string "localhost" (case-insensitive) — common in
-//     operator configs even though it requires DNS to actually
-//     resolve. We don't issue a lookup here (no network I/O in
-//     config land) but the literal is unambiguous enough to treat
-//     as loopback.
-//
-// All other hostnames (`host.docker.internal`, public DNS names,
-// internal-only DNS names) return TRUE — treated as routable so
-// Validate requires `allow_remote`. The operator has deviated from
-// the IP-literal default, which is itself a deliberate change worth
-// gating. The previous behavior (hostnames bypass the check) was a
-// gap that contradicted the PR framing "no off-host reachability
-// without two deliberate YAML changes" — a hostname resolving to a
-// public IP at runtime would pass Validate but expose the surface
-// off-host. Tightening here closes that gap; the carve-out for
-// "localhost" remains because it's structurally ambiguous-but-
-// always-local in every reasonable resolver config.
+// AdminBindLooksRoutable reports whether the enabled admin listener can be
+// reached off host. Unknown hostnames fail closed as routable.
 func AdminBindLooksRoutable(cfg *Config) bool {
 	if cfg == nil || !cfg.Admin.Enabled {
 		return false
@@ -550,64 +534,10 @@ func AdminBindLooksRoutable(cfg *Config) bool {
 		return false
 	}
 	ip := net.ParseIP(cfg.Admin.Addr)
-	if ip == nil {
-		// Non-IP hostname — treat as routable. The operator made a
-		// deliberate departure from the IP-literal default; the
-		// allow_remote gate exists exactly to require a second
-		// deliberate opt-in for that class of choice.
-		return true
-	}
-	return !ip.IsLoopback()
+	return ip == nil || !ip.IsLoopback()
 }
 
-// DefaultAdminAddr is the loopback bind for FRP's admin API when an
-// operator opts in. Hardcoded loopback is deliberate — the admin API
-// has no remote-management use case in the Docker install, and a
-// future YAML change that flipped this to 0.0.0.0 would silently
-// expose the surface to any container peer.
-const DefaultAdminAddr = "127.0.0.1"
-
-// DefaultAdminPort is the TCP port FRP's admin API binds when enabled.
-const DefaultAdminPort = 7400
-
-// AdminURL builds the FRP admin API base URL for (addr, port). Lives
-// next to DefaultAdminAddr/DefaultAdminPort so the URL-construction
-// contract (scheme=http, brackets-IPv6-via-net.JoinHostPort) is in
-// the same package as the bind defaults. The 4 callers in cmd/frpc
-// (run banner, add reload, status probe, status display) share this
-// one source of truth.
-//
-// net.JoinHostPort is the load-bearing detail: an operator setting
-// `admin.addr: "::1"` would otherwise produce the invalid URL
-// `http://::1:7400/...` and a silent connection failure.
-func AdminURL(addr string, port int) string {
-	return "http://" + net.JoinHostPort(addr, strconv.Itoa(port))
-}
-
-// LocalAdminURL is the AdminURL variant for callers reaching the FRP
-// admin API FROM the same host (the `add` reload path and the
-// `status` probe — both run alongside the daemon). Substitutes a
-// loopback address for the unspecified bind addresses (`0.0.0.0`,
-// `::`) so the outbound dial works on every OS, then defers to
-// AdminURL for the URL construction.
-//
-// Cross-platform correctness: Linux's kernel routing treats
-// `0.0.0.0` as `127.0.0.1` on outbound dials, but Windows and macOS
-// do not. An operator who set `admin.addr: 0.0.0.0` + `allow_remote:
-// true` on Windows would otherwise see `add` and `status` silently
-// fail to reach the local listener — the daemon IS reachable
-// off-host (which is what they opted into), they just can't dial it
-// from the same machine via the wildcard address.
-//
-// `0.0.0.0` → `127.0.0.1`, `::` → `::1`. Loopback (`127.0.0.0/8`,
-// `::1`), `localhost`, and non-wildcard addresses pass through
-// unchanged.
-func LocalAdminURL(addr string, port int) string {
-	switch addr {
-	case "0.0.0.0":
-		addr = "127.0.0.1"
-	case "::":
-		addr = "::1"
-	}
-	return AdminURL(addr, port)
-}
+const (
+	DefaultAdminAddr = "127.0.0.1"
+	DefaultAdminPort = 7400
+)

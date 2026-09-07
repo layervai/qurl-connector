@@ -21,8 +21,6 @@
 /coverage.html
 
 # Test fixtures and developer docs — not consumed by the Dockerfile.
-# (NOTE: do NOT exclude `/web/` — `cmd/frpc/main.go` blank-imports
-# `web/frpc`, which `go:embed`s `web/frpc/dist` into the binary.)
 /tests/
 /docs/
 

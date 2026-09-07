@@ -41,7 +41,6 @@ func init() {
 	rootCmd.AddCommand(addCmd)
 	rootCmd.AddCommand(listCmd)
 	rootCmd.AddCommand(removeCmd)
-	rootCmd.AddCommand(statusCmd)
 	rootCmd.AddCommand(desktopConfigCmd)
 }
 
@@ -154,9 +153,9 @@ func getToken() string {
 }
 
 // getAPIBaseURL returns the qURL management API base URL used by explicit
-// commands such as `remove`. The `run`, `list`, and `status` paths do not use
-// this endpoint: registered-agent resource resolution and continuity run over
-// the assigned-cell NHP exchange, while list/status read local durable state.
+// commands such as `remove`. The `run` and `list` paths do not use this
+// endpoint: registered-agent resource resolution and continuity run over the
+// assigned-cell NHP exchange, while list reads local durable state.
 //
 // Precedence: QURL_API_URL, then the `qurl.api_url` config field, then the
 // production default.

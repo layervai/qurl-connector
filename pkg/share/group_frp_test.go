@@ -98,24 +98,51 @@ func TestFRPSessionGroupFactoryBuildsOneSessionForManyRoutes(t *testing.T) {
 	}
 }
 
-func TestGroupProxyNameMatchesSingleRouteNameAtGenerationZero(t *testing.T) {
+func TestFRPSessionGroupFactoryRejectsUnsafeAdmittedHosts(t *testing.T) {
+	routes := groupRoutesOf(groupTestRoutes("a"))
+	factory, err := NewFRPSessionGroupFactory(FRPGroupFactoryConfig{Common: &v1.ClientCommonConfig{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, host := range []string{"frp.example", "2001:db8::1", ":7000", "frp.example:0", "frp.example:65536"} {
+		admission := groupTestAdmission(1)
+		admission.ResourceHost = host
+		if _, _, _, err := factory.BuildConfig(admission, routes); err == nil {
+			t.Errorf("unsafe admitted host %q was accepted", host)
+		}
+	}
+	tlsOn := true
+	tlsFactory, err := NewFRPSessionGroupFactory(FRPGroupFactoryConfig{Common: &v1.ClientCommonConfig{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tlsFactory.cfg.Common.Transport.TLS.Enable = &tlsOn
+	admission := groupTestAdmission(1)
+	admission.ResourceHost = "127.0.0.1:7000"
+	if _, _, _, err := tlsFactory.BuildConfig(admission, routes); err == nil {
+		t.Fatal("IP-literal admitted host with implicit TLS server name was accepted")
+	}
+	for _, protocol := range []string{"wss", "quic"} {
+		factory, err := NewFRPSessionGroupFactory(FRPGroupFactoryConfig{Common: &v1.ClientCommonConfig{}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		factory.cfg.Common.Transport.Protocol = protocol
+		if _, _, _, err := factory.BuildConfig(admission, routes); err == nil {
+			t.Errorf("IP-literal admitted host with %s transport was accepted without a TLS server name", protocol)
+		}
+	}
+}
+
+func TestGroupProxyNameGenerationZero(t *testing.T) {
 	route := groupTestRoutes("local-app")[0]
-	single, err := NewFRPSessionFactory(FRPFactoryConfig{Common: &v1.ClientCommonConfig{}, Route: route})
-	if err != nil {
-		t.Fatal(err)
-	}
-	admission := groupTestAdmission(4095)
-	admission.ResourceID = route.ResourceID
-	_, _, singleNames, err := single.BuildConfig(admission)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := groupProxyName(GroupRoute{LocalHTTPRoute: route}, 4095); got != singleNames[0] {
-		t.Fatalf("generation-0 group proxy name = %q, single-route name = %q", got, singleNames[0])
+	baseName := nhpconfig.FRPProxyName(route.RouteID, sessionProxyDiscriminator(4095))
+	if got := groupProxyName(GroupRoute{LocalHTTPRoute: route}, 4095); got != baseName {
+		t.Fatalf("generation-0 group proxy name = %q, want %q", got, baseName)
 	}
 	restarted := groupProxyName(GroupRoute{LocalHTTPRoute: route, Generation: 1}, 4095)
-	if restarted == singleNames[0] || !strings.HasPrefix(restarted, singleNames[0]+"-r") {
-		t.Fatalf("restart generation name = %q, want %q plus a restart suffix", restarted, singleNames[0])
+	if restarted == baseName || !strings.HasPrefix(restarted, baseName+"-r") {
+		t.Fatalf("restart generation name = %q, want %q plus a restart suffix", restarted, baseName)
 	}
 	// Session and restart discriminators are both base-36, so only the
 	// hyphen keeps a restarted route on one session distinct from a
@@ -130,16 +157,6 @@ func TestGroupProxyNameStaysUniquePastDiscriminatorCap(t *testing.T) {
 	// A session ID wide enough to fill the 16-character discriminator cap
 	// pushes a restart generation through Normalize's prefix+digest form.
 	route := groupTestRoutes("x")[0]
-	single, err := NewFRPSessionFactory(FRPFactoryConfig{Common: &v1.ClientCommonConfig{}, Route: route})
-	if err != nil {
-		t.Fatal(err)
-	}
-	admission := groupTestAdmission(math.MaxUint64)
-	admission.ResourceID = route.ResourceID
-	_, _, singleNames, err := single.BuildConfig(admission)
-	if err != nil {
-		t.Fatal(err)
-	}
 	names := map[uint64]string{}
 	for generation := uint64(0); generation < 3; generation++ {
 		name := groupProxyName(GroupRoute{LocalHTTPRoute: route, Generation: generation}, math.MaxUint64)
@@ -153,15 +170,15 @@ func TestGroupProxyNameStaysUniquePastDiscriminatorCap(t *testing.T) {
 		}
 		names[generation] = name
 	}
-	if names[0] != singleNames[0] || names[0] != "x-nhp3w5e11264sgsf" {
-		t.Fatalf("generation-0 name = %q, single-route name = %q, want the readable full-width session discriminator", names[0], singleNames[0])
+	if names[0] != "x-nhp3w5e11264sgsf" {
+		t.Fatalf("generation-0 name = %q, want the readable full-width session discriminator", names[0])
 	}
 	if !strings.HasPrefix(names[1], "x-nhp3w5e-") || len(names[1]) != len("x-nhp3w5e-")+8 {
 		t.Fatalf("capped restart name = %q, want the 7-character prefix plus an 8-hex digest", names[1])
 	}
 }
 
-func TestNewFRPSessionGroupFactoryRejectsStartFilter(t *testing.T) {
+func TestGroupProxyCompletionRejectsFilterAndInvalidProxy(t *testing.T) {
 	common := &v1.ClientCommonConfig{Start: []string{"other-proxy"}}
 	if _, err := NewFRPSessionGroupFactory(FRPGroupFactoryConfig{Common: common}); err == nil {
 		t.Fatal("a Login-level proxy start filter was accepted for a session group")
@@ -173,6 +190,31 @@ func TestNewFRPSessionGroupFactoryRejectsStartFilter(t *testing.T) {
 	}
 	if _, err := completeGroupProxies(common, proxies); err == nil || !strings.Contains(err.Error(), `"a-nhp1"`) {
 		t.Fatalf("completeGroupProxies() = %v, want an error naming the dropped proxies", err)
+	}
+	common.Start = nil
+	proxies[0].(*v1.HTTPProxyConfig).SubDomain = ""
+	if _, err := completeGroupProxies(common, proxies); err == nil || !strings.Contains(err.Error(), `validate FRP proxy "a-nhp1"`) {
+		t.Fatalf("completeGroupProxies() = %v, want per-proxy validation", err)
+	}
+}
+
+func TestGroupProxyCompletionAcceptsWorstCaseName(t *testing.T) {
+	factory, err := NewFRPSessionGroupFactory(FRPGroupFactoryConfig{Common: &v1.ClientCommonConfig{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	routes := groupRoutesOf(groupTestRoutes("fileviewer-sandbox"))
+	routes[0].Generation = math.MaxUint64
+	common, proxies, names, err := factory.BuildConfig(groupTestAdmission(math.MaxUint64), routes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	completed, err := completeGroupProxies(common, proxies)
+	if err != nil {
+		t.Fatalf("complete worst-case proxy name %q: %v", names[0], err)
+	}
+	if len(completed) != 1 || completed[0].GetBaseConfig().Name != names[0] {
+		t.Fatalf("completed proxies = %#v, want %q", completed, names[0])
 	}
 }
 
@@ -616,6 +658,37 @@ func TestFRPGroupSessionStaleAdmissionEndsWholeSession(t *testing.T) {
 	}
 	if err := session.Update(context.Background(), groupRoutesOf(groupTestRoutes("a"))); !errors.Is(err, ErrSessionGroupEnded) {
 		t.Fatalf("Update after the session ended = %v, want %v", err, ErrSessionGroupEnded)
+	}
+}
+
+func TestInspectRouteStatusMapsExactRejectionTags(t *testing.T) {
+	for _, test := range []struct {
+		wire      string
+		routeErr  error
+		fatalErr  error
+		transient bool
+	}{
+		{wire: "knock_invalid: expired", fatalErr: ErrAdmissionStale},
+		{wire: "owner_missing: missing", fatalErr: ErrAdmissionStale},
+		{wire: "session_stale: stale", fatalErr: ErrAdmissionStale},
+		{wire: "resource_not_found: gone", routeErr: ErrResourceGone},
+		{wire: "registration_failed: retry", transient: true},
+		{wire: "proxy knock_invalid: expired", transient: true},
+		{wire: " knock_invalid: expired", transient: true},
+		{wire: "knock_invalid:expired", transient: true},
+	} {
+		status := &lockedStatusMap{}
+		status.set("a", frpproxy.ProxyPhaseStartErr, test.wire)
+		_, routeErr, fatalErr := inspectRouteStatus(status, "a")
+		if test.transient {
+			if routeErr == nil || fatalErr != nil {
+				t.Errorf("inspectRouteStatus(%q) = route %v, fatal %v; want a transient route error", test.wire, routeErr, fatalErr)
+			}
+			continue
+		}
+		if !errors.Is(routeErr, test.routeErr) || !errors.Is(fatalErr, test.fatalErr) {
+			t.Errorf("inspectRouteStatus(%q) = route %v, fatal %v; want %v, %v", test.wire, routeErr, fatalErr, test.routeErr, test.fatalErr)
+		}
 	}
 }
 
