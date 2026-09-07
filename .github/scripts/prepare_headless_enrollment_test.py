@@ -791,6 +791,33 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
         sleep.assert_called_once_with(7)
         put.assert_called_once()
 
+    def test_initial_read_retry_preserves_complete_install_budget(self) -> None:
+        recovered = {"desired_state": "on", "serving_epoch": 1}
+        with (
+            mock.patch.object(
+                MODULE,
+                "api_request",
+                side_effect=[MODULE.APIRequestRetryable("temporary read"), recovered],
+            ),
+            mock.patch.object(
+                MODULE,
+                "sleep_before_deadline",
+                wraps=MODULE.sleep_before_deadline,
+            ) as guarded_sleep,
+            mock.patch.object(MODULE.time, "sleep"),
+        ):
+            result = MODULE.api_read_before_deadline(
+                MODULE.time.monotonic() + 1000,
+                "https://api.example.com",
+                "lv_live_account-key",
+                "/v1/resources/reviewed/sharing",
+            )
+        self.assertEqual(result, recovered)
+        self.assertEqual(
+            guarded_sleep.call_args.kwargs["reserve_seconds"],
+            MODULE.API_TIMEOUT_SECONDS + MODULE.ENROLLMENT_COMPLETION_RESERVE_SECONDS,
+        )
+
     def test_initial_read_stops_after_one_retry_without_mutation(self) -> None:
         failures = [
             MODULE.APIRequestOutcomeUnknown("first private read detail"),
@@ -851,6 +878,7 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
                 "expires_at": VALID_EXPIRY,
             },
         ]
+        install_complete = mock.Mock()
         with (
             mock.patch.object(MODULE, "api_request", side_effect=responses) as request,
             mock.patch.object(MODULE, "put_parameter") as put,
@@ -863,6 +891,7 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
                 "attempt-1",
                 "us-east-2",
                 now=FIXED_NOW,
+                on_install_complete=install_complete,
             )
         self.assertEqual(request.call_count, 5)
         self.assertEqual(
@@ -886,6 +915,7 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
             "us-east-2",
             "/qurl-s3-connector/fileviewer-nhp/replica-a/bootstrap",
             "lv_live_test-token",
+            on_success=install_complete,
         )
         self.assertEqual(
             {call.args[1] for call in request.call_args_list},
@@ -2455,6 +2485,48 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
         self.assertNotIn("may have been applied", str(raised.exception))
         put.assert_not_called()
 
+    def test_rejected_retry_after_unknown_put_remains_in_cause_chain(self) -> None:
+        rejected_retry = MODULE.EnrollmentError(
+            "qURL API rejected the PUT request with HTTP 403"
+        )
+        responses = [
+            [
+                {
+                    "slug": "fileviewer-sandbox",
+                    "type": "tunnel",
+                    "status": "active",
+                    "resource_id": "MFkw-resource",
+                }
+            ],
+            {"desired_state": "off", "serving_epoch": 0},
+            MODULE.APIRequestOutcomeUnknown(
+                "qURL API PUT response was lost", retry_after_seconds=0
+            ),
+            rejected_retry,
+            *[{"desired_state": "off", "serving_epoch": 0}]
+            * MODULE.SHARING_POLL_ATTEMPTS,
+        ]
+        with (
+            mock.patch.object(MODULE, "api_request", side_effect=responses),
+            mock.patch.object(MODULE, "put_parameter") as put,
+            mock.patch.object(MODULE.time, "sleep"),
+            self.assertRaisesRegex(
+                MODULE.EnrollmentError,
+                "sharing did not reach the required serving epoch",
+            ) as raised,
+        ):
+            MODULE.prepare_enrollment(
+                "https://api.example.com",
+                "lv_live_account-key",
+                "fileviewer-nhp-replica-a",
+                "attempt-1",
+                "us-east-2",
+                now=FIXED_NOW,
+            )
+        self.assertIs(raised.exception.__cause__, rejected_retry)
+        self.assertIn("HTTP 403", MODULE.format_enrollment_error(raised.exception))
+        put.assert_not_called()
+
     def test_deterministic_poll_rejection_fails_without_retry(self) -> None:
         responses = [
             [
@@ -2630,8 +2702,16 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
         )
 
     def test_run_arms_and_cancels_posix_wall_clock_deadline(self) -> None:
+        def complete_install(*, deadline, on_install_complete):
+            self.assertEqual(deadline, 100 + MODULE.SCRIPT_DEADLINE_SECONDS)
+            on_install_complete()
+            # A signal that was pending when the timer was disarmed must not
+            # turn the completed write into a reported failure.
+            deadline_handler = install_handler.call_args_list[0].args[1]
+            deadline_handler(MODULE.signal.SIGALRM, None)
+
         with (
-            mock.patch.object(MODULE, "main") as main,
+            mock.patch.object(MODULE, "main", side_effect=complete_install) as main,
             mock.patch.object(MODULE.time, "monotonic", return_value=100),
             mock.patch.object(
                 MODULE.signal,
@@ -2642,18 +2722,23 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
         ):
             MODULE.run()
 
-        main.assert_called_once_with(deadline=100 + MODULE.SCRIPT_DEADLINE_SECONDS)
-        install_handler.assert_has_calls(
-            [
-                mock.call(MODULE.signal.SIGALRM, MODULE._raise_script_deadline),
-                mock.call(MODULE.signal.SIGALRM, MODULE.signal.SIG_DFL),
-            ]
+        main.assert_called_once()
+        self.assertEqual(install_handler.call_count, 2)
+        self.assertEqual(
+            install_handler.call_args_list[0].args[0], MODULE.signal.SIGALRM
         )
-        timer.assert_has_calls(
+        self.assertTrue(callable(install_handler.call_args_list[0].args[1]))
+        self.assertEqual(
+            install_handler.call_args_list[1],
+            mock.call(MODULE.signal.SIGALRM, MODULE.signal.SIG_DFL),
+        )
+        self.assertEqual(
+            timer.call_args_list,
             [
                 mock.call(MODULE.signal.ITIMER_REAL, MODULE.SCRIPT_DEADLINE_SECONDS),
                 mock.call(MODULE.signal.ITIMER_REAL, 0),
-            ]
+                mock.call(MODULE.signal.ITIMER_REAL, 0),
+            ],
         )
 
     def test_posix_wall_clock_handler_raises_reviewed_deadline(self) -> None:
@@ -2933,6 +3018,7 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
             "attempt-1",
             "us-east-2",
             deadline=None,
+            on_install_complete=None,
         )
 
     def test_main_rejects_bad_api_key_before_request(self) -> None:
@@ -2997,13 +3083,30 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
         prepare.assert_not_called()
 
     def test_put_parameter_reports_process_start_failure(self) -> None:
+        install_complete = mock.Mock()
         with mock.patch.object(
             MODULE.subprocess, "run", side_effect=FileNotFoundError("aws")
         ):
             with self.assertRaisesRegex(MODULE.EnrollmentError, "could not start"):
                 MODULE.put_parameter(
-                    "us-east-2", "/reviewed/name", "lv_live_secret-token"
+                    "us-east-2",
+                    "/reviewed/name",
+                    "lv_live_secret-token",
+                    on_success=install_complete,
                 )
+        install_complete.assert_not_called()
+
+    def test_put_parameter_calls_completion_callback_after_success(self) -> None:
+        completed = mock.Mock(returncode=0, stderr="")
+        install_complete = mock.Mock()
+        with mock.patch.object(MODULE.subprocess, "run", return_value=completed):
+            MODULE.put_parameter(
+                "us-east-2",
+                "/reviewed/name",
+                "lv_live_secret-token",
+                on_success=install_complete,
+            )
+        install_complete.assert_called_once_with()
 
     def test_put_parameter_reports_timeout(self) -> None:
         with mock.patch.object(
@@ -3274,6 +3377,7 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
                     "/qurl-s3-connector/"
                     + f"fileviewer-nhp/replica-{replica}/bootstrap",
                     "lv_live_replica-token",
+                    on_success=None,
                 )
 
 

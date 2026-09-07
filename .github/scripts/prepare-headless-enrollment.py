@@ -20,7 +20,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from typing import Any
+from typing import Any, Callable
 
 KEY = re.compile(r"lv_live_[A-Za-z0-9_-]+\Z")
 GENERATION = re.compile(r"[a-z0-9][a-z0-9-]{0,63}\Z")
@@ -490,7 +490,9 @@ def api_read_before_deadline(
                 sleep_before_deadline(
                     min(max(retry_delay, 0.0), MAX_RETRY_AFTER_SECONDS),
                     deadline,
-                    reserve_seconds=API_TIMEOUT_SECONDS,
+                    reserve_seconds=(
+                        API_TIMEOUT_SECONDS + ENROLLMENT_COMPLETION_RESERVE_SECONDS
+                    ),
                 )
     raise EnrollmentError(
         "qURL API read failed after one bounded retry"
@@ -647,9 +649,20 @@ def _put_parameter(region: str, parameter: str, token: str) -> None:
         )
 
 
-def put_parameter(region: str, parameter: str, token: str) -> None:
+def put_parameter(
+    region: str,
+    parameter: str,
+    token: str,
+    *,
+    on_success: Callable[[], None] | None = None,
+) -> None:
     try:
         _put_parameter(region, parameter, token)
+        # The successful SSM response is the final outcome-changing event.
+        # Disarm the process deadline before this function returns so later
+        # notices cannot turn a completed installation into a false failure.
+        if on_success is not None:
+            on_success()
     except EnrollmentDeadlineExceeded as exc:
         # The POSIX alarm can interrupt the AWS child, response processing, or
         # retry delay after PutParameter starts. Keep every such outcome
@@ -670,6 +683,7 @@ def mint_and_install_enrollment(
     *,
     now: dt.datetime | None = None,
     deadline: float | None = None,
+    on_install_complete: Callable[[], None] | None = None,
 ) -> tuple[dt.datetime, str]:
     operation_deadline = _operation_deadline(deadline)
     mint_path = "/v1/api-keys"
@@ -797,7 +811,12 @@ def mint_and_install_enrollment(
         # operation after that deployment window; every minted token expires
         # within one hour.
         require_deadline_budget(operation_deadline, AWS_INSTALL_RESERVE_SECONDS)
-        put_parameter(region, parameter, token)
+        put_parameter(
+            region,
+            parameter,
+            token,
+            on_success=on_install_complete,
+        )
     except EnrollmentError as exc:
         possible_extra_suffix = (
             "; the first mint outcome is also unknown and another one-hour credential may remain live"
@@ -833,6 +852,7 @@ def prepare_enrollment(
     *,
     now: dt.datetime | None = None,
     deadline: float | None = None,
+    on_install_complete: Callable[[], None] | None = None,
 ) -> None:
     # The caller supplies one pre-provisioned qURL API key. Reuse it for the
     # complete bounded operation; this tool does not perform an OAuth or Auth0
@@ -1075,7 +1095,7 @@ def prepare_enrollment(
                     update_outcome_unknown=put_failure is not None,
                     final_poll_state_valid=final_poll_state_valid,
                 )
-            )
+            ) from last_put_rejection
 
     try:
         # Mint only after any required lifecycle transition is confirmed, so
@@ -1090,6 +1110,7 @@ def prepare_enrollment(
             parameter,
             now=now,
             deadline=operation_deadline,
+            on_install_complete=on_install_complete,
         )
     except EnrollmentError as exc:
         if sharing_transition_observed:
@@ -1110,7 +1131,11 @@ def prepare_enrollment(
     )
 
 
-def main(*, deadline: float | None = None) -> None:
+def main(
+    *,
+    deadline: float | None = None,
+    on_install_complete: Callable[[], None] | None = None,
+) -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--target", required=True)
     parser.add_argument("--generation", required=True)
@@ -1136,6 +1161,7 @@ def main(*, deadline: float | None = None) -> None:
         args.generation,
         args.region,
         deadline=deadline,
+        on_install_complete=on_install_complete,
     )
 
 
@@ -1163,10 +1189,28 @@ def run() -> None:
     # Compute the checkpoint deadline before arming the timer. It can be
     # slightly earlier than the alarm, but never optimistically later.
     script_deadline = time.monotonic() + SCRIPT_DEADLINE_SECONDS
-    previous_alarm_handler = signal.signal(signal.SIGALRM, _raise_script_deadline)
+    installation_complete = False
+
+    def deadline_handler(signum: int, frame: Any) -> None:
+        # The completion flag is set as part of the successful PutParameter
+        # path. It also makes a pending alarm harmless before setitimer(0)
+        # removes any future alarm.
+        if installation_complete:
+            return
+        _raise_script_deadline(signum, frame)
+
+    def complete_installation() -> None:
+        nonlocal installation_complete
+        installation_complete = True
+        signal.setitimer(signal.ITIMER_REAL, 0)
+
+    previous_alarm_handler = signal.signal(signal.SIGALRM, deadline_handler)
     signal.setitimer(signal.ITIMER_REAL, SCRIPT_DEADLINE_SECONDS)
     try:
-        main(deadline=script_deadline)
+        main(
+            deadline=script_deadline,
+            on_install_complete=complete_installation,
+        )
     except EnrollmentError as exc:
         print(f"error: {format_enrollment_error(exc)}", file=sys.stderr)
         raise SystemExit(1)
