@@ -56,6 +56,14 @@ func findOperationalPaths(text string) []string {
 		}
 		if !hasPublicRepositoryPrefix(text, start) {
 			paths = append(paths, candidate)
+			offset += match[3]
+			continue
+		}
+		// Exempt only the reviewed repository segment. Re-scan the rest of
+		// the match so a concatenated operational namespace cannot hide in it.
+		if nextSlash := strings.IndexByte(text[start+1:offset+match[3]], '/'); nextSlash >= 0 {
+			offset = start + 1 + nextSlash
+			continue
 		}
 		offset += match[3]
 	}
@@ -221,6 +229,15 @@ func TestOperationalPathDetectorIgnoresRepositoryReferences(t *testing.T) {
 	}
 	if got := findOperationalPaths("github.com/layervai" + path); len(got) != 1 || got[0] != path {
 		t.Fatalf("unreviewed repository bypassed operational path detection: %q", got)
+	}
+	hiddenPath := "/qurl-example-service/" + "nhp/replica-z/bootstrap"
+	for _, reference := range []string{
+		"github.com/layervai/qurl-go/x" + hiddenPath,
+		"github.com/layervai/qurl-connector/.." + hiddenPath,
+	} {
+		if got := findOperationalPaths(reference); len(got) != 1 || got[0] != hiddenPath {
+			t.Fatalf("reviewed repository prefix hid a second operational path: %q", got)
+		}
 	}
 }
 
