@@ -11,6 +11,7 @@ import http.client
 import json
 import os
 import re
+import signal
 import socket
 import ssl
 import subprocess
@@ -68,6 +69,8 @@ AWS_REJECTED_ERROR_CODES = {
     "KMSAccessDeniedException",
     "KMSInvalidStateException",
     "KMSKeyNotFound",
+    # --overwrite makes this unexpected, but AWS documents it as a rejection;
+    # classify it safely if a future CLI or service path returns it.
     "ParameterAlreadyExists",
     "ParameterLimitExceeded",
     "ParameterMaxVersionLimitExceeded",
@@ -294,20 +297,21 @@ def sleep_before_deadline(
     time.sleep(delay_seconds)
 
 
-def sharing_deadline_message(
+def sharing_failure_message(
+    message: str,
     *,
     sharing_transition_observed: bool,
     sharing_observed_on: bool,
     update_outcome_unknown: bool,
+    final_poll_state_valid: bool,
 ) -> str:
-    message = "enrollment preparation reached its internal deadline"
     if sharing_transition_observed:
         return (
             message + "; sharing changed from off to on during this run and was left on"
         )
     if sharing_observed_on:
         return message + "; sharing for this resource was observed on and was left on"
-    if update_outcome_unknown:
+    if update_outcome_unknown and not final_poll_state_valid:
         return (
             message
             + "; the sharing update outcome is unknown and sharing may have been applied before the response was lost and may have been left on"
@@ -315,7 +319,7 @@ def sharing_deadline_message(
     return message
 
 
-def api_request(
+def _api_request(
     api_endpoint: str,
     api_key: str,
     path: str,
@@ -416,6 +420,39 @@ def api_request(
     return envelope["data"]
 
 
+def api_request(
+    api_endpoint: str,
+    api_key: str,
+    path: str,
+    *,
+    method: str = "GET",
+    body: dict[str, Any] | None = None,
+    idempotency_key: str = "",
+    expected_status: int | tuple[int, ...] = 200,
+    response_status: list[int] | None = None,
+) -> Any:
+    try:
+        return _api_request(
+            api_endpoint,
+            api_key,
+            path,
+            method=method,
+            body=body,
+            idempotency_key=idempotency_key,
+            expected_status=expected_status,
+            response_status=response_status,
+        )
+    except EnrollmentDeadlineExceeded as exc:
+        # A wall-clock alarm can interrupt any point in response processing.
+        # Once a mutation starts, its outcome is unknown even if no complete
+        # response reached the runner.
+        if method in {"POST", "PUT"}:
+            raise APIRequestOutcomeUnknown(
+                f"qURL API {method} request reached the internal deadline"
+            ) from exc
+        raise
+
+
 def api_request_before_deadline(
     deadline: float,
     api_endpoint: str,
@@ -486,6 +523,8 @@ def _put_parameter_command(region: str, parameter: str) -> list[str]:
 
 def put_parameter(region: str, parameter: str, token: str) -> None:
     clean_env = os.environ.copy()
+    # main() already removes these values. Remove them again here so direct
+    # library-style calls cannot pass qURL bearer material to the AWS process.
     clean_env.pop("QURL_SANDBOX_API_KEY", None)
     clean_env.pop("QURL_SANDBOX_API_ENDPOINT", None)
     clean_env.pop("QURL_SANDBOX_API_ENDPOINT_SHA256", None)
@@ -892,10 +931,12 @@ def prepare_enrollment(
                     )
                 except EnrollmentDeadlineExceeded as deadline_exc:
                     raise EnrollmentError(
-                        sharing_deadline_message(
+                        sharing_failure_message(
+                            "enrollment preparation reached its internal deadline",
                             sharing_transition_observed=sharing_transition_observed,
                             sharing_observed_on=sharing_observed_on,
                             update_outcome_unknown=put_failure is not None,
+                            final_poll_state_valid=False,
                         )
                     ) from deadline_exc
                 continue
@@ -930,10 +971,13 @@ def prepare_enrollment(
                     )
             except EnrollmentDeadlineExceeded as exc:
                 raise EnrollmentError(
-                    sharing_deadline_message(
+                    sharing_failure_message(
+                        "enrollment preparation reached its internal deadline",
                         sharing_transition_observed=sharing_transition_observed,
                         sharing_observed_on=sharing_observed_on,
                         update_outcome_unknown=put_failure is not None,
+                        # This status request did not return a final state.
+                        final_poll_state_valid=False,
                     )
                 ) from exc
             except EnrollmentError as exc:
@@ -982,34 +1026,35 @@ def prepare_enrollment(
                     )
                 except EnrollmentDeadlineExceeded as exc:
                     raise EnrollmentError(
-                        sharing_deadline_message(
+                        sharing_failure_message(
+                            "enrollment preparation reached its internal deadline",
                             sharing_transition_observed=sharing_transition_observed,
                             sharing_observed_on=sharing_observed_on,
                             update_outcome_unknown=put_failure is not None,
+                            final_poll_state_valid=final_poll_state_valid,
                         )
                     ) from exc
         else:
             if last_poll_failure is not None:
-                message = "sharing did not reach the required serving epoch because status checks failed"
-                if sharing_transition_observed:
-                    message += "; sharing changed from off to on during this run and was left on"
-                elif sharing_observed_on:
-                    message += (
-                        "; sharing for this resource was observed on and was left on"
-                    )
-                elif put_failure is not None:
-                    message += "; the sharing update outcome is unknown and sharing may have been applied before the response was lost and may have been left on"
-                raise EnrollmentError(message) from last_poll_failure
-            message = "sharing did not reach the required serving epoch"
-            if sharing_transition_observed:
-                message += (
-                    "; sharing changed from off to on during this run and was left on"
+                message = sharing_failure_message(
+                    "sharing did not reach the required serving epoch because status checks failed",
+                    sharing_transition_observed=sharing_transition_observed,
+                    sharing_observed_on=sharing_observed_on,
+                    update_outcome_unknown=put_failure is not None,
+                    # The last status request failed, so an earlier valid off
+                    # observation is not a final reconciliation result.
+                    final_poll_state_valid=False,
                 )
-            elif sharing_observed_on:
-                message += "; sharing for this resource was observed on and was left on"
-            elif put_failure is not None and not final_poll_state_valid:
-                message += "; the sharing update outcome is unknown and sharing may have been applied before the response was lost and may have been left on"
-            raise EnrollmentError(message)
+                raise EnrollmentError(message) from last_poll_failure
+            raise EnrollmentError(
+                sharing_failure_message(
+                    "sharing did not reach the required serving epoch",
+                    sharing_transition_observed=sharing_transition_observed,
+                    sharing_observed_on=sharing_observed_on,
+                    update_outcome_unknown=put_failure is not None,
+                    final_poll_state_valid=final_poll_state_valid,
+                )
+            )
 
     try:
         # Mint only after any required lifecycle transition is confirmed, so
@@ -1080,7 +1125,15 @@ def format_enrollment_error(exc: EnrollmentError) -> str:
     return f"{messages[0]} (caused by: {'; '.join(messages[1:])})"
 
 
+def _raise_script_deadline(_signum: int, _frame: Any) -> None:
+    raise EnrollmentDeadlineExceeded(
+        "enrollment preparation reached its internal deadline"
+    )
+
+
 def run() -> None:
+    previous_alarm_handler = signal.signal(signal.SIGALRM, _raise_script_deadline)
+    signal.setitimer(signal.ITIMER_REAL, SCRIPT_DEADLINE_SECONDS)
     try:
         main()
     except EnrollmentError as exc:
@@ -1092,6 +1145,9 @@ def run() -> None:
             file=sys.stderr,
         )
         raise SystemExit(1) from None
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous_alarm_handler)
 
 
 if __name__ == "__main__":

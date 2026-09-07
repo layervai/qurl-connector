@@ -49,8 +49,8 @@ Use reserved example domains and documentation account IDs in tests and docs.
 
 Tests must not depend on LayerV credentials or a live LayerV environment.
 Deployment smoke and soak automation is maintained separately from this public
-source repository. A manual, fail-closed recovery workflow can live here when
-it is version-bound to this module and contains only reviewed, non-secret fixed
+source repository. A manual, fail-closed recovery workflow for this module's
+Connector fleet can live here when it contains only reviewed, non-secret fixed
 slot topology. It must not contain a private endpoint, credential, cloud account
 identifier, customer data, or rollout evidence.
 
@@ -58,6 +58,10 @@ The manual recovery also requires the compiled OpenSSL CA file or directory
 from the Python runtime. A missing trust store is a hard stop before the first
 qURL API request. It reports `no compiled TLS trust store is available`, not a
 network failure.
+
+The recovery workflow is Ubuntu/POSIX-only. It uses a POSIX wall-clock alarm and
+AWS CLI `file:///dev/stdin` expansion. Do not move it to a non-POSIX runner
+without equivalent deadline and decoded-wire tests.
 
 ## Commit messages
 

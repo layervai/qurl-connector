@@ -618,6 +618,40 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
                 MODULE.sleep_before_deadline(2, 100, reserve_seconds=10)
         sleep.assert_not_called()
 
+    def test_wall_clock_deadline_marks_mutation_outcome_unknown(self) -> None:
+        with mock.patch.object(
+            MODULE,
+            "_api_request",
+            side_effect=MODULE.EnrollmentDeadlineExceeded("internal deadline"),
+        ):
+            with self.assertRaisesRegex(
+                MODULE.APIRequestOutcomeUnknown, "POST request.*internal deadline"
+            ) as raised:
+                MODULE.api_request(
+                    "https://api.example.com",
+                    "lv_live_account-key",
+                    "/v1/api-keys",
+                    method="POST",
+                )
+        self.assertIsInstance(
+            raised.exception.__cause__, MODULE.EnrollmentDeadlineExceeded
+        )
+
+    def test_wall_clock_deadline_remains_terminal_for_read(self) -> None:
+        with mock.patch.object(
+            MODULE,
+            "_api_request",
+            side_effect=MODULE.EnrollmentDeadlineExceeded("internal deadline"),
+        ):
+            with self.assertRaisesRegex(
+                MODULE.EnrollmentDeadlineExceeded, "internal deadline"
+            ):
+                MODULE.api_request(
+                    "https://api.example.com",
+                    "lv_live_account-key",
+                    "/v1/resources",
+                )
+
     def test_api_request_normalizes_protocol_failure(self) -> None:
         with mock.patch.object(
             MODULE.NO_REDIRECT_OPENER,
@@ -1293,6 +1327,32 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
                     deadline=100,
                 )
         request.assert_not_called()
+        put.assert_not_called()
+
+    def test_wall_clock_alarm_during_mint_reports_unknown_credential(self) -> None:
+        with (
+            mock.patch.object(
+                MODULE,
+                "_api_request",
+                side_effect=MODULE.EnrollmentDeadlineExceeded("internal deadline"),
+            ),
+            mock.patch.object(MODULE, "put_parameter") as put,
+            mock.patch.object(MODULE.time, "sleep"),
+        ):
+            with self.assertRaisesRegex(
+                MODULE.EnrollmentError,
+                "credential result is unknown.*retry the same target and generation",
+            ):
+                MODULE.mint_and_install_enrollment(
+                    "https://api.example.com",
+                    "lv_live_account-key",
+                    "fileviewer-nhp-replica-a",
+                    "attempt-1",
+                    "us-east-2",
+                    "fileviewer-sandbox",
+                    "/reviewed/name",
+                    now=FIXED_NOW,
+                )
         put.assert_not_called()
 
     def test_minted_credential_keeps_guidance_if_budget_later_disappears(
@@ -2478,6 +2538,52 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
         output.assert_called_once_with(
             "error: unexpected internal failure (ValueError)", file=MODULE.sys.stderr
         )
+
+    def test_run_arms_and_cancels_posix_wall_clock_deadline(self) -> None:
+        with (
+            mock.patch.object(MODULE, "main") as main,
+            mock.patch.object(
+                MODULE.signal,
+                "signal",
+                return_value=MODULE.signal.SIG_DFL,
+            ) as install_handler,
+            mock.patch.object(MODULE.signal, "setitimer") as timer,
+        ):
+            MODULE.run()
+
+        main.assert_called_once_with()
+        install_handler.assert_has_calls(
+            [
+                mock.call(MODULE.signal.SIGALRM, MODULE._raise_script_deadline),
+                mock.call(MODULE.signal.SIGALRM, MODULE.signal.SIG_DFL),
+            ]
+        )
+        timer.assert_has_calls(
+            [
+                mock.call(MODULE.signal.ITIMER_REAL, MODULE.SCRIPT_DEADLINE_SECONDS),
+                mock.call(MODULE.signal.ITIMER_REAL, 0),
+            ]
+        )
+
+    def test_posix_wall_clock_handler_raises_reviewed_deadline(self) -> None:
+        with self.assertRaisesRegex(
+            MODULE.EnrollmentDeadlineExceeded, "internal deadline"
+        ):
+            MODULE._raise_script_deadline(MODULE.signal.SIGALRM, None)
+
+    def test_posix_wall_clock_timer_interrupts_blocking_work(self) -> None:
+        previous_handler = MODULE.signal.signal(
+            MODULE.signal.SIGALRM, MODULE._raise_script_deadline
+        )
+        try:
+            MODULE.signal.setitimer(MODULE.signal.ITIMER_REAL, 0.01)
+            with self.assertRaisesRegex(
+                MODULE.EnrollmentDeadlineExceeded, "internal deadline"
+            ):
+                MODULE.time.sleep(1)
+        finally:
+            MODULE.signal.setitimer(MODULE.signal.ITIMER_REAL, 0)
+            MODULE.signal.signal(MODULE.signal.SIGALRM, previous_handler)
 
     def test_put_parameter_sends_token_only_on_stdin(self) -> None:
         clean_env = {
