@@ -219,8 +219,8 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
         self.assertIn("lint-python:", makefile)
         self.assertIn("test-python:", makefile)
         self.assertIn(
-            "cd .github/scripts && PYTHONDONTWRITEBYTECODE=1 $(PYTHON) "
-            "-m unittest $(notdir $(PYTHON_TEST_FILES))",
+            "PYTHONDONTWRITEBYTECODE=1 $(PYTHON) -m unittest discover "
+            "-s .github/scripts -p '*_test.py'",
             makefile,
         )
         self.assertIn("ruff check --no-cache $(PYTHON_LINT_FILES)", makefile)
@@ -1941,7 +1941,7 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
                 )
         put.assert_not_called()
 
-    def test_transient_poll_failure_uses_remaining_attempts(self) -> None:
+    def test_transient_poll_failure_preserves_install_budget(self) -> None:
         responses = [
             [
                 {
@@ -1966,6 +1966,11 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
         with (
             mock.patch.object(MODULE, "api_request", side_effect=responses),
             mock.patch.object(MODULE, "put_parameter") as put,
+            mock.patch.object(
+                MODULE,
+                "sleep_before_deadline",
+                wraps=MODULE.sleep_before_deadline,
+            ) as guarded_sleep,
             mock.patch.object(MODULE.time, "sleep") as sleep,
         ):
             MODULE.prepare_enrollment(
@@ -1977,6 +1982,10 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
                 now=FIXED_NOW,
             )
         sleep.assert_called_once_with(MODULE.SHARING_POLL_SECONDS)
+        self.assertEqual(
+            guarded_sleep.call_args.kwargs["reserve_seconds"],
+            MODULE.API_TIMEOUT_SECONDS + MODULE.ENROLLMENT_COMPLETION_RESERVE_SECONDS,
+        )
         put.assert_called_once()
 
     def test_rate_limited_poll_honors_retry_after_and_continues(self) -> None:
@@ -2093,7 +2102,7 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
         )
         self.assertLess(MODULE.SCRIPT_DEADLINE_SECONDS, 12 * 60)
 
-    def test_deadline_after_sharing_transition_reports_left_on(self) -> None:
+    def test_poll_does_not_consume_mint_and_install_reserve(self) -> None:
         responses = [
             [
                 {
@@ -2109,7 +2118,7 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
         with (
             mock.patch.object(MODULE, "api_request", side_effect=responses) as request,
             mock.patch.object(MODULE, "put_parameter") as put,
-            mock.patch.object(MODULE.time, "monotonic", side_effect=[0, 0, 0, 91]),
+            mock.patch.object(MODULE.time, "monotonic", side_effect=[0, 0, 0, 9]),
             mock.patch.object(MODULE.time, "sleep") as sleep,
         ):
             with self.assertRaisesRegex(

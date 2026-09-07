@@ -24,17 +24,22 @@ Use reserved example domains and documentation account IDs in tests and docs.
    make test
    make test-race
    make lint
-   make lint-python
-   make test-python
+   (
+   set -e
+   qurl_lint_venv=$(mktemp -d)
+   trap 'rm -rf -- "$qurl_lint_venv"' EXIT
+   python3.13 -m venv "$qurl_lint_venv"
+   "$qurl_lint_venv/bin/python" -m pip install --require-hashes -r .github/scripts/requirements-lint.txt
+   PYTHON="$qurl_lint_venv/bin/python" make lint-python
+   PYTHON="$qurl_lint_venv/bin/python" make test-python
+   )
    make vet
    make verify-deps
    go test ./.github/scripts
    make frpc
    ```
 
-   The Python tests require Python 3.13 and AWS CLI v2. Install the pinned
-   linter in a temporary Python 3.13 virtual environment, then run
-   `PYTHON=/path/to/venv/bin/python make lint-python`. On Debian or Ubuntu,
+   The Python tests require Python 3.13 and AWS CLI v2. On Debian or Ubuntu,
    install the matching `python3.13-venv` package first.
 
 5. Describe user-visible behavior, security impact, and validation in the pull

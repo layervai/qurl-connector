@@ -68,7 +68,7 @@ test-race:
 
 test-python:
 	@test -n "$(PYTHON_TEST_FILES)" || { echo "no Python tests found under .github/scripts" >&2; exit 1; }
-	cd .github/scripts && PYTHONDONTWRITEBYTECODE=1 $(PYTHON) -m unittest $(notdir $(PYTHON_TEST_FILES))
+	PYTHONDONTWRITEBYTECODE=1 $(PYTHON) -m unittest discover -s .github/scripts -p '*_test.py'
 
 vet:
 	go vet ./...

@@ -80,7 +80,7 @@ AWS_REJECTED_ERROR_CODES = {
     "UnsupportedOperationException",
     "UnsupportedParameterType",
     "ValidationException",
-} | (AWS_RETRYABLE_ERROR_CODES - AWS_UNKNOWN_OUTCOME_ERROR_CODES)
+}
 MAX_RESPONSE_BYTES = 64 * 1024
 API_TIMEOUT_SECONDS = 10
 AWS_CLI_CONNECT_TIMEOUT_SECONDS = 5
@@ -93,6 +93,9 @@ SHARING_POLL_ATTEMPTS = 13
 SHARING_POLL_SECONDS = 10
 RETRY_SECONDS = 2
 AWS_INSTALL_RESERVE_SECONDS = (2 * AWS_TIMEOUT_SECONDS) + RETRY_SECONDS
+ENROLLMENT_COMPLETION_RESERVE_SECONDS = (
+    API_TIMEOUT_SECONDS + AWS_INSTALL_RESERVE_SECONDS
+)
 MAX_RETRY_AFTER_SECONDS = 30
 SCRIPT_DEADLINE_SECONDS = 8 * 60
 TARGETS = {
@@ -444,9 +447,15 @@ def api_request(
 
 
 def api_request_before_deadline(
-    deadline: float, api_endpoint: str, api_key: str, path: str, **kwargs: Any
+    deadline: float,
+    api_endpoint: str,
+    api_key: str,
+    path: str,
+    *,
+    remaining_reserve_seconds: float = 0,
+    **kwargs: Any,
 ) -> Any:
-    require_deadline_budget(deadline, API_TIMEOUT_SECONDS)
+    require_deadline_budget(deadline, API_TIMEOUT_SECONDS + remaining_reserve_seconds)
     return api_request(api_endpoint, api_key, path, **kwargs)
 
 
@@ -654,7 +663,7 @@ def mint_and_install_enrollment(
     # consume the SSM installation budget.
     require_deadline_budget(
         operation_deadline,
-        API_TIMEOUT_SECONDS + AWS_INSTALL_RESERVE_SECONDS,
+        ENROLLMENT_COMPLETION_RESERVE_SECONDS,
     )
     for attempt in range(2):
         try:
@@ -691,9 +700,7 @@ def mint_and_install_enrollment(
                     sleep_before_deadline(
                         bounded_retry_delay,
                         operation_deadline,
-                        reserve_seconds=(
-                            API_TIMEOUT_SECONDS + AWS_INSTALL_RESERVE_SECONDS
-                        ),
+                        reserve_seconds=ENROLLMENT_COMPLETION_RESERVE_SECONDS,
                     )
                 except EnrollmentDeadlineExceeded as deadline_exc:
                     if mint_outcome_unknown:
@@ -930,6 +937,9 @@ def prepare_enrollment(
                     api_endpoint,
                     api_key,
                     resource_path + "/sharing",
+                    # Keep the complete mint request and SSM installation
+                    # budget available after this status request finishes.
+                    remaining_reserve_seconds=ENROLLMENT_COMPLETION_RESERVE_SECONDS,
                 )
                 last_poll_failure = None
             except APIRequestRetryable as exc:
@@ -988,7 +998,9 @@ def prepare_enrollment(
                     sleep_before_deadline(
                         poll_delay,
                         operation_deadline,
-                        reserve_seconds=API_TIMEOUT_SECONDS,
+                        reserve_seconds=(
+                            API_TIMEOUT_SECONDS + ENROLLMENT_COMPLETION_RESERVE_SECONDS
+                        ),
                     )
                 except EnrollmentDeadlineExceeded as exc:
                     raise EnrollmentError(
