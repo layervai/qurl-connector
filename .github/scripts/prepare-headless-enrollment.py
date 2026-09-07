@@ -92,7 +92,13 @@ AWS_TIMEOUT_SECONDS = 35
 SHARING_POLL_ATTEMPTS = 13
 SHARING_POLL_SECONDS = 10
 RETRY_SECONDS = 2
-AWS_INSTALL_RESERVE_SECONDS = (2 * AWS_TIMEOUT_SECONDS) + RETRY_SECONDS
+# Include process creation and interpreter overhead around the two wall-clock
+# subprocess timeouts. The workflow step also keeps 60 seconds beyond the
+# script's internal deadline for safe error reporting.
+AWS_INSTALL_RESERVE_SECONDS = (2 * AWS_TIMEOUT_SECONDS) + RETRY_SECONDS + 1
+# urllib applies API_TIMEOUT_SECONDS to each socket operation, not to the whole
+# request. This reserve is a best-effort preflight. A slow mint can consume it,
+# so the post-mint guard still reports the live credential without starting SSM.
 ENROLLMENT_COMPLETION_RESERVE_SECONDS = (
     API_TIMEOUT_SECONDS + AWS_INSTALL_RESERVE_SECONDS
 )
@@ -569,6 +575,8 @@ def put_parameter(region: str, parameter: str, token: str) -> None:
         # A returned service error means the request finished, so repeating the
         # same value with --overwrite is idempotent. A subprocess timeout can
         # leave the original request in flight and is never retried blindly.
+        # Codes in both sets retry once because the value is byte-identical;
+        # only a second failure is reported as outcome unknown.
         if attempt == 0 and error_class in AWS_RETRYABLE_ERROR_CODES:
             time.sleep(RETRY_SECONDS)
             continue

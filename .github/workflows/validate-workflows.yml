@@ -39,22 +39,11 @@ jobs:
           python-version: "3.13"
       - name: Install pinned Python linter
         run: python3 -m pip install --require-hashes -r .github/scripts/requirements-lint.txt
-      - name: Lint sandbox enrollment recovery
-        run: make lint-python
       - name: Require tested AWS CLI major
         # ubuntu-latest supplies AWS CLI v2; fail with a clear contract error
         # if a future runner image changes that dependency.
-        run: |
-          set -euo pipefail
-          if ! aws_version=$(aws --version 2>&1); then
-            echo "::error::enrollment recovery tests require AWS CLI v2, but aws is unavailable"
-            exit 1
-          fi
-          if [[ ! "$aws_version" =~ ^aws-cli/2\. ]]; then
-            echo "::error::enrollment recovery tests require AWS CLI v2"
-            exit 1
-          fi
-      - name: Test sandbox enrollment recovery
-        run: make test-python
+        run: ./scripts/require-aws-cli-v2.sh
+      - name: Check sandbox enrollment recovery
+        run: make check-python
       - name: Test workflow contracts
         run: go test ./.github/scripts

@@ -139,16 +139,7 @@ jobs:
       - name: Require tested AWS CLI major
         # ubuntu-latest supplies AWS CLI v2 today. This explicit precondition
         # keeps an image change from assuming the recovery role before failure.
-        run: |
-          set -euo pipefail
-          if ! aws_version=$(aws --version 2>&1); then
-            echo "::error::enrollment recovery requires AWS CLI v2, but aws is unavailable"
-            exit 1
-          fi
-          if [[ ! "$aws_version" =~ ^aws-cli/2\. ]]; then
-            echo "::error::enrollment recovery requires AWS CLI v2"
-            exit 1
-          fi
+        run: ./scripts/require-aws-cli-v2.sh
 
       - name: Configure narrow AWS credentials
         uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3

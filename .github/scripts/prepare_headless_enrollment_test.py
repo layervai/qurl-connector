@@ -15,9 +15,11 @@ from unittest import mock
 SCRIPT = pathlib.Path(__file__).with_name("prepare-headless-enrollment.py")
 WORKFLOW = SCRIPT.parent.parent / "workflows" / "rotate-tunnel-enrollment.yml"
 VALIDATE_WORKFLOW = SCRIPT.parent.parent / "workflows" / "validate-workflows.yml"
+CI_WORKFLOW = SCRIPT.parent.parent / "workflows" / "ci.yml"
 SANITIZER = SCRIPT.with_name("public_source_sanitization_test.go")
 GITIGNORE = SCRIPT.parent.parent.parent / ".gitignore"
 MAKEFILE = SCRIPT.parent.parent.parent / "Makefile"
+AWS_CLI_REQUIREMENT = SCRIPT.parent.parent.parent / "scripts/require-aws-cli-v2.sh"
 SPEC = importlib.util.spec_from_file_location("prepare_headless_enrollment", SCRIPT)
 assert SPEC is not None and SPEC.loader is not None
 MODULE = importlib.util.module_from_spec(SPEC)
@@ -118,9 +120,7 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
             "        env:",
             workflow,
         )
-        self.assertIn("if ! aws_version=$(aws --version 2>&1); then", workflow)
-        self.assertIn("AWS CLI v2, but aws is unavailable", workflow)
-        self.assertIn('[[ ! "$aws_version" =~ ^aws-cli/2\\. ]]', workflow)
+        self.assertIn("run: ./scripts/require-aws-cli-v2.sh", workflow)
         self.assertIn("needs: verify-environment", workflow)
         verify_permissions = workflow[verify_job:rotate_job]
         self.assertIn("permissions:\n      actions: read", verify_permissions)
@@ -196,15 +196,15 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
         self.assertNotIn("make test-python", actionlint_job)
         self.assertIn("timeout-minutes: 10", enrollment_job)
         require_cli = enrollment_job.index("- name: Require tested AWS CLI major")
-        contract_test = enrollment_job.index("- name: Test sandbox enrollment recovery")
-        self.assertLess(require_cli, contract_test)
-        self.assertIn("if ! aws_version=$(aws --version 2>&1); then", enrollment_job)
-        self.assertIn("AWS CLI v2, but aws is unavailable", enrollment_job)
-        self.assertIn('[[ ! "$aws_version" =~ ^aws-cli/2\\. ]]', enrollment_job)
+        recovery_check = enrollment_job.index(
+            "- name: Check sandbox enrollment recovery"
+        )
+        self.assertLess(require_cli, recovery_check)
+        self.assertIn("run: ./scripts/require-aws-cli-v2.sh", enrollment_job)
         self.assertEqual(enrollment_job.count("actions/setup-python@"), 1)
         self.assertIn('python-version: "3.13"', enrollment_job)
         self.assertIn("pip install --require-hashes", enrollment_job)
-        self.assertIn("run: make lint-python", enrollment_job)
+        self.assertIn("run: make check-python", enrollment_job)
         self.assertNotIn("ruff check --no-cache", enrollment_job)
         self.assertIn(
             "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1\n"
@@ -212,12 +212,12 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
             "          persist-credentials: false",
             enrollment_job,
         )
-        self.assertIn("run: make test-python", enrollment_job)
         self.assertIn("run: go test ./.github/scripts", enrollment_job)
         self.assertNotIn("unittest discover", enrollment_job)
         makefile = MAKEFILE.read_text()
         self.assertIn("lint-python:", makefile)
         self.assertIn("test-python:", makefile)
+        self.assertIn("check-python: lint-python test-python", makefile)
         self.assertIn(
             "PYTHONDONTWRITEBYTECODE=1 $(PYTHON) -m unittest discover "
             "-s .github/scripts -p '*_test.py'",
@@ -235,6 +235,19 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
         self.assertRegex(
             requirements, r"ruff==0\.15\.8.*\\\n\s+--hash=sha256:[0-9a-f]{64}"
         )
+
+        aws_cli_requirement = AWS_CLI_REQUIREMENT.read_text()
+        self.assertEqual(workflow.count("run: ./scripts/require-aws-cli-v2.sh"), 1)
+        self.assertEqual(
+            WORKFLOW.read_text().count("run: ./scripts/require-aws-cli-v2.sh"), 1
+        )
+        self.assertTrue(AWS_CLI_REQUIREMENT.stat().st_mode & 0o111)
+        self.assertIn("run: shellcheck scripts/*.sh", CI_WORKFLOW.read_text())
+        self.assertIn(
+            "if ! aws_version=$(aws --version 2>&1); then", aws_cli_requirement
+        )
+        self.assertIn("AWS CLI v2, but aws is unavailable", aws_cli_requirement)
+        self.assertIn('[[ ! "$aws_version" =~ ^aws-cli/2\\. ]]', aws_cli_requirement)
 
     def test_every_target_has_a_distinct_parameter(self) -> None:
         parameters = [parameter for _slug, parameter in MODULE.TARGETS.values()]
@@ -2540,28 +2553,37 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
             "AWS_ACCESS_KEY_ID": "dummy",
             "AWS_SECRET_ACCESS_KEY": "dummy",
             "AWS_EC2_METADATA_DISABLED": "true",
-            "AWS_CONFIG_FILE": MODULE.os.devnull,
-            "AWS_SHARED_CREDENTIALS_FILE": MODULE.os.devnull,
-            "NO_PROXY": "127.0.0.1",
+            "AWS_CONFIG_FILE": "/tmp/ambient-config",
+            "AWS_SHARED_CREDENTIALS_FILE": "/tmp/ambient-credentials",
+            "AWS_ENDPOINT_URL": "https://unused.invalid",
+            "AWS_ENDPOINT_URL_SSM": "https://unused.invalid/ssm",
+            "AWS_CLI_FILE_ENCODING": "utf-16",
+            "AWS_USE_FIPS_ENDPOINT": "true",
+            "HTTP_PROXY": "http://127.0.0.1:1",
         }
+        production_command = MODULE._put_parameter_command
+
+        def loopback_command(region: str, parameter: str) -> list[str]:
+            return [
+                *production_command(region, parameter),
+                "--endpoint-url",
+                f"http://127.0.0.1:{server.server_port}",
+            ]
+
         try:
-            result = MODULE.subprocess.run(
-                [
-                    *MODULE._put_parameter_command("us-east-2", "/tmp/probe"),
-                    "--endpoint-url",
-                    f"http://127.0.0.1:{server.server_port}",
-                ],
-                input="probe-value",
-                text=True,
-                stdout=MODULE.subprocess.PIPE,
-                stderr=MODULE.subprocess.PIPE,
-                env=clean_env,
-                timeout=20,
-            )
+            with (
+                mock.patch.dict(MODULE.os.environ, clean_env, clear=True),
+                mock.patch.object(
+                    MODULE,
+                    "_put_parameter_command",
+                    side_effect=loopback_command,
+                ) as command,
+            ):
+                MODULE.put_parameter("us-east-2", "/tmp/probe", "probe-value")
         finally:
             server.server_close()
             thread.join(timeout=16)
-        self.assertEqual(result.returncode, 0, result.stderr)
+        command.assert_called_once_with("us-east-2", "/tmp/probe")
         self.assertFalse(thread.is_alive())
         self.assertEqual(
             len(captured), 1, "AWS CLI did not send exactly one SSM request"

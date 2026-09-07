@@ -30,8 +30,7 @@ Use reserved example domains and documentation account IDs in tests and docs.
    trap 'rm -rf -- "$qurl_lint_venv"' EXIT
    python3.13 -m venv "$qurl_lint_venv"
    "$qurl_lint_venv/bin/python" -m pip install --require-hashes -r .github/scripts/requirements-lint.txt
-   PYTHON="$qurl_lint_venv/bin/python" make lint-python
-   PYTHON="$qurl_lint_venv/bin/python" make test-python
+   PYTHON="$qurl_lint_venv/bin/python" make check-python
    )
    make vet
    make verify-deps

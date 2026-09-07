@@ -20,7 +20,10 @@ var (
 	// operational paths are reviewed for public source. References into reviewed
 	// public qurl-* repos are excluded separately after this deliberately broad
 	// match.
-	operationalPath    = regexp.MustCompile(`(?i)(/qurl-[a-z0-9_.{}-]+(?:/[a-z0-9_.{}-]+)+)(?:[^A-Za-z0-9_.{}-]|$)`)
+	operationalPath = regexp.MustCompile(`(?i)(/qurl-[a-z0-9_.{}-]+(?:/[a-z0-9_.{}-]+)+)(?:[^A-Za-z0-9_.{}-]|$)`)
+	// This map serves both the LayerV repository-reference scanner and the
+	// qurl-* operational-path exemption. Repositories without a qurl-* name are
+	// still required by the first caller.
 	publicRepositories = map[string]bool{
 		"frp":                    true,
 		"ops-routines-workflows": true,

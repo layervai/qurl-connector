@@ -21,7 +21,7 @@ BLUE := \033[34m
 GREEN := \033[32m
 RESET := \033[0m
 
-.PHONY: all build frpc test test-race test-python lint lint-python vet fmt clean verify-deps proof-1000
+.PHONY: all build frpc test test-race test-python lint lint-python check-python vet fmt clean verify-deps proof-1000
 
 all: print-version env frpc
 
@@ -50,6 +50,8 @@ lint-python:
 	@test -n "$(PYTHON_LINT_FILES)" || { echo "no Python files found under .github/scripts" >&2; exit 1; }
 	$(PYTHON) -m ruff check --no-cache $(PYTHON_LINT_FILES)
 	$(PYTHON) -m ruff format --check --no-cache $(PYTHON_LINT_FILES)
+
+check-python: lint-python test-python
 
 frpc:
 	@printf "$(BLUE)[qURL Connector] Building developer command...$(RESET)\n"
