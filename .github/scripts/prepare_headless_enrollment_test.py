@@ -1034,6 +1034,50 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
                 )
         put.assert_not_called()
 
+    def test_additive_claim_authority_drift_never_writes_secret(self) -> None:
+        responses = [
+            [
+                {
+                    "slug": "fileviewer-sandbox",
+                    "type": "tunnel",
+                    "status": "active",
+                    "resource_id": "MFkw-resource",
+                }
+            ],
+            {"desired_state": "on", "serving_epoch": 1},
+            {
+                "kind": "enrollment_token",
+                "key_id": "key_abc123def456",
+                "target": "agent",
+                "claims": [
+                    {
+                        "type": "connector",
+                        "id": "fileviewer-sandbox",
+                        "scope": "future-authority",
+                    }
+                ],
+                "api_key": "lv_live_test-token",
+                "expires_at": VALID_EXPIRY,
+            },
+        ]
+        with (
+            mock.patch.object(MODULE, "api_request", side_effect=responses),
+            mock.patch.object(MODULE, "put_parameter") as put,
+        ):
+            with self.assertRaisesRegex(
+                MODULE.EnrollmentError,
+                "credential key_abc123def456 was minted but not installed",
+            ):
+                MODULE.prepare_enrollment(
+                    "https://api.example.com",
+                    "lv_live_account-key",
+                    "fileviewer-nhp-replica-a",
+                    "attempt-1",
+                    "us-east-2",
+                    now=FIXED_NOW,
+                )
+        put.assert_not_called()
+
     def test_mint_lost_response_retries_same_operation_and_accepts_replay(self) -> None:
         credential = {
             "kind": "enrollment_token",
@@ -1842,6 +1886,38 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
         sleep.assert_not_called()
         put.assert_not_called()
 
+    def test_sharing_put_preserves_enrollment_completion_budget(self) -> None:
+        responses = [
+            [
+                {
+                    "slug": "fileviewer-sandbox",
+                    "type": "tunnel",
+                    "status": "active",
+                    "resource_id": "MFkw-resource",
+                }
+            ],
+            {"desired_state": "off", "serving_epoch": 0},
+        ]
+        with (
+            mock.patch.object(MODULE, "api_request", side_effect=responses) as request,
+            mock.patch.object(MODULE, "put_parameter") as put,
+            mock.patch.object(MODULE.time, "monotonic", side_effect=[0, 0, 4]),
+        ):
+            with self.assertRaisesRegex(
+                MODULE.EnrollmentDeadlineExceeded, "internal deadline"
+            ):
+                MODULE.prepare_enrollment(
+                    "https://api.example.com",
+                    "lv_live_account-key",
+                    "fileviewer-nhp-replica-a",
+                    "attempt-1",
+                    "us-east-2",
+                    now=FIXED_NOW,
+                    deadline=100,
+                )
+        self.assertEqual(request.call_count, 2)
+        put.assert_not_called()
+
     def test_retryable_put_rejection_retries_once_and_confirms_epoch(self) -> None:
         responses = [
             [
@@ -1867,6 +1943,11 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
         with (
             mock.patch.object(MODULE, "api_request", side_effect=responses) as request,
             mock.patch.object(MODULE, "put_parameter") as put,
+            mock.patch.object(
+                MODULE,
+                "sleep_before_deadline",
+                wraps=MODULE.sleep_before_deadline,
+            ) as guarded_sleep,
             mock.patch.object(MODULE.time, "sleep") as sleep,
         ):
             MODULE.prepare_enrollment(
@@ -1880,6 +1961,10 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
         self.assertEqual(request.call_count, 6)
         self.assertEqual(request.call_args_list[2], request.call_args_list[3])
         sleep.assert_called_once_with(17)
+        self.assertEqual(
+            guarded_sleep.call_args.kwargs["reserve_seconds"],
+            MODULE.API_TIMEOUT_SECONDS + MODULE.ENROLLMENT_COMPLETION_RESERVE_SECONDS,
+        )
         put.assert_called_once()
 
     def test_retryable_put_rejection_stops_after_one_retry_without_polling(

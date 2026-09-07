@@ -72,10 +72,19 @@ func hasPublicRepositoryPrefix(text string, pathStart int) bool {
 		preceding := text[prefixStart-1]
 		// Use a closed separator allowlist. Unknown punctuation can be part of a
 		// lookalike hostname and must not exempt an operational path.
-		switch preceding {
-		case '/', '"', '\'', '`', '(', '[', '<', ' ', '\t', '\n', '\r', ',', ';':
-		default:
-			return false
+		if preceding == '/' {
+			// A slash is valid only after a reviewed URL scheme. One or two
+			// slashes can put github.com/layervai inside another host's path.
+			beforePrefix := strings.ToLower(text[:prefixStart])
+			if !strings.HasSuffix(beforePrefix, "https://") && !strings.HasSuffix(beforePrefix, "http://") {
+				return false
+			}
+		} else {
+			switch preceding {
+			case '"', '\'', '`', '(', '[', '<', ' ', '\t', '\n', '\r', ',', ';':
+			default:
+				return false
+			}
 		}
 	}
 	afterSlash := text[pathStart+1:]
@@ -195,6 +204,15 @@ func TestOperationalPathDetectorIgnoresRepositoryReferences(t *testing.T) {
 		t.Fatalf("lookalike GitHub host bypassed operational path detection: %q", got)
 	}
 	repositoryPath := "/qurl-go/" + "relayknock/nativeudp"
+	for _, embedded := range []string{
+		"https://attacker.example/github.com/layervai" + repositoryPath,
+		"https://attacker.example//github.com/layervai" + repositoryPath,
+		"/github.com/layervai" + repositoryPath,
+	} {
+		if got := findOperationalPaths(embedded); len(got) != 1 || got[0] != repositoryPath {
+			t.Fatalf("path-embedded GitHub reference %q bypassed operational path detection: %q", embedded, got)
+		}
+	}
 	for _, separator := range []string{"_", "~", "+", "%", ":"} {
 		lookalike := "evil" + separator + "github.com/layervai" + repositoryPath
 		if got := findOperationalPaths(lookalike); len(got) != 1 || got[0] != repositoryPath {

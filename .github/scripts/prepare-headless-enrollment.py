@@ -95,7 +95,7 @@ RETRY_SECONDS = 2
 # Include process creation and interpreter overhead around the two wall-clock
 # subprocess timeouts. The workflow step also keeps 60 seconds beyond the
 # script's internal deadline for safe error reporting.
-AWS_INSTALL_RESERVE_SECONDS = (2 * AWS_TIMEOUT_SECONDS) + RETRY_SECONDS + 1
+AWS_INSTALL_RESERVE_SECONDS = (2 * AWS_TIMEOUT_SECONDS) + RETRY_SECONDS + 5
 # urllib applies API_TIMEOUT_SECONDS to each socket operation, not to the whole
 # request. This reserve is a best-effort preflight. A slow mint can consume it,
 # so the post-mint guard still reports the live credential without starting SSM.
@@ -714,6 +714,9 @@ def mint_and_install_enrollment(
             )
     try:
         expected_claims = [{"type": "connector", "id": slug}]
+        # Claims are the credential authority boundary. Reject extra claims and
+        # additive claim fields until this recovery contract is reviewed again.
+        # The wrapper below reports the live key ID and revocation guidance.
         if (
             not isinstance(credential, dict)
             or credential.get("kind") != "enrollment_token"
@@ -848,6 +851,7 @@ def prepare_enrollment(
                     api_endpoint,
                     api_key,
                     resource_path + "/sharing",
+                    remaining_reserve_seconds=ENROLLMENT_COMPLETION_RESERVE_SECONDS,
                     method="PUT",
                     body={"desired_state": "on"},
                     idempotency_key=sharing_idempotency_key,
@@ -882,7 +886,9 @@ def prepare_enrollment(
                     sleep_before_deadline(
                         bounded_retry_delay,
                         operation_deadline,
-                        reserve_seconds=API_TIMEOUT_SECONDS,
+                        reserve_seconds=(
+                            API_TIMEOUT_SECONDS + ENROLLMENT_COMPLETION_RESERVE_SECONDS
+                        ),
                     )
                 except EnrollmentDeadlineExceeded as deadline_exc:
                     raise EnrollmentError(
