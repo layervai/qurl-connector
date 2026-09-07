@@ -31,7 +31,8 @@ class FakeResponse:
         self, body: bytes, *, status: int = 200, content_types: list[str] | None = None
     ) -> None:
         self.body = body
-        self.status = status
+        self._status = status
+        self.closed = False
         self.headers = mock.Mock()
         self.headers.get_all.return_value = (
             ["application/json"] if content_types is None else content_types
@@ -41,7 +42,14 @@ class FakeResponse:
         return self
 
     def __exit__(self, *_args: object) -> None:
+        self.closed = True
         return None
+
+    @property
+    def status(self) -> int:
+        if self.closed:
+            raise AssertionError("response status was read after the response closed")
+        return self._status
 
     def read(self, _limit: int) -> bytes:
         return self.body
@@ -67,6 +75,10 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
         }
         self.assertEqual(options, set(MODULE.TARGETS))
         self.assertIn('--target "$RECOVERY_TARGET"', workflow)
+        self.assertIn(
+            "description: Replica enrollment to prepare; may turn route sharing on and leave it on",
+            workflow,
+        )
         self.assertNotIn("--api-endpoint", workflow)
         self.assertIn("RECOVERY_TARGET: ${{ inputs.target }}", workflow)
         self.assertIn("name: Rotate ${{ inputs.target }}", workflow)
@@ -112,6 +124,21 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
         self.assertIn("needs: verify-environment", workflow)
         verify_permissions = workflow[verify_job:rotate_job]
         self.assertIn("permissions:\n      actions: read", verify_permissions)
+        self.assertIn(
+            "does not expose Environments read as a workflow permission",
+            verify_permissions,
+        )
+        self.assertIn("relies on public-repository read access", verify_permissions)
+        self.assertIn(
+            "fails closed if repository visibility changes", verify_permissions
+        )
+        self.assertIn(
+            "GitHub environment gate remains authoritative", verify_permissions
+        )
+        self.assertNotIn(
+            "documents Actions read as the fine-grained permission",
+            verify_permissions,
+        )
         self.assertNotIn("contents: read", verify_permissions)
         self.assertIn("permissions: {}\n\njobs:", workflow)
         rotate_permissions = workflow[rotate_job:preflight]
@@ -137,6 +164,7 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
             ".deployment_branch_policy.custom_branch_policies == true", workflow
         )
         self.assertIn("/deployment-branch-policies?per_page=100", workflow)
+        self.assertNotIn("gh api --paginate", workflow)
         self.assertIn('.branch_policies[0].name == "main"', workflow)
         self.assertIn('.branch_policies[0].type == "branch"', workflow)
         self.assertIn('.type == "required_reviewers"', workflow)
@@ -2397,6 +2425,12 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
             MODULE.AWS_CLI_CONNECT_TIMEOUT_SECONDS
             + MODULE.AWS_CLI_READ_TIMEOUT_SECONDS,
             MODULE.AWS_TIMEOUT_SECONDS,
+        )
+        self.assertGreaterEqual(
+            MODULE.AWS_TIMEOUT_SECONDS
+            - MODULE.AWS_CLI_CONNECT_TIMEOUT_SECONDS
+            - MODULE.AWS_CLI_READ_TIMEOUT_SECONDS,
+            10,
         )
         self.assertIn("--overwrite", args)
         self.assertEqual(kwargs["timeout"], MODULE.AWS_TIMEOUT_SECONDS)

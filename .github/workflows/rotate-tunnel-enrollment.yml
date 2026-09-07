@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       target:
-        description: Tunnel enrollment to prepare
+        description: Replica enrollment to prepare; may turn route sharing on and leave it on
         required: true
         type: choice
         # prepare_headless_enrollment_test.py checks exact equality with the
@@ -42,12 +42,14 @@ jobs:
     name: Verify protected sandbox environment
     runs-on: ubuntu-latest
     timeout-minutes: 2
-    # GitHub documents Actions read as the fine-grained permission for both
-    # environment and deployment-branch-policy reads:
+    # GitHub does not expose Environments read as a workflow permission.
+    # The check relies on public-repository read access; actions: read is a
+    # minimal explicit non-default scope and does not grant environment access.
+    # The gh api command fails closed if repository visibility changes.
+    # The GitHub environment gate remains authoritative; this earlier policy
+    # snapshot is defense in depth and can age while approval is pending.
     # https://docs.github.com/rest/deployments/environments#get-an-environment
     # https://docs.github.com/rest/deployments/branch-policies#list-deployment-branch-policies
-    # The public repository also permits unauthenticated reads, but this
-    # declares the exact scope.
     permissions:
       actions: read
     steps:
@@ -78,9 +80,8 @@ jobs:
             echo "::error::sandbox environment must use an exact custom branch policy and prevent self-review by the dispatcher"
             exit 1
           fi
-          # More than one page emits concatenated objects. The single-object
-          # shape check below rejects that output, so pagination fails closed.
-          branches=$(gh api --paginate "repos/${GITHUB_REPOSITORY}/environments/sandbox/deployment-branch-policies?per_page=100")
+          # total_count must be one, so one 100-item page contains the full set.
+          branches=$(gh api "repos/${GITHUB_REPOSITORY}/environments/sandbox/deployment-branch-policies?per_page=100")
           if ! jq -e '
             (.total_count | type) == "number" and .total_count == 1 and
             (.branch_policies | type) == "array" and

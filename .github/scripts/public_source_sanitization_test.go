@@ -20,7 +20,7 @@ var (
 	// operational paths are reviewed for public source. References into reviewed
 	// public qurl-* repos are excluded separately after this deliberately broad
 	// match.
-	operationalPath    = regexp.MustCompile(`(?i)(/qurl-[a-z0-9_.-]+(?:/[a-z0-9_.{}-]+)+)(?:[^A-Za-z0-9_.{}-]|$)`)
+	operationalPath    = regexp.MustCompile(`(?i)(/qurl-[a-z0-9_.{}-]+(?:/[a-z0-9_.{}-]+)+)(?:[^A-Za-z0-9_.{}-]|$)`)
 	publicRepositories = map[string]bool{
 		"frp":                    true,
 		"ops-routines-workflows": true,
@@ -107,6 +107,10 @@ func TestOperationalPathDetectorStaysBroaderThanAllowlist(t *testing.T) {
 	secondSegmentTemplate := "/qurl-example-service/" + "{service}/replica-a/bootstrap"
 	if got := findOperationalPaths(secondSegmentTemplate); len(got) != 1 || got[0] != "/qurl-example-service" {
 		t.Fatalf("early template did not preserve its operational namespace: %q", got)
+	}
+	firstSegmentTemplate := "/qurl-" + "{service}/nhp/replica-a/bootstrap"
+	if got := findOperationalPaths(firstSegmentTemplate); len(got) != 1 || got[0] != "/qurl-" {
+		t.Fatalf("first-segment template did not preserve its operational namespace: %q", got)
 	}
 	trailingSlash := "/qurl-example-service/" + "nhp/replica-z/"
 	if got := findOperationalPaths(trailingSlash); len(got) != 1 || got[0] != strings.TrimSuffix(trailingSlash, "/") {

@@ -85,7 +85,7 @@ MAX_RESPONSE_BYTES = 64 * 1024
 API_TIMEOUT_SECONDS = 10
 AWS_CLI_CONNECT_TIMEOUT_SECONDS = 5
 AWS_CLI_READ_TIMEOUT_SECONDS = 20
-AWS_TIMEOUT_SECONDS = 30
+AWS_TIMEOUT_SECONDS = 35
 # Allow up to two minutes of normal polling for an off-to-on serving epoch to
 # propagate. The internal deadline below also bounds slow requests and
 # Retry-After responses before the protected workflow's 12-minute hard cap.
@@ -367,12 +367,13 @@ def api_request(
     )
     try:
         with NO_REDIRECT_OPENER.open(request, timeout=API_TIMEOUT_SECONDS) as response:
-            if response.status not in expected_statuses:
+            actual_status = response.status
+            if actual_status not in expected_statuses:
                 # urllib raises HTTPError for non-2xx responses. Reaching this
                 # branch means a success response had an unexpected contract,
                 # so a mutation could have committed.
                 raise APIRequestOutcomeUnknown(
-                    f"qURL API returned HTTP {response.status} for the {method} request; expected one of {expected_statuses}"
+                    f"qURL API returned HTTP {actual_status} for the {method} request; expected one of {expected_statuses}"
                 )
             content_types = response.headers.get_all("Content-Type", [])
             if (
@@ -437,7 +438,7 @@ def api_request(
     if not isinstance(envelope, dict) or "data" not in envelope:
         raise APIRequestOutcomeUnknown("qURL API response has no data field")
     if response_status is not None:
-        response_status[:] = [response.status]
+        response_status[:] = [actual_status]
     return envelope["data"]
 
 
@@ -591,6 +592,9 @@ def put_parameter(region: str, parameter: str, token: str) -> None:
                 "",
             )
         )
+        # A returned service error means the request finished, so repeating the
+        # same value with --overwrite is idempotent. A subprocess timeout can
+        # leave the original request in flight and is never retried blindly.
         if attempt == 0 and error_class in AWS_RETRYABLE_ERROR_CODES:
             time.sleep(RETRY_SECONDS)
             continue
