@@ -287,16 +287,20 @@ func Load(path string) (*Config, error) {
 
 func decodeConfig(data []byte, path string) (*Config, error) {
 	resolved := resolveEnvVars(string(data))
-	resolved, err := stripRetiredGeneratedFields(resolved)
+	stripped, err := stripRetiredGeneratedFields(resolved)
 	if err != nil {
 		return nil, fmt.Errorf("parsing retired config fields in %s: %w", path, err)
 	}
+	lineContext := ""
+	if stripped != resolved {
+		lineContext = " (line numbers refer to the config after retired generated fields were dropped)"
+	}
 
 	var cfg Config
-	dec := yaml.NewDecoder(strings.NewReader(resolved))
+	dec := yaml.NewDecoder(strings.NewReader(stripped))
 	dec.KnownFields(true)
 	if err := dec.Decode(&cfg); err != nil {
-		return nil, fmt.Errorf("parsing config file %s: %w", path, err)
+		return nil, fmt.Errorf("parsing config file %s%s: %w", path, lineContext, err)
 	}
 
 	applyDefaults(&cfg)
@@ -327,11 +331,15 @@ func stripRetiredGeneratedFields(data string) (string, error) {
 	dropped := false
 	var errs []error
 	if server := yamlField(root, "server"); server != nil {
-		if token := yamlField(server, "token"); token != nil && (token.Kind != yaml.ScalarNode || (token.Tag != "!!null" && strings.TrimSpace(token.Value) != "")) {
-			line, _ := yamlFieldLine(server, "token")
-			errs = append(errs, fmt.Errorf("config field server.token at line %d was removed; delete it because NHP admission supplies the FRP session token", line))
+		if token := yamlField(server, "token"); token != nil {
+			if token.Kind != yaml.ScalarNode || (token.Tag != "!!null" && strings.TrimSpace(token.Value) != "") {
+				line, _ := yamlFieldLine(server, "token")
+				errs = append(errs, fmt.Errorf("config field server.token at line %d was removed; delete it because NHP admission supplies the FRP session token", line))
+			} else {
+				// An explicitly empty or null token carries no operator intent.
+				dropped = dropYAMLField(server, "token") || dropped
+			}
 		}
-		dropped = dropYAMLField(server, "token") || dropped
 		dropped = dropYAMLField(server, "public_domain") || dropped
 		dropped = dropYAMLField(server, "replica_discriminator") || dropped
 	}

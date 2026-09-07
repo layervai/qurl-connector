@@ -912,6 +912,8 @@ func resolveConnectorIdentitiesLocked(
 		return err
 	}
 
+	// Every configured route re-resolves, including fully hydrated cache-backed
+	// routes, so persisted placement assertions are checked on every startup.
 	for _, resolution := range resolutions {
 		route := &cfg.Routes[resolution.index]
 		configuredRoutingID := route.ConnectorRoutingID
@@ -966,7 +968,7 @@ func resolveConnectorIdentitiesLocked(
 			return fmt.Errorf("route %q: configured connector_routing_id %q conflicts with authenticated producer value %q; exact resource binding is retained for explicit cleanup", resolution.id, configuredRoutingID, resource.ConnectorRoutingID)
 		}
 		if configuredKnockResourceID != "" && configuredKnockResourceID != resource.KnockResourceID {
-			return fmt.Errorf("route %q: configured knock_resource_id %q conflicts with authenticated producer value %q; exact resource binding is retained for explicit cleanup", resolution.id, configuredKnockResourceID, resource.KnockResourceID)
+			return fmt.Errorf("route %q: configured knock_resource_id %q conflicts with authenticated producer value %q; remove knock_resource_id from the route in qurl-proxy.yaml to accept the authenticated admission target, or delete the resource (the exact resource binding is retained for explicit cleanup)", resolution.id, configuredKnockResourceID, resource.KnockResourceID)
 		}
 		if existingResourceID, existingKnockResourceID, conflict := cfg.FirstDifferentKnockResourceID(resource.ResourceID, resource.KnockResourceID); conflict {
 			overrideNote := ""

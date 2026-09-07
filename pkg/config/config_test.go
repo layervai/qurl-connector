@@ -149,6 +149,13 @@ func TestStripRetiredGeneratedFieldsPreservesCleanBytes(t *testing.T) {
 	}
 }
 
+func TestLoadLabelsNormalizedStrictDecodeLines(t *testing.T) {
+	_, err := Load(writeConfig(t, "server:\n  public_domain: qurl.site\nunknown: true\nroutes: []\n"))
+	if err == nil || !strings.Contains(err.Error(), "line numbers refer to the config after retired generated fields were dropped") {
+		t.Fatalf("Load error = %v, want normalized-line warning", err)
+	}
+}
+
 func TestLoadAcceptsNullRetiredServerToken(t *testing.T) {
 	for _, value := range []string{"null", "~"} {
 		t.Run(value, func(t *testing.T) {

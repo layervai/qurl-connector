@@ -13,10 +13,29 @@ import (
 	frpclient "github.com/fatedier/frp/client"
 	"github.com/fatedier/frp/pkg/config/source"
 	v1 "github.com/fatedier/frp/pkg/config/v1"
+	"github.com/fatedier/frp/pkg/config/v1/validation"
 	"github.com/fatedier/frp/pkg/policy/security"
 
 	nhpconfig "github.com/layervai/qurl-connector/pkg/config"
 )
+
+func TestFRPClientCommonDefaultsAuthToToken(t *testing.T) {
+	loginFailExit := false
+	common := &v1.ClientCommonConfig{ServerAddr: "frp.example", ServerPort: 7000, LoginFailExit: &loginFailExit}
+	common.Transport.Protocol = "tcp"
+	common.Transport.DialServerKeepAlive = 60
+	common.Transport.DialServerTimeout = 10
+	common.Log.Level = "info"
+	if err := common.Complete(); err != nil {
+		t.Fatal(err)
+	}
+	if common.Auth.Method != v1.AuthMethodToken {
+		t.Fatalf("FRP auth method = %q, want %q", common.Auth.Method, v1.AuthMethodToken)
+	}
+	if _, err := validation.ValidateAllClientConfig(common, nil, nil, &security.UnsafeFeatures{}); err != nil {
+		t.Fatalf("validate completed FRP common config: %v", err)
+	}
+}
 
 func TestStartFRPFromConfigRejectsInvalidLogLevel(t *testing.T) {
 	oldLevel := logLevel
