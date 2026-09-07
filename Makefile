@@ -1,5 +1,8 @@
 export PATH := $(PATH):$(shell go env GOPATH)/bin
 export GO111MODULE=on
+PYTHON ?= python3
+PYTHON_LINT_FILES := $(wildcard .github/scripts/*.py)
+PYTHON_TEST_FILES := $(wildcard .github/scripts/*_test.py)
 
 # Version info injected at build time
 BASE_VERSION ?= $(shell git describe --tags --abbrev=0 2>/dev/null || echo "0.1.0")
@@ -18,7 +21,7 @@ BLUE := \033[34m
 GREEN := \033[32m
 RESET := \033[0m
 
-.PHONY: all build frpc test test-race lint vet fmt clean verify-deps proof-1000
+.PHONY: all build frpc test test-race test-python lint lint-python check-python vet fmt clean verify-deps proof-1000
 
 all: print-version env frpc
 
@@ -43,6 +46,13 @@ lint:
 	golangci-lint run ./pkg/... ./cmd/... ./internal/...
 	GOOS=windows GOARCH=amd64 CGO_ENABLED=0 golangci-lint run ./pkg/... ./cmd/... ./internal/...
 
+lint-python:
+	@test -n "$(PYTHON_LINT_FILES)" || { echo "no Python files found under .github/scripts" >&2; exit 1; }
+	$(PYTHON) -m ruff check --no-cache $(PYTHON_LINT_FILES)
+	$(PYTHON) -m ruff format --check --no-cache $(PYTHON_LINT_FILES)
+
+check-python: lint-python test-python
+
 frpc:
 	@printf "$(BLUE)[qURL Connector] Building developer command...$(RESET)\n"
 	CGO_ENABLED=0 go build -trimpath -ldflags "$(LDFLAGS)" -o bin/qurl-connector ./cmd/frpc
@@ -57,6 +67,10 @@ test:
 # CGO_ENABLED=0 build works.
 test-race:
 	CGO_ENABLED=1 go test -race -count=1 ./pkg/... ./cmd/... ./internal/...
+
+test-python:
+	@test -n "$(PYTHON_TEST_FILES)" || { echo "no Python tests found under .github/scripts" >&2; exit 1; }
+	PYTHONDONTWRITEBYTECODE=1 $(PYTHON) -m unittest discover -s .github/scripts -p '*_test.py'
 
 vet:
 	go vet ./...
