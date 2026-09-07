@@ -224,3 +224,61 @@ func TestHermeticSessionGroupServesManyRoutesOnOneAdmission(t *testing.T) {
 		t.Fatalf("retired admissions = %s, want exactly the group's one admission", fmt.Sprint(retired))
 	}
 }
+
+// A failed FRP control connection must return to the NHP admitter, which may
+// select a new endpoint. Retrying the old endpoint cannot recover this case.
+func TestHermeticSessionGroupRecoversLostControlOnFreshAdmission(t *testing.T) {
+	withControlRecoveryGrace(t)
+	plugin := newHermeticQRTSPlugin(t)
+	oldPort, newPort := reserveHermeticPort(t), reserveHermeticPort(t)
+	oldServer := startHermeticFRPS(t, oldPort, oldPort, "example.test", plugin.server.URL)
+	newServer := startHermeticFRPS(t, newPort, newPort, "example.test", plugin.server.URL)
+	t.Cleanup(func() { _ = oldServer.Close(); _ = newServer.Close() })
+	common := &v1.ClientCommonConfig{}
+	common.Log.Level = "error"
+	common.Transport.TLS.Enable = new(bool)
+	if err := common.Complete(); err != nil {
+		t.Fatal(err)
+	}
+	factory, err := NewFRPSessionGroupFactory(FRPGroupFactoryConfig{Common: common, ReadyPoll: time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := Admission{KnockResourceID: "knock", ResourceID: "group", RunID: "1111111111111111", RunAttempt: 1,
+		Token: "first", ResourceHost: net.JoinHostPort("127.0.0.1", strconv.Itoa(oldPort)), SessionID: 101,
+		SessionReceipt: testSessionReceipt(101, "1111111111111111", 1), OpenTime: time.Hour}
+	next := old
+	next.RunID, next.Token, next.SessionID = "2222222222222222", "second", 102
+	next.SessionReceipt = testSessionReceipt(102, next.RunID, 1)
+	next.ResourceHost = net.JoinHostPort("127.0.0.1", strconv.Itoa(newPort))
+	admitter := &hermeticAdmitter{admissions: []Admission{old, next}}
+	runner, err := NewSessionGroupRunner(SessionGroupConfig{KnockResourceID: "knock", ResourceID: "group",
+		Routes: []LocalHTTPRoute{hermeticGroupRoute(t, "a")}, Admitter: admitter, Sessions: factory,
+		MinBackoff: time.Millisecond, MaxBackoff: 10 * time.Millisecond, StopTimeout: time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() { result <- runner.Run(ctx) }()
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case <-result:
+		case <-time.After(5 * time.Second):
+			t.Error("runner did not stop")
+		}
+	})
+	pollHermeticRoute(t, oldPort, "routing-a.example.test", "echo-a", result)
+	if err := oldServer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	pollHermeticRoute(t, newPort, "routing-a.example.test", "echo-a", result)
+	if admitter.admissionCount() != 2 {
+		t.Fatalf("admissions = %d, want 2", admitter.admissionCount())
+	}
+	retired := admitter.retiredSnapshot()
+	if len(retired) != 1 || retired[0].SessionID != old.SessionID {
+		t.Fatalf("old admission not retired: %v", retired)
+	}
+}
