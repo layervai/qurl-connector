@@ -173,6 +173,7 @@ func TestLoadRejectsOtherRetiredFRPFields(t *testing.T) {
 		yaml     string
 		wantLine string
 	}{
+		{name: "resource ID", path: "routes[0].resource_id", yaml: "routes:\n  - id: web\n    resource_id: old-key\n", wantLine: "at line 3"},
 		{name: "server token", path: "server.token", yaml: "server:\n  token: {from_env: FRPS_TOKEN}\n"},
 		{name: "subdomain", path: "routes[0].subdomain", yaml: "routes:\n  - id: web\n    type: http\n    local_port: 8080\n    subdomain: {unexpected: value}\n", wantLine: "at line 5"},
 		{name: "pinned subdomain", path: "routes[0].subdomain", yaml: "routes:\n  - id: web\n    type: http\n    local_port: 8080\n    crid: qgxd4jfvlumhscxrw7wwcwco2h6cda4fi5xixx43xybcfri2liym3d5gmjmq\n    subdomain: {unexpected: value}\n", wantLine: "at line 6"},
@@ -472,8 +473,8 @@ routes:
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			if _, err := Load(writeConfig(t, tc.yaml)); err == nil {
-				t.Fatal("accepted invalid Connector slug with a pinned CRID")
+			if _, err := Load(writeConfig(t, tc.yaml)); err == nil || !strings.Contains(err.Error(), "slug \""+tc.want+"\" does not match") {
+				t.Fatalf("Load error = %v, want invalid slug %q", err, tc.want)
 			}
 		})
 	}

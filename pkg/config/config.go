@@ -346,6 +346,9 @@ func stripRetiredGeneratedFields(data string) (string, error) {
 	}
 	if routes := yamlField(root, "routes"); routes != nil && routes.Kind == yaml.SequenceNode {
 		for i, route := range routes.Content {
+			if line, ok := yamlFieldLine(route, "resource_id"); ok {
+				errs = append(errs, fmt.Errorf("config field routes[%d].resource_id at line %d was removed; delete it and use crid with the issued CRID", i, line))
+			}
 			for _, key := range []string{"subdomain", "load_balancer_group"} {
 				field := yamlField(route, key)
 				if field == nil {

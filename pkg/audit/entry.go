@@ -106,8 +106,8 @@ const (
 // Field naming: JSON tags use snake_case; ts is short to keep the most-
 // frequent field compact on disk. New fields land at the end of the
 // JSON object on the wire — readers MUST tolerate unknown fields
-// (encoding/json does so by default) so the taxonomy can ratchet
-// forward without breaking existing consumers.
+// (encoding/json does so by default). Breaking releases can rename fields;
+// the CRID release renamed resource_id to resource_public_key.
 type Entry struct {
 	Timestamp time.Time `json:"ts"`
 	Event     string    `json:"event"`

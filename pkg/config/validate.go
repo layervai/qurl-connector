@@ -62,8 +62,7 @@ func ValidateConnectorRoutingID(s string) error {
 }
 
 // validateExactOpaqueIdentifier rejects transport-hostile spellings without
-// inventing semantics for a producer-owned identifier. Resource IDs are public
-// keys, but canonical key parsing remains owned by qurl-go; this package only
+// inventing semantics for the producer-owned knock resource identifier. It only
 // guarantees that the exact value is non-empty, valid UTF-8, unpadded by
 // surrounding whitespace, and free of control characters before it enters FRP
 // metadata or config comparisons.
