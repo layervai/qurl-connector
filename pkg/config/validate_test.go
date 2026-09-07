@@ -99,6 +99,16 @@ func TestValidate_RejectsTransportHostilePublicResourceID(t *testing.T) {
 	}
 }
 
+func TestValidateRejectsTransportHostileKnockResourceID(t *testing.T) {
+	cfg := &Config{Routes: []Route{{
+		ID: "managed", Type: RouteTypeHTTP, LocalIP: "127.0.0.1", LocalPort: 8080,
+		ResourceID: testPublicResourceA, ConnectorRoutingID: testRoutingA, KnockResourceID: " cell-resource",
+	}}}
+	if err := validateStartupInput(cfg); err == nil || !strings.Contains(err.Error(), "knock_resource_id must not contain leading or trailing whitespace") {
+		t.Fatalf("validateStartupInput error = %v, want local knock-resource rejection", err)
+	}
+}
+
 func TestValidateRejectsNonCanonicalEgressLocalIPWhitespace(t *testing.T) {
 	for name, value := range map[string]string{
 		"leading":  " 192.0.2.10",

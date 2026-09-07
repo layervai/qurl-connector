@@ -209,6 +209,11 @@ func validate(cfg *Config, requireManagedRouting bool) error {
 				errs = append(errs, fmt.Errorf("%s (%s): %w", prefix, r.ID, err))
 			}
 		}
+		if r.KnockResourceID != "" {
+			if err := validateExactOpaqueIdentifier("knock_resource_id", r.KnockResourceID); err != nil {
+				errs = append(errs, fmt.Errorf("%s (%s): %w", prefix, r.ID, err))
+			}
+		}
 		if r.ConnectorRoutingID != "" {
 			if r.ResourceID == "" {
 				errs = append(errs, fmt.Errorf("%s (%s): connector_routing_id requires the paired public resource_id", prefix, r.ID))

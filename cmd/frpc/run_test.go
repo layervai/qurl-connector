@@ -70,26 +70,34 @@ func TestAdminAPIWorksWithoutDashboardAssets(t *testing.T) {
 	if assets.FileSystem != nil {
 		t.Fatal("connector binary registered FRP dashboard assets; the embedded web UI must stay unlinked")
 	}
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	adminPort := listener.Addr().(*net.TCPAddr).Port
-	if err := listener.Close(); err != nil {
-		t.Fatal(err)
-	}
-
 	loginFailExit := false
-	common := &v1.ClientCommonConfig{ServerAddr: "127.0.0.1", ServerPort: 1, LoginFailExit: &loginFailExit}
-	common.Log.Level = "error"
-	common.WebServer.Addr, common.WebServer.Port = "127.0.0.1", adminPort
-	common.WebServer.User, common.WebServer.Password = "admin", "secret"
-	service, err := frpclient.NewService(frpclient.ServiceOptions{
-		Common: common, ConfigSourceAggregator: source.NewAggregator(source.NewConfigSource()),
-		UnsafeFeatures: &security.UnsafeFeatures{},
-	})
+	var service *frpclient.Service
+	var adminPort int
+	var err error
+	for range 5 {
+		listener, listenErr := net.Listen("tcp", "127.0.0.1:0")
+		if listenErr != nil {
+			t.Fatal(listenErr)
+		}
+		adminPort = listener.Addr().(*net.TCPAddr).Port
+		if closeErr := listener.Close(); closeErr != nil {
+			t.Fatal(closeErr)
+		}
+
+		common := &v1.ClientCommonConfig{ServerAddr: "127.0.0.1", ServerPort: 1, LoginFailExit: &loginFailExit}
+		common.Log.Level = "error"
+		common.WebServer.Addr, common.WebServer.Port = "127.0.0.1", adminPort
+		common.WebServer.User, common.WebServer.Password = "admin", "secret"
+		service, err = frpclient.NewService(frpclient.ServiceOptions{
+			Common: common, ConfigSourceAggregator: source.NewAggregator(source.NewConfigSource()),
+			UnsafeFeatures: &security.UnsafeFeatures{},
+		})
+		if err == nil {
+			break
+		}
+	}
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("bind FRP admin service after retries: %v", err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
