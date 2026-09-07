@@ -37,6 +37,7 @@ func init() {
 		"LayerV-issued headless Connector enrollment credential for first native UDP registration; account/OAuth credentials are rejected, and assignment refresh uses the persisted device identity")
 
 	rootCmd.AddCommand(runCmd)
+	rootCmd.AddCommand(healthcheckCmd)
 	rootCmd.AddCommand(versionCmd)
 	rootCmd.AddCommand(addCmd)
 	rootCmd.AddCommand(listCmd)
