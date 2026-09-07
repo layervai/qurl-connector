@@ -349,6 +349,8 @@ func hydrateConnectorResourceIDsReadOnlyContext(ctx context.Context, cfg *nhpcon
 		}
 		fallbackID := routeIDEnvFallback()
 		for i := range cfg.Routes {
+			// Configured CRID/routing pins were checked against the cache above.
+			// A pinned CRID still needs its runtime-only verification key.
 			if cfg.Routes[i].ResourcePublicKey != "" {
 				continue
 			}
@@ -587,7 +589,7 @@ func loadConnectorIdentityCacheUnlocked(txn *connectorIdentityCacheTxn) (cache *
 		return nil, fmt.Errorf("decode Connector identity cache %s: %w", path, err)
 	}
 	if envelope.Version != connectorIdentityCacheVersion {
-		return nil, fmt.Errorf("Connector identity cache %s version is %d, want %d", path, envelope.Version, connectorIdentityCacheVersion)
+		return nil, fmt.Errorf("Connector identity cache %s version is %d, want %d; finish pending operations with the previous binary before upgrading; preserve agent_state.json and do not delete unresolved request state", path, envelope.Version, connectorIdentityCacheVersion)
 	}
 	if envelope.AgentID == nil {
 		return nil, fmt.Errorf("Connector identity cache %s is missing agent_id", path)
@@ -827,7 +829,7 @@ func rejectNonCanonicalConnectorIdentityCacheKeys(raw []byte) error {
 			}
 		}
 		if value, present := entry["crid"]; present && bytes.Equal(bytes.TrimSpace(value), []byte("null")) {
-			return fmt.Errorf("identities[%d]: crid must be absent rather than null", i)
+			return fmt.Errorf("identities[%d]: crid must not be null", i)
 		}
 	}
 	pendingRaw, ok := envelope["pending_requests"]
@@ -851,7 +853,7 @@ func rejectNonCanonicalConnectorIdentityCacheKeys(raw []byte) error {
 			}
 		}
 		if value, present := request["expected_crid"]; present && bytes.Equal(bytes.TrimSpace(value), []byte("null")) {
-			return fmt.Errorf("pending_requests[%d]: expected_crid must be absent rather than null", i)
+			return fmt.Errorf("pending_requests[%d]: expected_crid must not be null", i)
 		}
 	}
 	return nil
@@ -916,8 +918,8 @@ func validateCachedConnectorBinding(binding connectorIdentityCacheEntry) error {
 	if err := validateCachedKnockResourceID(binding.KnockResourceID); err != nil {
 		return err
 	}
-	if binding.ResourcePublicKey == binding.KnockResourceID || binding.ConnectorRoutingID == binding.KnockResourceID {
-		return errors.New("resource_public_key, connector_routing_id, and knock_resource_id must be distinct")
+	if binding.ResourcePublicKey == binding.KnockResourceID || binding.ConnectorRoutingID == binding.KnockResourceID || binding.CRID == binding.KnockResourceID {
+		return errors.New("crid, resource_public_key, connector_routing_id, and knock_resource_id must be distinct")
 	}
 	if binding.CRID == "" {
 		return errors.New("crid is required")
@@ -1133,7 +1135,7 @@ func (c *connectorIdentityCache) recordResolutionLocked(txn *connectorIdentityCa
 			return fmt.Errorf("Connector id %q returned a changed routing or knock binding for resource_id %q", id, binding.ResourcePublicKey)
 		}
 		if existing.CRID != binding.CRID {
-			return errors.New("Connector CRID changed for cached key")
+			return fmt.Errorf("Connector id %q changed CRID from %q to %q", id, existing.CRID, binding.CRID)
 		}
 
 		// A warm-start continuity check that returns the exact binding is a

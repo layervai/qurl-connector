@@ -174,20 +174,15 @@ func validate(cfg *Config, requireManagedRouting bool) error {
 			}
 		} else {
 			checkDuplicateRouteID := true
-			if r.CRID == "" {
-				if err := ValidateSlug(r.ID); err != nil {
-					errs = append(errs, routeIDFormatError(prefix, r, err))
-					// Prefer fixing the API-slug shape before reporting
-					// duplicates among malformed ids; once the operator
-					// fixes the format, duplicate detection runs normally.
-					checkDuplicateRouteID = false
-				}
+			if err := ValidateSlug(r.ID); err != nil {
+				errs = append(errs, routeIDFormatError(prefix, r, err))
+				// Prefer fixing the API-slug shape before reporting
+				// duplicates among malformed ids; once the operator
+				// fixes the format, duplicate detection runs normally.
+				checkDuplicateRouteID = false
 			}
 			if checkDuplicateRouteID {
-				// Deliberately byte-exact: unpinned/API-slug ids are already
-				// lowercase via ValidateSlug above, while pinned legacy routes
-				// may preserve FRP proxy-name bases that differ only by case.
-				// FRP also indexes rendered proxy names by exact string.
+				// Slugs are canonical lowercase, and FRP indexes exact names.
 				if seenRouteIDs[r.ID] {
 					errs = append(errs, fmt.Errorf("%s: duplicate route id %q (check id and migrated legacy name/slug fields)", prefix, r.ID))
 				} else {

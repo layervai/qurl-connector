@@ -447,7 +447,7 @@ routes:
 	}
 }
 
-func TestLoad_AllowsPinnedRouteIDOutsideSlugRegex(t *testing.T) {
+func TestLoad_RejectsPinnedRouteIDOutsideSlugRegex(t *testing.T) {
 	tests := []struct {
 		name string
 		yaml string
@@ -472,12 +472,8 @@ routes:
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			cfg, err := Load(writeConfig(t, tc.yaml))
-			if err != nil {
-				t.Fatalf("Load pinned route with non-slug id: %v", err)
-			}
-			if got := cfg.Routes[0].ID; got != tc.want {
-				t.Fatalf("Route.ID = %q, want %q", got, tc.want)
+			if _, err := Load(writeConfig(t, tc.yaml)); err == nil {
+				t.Fatal("accepted invalid Connector slug with a pinned CRID")
 			}
 		})
 	}
@@ -503,25 +499,25 @@ routes:
 }
 
 func TestLoad_DuplicatePinnedRouteIDs(t *testing.T) {
-	yaml := `
+	yaml := fmt.Sprintf(`
 server:
   addr: example.com
   port: 7000
 routes:
-  - id: "My App"
+  - id: "my-app"
     type: http
     local_port: 80
-    crid: r_first000000
-  - id: "My App"
+    crid: %s
+  - id: "my-app"
     type: http
     local_port: 81
-    crid: r_second00000
-`
+    crid: %s
+`, testPublicResourceA, testPublicResourceB)
 	_, err := Load(writeConfig(t, yaml))
 	if err == nil {
 		t.Fatal("expected validation error for duplicate pinned route ids")
 	}
-	if !strings.Contains(err.Error(), `duplicate route id "My App"`) {
+	if !strings.Contains(err.Error(), `duplicate route id "my-app"`) {
 		t.Fatalf("error = %q, want duplicate pinned route id", err.Error())
 	}
 }
@@ -844,8 +840,12 @@ func TestConfig_RoutingAndPublicIdentityStaySeparate(t *testing.T) {
 	cfg := &Config{Routes: []Route{{
 		ID: "managed", CRID: testPublicResourceA, ConnectorRoutingID: testRoutingA,
 	}}}
-	if got := cfg.Routes[0].CRID; got != testPublicResourceA {
-		t.Fatalf("PrimaryResourceID = %q, want public identity", got)
+	if got := cfg.PrimaryResourceID(); got != "" {
+		t.Fatalf("unhydrated public key = %q, want empty", got)
+	}
+	cfg.Routes[0].ResourcePublicKey = "runtime-public-key"
+	if got := cfg.PrimaryResourceID(); got != "runtime-public-key" {
+		t.Fatalf("hydrated public key = %q", got)
 	}
 	cfg.SetKnockResourceID(testPublicResourceA, "qurl-tunnel-server")
 	if got := cfg.KnockResourceID(cfg.Routes[0].CRID); got != "qurl-tunnel-server" {

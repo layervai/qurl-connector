@@ -143,7 +143,7 @@ type Entry struct {
 	Reason string `json:"reason,omitempty"`
 
 	SessionID         string `json:"session_id,omitempty"`
-	ResourcePublicKey string `json:"resource_id,omitempty"`
+	ResourcePublicKey string `json:"resource_public_key,omitempty"`
 	RouteID           string `json:"route_id,omitempty"`
 	Subject           string `json:"subject,omitempty"`
 
