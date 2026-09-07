@@ -410,6 +410,8 @@ type groupRouteEntry struct {
 	// it bounds how long the entry's refusals count against the
 	// released-pending ceiling.
 	erroredAt time.Time
+	// lastObserved stays zero until this exact proxy name appears in FRP.
+	lastObserved time.Time
 	// replaces marks a regenerated route whose previous proxy was already
 	// released: the old proxy leaves the pushed set with this entry's first
 	// push, so the entry takes the next slot ahead of routes that never
@@ -622,19 +624,22 @@ func (s *frpGroupSession) observe() error {
 		return nil
 	}
 	changed := false
-	lostServing, anyObserved := false, false
+	lostProxy, anyObserved := false, false
+	now := time.Now()
 	for _, observed := range observations {
 		entry, ok := s.routes[observed.routeID]
 		if !ok || entry.name != observed.name || entry.phase == RouteFailed {
 			continue
 		}
-		// FRP clears its proxy table when the control connection ends, but
-		// retries Login internally with the old admission. End this cycle so
-		// the runner retires that admission and obtains a fresh NHP knock.
-		// Initial registration and deliberate route replacement are pending,
-		// not serving; the name check above excludes concurrent replacements.
-		lostServing = lostServing || (observed.missing && entry.phase == RouteServing)
-		anyObserved = anyObserved || !observed.missing
+		if !observed.missing {
+			entry.lastObserved = now
+			anyObserved = true
+		} else if !entry.lastObserved.IsZero() && now.Sub(entry.lastObserved) >= 3*time.Second {
+			// Allow FRP's fast reconnect to repair a brief control loss. A
+			// vanished proxy that stays absent needs a fresh admission; new
+			// and regenerated names have no prior observation to expire.
+			lostProxy = true
+		}
 		if observed.phase == RouteFailed {
 			s.version++
 		}
@@ -654,7 +659,8 @@ func (s *frpGroupSession) observe() error {
 			entry.erroredAt = time.Now()
 		}
 	}
-	if lostServing && !anyObserved {
+	if lostProxy && !anyObserved {
+		s.notify()
 		return ErrSessionGroupEnded
 	}
 	// Proxies that registered (or failed) free window slots; the next routes

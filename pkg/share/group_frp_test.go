@@ -1141,10 +1141,62 @@ func TestFRPGroupSessionReopensAfterControlProxyTableDisappears(t *testing.T) {
 	status.mu.Unlock()
 	select {
 	case <-session.Done():
-	case <-time.After(2 * time.Second):
+	case <-time.After(5 * time.Second):
 		t.Fatal("lost control connection kept retrying the stale admission")
 	}
 	if !errors.Is(session.Err(), ErrSessionGroupEnded) {
 		t.Fatalf("error = %v", session.Err())
+	}
+}
+
+func TestFRPGroupSessionLostProxyRecoveryBoundaries(t *testing.T) {
+	for _, scenario := range []string{"brief loss", "healthy sibling", "regenerated route", "lost initial registration"} {
+		t.Run(scenario, func(t *testing.T) {
+			status := &lockedStatusMap{}
+			routes := groupRoutesOf(groupTestRoutes("a", "b"))
+			if scenario != "healthy sibling" {
+				routes = routes[:1]
+			}
+			session := newFRPGroupSession(&recordingGroupService{}, status, &v1.ClientCommonConfig{}, 7, time.Millisecond, routes)
+			phase := frpproxy.ProxyPhaseRunning
+			if scenario == "lost initial registration" {
+				phase = frpproxy.ProxyPhaseWaitStart
+			}
+			for _, route := range routes {
+				status.set(groupProxyName(route, 7), phase, "")
+			}
+			if err := session.observe(); err != nil {
+				t.Fatal(err)
+			}
+			delete(status.items, "a-nhp7")
+			if scenario != "brief loss" {
+				session.routes["a"].lastObserved = time.Now().Add(-4 * time.Second)
+			}
+			if scenario == "regenerated route" {
+				routes[0].Generation++
+				if err := session.Update(context.Background(), routes); err != nil {
+					t.Fatal(err)
+				}
+			}
+			err := session.observe()
+			if scenario == "lost initial registration" {
+				if !errors.Is(err, ErrSessionGroupEnded) {
+					t.Fatalf("lost registration error = %v", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := session.RouteStates()["a"].Phase; got != RoutePending {
+				t.Fatalf("missing route phase = %v", got)
+			}
+			if scenario == "brief loss" {
+				status.set("a-nhp7", frpproxy.ProxyPhaseRunning, "")
+				if err := session.observe(); err != nil || session.RouteStates()["a"].Phase != RouteServing {
+					t.Fatalf("brief loss did not recover: %v", err)
+				}
+			}
+		})
 	}
 }
