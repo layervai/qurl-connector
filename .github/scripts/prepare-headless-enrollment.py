@@ -11,6 +11,7 @@ import http.client
 import json
 import os
 import re
+import socket
 import ssl
 import subprocess
 import sys
@@ -55,7 +56,6 @@ AWS_REJECTED_ERROR_CODES = {
     "InvalidPolicyAttributeException",
     "InvalidPolicyTypeException",
     "InvalidSignatureException",
-    "ParameterAlreadyExists",
     "ParameterLimitExceeded",
     "ParameterMaxVersionLimitExceeded",
     "PoliciesLimitExceededException",
@@ -67,6 +67,8 @@ AWS_REJECTED_ERROR_CODES = {
 } | (AWS_RETRYABLE_ERROR_CODES - AWS_UNKNOWN_OUTCOME_ERROR_CODES)
 MAX_RESPONSE_BYTES = 64 * 1024
 API_TIMEOUT_SECONDS = 10
+AWS_CLI_CONNECT_TIMEOUT_SECONDS = 5
+AWS_CLI_READ_TIMEOUT_SECONDS = 20
 AWS_TIMEOUT_SECONDS = 30
 # Allow up to two minutes of normal polling for an off-to-on serving epoch to
 # propagate. The internal deadline below also bounds slow requests and
@@ -145,7 +147,7 @@ class APIRequestOutcomeUnknown(APIRequestRetryable):
 
 
 class APIRequestRejectedRetryable(APIRequestRetryable):
-    """The origin rejected a request that can be retried safely."""
+    """The request did not commit and can be retried safely."""
 
 
 class EnrollmentParameterOutcomeUnknown(EnrollmentError):
@@ -395,6 +397,19 @@ def api_request(
                 retry_after_seconds=retry_after_seconds,
             ) from exc
         raise EnrollmentError(message) from exc
+    except urllib.error.URLError as exc:
+        # DNS resolution, a refused TCP connection, and TLS certificate
+        # verification all fail before urllib can send the HTTP request. Other
+        # URL errors can happen after request bytes leave the runner, so their
+        # outcomes remain unknown.
+        if isinstance(
+            exc.reason,
+            (socket.gaierror, ConnectionRefusedError, ssl.SSLCertVerificationError),
+        ):
+            raise APIRequestRejectedRetryable(
+                f"qURL API could not connect for the {method} request"
+            ) from exc
+        raise APIRequestOutcomeUnknown(f"qURL API {method} request failed") from exc
     except (OSError, http.client.HTTPException) as exc:
         raise APIRequestOutcomeUnknown(f"qURL API {method} request failed") from exc
     if len(raw) > MAX_RESPONSE_BYTES:
@@ -417,6 +432,32 @@ def api_request_before_deadline(
     return api_request(api_endpoint, api_key, path, **kwargs)
 
 
+def api_read_before_deadline(
+    deadline: float, api_endpoint: str, api_key: str, path: str
+) -> Any:
+    """Perform one read with one bounded retry and no mutation ambiguity."""
+    last_failure: APIRequestRetryable | None = None
+    for attempt in range(2):
+        try:
+            return api_request_before_deadline(deadline, api_endpoint, api_key, path)
+        except APIRequestRetryable as exc:
+            last_failure = exc
+            if attempt == 0:
+                retry_delay = (
+                    exc.retry_after_seconds
+                    if exc.retry_after_seconds is not None
+                    else RETRY_SECONDS
+                )
+                sleep_before_deadline(
+                    min(max(retry_delay, 0.0), MAX_RETRY_AFTER_SECONDS),
+                    deadline,
+                    reserve_seconds=API_TIMEOUT_SECONDS,
+                )
+    raise EnrollmentError(
+        "qURL API read failed after one bounded retry"
+    ) from last_failure
+
+
 def _put_parameter_command(region: str, parameter: str) -> list[str]:
     # KEY excludes non-ASCII and newlines, so text-mode paramfile expansion
     # preserves the validated token byte-for-byte. /dev/stdin requires the
@@ -428,6 +469,10 @@ def _put_parameter_command(region: str, parameter: str) -> list[str]:
     # customer-managed KMS authority and cannot silently select another key.
     return [
         "aws",
+        "--cli-connect-timeout",
+        str(AWS_CLI_CONNECT_TIMEOUT_SECONDS),
+        "--cli-read-timeout",
+        str(AWS_CLI_READ_TIMEOUT_SECONDS),
         "ssm",
         "put-parameter",
         "--region",
@@ -718,8 +763,8 @@ def prepare_enrollment(
     # client-credentials exchange per request or per resource.
     operation_deadline = _operation_deadline(deadline)
     slug, parameter = TARGETS[target]
-    # Pre-mint reads fail immediately; rerunning them cannot create state.
-    resources = api_request_before_deadline(
+    # These pre-mint reads can retry once because they cannot create state.
+    resources = api_read_before_deadline(
         operation_deadline,
         api_endpoint,
         api_key,
@@ -743,7 +788,7 @@ def prepare_enrollment(
         raise EnrollmentError("connector resource has no resource ID")
     resource_path = "/v1/resources/" + urllib.parse.quote(resource_id, safe="")
 
-    sharing = api_request_before_deadline(
+    sharing = api_read_before_deadline(
         operation_deadline, api_endpoint, api_key, resource_path + "/sharing"
     )
     desired_state = sharing.get("desired_state") if isinstance(sharing, dict) else None

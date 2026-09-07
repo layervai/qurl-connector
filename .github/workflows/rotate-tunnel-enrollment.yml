@@ -29,8 +29,9 @@ on:
 
 concurrency:
   # Replica targets for one route can run together. Sharing updates are
-  # idempotent, each run requires an adequate serving epoch, and token
-  # idempotency keys remain target-specific.
+  # idempotent, and each run requires an adequate serving epoch. The current
+  # control-plane contract binds an enrollment token to its Connector slug,
+  # not to its serving epoch, and token idempotency keys remain target-specific.
   group: rotate-sandbox-tunnel-enrollment-${{ inputs.target }}
   cancel-in-progress: false
 

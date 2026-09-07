@@ -73,6 +73,7 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
         self.assertIn(
             "group: rotate-sandbox-tunnel-enrollment-${{ inputs.target }}", workflow
         )
+        self.assertIn("not to its serving epoch", workflow)
         self.assertIn("reuse for immediate retries", workflow)
         self.assertIn("less than 45 minutes left", workflow)
         self.assertNotIn("matrix:", workflow)
@@ -573,6 +574,157 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
                 MODULE.api_request(
                     "https://api.example.com", "lv_live_account-key", "/v1/resources"
                 )
+
+    def test_api_request_marks_connect_phase_failure_safe_to_retry(self) -> None:
+        for reason in (
+            MODULE.socket.gaierror(-2, "private DNS detail"),
+            ConnectionRefusedError(111, "private endpoint detail"),
+            MODULE.ssl.SSLCertVerificationError(1, "private certificate detail"),
+        ):
+            with (
+                self.subTest(reason=type(reason).__name__),
+                mock.patch.object(
+                    MODULE.NO_REDIRECT_OPENER,
+                    "open",
+                    side_effect=MODULE.urllib.error.URLError(reason),
+                ),
+                self.assertRaisesRegex(
+                    MODULE.APIRequestRejectedRetryable, "could not connect"
+                ) as raised,
+            ):
+                MODULE.api_request(
+                    "https://api.example.com",
+                    "lv_live_account-key",
+                    "/v1/resources",
+                )
+            self.assertNotIsInstance(raised.exception, MODULE.APIRequestOutcomeUnknown)
+            self.assertNotIn("private", str(raised.exception))
+
+    def test_api_request_keeps_timeout_outcome_unknown(self) -> None:
+        with (
+            mock.patch.object(
+                MODULE.NO_REDIRECT_OPENER,
+                "open",
+                side_effect=MODULE.urllib.error.URLError(
+                    TimeoutError("private timeout detail")
+                ),
+            ),
+            self.assertRaisesRegex(
+                MODULE.APIRequestOutcomeUnknown, "GET request failed"
+            ) as raised,
+        ):
+            MODULE.api_request(
+                "https://api.example.com", "lv_live_account-key", "/v1/resources"
+            )
+        self.assertNotIn("private", str(raised.exception))
+
+    def test_initial_resource_read_retries_once_before_any_mutation(self) -> None:
+        resource = [
+            {
+                "slug": "detect-sandbox",
+                "type": "tunnel",
+                "status": "active",
+                "resource_id": "r_one",
+            }
+        ]
+        sharing = {"desired_state": "on", "serving_epoch": 1}
+        credential = {
+            "kind": "enrollment_token",
+            "target": "agent",
+            "claims": [{"type": "connector", "id": "detect-sandbox"}],
+            "api_key": "lv_live_test-token",
+            "expires_at": VALID_EXPIRY,
+        }
+        responses = [
+            MODULE.APIRequestOutcomeUnknown("temporary read failure"),
+            resource,
+            sharing,
+            credential,
+        ]
+        with (
+            mock.patch.object(MODULE, "api_request", side_effect=responses) as request,
+            mock.patch.object(MODULE, "put_parameter") as put,
+            mock.patch.object(MODULE.time, "sleep") as sleep,
+        ):
+            MODULE.prepare_enrollment(
+                "https://api.example.com",
+                "lv_live_account-key",
+                "detect-nhp-replica-a",
+                "attempt-1",
+                "us-east-2",
+                now=FIXED_NOW,
+            )
+        self.assertEqual(request.call_args_list[0], request.call_args_list[1])
+        sleep.assert_called_once_with(MODULE.RETRY_SECONDS)
+        put.assert_called_once()
+
+    def test_initial_sharing_read_retries_once_before_any_mutation(self) -> None:
+        resource = [
+            {
+                "slug": "detect-sandbox",
+                "type": "tunnel",
+                "status": "active",
+                "resource_id": "r_one",
+            }
+        ]
+        sharing = {"desired_state": "on", "serving_epoch": 1}
+        credential = {
+            "kind": "enrollment_token",
+            "target": "agent",
+            "claims": [{"type": "connector", "id": "detect-sandbox"}],
+            "api_key": "lv_live_test-token",
+            "expires_at": VALID_EXPIRY,
+        }
+        responses = [
+            resource,
+            MODULE.APIRequestRejectedRetryable(
+                "temporary read rejection", retry_after_seconds=7
+            ),
+            sharing,
+            credential,
+        ]
+        with (
+            mock.patch.object(MODULE, "api_request", side_effect=responses) as request,
+            mock.patch.object(MODULE, "put_parameter") as put,
+            mock.patch.object(MODULE.time, "sleep") as sleep,
+        ):
+            MODULE.prepare_enrollment(
+                "https://api.example.com",
+                "lv_live_account-key",
+                "detect-nhp-replica-a",
+                "attempt-1",
+                "us-east-2",
+                now=FIXED_NOW,
+            )
+        self.assertEqual(request.call_args_list[1], request.call_args_list[2])
+        sleep.assert_called_once_with(7)
+        put.assert_called_once()
+
+    def test_initial_read_stops_after_one_retry_without_mutation(self) -> None:
+        failures = [
+            MODULE.APIRequestOutcomeUnknown("first private read detail"),
+            MODULE.APIRequestOutcomeUnknown("second private read detail"),
+        ]
+        with (
+            mock.patch.object(MODULE, "api_request", side_effect=failures) as request,
+            mock.patch.object(MODULE, "put_parameter") as put,
+            mock.patch.object(MODULE.time, "sleep") as sleep,
+            self.assertRaisesRegex(
+                MODULE.EnrollmentError, "read failed after one bounded retry"
+            ) as raised,
+        ):
+            MODULE.prepare_enrollment(
+                "https://api.example.com",
+                "lv_live_account-key",
+                "detect-nhp-replica-a",
+                "attempt-1",
+                "us-east-2",
+                now=FIXED_NOW,
+            )
+        self.assertEqual(request.call_count, 2)
+        self.assertNotIn("private", str(raised.exception))
+        sleep.assert_called_once_with(MODULE.RETRY_SECONDS)
+        put.assert_not_called()
 
     def test_expiry_rejects_naive_and_short_lived_values(self) -> None:
         now = dt.datetime(2026, 9, 4, 18, 0, tzinfo=dt.timezone.utc)
@@ -1153,6 +1305,50 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
         self.assertNotIn("unknown", str(raised.exception))
         sleep.assert_called_once_with(MODULE.RETRY_SECONDS)
         put.assert_not_called()
+
+    def test_mint_connect_failure_then_success_has_no_extra_credential_warning(
+        self,
+    ) -> None:
+        credential = {
+            "kind": "enrollment_token",
+            "key_id": "key_abc123def456",
+            "target": "agent",
+            "claims": [{"type": "connector", "id": "detect-sandbox"}],
+            "api_key": "lv_live_test-token",
+            "expires_at": VALID_EXPIRY,
+        }
+        responses = [
+            MODULE.APIRequestRejectedRetryable("qURL API could not connect"),
+            credential,
+        ]
+
+        def request(*_args: object, **kwargs: object) -> object:
+            result = responses.pop(0)
+            if isinstance(result, Exception):
+                raise result
+            response_status = kwargs["response_status"]
+            assert isinstance(response_status, list)
+            response_status[:] = [201]
+            return result
+
+        with (
+            mock.patch.object(MODULE, "api_request", side_effect=request),
+            mock.patch.object(MODULE, "put_parameter") as put,
+            mock.patch.object(MODULE.time, "sleep") as sleep,
+        ):
+            _expiry, warning = MODULE.mint_and_install_enrollment(
+                "https://api.example.com",
+                "lv_live_account-key",
+                "detect-nhp-replica-a",
+                "attempt-1",
+                "us-east-2",
+                "detect-sandbox",
+                "/reviewed/name",
+                now=FIXED_NOW,
+            )
+        self.assertEqual(warning, "")
+        sleep.assert_called_once_with(MODULE.RETRY_SECONDS)
+        put.assert_called_once()
 
     def test_later_failure_reports_observed_sharing_transition(self) -> None:
         responses = [
@@ -2175,6 +2371,19 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
         self.assertEqual(args[args.index("--name") + 1], "/reviewed/name")
         self.assertEqual(args[args.index("--region") + 1], "us-east-2")
         self.assertEqual(args[args.index("--type") + 1], "SecureString")
+        self.assertEqual(
+            args[args.index("--cli-connect-timeout") + 1],
+            str(MODULE.AWS_CLI_CONNECT_TIMEOUT_SECONDS),
+        )
+        self.assertEqual(
+            args[args.index("--cli-read-timeout") + 1],
+            str(MODULE.AWS_CLI_READ_TIMEOUT_SECONDS),
+        )
+        self.assertLess(
+            MODULE.AWS_CLI_CONNECT_TIMEOUT_SECONDS
+            + MODULE.AWS_CLI_READ_TIMEOUT_SECONDS,
+            MODULE.AWS_TIMEOUT_SECONDS,
+        )
         self.assertIn("--overwrite", args)
         self.assertEqual(kwargs["timeout"], MODULE.AWS_TIMEOUT_SECONDS)
 
