@@ -186,26 +186,35 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
 
     def test_validation_workflow_requires_tested_aws_cli_major(self) -> None:
         workflow = VALIDATE_WORKFLOW.read_text()
-        self.assertIn("timeout-minutes: 10", workflow)
-        require_cli = workflow.index("- name: Require tested AWS CLI major")
-        contract_test = workflow.index("- name: Test sandbox enrollment recovery")
+        actionlint_start = workflow.index("  actionlint:")
+        enrollment_start = workflow.index("  enrollment-recovery:")
+        actionlint_job = workflow[actionlint_start:enrollment_start]
+        enrollment_job = workflow[enrollment_start:]
+        self.assertIn("reviewdog/action-actionlint@", actionlint_job)
+        self.assertNotIn("actions/setup-go@", actionlint_job)
+        self.assertNotIn("actions/setup-python@", actionlint_job)
+        self.assertNotIn("make test-python", actionlint_job)
+        self.assertIn("timeout-minutes: 10", enrollment_job)
+        require_cli = enrollment_job.index("- name: Require tested AWS CLI major")
+        contract_test = enrollment_job.index("- name: Test sandbox enrollment recovery")
         self.assertLess(require_cli, contract_test)
-        self.assertIn("if ! aws_version=$(aws --version 2>&1); then", workflow)
-        self.assertIn("AWS CLI v2, but aws is unavailable", workflow)
-        self.assertIn('[[ ! "$aws_version" =~ ^aws-cli/2\\. ]]', workflow)
-        self.assertGreaterEqual(workflow.count("actions/setup-python@"), 1)
-        self.assertIn('python-version: "3.13"', workflow)
-        self.assertIn("pip install --require-hashes", workflow)
-        self.assertIn("run: make lint-python", workflow)
-        self.assertNotIn("ruff check --no-cache", workflow)
+        self.assertIn("if ! aws_version=$(aws --version 2>&1); then", enrollment_job)
+        self.assertIn("AWS CLI v2, but aws is unavailable", enrollment_job)
+        self.assertIn('[[ ! "$aws_version" =~ ^aws-cli/2\\. ]]', enrollment_job)
+        self.assertEqual(enrollment_job.count("actions/setup-python@"), 1)
+        self.assertIn('python-version: "3.13"', enrollment_job)
+        self.assertIn("pip install --require-hashes", enrollment_job)
+        self.assertIn("run: make lint-python", enrollment_job)
+        self.assertNotIn("ruff check --no-cache", enrollment_job)
         self.assertIn(
             "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1\n"
             "        with:\n"
             "          persist-credentials: false",
-            workflow,
+            enrollment_job,
         )
-        self.assertIn("run: make test-python", workflow)
-        self.assertNotIn("unittest discover", workflow)
+        self.assertIn("run: make test-python", enrollment_job)
+        self.assertIn("run: go test ./.github/scripts", enrollment_job)
+        self.assertNotIn("unittest discover", enrollment_job)
         makefile = MAKEFILE.read_text()
         self.assertIn("lint-python:", makefile)
         self.assertIn("test-python:", makefile)
@@ -841,7 +850,8 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
         output.assert_has_calls(
             [
                 mock.call(
-                    "::notice::sharing for detect-nhp-replica-a changed from off to on during this run and was deliberately left on"
+                    "::notice::sharing for detect-nhp-replica-a changed from off to on during this run and was deliberately left on",
+                    file=MODULE.sys.stderr,
                 ),
                 mock.call(
                     "prepared one-hour enrollment for detect-nhp-replica-a at serving epoch 1; "
@@ -1185,7 +1195,7 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
                 side_effect=MODULE.APIRequestOutcomeUnknown("response lost"),
             ),
             mock.patch.object(MODULE, "put_parameter") as put,
-            mock.patch.object(MODULE.time, "monotonic", side_effect=[0, 90]),
+            mock.patch.object(MODULE.time, "monotonic", side_effect=[0, 0, 90]),
             mock.patch.object(MODULE.time, "sleep") as sleep,
         ):
             with self.assertRaisesRegex(
@@ -1208,7 +1218,30 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
         sleep.assert_not_called()
         put.assert_not_called()
 
-    def test_minted_credential_keeps_operator_guidance_when_ssm_budget_is_gone(
+    def test_mint_is_not_started_without_install_budget(self) -> None:
+        with (
+            mock.patch.object(MODULE, "api_request") as request,
+            mock.patch.object(MODULE, "put_parameter") as put,
+            mock.patch.object(MODULE.time, "monotonic", return_value=20),
+        ):
+            with self.assertRaisesRegex(
+                MODULE.EnrollmentDeadlineExceeded, "internal deadline"
+            ):
+                MODULE.mint_and_install_enrollment(
+                    "https://api.example.com",
+                    "lv_live_account-key",
+                    "detect-nhp-replica-a",
+                    "attempt-1",
+                    "us-east-2",
+                    "detect-sandbox",
+                    "/reviewed/name",
+                    now=FIXED_NOW,
+                    deadline=100,
+                )
+        request.assert_not_called()
+        put.assert_not_called()
+
+    def test_minted_credential_keeps_guidance_if_budget_later_disappears(
         self,
     ) -> None:
         credential = {
@@ -1222,7 +1255,7 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
         with (
             mock.patch.object(MODULE, "api_request", return_value=credential),
             mock.patch.object(MODULE, "put_parameter") as put,
-            mock.patch.object(MODULE.time, "monotonic", side_effect=[0, 40]),
+            mock.patch.object(MODULE.time, "monotonic", side_effect=[0, 0, 40]),
         ):
             with self.assertRaisesRegex(
                 MODULE.EnrollmentError,
@@ -2020,6 +2053,39 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
         self.assertNotIn("left on", str(raised.exception))
         put.assert_not_called()
 
+    def test_invalid_poll_payload_preserves_unknown_put_warning(self) -> None:
+        responses = [
+            [
+                {
+                    "slug": "detect-sandbox",
+                    "type": "tunnel",
+                    "status": "active",
+                    "resource_id": "MFkw-resource",
+                }
+            ],
+            {"desired_state": "off", "serving_epoch": 0},
+            MODULE.APIRequestOutcomeUnknown("qURL API PUT response was lost"),
+            *[None] * MODULE.SHARING_POLL_ATTEMPTS,
+        ]
+        with (
+            mock.patch.object(MODULE, "api_request", side_effect=responses),
+            mock.patch.object(MODULE, "put_parameter") as put,
+            mock.patch.object(MODULE.time, "sleep"),
+        ):
+            with self.assertRaisesRegex(
+                MODULE.EnrollmentError,
+                "sharing update outcome is unknown.*may have been left on",
+            ):
+                MODULE.prepare_enrollment(
+                    "https://api.example.com",
+                    "lv_live_account-key",
+                    "detect-nhp-replica-a",
+                    "attempt-1",
+                    "us-east-2",
+                    now=FIXED_NOW,
+                )
+        put.assert_not_called()
+
     def test_sharing_poll_allows_propagation_before_operator_retry(self) -> None:
         self.assertGreaterEqual(
             (MODULE.SHARING_POLL_ATTEMPTS - 1) * MODULE.SHARING_POLL_SECONDS,
@@ -2650,7 +2716,8 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
             ) as run,
             mock.patch.object(MODULE.time, "sleep") as sleep,
             self.assertRaisesRegex(
-                MODULE.EnrollmentError, "ThrottlingException.*exit status 255"
+                MODULE.EnrollmentError,
+                "temporarily rejected.*ThrottlingException.*retrying the same generation is safe",
             ) as raised,
         ):
             MODULE.put_parameter("us-east-2", "/reviewed/name", "lv_live_secret-token")

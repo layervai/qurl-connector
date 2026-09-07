@@ -92,6 +92,7 @@ AWS_TIMEOUT_SECONDS = 35
 SHARING_POLL_ATTEMPTS = 13
 SHARING_POLL_SECONDS = 10
 RETRY_SECONDS = 2
+AWS_INSTALL_RESERVE_SECONDS = (2 * AWS_TIMEOUT_SECONDS) + RETRY_SECONDS
 MAX_RETRY_AFTER_SECONDS = 30
 SCRIPT_DEADLINE_SECONDS = 8 * 60
 TARGETS = {
@@ -602,6 +603,10 @@ def put_parameter(region: str, parameter: str, token: str) -> None:
             raise EnrollmentParameterOutcomeUnknown(
                 f"AWS returned {error_class} after the enrollment parameter update; the update may have completed"
             )
+        if error_class in AWS_RETRYABLE_ERROR_CODES:
+            raise EnrollmentError(
+                f"AWS temporarily rejected the enrollment parameter update with {error_class} after one bounded retry; retrying the same generation is safe"
+            )
         if error_class in AWS_REJECTED_ERROR_CODES or error_class in set(
             AWS_LOCAL_ERROR_CLASSES.values()
         ):
@@ -644,6 +649,13 @@ def mint_and_install_enrollment(
     mint_failure: EnrollmentError | None = None
     mint_outcome_unknown = False
     mint_response_status: list[int] = []
+    # Reserve the full write path before any POST can create a live credential.
+    # Repeat this reservation before a retry so its sleep and request cannot
+    # consume the SSM installation budget.
+    require_deadline_budget(
+        operation_deadline,
+        API_TIMEOUT_SECONDS + AWS_INSTALL_RESERVE_SECONDS,
+    )
     for attempt in range(2):
         try:
             mint_response_status.clear()
@@ -679,7 +691,9 @@ def mint_and_install_enrollment(
                     sleep_before_deadline(
                         bounded_retry_delay,
                         operation_deadline,
-                        reserve_seconds=API_TIMEOUT_SECONDS,
+                        reserve_seconds=(
+                            API_TIMEOUT_SECONDS + AWS_INSTALL_RESERVE_SECONDS
+                        ),
                     )
                 except EnrollmentDeadlineExceeded as deadline_exc:
                     if mint_outcome_unknown:
@@ -740,9 +754,7 @@ def mint_and_install_enrollment(
         # parameter write for only 15 minutes. A new generation creates a new
         # operation after that deployment window; every minted token expires
         # within one hour.
-        require_deadline_budget(
-            operation_deadline, (2 * AWS_TIMEOUT_SECONDS) + RETRY_SECONDS
-        )
+        require_deadline_budget(operation_deadline, AWS_INSTALL_RESERVE_SECONDS)
         put_parameter(region, parameter, token)
     except EnrollmentError as exc:
         possible_extra_suffix = (
@@ -909,6 +921,7 @@ def prepare_enrollment(
             ) from last_put_rejection
         minimum_epoch = serving_epoch + 1
         last_poll_failure: EnrollmentError | None = None
+        final_poll_state_valid = False
         for attempt in range(SHARING_POLL_ATTEMPTS):
             poll_delay = float(SHARING_POLL_SECONDS)
             try:
@@ -950,13 +963,22 @@ def prepare_enrollment(
             observed_epoch = (
                 sharing.get("serving_epoch") if isinstance(sharing, dict) else None
             )
+            observed_desired_state = (
+                sharing.get("desired_state") if isinstance(sharing, dict) else None
+            )
+            final_poll_state_valid = (
+                observed_desired_state in {"off", "on"}
+                and isinstance(observed_epoch, int)
+                and not isinstance(observed_epoch, bool)
+                and observed_epoch >= 0
+            )
             sharing_observed_on = sharing_observed_on or (
-                isinstance(sharing, dict) and sharing.get("desired_state") == "on"
+                observed_desired_state == "on"
             )
             if (
                 isinstance(observed_epoch, int)
                 and not isinstance(observed_epoch, bool)
-                and sharing.get("desired_state") == "on"
+                and observed_desired_state == "on"
                 and observed_epoch >= minimum_epoch
             ):
                 sharing_transition_observed = True
@@ -995,6 +1017,8 @@ def prepare_enrollment(
                 )
             elif sharing_observed_on:
                 message += "; sharing for this resource was observed on and was left on"
+            elif put_failure is not None and not final_poll_state_valid:
+                message += "; the sharing update outcome is unknown and sharing may have been applied before the response was lost and may have been left on"
             raise EnrollmentError(message)
 
     try:
@@ -1021,7 +1045,8 @@ def prepare_enrollment(
         print(f"::warning::{mint_warning}", file=sys.stderr)
     if sharing_transition_observed:
         print(
-            f"::notice::sharing for {target} changed from off to on during this run and was deliberately left on"
+            f"::notice::sharing for {target} changed from off to on during this run and was deliberately left on",
+            file=sys.stderr,
         )
     print(
         f"prepared one-hour enrollment for {target} at serving epoch {observed_epoch}; "
