@@ -979,7 +979,6 @@ func resolveConnectorIdentitiesLocked(
 		}
 		route.ResourceID = resource.ResourceID
 		route.ConnectorRoutingID = resource.ConnectorRoutingID
-		route.KnockResourceID = resource.KnockResourceID
 		cfg.SetKnockResourceID(resource.ResourceID, resource.KnockResourceID)
 	}
 	if err := nhpconfig.ValidateManagedRouteIdentities(cfg.Routes); err != nil {

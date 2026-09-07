@@ -361,7 +361,7 @@ func stripRetiredGeneratedFields(data string) (string, error) {
 					dropped = dropYAMLField(route, key) || dropped
 				case routingValue != "" && strings.TrimSpace(field.Value) == routingValue:
 					dropped = dropYAMLField(route, key) || dropped
-				case routingValue == "" && resourceID != nil && strings.TrimSpace(resourceID.Value) != "":
+				case field.Kind == yaml.ScalarNode && routingValue == "" && resourceID != nil && strings.TrimSpace(resourceID.Value) != "":
 					// A pinned managed resource can load before routing hydration.
 					dropped = dropYAMLField(route, key) || dropped
 				default:

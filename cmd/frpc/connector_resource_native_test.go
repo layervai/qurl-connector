@@ -148,6 +148,9 @@ func TestNativeConnectorWarmContinuityUsesFreshNonceAndExactResource(t *testing.
 	if got := warm.KnockResourceID(testPublicResourceID); got != "cell-resource" {
 		t.Fatalf("warm knock_resource_id = %q", got)
 	}
+	if warm.Routes[0].KnockResourceID != "" {
+		t.Fatalf("runtime hydration persisted a Desktop-only knock_resource_id pin: %#v", warm.Routes[0])
+	}
 }
 
 func TestNativeConnectorMultiRoutePersistsCompleteSharedKnockBindings(t *testing.T) {
