@@ -2723,13 +2723,17 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
             MODULE.run()
 
         main.assert_called_once()
-        self.assertEqual(install_handler.call_count, 2)
+        self.assertEqual(install_handler.call_count, 3)
         self.assertEqual(
             install_handler.call_args_list[0].args[0], MODULE.signal.SIGALRM
         )
         self.assertTrue(callable(install_handler.call_args_list[0].args[1]))
         self.assertEqual(
             install_handler.call_args_list[1],
+            mock.call(MODULE.signal.SIGALRM, MODULE.signal.SIG_IGN),
+        )
+        self.assertEqual(
+            install_handler.call_args_list[2],
             mock.call(MODULE.signal.SIGALRM, MODULE.signal.SIG_DFL),
         )
         self.assertEqual(

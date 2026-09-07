@@ -1202,6 +1202,9 @@ def run() -> None:
     def complete_installation() -> None:
         nonlocal installation_complete
         installation_complete = True
+        # Ignore and discard any alarm that was already pending before the
+        # timer is cancelled. The previous handler is restored in finally.
+        signal.signal(signal.SIGALRM, signal.SIG_IGN)
         signal.setitimer(signal.ITIMER_REAL, 0)
 
     previous_alarm_handler = signal.signal(signal.SIGALRM, deadline_handler)
