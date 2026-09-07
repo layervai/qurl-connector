@@ -169,6 +169,9 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
         self.assertIn('.branch_policies[0].type == "branch"', workflow)
         self.assertIn('.type == "required_reviewers"', workflow)
         self.assertIn(".prevent_self_review == true", workflow)
+        self.assertIn(".can_admins_bypass == false", workflow)
+        self.assertIn('"true true true true"', workflow)
+        self.assertIn("prohibit administrator bypass", workflow)
         for name in (
             "QURL_SANDBOX_API_KEY",
             "QURL_SANDBOX_API_ENDPOINT",
