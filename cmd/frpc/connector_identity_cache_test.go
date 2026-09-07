@@ -336,6 +336,24 @@ func TestHydrateConnectorResourceIDsReadOnlyToleratesOrphanCacheEntries(t *testi
 	}
 }
 
+func TestHydrateConnectorIdentitiesRejectsConflictingRoutingPin(t *testing.T) {
+	dir := newIdentityCacheTestDir(t)
+	t.Setenv(agentstate.EnvStateDirPrimary, dir)
+	seedConnectorIdentityCacheForTest(t, dir, "web", testPublicResourceID)
+	cfg := nhpconfig.NewDefaulted()
+	cfg.Routes = []nhpconfig.Route{{ID: "web", Type: nhpconfig.RouteTypeHTTP,
+		CRID:               testCRIDForKey(testPublicResourceID),
+		ConnectorRoutingID: testConnectorRoutingID2,
+		LocalIP:            "127.0.0.1", LocalPort: 8080}}
+	before := cfg.Routes[0]
+	if err := hydrateConnectorResourceIDsReadOnlyContext(context.Background(), cfg); err == nil || !strings.Contains(err.Error(), "pinned connector_routing_id") {
+		t.Fatalf("hydration error = %v, want routing pin conflict", err)
+	}
+	if cfg.Routes[0].ConnectorRoutingID != before.ConnectorRoutingID || cfg.Routes[0].ResourcePublicKey != "" {
+		t.Fatal("failed diagnostic hydration changed the configured identity")
+	}
+}
+
 func TestConnectorIdentityCacheStrictSchema(t *testing.T) {
 	tests := map[string]struct {
 		raw  string

@@ -797,7 +797,7 @@ func validateConfiguredConnectorIdentityGraph(cfg *nhpconfig.Config, cache *conn
 	}
 	fallbackID := routeIDEnvFallback()
 	configuredIDs := make(map[string]struct{}, len(cfg.Routes))
-	resourceOwners := make(map[string]string, len(cfg.Routes))
+	cridOwners := make(map[string]string, len(cfg.Routes))
 	for i, route := range cfg.Routes {
 		id := routeIDWithFallback(cfg, route, fallbackID)
 		if err := nhpconfig.ValidateSlug(id); err != nil {
@@ -807,24 +807,28 @@ func validateConfiguredConnectorIdentityGraph(cfg *nhpconfig.Config, cache *conn
 			return nil, fmt.Errorf("routes[%d]: duplicate Connector id %q", i, id)
 		}
 		configuredIDs[id] = struct{}{}
-		cachedCRID, cached := cache.crid(id)
+		binding, cached := cache.binding(id)
+		cachedCRID := binding.CRID
+		if route.ConnectorRoutingID != "" && cached && route.ConnectorRoutingID != binding.ConnectorRoutingID {
+			return nil, fmt.Errorf("route %q: pinned connector_routing_id %q conflicts with cached connector_routing_id %q", id, route.ConnectorRoutingID, binding.ConnectorRoutingID)
+		}
 		if route.CRID != "" && cached && route.CRID != cachedCRID {
 			return nil, fmt.Errorf("route %q: pinned crid %q conflicts with cached crid %q", id, route.CRID, cachedCRID)
 		}
-		resourceID := route.CRID
-		if resourceID == "" {
-			resourceID = cachedCRID
+		cridValue := route.CRID
+		if cridValue == "" {
+			cridValue = cachedCRID
 		}
-		if resourceID == "" {
+		if cridValue == "" {
 			continue
 		}
-		if err := qurlcrid.Validate(resourceID); err != nil {
+		if err := qurlcrid.Validate(cridValue); err != nil {
 			return nil, fmt.Errorf("route %q: invalid crid: %w", id, err)
 		}
-		if owner, duplicate := resourceOwners[resourceID]; duplicate {
-			return nil, fmt.Errorf("routes %q and %q resolve to duplicate crid %q", owner, id, resourceID)
+		if owner, duplicate := cridOwners[cridValue]; duplicate {
+			return nil, fmt.Errorf("routes %q and %q resolve to duplicate crid %q", owner, id, cridValue)
 		}
-		resourceOwners[resourceID] = id
+		cridOwners[cridValue] = id
 	}
 	return configuredIDs, nil
 }
