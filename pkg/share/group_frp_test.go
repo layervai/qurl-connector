@@ -679,7 +679,7 @@ func TestInspectRouteStatusMapsExactRejectionTags(t *testing.T) {
 	} {
 		status := &lockedStatusMap{}
 		status.set("a", frpproxy.ProxyPhaseStartErr, test.wire)
-		_, routeErr, fatalErr := inspectRouteStatus(status, "a")
+		_, routeErr, fatalErr, _ := inspectRouteStatus(status, "a")
 		if test.transient {
 			if routeErr == nil || fatalErr != nil {
 				t.Errorf("inspectRouteStatus(%q) = route %v, fatal %v; want a transient route error", test.wire, routeErr, fatalErr)
@@ -1123,5 +1123,92 @@ func TestFRPGroupSessionCeilingAgesOutDurableStartErrors(t *testing.T) {
 	waitForRouteStates(t, session, func(s map[string]RouteState) bool { return phaseOf(s, "a") == RouteServing })
 	if !erroredAt("a").IsZero() {
 		t.Fatalf("registered proxy a still carries a hold stamp: %s", erroredAt("a"))
+	}
+}
+
+func withControlRecoveryGrace(t *testing.T) {
+	t.Helper()
+	previous := groupControlRecoveryGrace
+	groupControlRecoveryGrace = 3 * time.Second
+	t.Cleanup(func() { groupControlRecoveryGrace = previous })
+}
+
+func TestFRPGroupSessionReopensAfterControlProxyTableDisappears(t *testing.T) {
+	withControlRecoveryGrace(t)
+	status := &lockedStatusMap{}
+	session := startTestGroupSession(t, &recordingGroupService{}, status, groupRoutesOf(groupTestRoutes("a")))
+	// An empty initial table is normal while the first registration starts.
+	if err := session.observe(); err != nil {
+		t.Fatal(err)
+	}
+	status.set("a-nhp7", frpproxy.ProxyPhaseRunning, "")
+	waitForRouteStates(t, session, func(states map[string]RouteState) bool { return phaseOf(states, "a") == RouteServing })
+	// The real FRP Manager.Close clears this table on control disconnect.
+	status.mu.Lock()
+	delete(status.items, "a-nhp7")
+	status.mu.Unlock()
+	select {
+	case <-session.Done():
+	case <-time.After(5 * time.Second):
+		t.Fatal("lost control connection kept retrying the stale admission")
+	}
+	if !errors.Is(session.Err(), ErrSessionGroupEnded) {
+		t.Fatalf("error = %v", session.Err())
+	}
+}
+
+func TestFRPGroupSessionLostProxyRecoveryBoundaries(t *testing.T) {
+	for _, scenario := range []string{"brief loss", "healthy sibling", "regenerated route", "lost initial registration"} {
+		t.Run(scenario, func(t *testing.T) {
+			status := &lockedStatusMap{}
+			routes := groupRoutesOf(groupTestRoutes("a", "b"))
+			if scenario != "healthy sibling" {
+				routes = routes[:1]
+			}
+			session := newFRPGroupSession(&recordingGroupService{}, status, &v1.ClientCommonConfig{}, 7, time.Millisecond, routes)
+			phase := frpproxy.ProxyPhaseRunning
+			if scenario == "lost initial registration" {
+				phase = frpproxy.ProxyPhaseWaitStart
+			}
+			for _, route := range routes {
+				status.set(groupProxyName(route, 7), phase, "")
+			}
+			if err := session.observe(); err != nil {
+				t.Fatal(err)
+			}
+			status.mu.Lock()
+			delete(status.items, "a-nhp7")
+			status.mu.Unlock()
+			if scenario != "brief loss" {
+				session.mu.Lock()
+				session.routes["a"].lastObserved = time.Now().Add(-groupControlRecoveryGrace - time.Second)
+				session.mu.Unlock()
+			}
+			if scenario == "regenerated route" {
+				routes[0].Generation++
+				if err := session.Update(context.Background(), routes); err != nil {
+					t.Fatal(err)
+				}
+			}
+			err := session.observe()
+			if scenario == "lost initial registration" {
+				if !errors.Is(err, ErrSessionGroupEnded) {
+					t.Fatalf("lost registration error = %v", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := session.RouteStates()["a"].Phase; got != RoutePending {
+				t.Fatalf("missing route phase = %v", got)
+			}
+			if scenario == "brief loss" {
+				status.set("a-nhp7", frpproxy.ProxyPhaseRunning, "")
+				if err := session.observe(); err != nil || session.RouteStates()["a"].Phase != RouteServing {
+					t.Fatalf("brief loss did not recover: %v", err)
+				}
+			}
+		})
 	}
 }

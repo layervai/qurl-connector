@@ -1,5 +1,26 @@
 # Changelog
 
+## [0.12.0](https://github.com/layervai/qurl-connector/compare/v0.11.5...v0.12.0) (2026-09-07)
+
+
+### ⚠ BREAKING CHANGES
+
+* remove obsolete connector paths ([#72](https://github.com/layervai/qurl-connector/issues/72))
+
+### Bug Fixes
+
+* **share:** renew admission after control connection loss ([#82](https://github.com/layervai/qurl-connector/issues/82)) ([f339b9c](https://github.com/layervai/qurl-connector/commit/f339b9c2ab74b206e5cbe61f4e93a0768ba950c7))
+
+
+### Continuous Integration
+
+* restore fixed-slot enrollment recovery ([#71](https://github.com/layervai/qurl-connector/issues/71)) ([48e0fa8](https://github.com/layervai/qurl-connector/commit/48e0fa8969f361a6d52cd7b4c9190a18c0cd941c))
+
+
+### Code Refactoring
+
+* remove obsolete connector paths ([#72](https://github.com/layervai/qurl-connector/issues/72)) ([81a710b](https://github.com/layervai/qurl-connector/commit/81a710b5116a042933642549cf88a8d69eec6311))
+
 ## [0.11.5](https://github.com/layervai/qurl-connector/compare/v0.11.4...v0.11.5) (2026-09-03)
 
 

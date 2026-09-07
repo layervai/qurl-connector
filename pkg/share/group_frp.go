@@ -88,6 +88,11 @@ const groupReleasedPendingFactor = 2
 // groupReleasedPendingFactor.
 var groupErroredHold = 60 * time.Second
 
+// Allow one maximum FRP reconnect backoff (20s plus jitter) and a Login
+// exchange before discarding a usable admission. This delay applies only
+// while the proxy table is absent, never to serving traffic.
+var groupControlRecoveryGrace = 25 * time.Second
+
 // ErrRouteNotServing reports a route that stayed configured but did not reach
 // FRP's running phase on a replacement session before the prior admission
 // expired. The route remains in the group and inside FRP's same-session
@@ -100,7 +105,8 @@ const maxPushRetryDelay = 5 * time.Second
 
 // ErrSessionGroupEnded is returned by GroupServingSession.Update once the
 // session has stopped. SessionGroupRunner treats it as benign: the desired
-// set is authoritative and the next cycle starts from it.
+// set is authoritative and the next cycle starts from it. It also ends a
+// session whose control proxy table remains absent past the recovery grace.
 var ErrSessionGroupEnded = errors.New("FRP session group has ended")
 
 // GroupRoute is one route of a session group. Generation is the route's
@@ -410,6 +416,8 @@ type groupRouteEntry struct {
 	// it bounds how long the entry's refusals count against the
 	// released-pending ceiling.
 	erroredAt time.Time
+	// lastObserved stays zero until this exact proxy name appears in FRP.
+	lastObserved time.Time
 	// replaces marks a regenerated route whose previous proxy was already
 	// released: the old proxy leaves the pushed set with this entry's first
 	// push, so the entry takes the next slot ahead of routes that never
@@ -578,6 +586,7 @@ func (s *frpGroupSession) watch(ctx context.Context) {
 }
 
 type routeObservation struct {
+	missing bool
 	routeID string
 	name    string
 	phase   RoutePhase
@@ -603,7 +612,8 @@ func (s *frpGroupSession) observe() error {
 	}
 	s.mu.Unlock()
 	for i := range observations {
-		phase, err, terminal := inspectRouteStatus(s.status, observations[i].name)
+		phase, err, terminal, missing := inspectRouteStatus(s.status, observations[i].name)
+		observations[i].missing = missing
 		if terminal != nil {
 			return fmt.Errorf("route %q: %w", observations[i].routeID, terminal)
 		}
@@ -620,10 +630,21 @@ func (s *frpGroupSession) observe() error {
 		return nil
 	}
 	changed := false
+	lostProxy, anyObserved := false, false
+	now := time.Now()
 	for _, observed := range observations {
 		entry, ok := s.routes[observed.routeID]
 		if !ok || entry.name != observed.name || entry.phase == RouteFailed {
 			continue
+		}
+		if !observed.missing {
+			entry.lastObserved = now
+			anyObserved = true
+		} else if !entry.lastObserved.IsZero() && now.Sub(entry.lastObserved) >= groupControlRecoveryGrace {
+			// Allow FRP's fast reconnect to repair a brief control loss. A
+			// vanished proxy that stays absent needs a fresh admission; new
+			// and regenerated names have no prior observation to expire.
+			lostProxy = true
 		}
 		if observed.phase == RouteFailed {
 			s.version++
@@ -643,6 +664,10 @@ func (s *frpGroupSession) observe() error {
 		case observed.err != nil && entry.erroredAt.IsZero():
 			entry.erroredAt = time.Now()
 		}
+	}
+	if lostProxy && !anyObserved {
+		s.notify()
+		return ErrSessionGroupEnded
 	}
 	// Proxies that registered (or failed) free window slots; the next routes
 	// in line are handed to FRP on this tick's push.
@@ -672,24 +697,24 @@ func (s *frpGroupSession) observe() error {
 // rejection tags come back as terminalErr; resource_not_found is the route's
 // own permanent failure (routeErr); every other state stays pending inside
 // FRP's same-session retry, with the last transient start error in routeErr.
-func inspectRouteStatus(status frpclient.StatusExporter, name string) (phase RoutePhase, routeErr, terminalErr error) {
+func inspectRouteStatus(status frpclient.StatusExporter, name string) (phase RoutePhase, routeErr, terminalErr error, missing bool) {
 	item, ok := status.GetProxyStatus(name)
 	if !ok || item == nil {
-		return RoutePending, nil, nil
+		return RoutePending, nil, nil, true
 	}
 	switch item.Phase {
 	case frpproxy.ProxyPhaseRunning:
-		return RouteServing, nil, nil
+		return RouteServing, nil, nil, false
 	case frpproxy.ProxyPhaseStartErr:
 		switch proxyStartErrorTag(item.Err) {
 		case "knock_invalid", "owner_missing", "session_stale":
-			return RoutePending, nil, fmt.Errorf("%w: %s", ErrAdmissionStale, item.Err)
+			return RoutePending, nil, fmt.Errorf("%w: %s", ErrAdmissionStale, item.Err), false
 		case "resource_not_found":
-			return RouteFailed, fmt.Errorf("%w: %s", ErrResourceGone, item.Err), nil
+			return RouteFailed, fmt.Errorf("%w: %s", ErrResourceGone, item.Err), nil, false
 		}
-		return RoutePending, errors.New(item.Err), nil
+		return RoutePending, errors.New(item.Err), nil, false
 	default:
-		return RoutePending, nil, nil
+		return RoutePending, nil, nil, false
 	}
 }
 
