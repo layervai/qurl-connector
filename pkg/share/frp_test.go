@@ -42,6 +42,7 @@ func TestLocalHTTPRouteStringRedactsHeaders(t *testing.T) {
 		{name: "group route", value: group},
 		{name: "group route pointer", value: &group},
 		{name: "route state", value: state},
+		{name: "session group config", value: SessionGroupConfig{KnockResourceID: "knock", Routes: []LocalHTTPRoute{route}}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			for _, format := range []string{"%v", "%+v", "%#v", "%s"} {

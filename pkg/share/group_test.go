@@ -1239,6 +1239,45 @@ func TestSessionGroupRunnerClonesRequestHeadersOnEntry(t *testing.T) {
 	}
 }
 
+// The FRP factory is the routeValidator in production: a headered set on a
+// transport it cannot carry is refused by the runner before the desired set
+// or any route generation changes.
+func TestSessionGroupRunnerRefusesHeadersTheFRPFactoryCannotCarry(t *testing.T) {
+	headered := groupTestRoutes("a", "b")
+	headered[0].RequestHeaders = map[string]string{testProxyTokenHeader: "abc"}
+	for _, tc := range []struct {
+		name    string
+		factory *FRPSessionGroupFactory
+		wantErr string
+	}{
+		{name: "plaintext", factory: newTestGroupFactory(t, false, 0), wantErr: "runtime request headers require encrypted FRP transport"},
+		{name: "web server", factory: newTestGroupFactory(t, true, 7400), wantErr: "runtime request headers require FRP web server to be disabled"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := SessionGroupConfig{
+				KnockResourceID: "q_catalog_key", ResourcePublicKey: "group-resource", Routes: headered,
+				Admitter: &rotatingAdmitter{openTime: time.Hour}, Sessions: tc.factory,
+			}
+			if _, err := NewSessionGroupRunner(cfg); err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("NewSessionGroupRunner with headers = %v, want %q", err, tc.wantErr)
+			}
+			cfg.Routes = groupTestRoutes("a", "b")
+			runner, err := NewSessionGroupRunner(cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			before := runner.desiredRoutes()
+			if err := runner.SetRoutes(context.Background(), headered); err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("SetRoutes with headers = %v, want %q", err, tc.wantErr)
+			}
+			after := runner.desiredRoutes()
+			if len(after) != len(before) || !after[0].Equal(before[0]) || !after[1].Equal(before[1]) {
+				t.Fatalf("refused set changed the desired routes: before %v, after %v", before, after)
+			}
+		})
+	}
+}
+
 func TestSessionGroupRunnerRefusesRoutesTheFactoryCannotServe(t *testing.T) {
 	refuse := func(routes []LocalHTTPRoute) error {
 		for _, route := range routes {
