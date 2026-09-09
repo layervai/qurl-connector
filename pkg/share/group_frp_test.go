@@ -1401,7 +1401,9 @@ func TestGroupRouteHeaderlessWireContractUnchanged(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := strings.TrimRight(string(golden), "\n")
+	// A Windows checkout under text=auto stores the golden with CRLF, so the
+	// trailing line ending is stripped whichever form it took.
+	want := strings.TrimRight(string(golden), "\r\n")
 	for _, test := range []struct {
 		name    string
 		headers map[string]string
