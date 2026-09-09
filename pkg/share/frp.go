@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	v1 "github.com/fatedier/frp/pkg/config/v1"
 
@@ -272,9 +273,9 @@ func RequestHeadersDigest(headers map[string]string) string {
 }
 
 // ValidateRequestHeaders checks a runtime request-header set against the
-// runtime limits and HTTP's own rules: token names, no control bytes in
-// values, no hop-by-hop, forwarding, or framing names, and no two names that
-// differ only in case. The errors are fixed strings that never carry a
+// runtime limits and HTTP's own rules: token names, valid UTF-8 values with
+// no control bytes, no hop-by-hop, forwarding, or framing names, and no two
+// names that differ only in case. The errors are fixed strings that never carry a
 // header, and the checks run in a deterministic order so the same input
 // always yields the same error. A nil or empty map is valid.
 func ValidateRequestHeaders(headers map[string]string) error {
@@ -369,8 +370,13 @@ func validHTTPHeaderName(value string) bool {
 }
 
 // validHTTPHeaderValue matches Go's HTTP transport rule by rejecting control
-// bytes other than horizontal tab.
+// bytes other than horizontal tab, and requires valid UTF-8: the FRP control
+// channel carries the value as JSON, which would rewrite any other byte to
+// U+FFFD before the origin saw it.
 func validHTTPHeaderValue(value string) bool {
+	if !utf8.ValidString(value) {
+		return false
+	}
 	for i := 0; i < len(value); i++ {
 		c := value[i]
 		if c != '\t' && (c < ' ' || c == 0x7f) {

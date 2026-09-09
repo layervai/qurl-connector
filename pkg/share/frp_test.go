@@ -138,6 +138,12 @@ func TestValidateRequestHeadersRejectsInvalidWithoutDisclosingThem(t *testing.T)
 			wantErr: "request header value is invalid",
 			secrets: []string{"top-secret-value"},
 		},
+		{
+			name:    "invalid UTF-8",
+			headers: map[string]string{"X-QURL-Share-Token": "top-secret-value\xff"},
+			wantErr: "request header value is invalid",
+			secrets: []string{"top-secret-value"},
+		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
