@@ -325,8 +325,9 @@ func TestRequestHeadersDigest(t *testing.T) {
 		t.Fatalf("digest of empty map = %q, want empty", got)
 	}
 	// The format is pinned so another process can reproduce a digest: the
-	// entries as sorted name=value lines, SHA-256, lowercase hex.
-	sum := sha256.Sum256([]byte("A=1\nB=2\n"))
+	// entries as sorted len(name):len(value):name=value lines, SHA-256,
+	// lowercase hex.
+	sum := sha256.Sum256([]byte("1:1:A=1\n1:1:B=2\n"))
 	want := hex.EncodeToString(sum[:])
 	if got := RequestHeadersDigest(map[string]string{"B": "2", "A": "1"}); got != want {
 		t.Fatalf("digest = %q, want %q", got, want)
@@ -339,6 +340,9 @@ func TestRequestHeadersDigest(t *testing.T) {
 		"dropped entry":   {"X-A": "1"},
 		"added entry":     {"X-A": "1", "X-B": "2", "X-C": ""},
 		"moved separator": {"X-A": "1\nX-B", "X-B": "2"},
+		// Without length prefixes this value would canonicalize to the same
+		// bytes as the base set.
+		"separator inside value": {"X-A": "1\nX-B=2"},
 	} {
 		if got := RequestHeadersDigest(headers); got == base || len(got) != 64 {
 			t.Fatalf("%s: digest %q did not distinguish the header set from %q", name, got, base)

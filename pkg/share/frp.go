@@ -240,9 +240,11 @@ const (
 )
 
 // RequestHeadersDigest is a stable identity for a header set: the entries as
-// sorted name=value lines, SHA-256, lowercase hex. A nil and an empty map are
-// the same headerless set and digest to "". It lets a caller detect a change
-// without keeping the values; two sets with the same digest are the same
+// sorted len(name):len(value):name=value lines, SHA-256, lowercase hex. The
+// length prefixes keep the form injective whatever the entries hold, so two
+// distinct sets never share a digest. A nil and an empty map are the same
+// headerless set and digest to "". It lets a caller detect a change without
+// keeping the values; two sets with the same digest are the same
 // registration to SessionGroupRunner.SetRoutes.
 func RequestHeadersDigest(headers map[string]string) string {
 	if len(headers) == 0 {
@@ -255,9 +257,14 @@ func RequestHeadersDigest(headers map[string]string) string {
 	sort.Strings(names)
 	var canonical strings.Builder
 	for _, name := range names {
+		value := headers[name]
+		canonical.WriteString(strconv.Itoa(len(name)))
+		canonical.WriteByte(':')
+		canonical.WriteString(strconv.Itoa(len(value)))
+		canonical.WriteByte(':')
 		canonical.WriteString(name)
 		canonical.WriteByte('=')
-		canonical.WriteString(headers[name])
+		canonical.WriteString(value)
 		canonical.WriteByte('\n')
 	}
 	sum := sha256.Sum256([]byte(canonical.String()))
