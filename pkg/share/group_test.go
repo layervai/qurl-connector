@@ -1203,6 +1203,43 @@ func TestGroupRouteHeaderChangeReRegistersOnlyThatRoute(t *testing.T) {
 	}
 }
 
+func TestGroupRouteHeaderChangeDuringRotationRetainsOldHeaders(t *testing.T) {
+	hold := func(sessionIndex int, _ string) bool { return sessionIndex == 2 }
+	h := startGroupHarness(t, 2*time.Second, 0, hold, "a", "b")
+	h.waitServing(t, 1, "a", "b")
+	routes := groupTestRoutes("a", "b")
+	routes[0].RequestHeaders = map[string]string{testProxyTokenHeader: "first"}
+	if err := h.runner.SetRoutes(context.Background(), routes); err != nil {
+		t.Fatal(err)
+	}
+	first := h.factory.session(1)
+	old := first.RouteStates()["a"]
+	waitUntil(t, 2*time.Second, func() bool { return h.factory.startCount() == 2 }, "replacement session start")
+	second := h.factory.session(2)
+	routes[0].RequestHeaders = map[string]string{testProxyTokenHeader: "second"}
+	if err := h.runner.SetRoutes(context.Background(), routes); err != nil {
+		t.Fatal(err)
+	}
+	retained := first.RouteStates()["a"]
+	if retained.ProxyName != old.ProxyName || !retained.Route.Equal(old.Route) {
+		t.Fatal("rotating session changed its previous registration")
+	}
+	replacement := second.RouteStates()["a"]
+	if replacement.Route.RequestHeaders[testProxyTokenHeader] != "second" || replacement.ProxyName != "a-nhp2-r2" {
+		t.Fatal("replacement did not receive the new header generation")
+	}
+	if first.isDrained() || first.isStopped() {
+		t.Fatal("old session retired before replacement served")
+	}
+	second.serve("a")
+	second.serve("b")
+	waitUntil(t, time.Second, func() bool { return len(h.events.promotions()) == 2 }, "replacement promotion")
+	h.waitServing(t, 2, "a", "b")
+	if retained := first.RouteStates()["a"]; !retained.Route.Equal(old.Route) {
+		t.Fatal("retiring session changed its previous headers")
+	}
+}
+
 func TestSessionGroupRunnerClonesRequestHeadersOnEntry(t *testing.T) {
 	want := map[string]string{testProxyTokenHeader: "original"}
 	mutate := func(headers map[string]string) {

@@ -37,7 +37,8 @@ type LocalHTTPRoute struct {
 	// applied to requests reaching the local origin. They are never
 	// persisted, logged, or reported; the map is cloned on the way in and
 	// per rendered cycle. A non-empty map requires an encrypted FRP
-	// transport and the local FRP web/admin server disabled. At most 16
+	// transport with TrustedCaFile configured (and TLS.Enable for QUIC),
+	// and the local FRP web/admin server disabled. At most 16
 	// entries and 1,024 aggregate name and value bytes. An empty value is
 	// allowed (a marker header) and still counts as an entry.
 	RequestHeaders map[string]string `json:"-" yaml:"-"`
@@ -216,7 +217,8 @@ func tlsEnabled(common *v1.ClientCommonConfig) bool {
 
 // requestHeaderTransportError fails closed when a route set carries runtime
 // request headers and the FRP transport would expose them: a plaintext
-// control connection sends NewProxy in the clear, and the local FRP
+// control connection sends NewProxy in the clear, unverified TLS permits
+// interception, and the local FRP
 // web/admin server reports every proxy's configuration to whoever reaches
 // it. A headerless set is never gated. The message names no header.
 func requestHeaderTransportError(common *v1.ClientCommonConfig, headered bool) error {
@@ -225,6 +227,13 @@ func requestHeaderTransportError(common *v1.ClientCommonConfig, headered bool) e
 	}
 	if !tlsEnabled(common) {
 		return errors.New("runtime request headers require encrypted FRP transport")
+	}
+	// The pinned fork skips peer verification without a CA file. QUIC also
+	// ignores that file unless TLS.Enable is true; wss enables TLS implicitly.
+	if common.Transport.TLS.TrustedCaFile == "" ||
+		(strings.EqualFold(common.Transport.Protocol, "quic") &&
+			(common.Transport.TLS.Enable == nil || !*common.Transport.TLS.Enable)) {
+		return errors.New("runtime request headers require a verified FRP server certificate")
 	}
 	if common.WebServer.Port > 0 {
 		return errors.New("runtime request headers require FRP web server to be disabled")

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"math"
 	"os"
 	"path/filepath"
@@ -1230,6 +1231,7 @@ func newTestGroupFactory(t *testing.T, tls bool, webServerPort int) *FRPSessionG
 	if tls {
 		enabled := true
 		common.Transport.TLS.Enable = &enabled
+		common.Transport.TLS.TrustedCaFile = "test-ca.pem"
 	}
 	common.WebServer.Port = webServerPort
 	factory, err := NewFRPSessionGroupFactory(FRPGroupFactoryConfig{Common: common})
@@ -1243,6 +1245,7 @@ func encryptedTestCommon() *v1.ClientCommonConfig {
 	enabled := true
 	common := &v1.ClientCommonConfig{}
 	common.Transport.TLS.Enable = &enabled
+	common.Transport.TLS.TrustedCaFile = "test-ca.pem"
 	return common
 }
 
@@ -1373,11 +1376,12 @@ func TestGroupRouteHeadersRequireTLSAndNoWebServer(t *testing.T) {
 		{name: "explicit TLS", common: encryptedTestCommon},
 		{name: "secure websocket", common: func() *v1.ClientCommonConfig {
 			common := &v1.ClientCommonConfig{}
+			common.Transport.TLS.TrustedCaFile = "test-ca.pem"
 			common.Transport.Protocol = "wss"
 			return common
 		}},
 		{name: "QUIC", common: func() *v1.ClientCommonConfig {
-			common := &v1.ClientCommonConfig{}
+			common := encryptedTestCommon()
 			common.Transport.Protocol = "quic"
 			return common
 		}},
@@ -1391,6 +1395,34 @@ func TestGroupRouteHeadersRequireTLSAndNoWebServer(t *testing.T) {
 				t.Fatal(err)
 			}
 		})
+	}
+}
+
+func TestGroupRouteHeadersRequireVerifiedPeer(t *testing.T) {
+	for _, protocol := range []string{"tcp", "wss", "quic", "QUIC"} {
+		for _, enabled := range []bool{false, true} {
+			for _, ca := range []string{"", "test-ca.pem"} {
+				t.Run(fmt.Sprintf("%s/tls=%t/ca=%t", protocol, enabled, ca != ""), func(t *testing.T) {
+					common := &v1.ClientCommonConfig{}
+					common.Transport.Protocol = protocol
+					common.Transport.TLS.Enable = &enabled
+					common.Transport.TLS.TrustedCaFile = ca
+					factory, err := NewFRPSessionGroupFactory(FRPGroupFactoryConfig{Common: common})
+					if err != nil {
+						t.Fatal(err)
+					}
+					wantAllowed := ca != "" && (enabled || protocol == "wss")
+					err = factory.ValidateRoutes([]LocalHTTPRoute{headeredTestRoute()})
+					if (err == nil) != wantAllowed {
+						t.Fatalf("ValidateRoutes error = %v, allowed = %t", err, wantAllowed)
+					}
+					_, _, _, err = factory.BuildConfig(groupTestAdmission(101), headeredGroupRoutes("abc"))
+					if (err == nil) != wantAllowed {
+						t.Fatalf("BuildConfig error = %v, allowed = %t", err, wantAllowed)
+					}
+				})
+			}
+		}
 	}
 }
 

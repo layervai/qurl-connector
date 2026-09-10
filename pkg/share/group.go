@@ -431,7 +431,11 @@ func (r *SessionGroupRunner) Run(ctx context.Context) (retErr error) {
 // timer is re-armed for the new route count. A route that was removed and
 // later re-added, or whose local target or runtime request headers changed,
 // registers under a fresh proxy name so the server sees a new NewProxy
-// rather than the stale one, and its siblings are untouched; a route's
+// rather than the stale one, and its siblings are untouched. New headers take
+// effect when the new registration reaches RouteServing (OnRouteServing or
+// RouteStates). During rotation the retiring session retains its previous
+// headers until the replacement is promoted and its drain grace ends: a
+// header change is replacement, not revocation. A route's
 // public resource ID and connector routing ID are immutable identities and
 // may not change in place (remove the route and add it again). Request
 // headers are copied on entry, so the caller keeps ownership of its map. A
