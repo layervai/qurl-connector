@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 	"strconv"
 	"sync"
@@ -210,15 +211,6 @@ func validateGroupRouteSet(routes []GroupRoute) error {
 	return validateGroupRouteIdentities(len(routes), func(i int) LocalHTTPRoute { return routes[i].LocalHTTPRoute })
 }
 
-func carriesRequestHeaders(routes []GroupRoute) bool {
-	for _, route := range routes {
-		if len(route.RequestHeaders) > 0 {
-			return true
-		}
-	}
-	return false
-}
-
 func validateGroupRouteIdentities(count int, at func(int) LocalHTTPRoute) error {
 	if count == 0 {
 		return errors.New("session group has no routes")
@@ -303,14 +295,7 @@ func NewFRPSessionGroupFactory(cfg FRPGroupFactoryConfig) (*FRPSessionGroupFacto
 // as desired. BuildConfig repeats the check on the config each cycle
 // actually renders.
 func (f *FRPSessionGroupFactory) ValidateRoutes(routes []LocalHTTPRoute) error {
-	headered := false
-	for _, route := range routes {
-		if len(route.RequestHeaders) > 0 {
-			headered = true
-			break
-		}
-	}
-	return requestHeaderTransportError(f.cfg.Common, headered)
+	return requestHeaderTransportError(f.cfg.Common, slices.ContainsFunc(routes, LocalHTTPRoute.hasRequestHeaders))
 }
 
 // BuildConfig renders one admission's Login config plus one proxy per route.
@@ -331,7 +316,7 @@ func (f *FRPSessionGroupFactory) BuildConfig(admission Admission, routes []Group
 	}
 	// cloneCommon copies the TLS enablement pointee and WebServer.Port is
 	// value-typed, so the check binds to the exact config handed to FRP.
-	if err := requestHeaderTransportError(common, carriesRequestHeaders(routes)); err != nil {
+	if err := requestHeaderTransportError(common, slices.ContainsFunc(routes, GroupRoute.hasRequestHeaders)); err != nil {
 		return nil, nil, nil, err
 	}
 	proxies, names, err := renderGroupProxies(routes, admission.SessionID)
@@ -818,7 +803,7 @@ func (s *frpGroupSession) Update(ctx context.Context, routes []GroupRoute) error
 			return err
 		}
 	}
-	if err := requestHeaderTransportError(s.common, carriesRequestHeaders(routes)); err != nil {
+	if err := requestHeaderTransportError(s.common, slices.ContainsFunc(routes, GroupRoute.hasRequestHeaders)); err != nil {
 		return fmt.Errorf("update FRP session group: %w", err)
 	}
 	s.updateMu.Lock()

@@ -8,13 +8,14 @@ import (
 	"fmt"
 	"maps"
 	"net"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
 
 	v1 "github.com/fatedier/frp/pkg/config/v1"
+	"golang.org/x/net/http/httpguts"
 
 	nhpconfig "github.com/layervai/qurl-connector/pkg/config"
 )
@@ -35,7 +36,8 @@ type LocalHTTPRoute struct {
 	ConnectorRoutingID string
 	// RequestHeaders are runtime-only values sent to frps in NewProxy and
 	// applied to requests reaching the local origin. They are never
-	// persisted, logged, or reported; the map is cloned on the way in and
+	// persisted or logged, and are returned to the owning caller only as a
+	// copy through RouteStates; the map is cloned on the way in and
 	// per rendered cycle. A non-empty map requires an encrypted FRP
 	// transport with TrustedCaFile configured (and TLS.Enable for QUIC),
 	// and the local FRP web/admin server disabled. At most 16
@@ -55,6 +57,8 @@ func (r LocalHTTPRoute) String() string {
 
 // GoString applies the same redaction to %#v formatting.
 func (r LocalHTTPRoute) GoString() string { return r.String() }
+
+func (r LocalHTTPRoute) hasRequestHeaders() bool { return len(r.RequestHeaders) > 0 }
 
 // Equal reports whether two routes are the same registration: identity,
 // local target, and runtime request headers all match (nil and empty
@@ -231,7 +235,7 @@ func requestHeaderTransportError(common *v1.ClientCommonConfig, headered bool) e
 	// The pinned fork skips peer verification without a CA file. QUIC also
 	// ignores that file unless TLS.Enable is true; wss enables TLS implicitly.
 	if common.Transport.TLS.TrustedCaFile == "" ||
-		(strings.EqualFold(common.Transport.Protocol, "quic") &&
+		(common.Transport.Protocol == "quic" &&
 			(common.Transport.TLS.Enable == nil || !*common.Transport.TLS.Enable)) {
 		return errors.New("runtime request headers require a verified FRP server certificate")
 	}
@@ -260,11 +264,7 @@ func RequestHeadersDigest(headers map[string]string) string {
 	if len(headers) == 0 {
 		return ""
 	}
-	names := make([]string, 0, len(headers))
-	for name := range headers {
-		names = append(names, name)
-	}
-	sort.Strings(names)
+	names := slices.Sorted(maps.Keys(headers))
 	var canonical strings.Builder
 	for _, name := range names {
 		value := headers[name]
@@ -291,27 +291,19 @@ func ValidateRequestHeaders(headers map[string]string) error {
 	if len(headers) > maxRuntimeRequestHeaderCount {
 		return errors.New("request headers exceed runtime limits")
 	}
-	names := make([]string, 0, len(headers))
-	for name := range headers {
-		names = append(names, name)
-	}
-	sort.Strings(names)
 	aggregateBytes := 0
-	for _, name := range names {
-		if len(name) > maxRuntimeRequestHeaderBytes-aggregateBytes {
-			return errors.New("request headers exceed runtime limits")
-		}
-		aggregateBytes += len(name)
-		if len(headers[name]) > maxRuntimeRequestHeaderBytes-aggregateBytes {
-			return errors.New("request headers exceed runtime limits")
-		}
-		aggregateBytes += len(headers[name])
+	for name, value := range headers {
+		aggregateBytes += len(name) + len(value)
+	}
+	if aggregateBytes > maxRuntimeRequestHeaderBytes {
+		return errors.New("request headers exceed runtime limits")
 	}
 
+	names := slices.Sorted(maps.Keys(headers))
 	seen := make(map[string]struct{}, len(headers))
 	for _, name := range names {
 		value := headers[name]
-		if !validHTTPHeaderName(name) {
+		if !httpguts.ValidHeaderFieldName(name) {
 			return errors.New("request header name is invalid")
 		}
 		canonicalName := strings.ToLower(name)
@@ -363,34 +355,9 @@ func reservedRequestHeaderName(canonicalName string) bool {
 	}
 }
 
-func validHTTPHeaderName(value string) bool {
-	if value == "" {
-		return false
-	}
-	for i := 0; i < len(value); i++ {
-		switch c := value[i]; {
-		case c >= '0' && c <= '9', c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z':
-		case strings.ContainsRune("!#$%&'*+-.^_`|~", rune(c)):
-		default:
-			return false
-		}
-	}
-	return true
-}
-
-// validHTTPHeaderValue matches Go's HTTP transport rule by rejecting control
-// bytes other than horizontal tab, and requires valid UTF-8: the FRP control
-// channel carries the value as JSON, which would rewrite any other byte to
-// U+FFFD before the origin saw it.
+// validHTTPHeaderValue is Go's HTTP transport rule plus valid UTF-8: the FRP
+// control channel carries the value as JSON, which would rewrite any other
+// byte to U+FFFD before the origin saw it.
 func validHTTPHeaderValue(value string) bool {
-	if !utf8.ValidString(value) {
-		return false
-	}
-	for i := 0; i < len(value); i++ {
-		c := value[i]
-		if c != '\t' && (c < ' ' || c == 0x7f) {
-			return false
-		}
-	}
-	return true
+	return utf8.ValidString(value) && httpguts.ValidHeaderFieldValue(value)
 }

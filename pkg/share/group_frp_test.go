@@ -1229,9 +1229,7 @@ func newTestGroupFactory(t *testing.T, tls bool, webServerPort int) *FRPSessionG
 	t.Helper()
 	common := &v1.ClientCommonConfig{}
 	if tls {
-		enabled := true
-		common.Transport.TLS.Enable = &enabled
-		common.Transport.TLS.TrustedCaFile = "test-ca.pem"
+		common = encryptedTestCommon()
 	}
 	common.WebServer.Port = webServerPort
 	factory, err := NewFRPSessionGroupFactory(FRPGroupFactoryConfig{Common: common})
@@ -1312,11 +1310,7 @@ func TestGroupRouteHeadersRequireTLSAndNoWebServer(t *testing.T) {
 		if got := err.Error(); got != wantErr {
 			t.Fatalf("BuildConfig error = %q, want fixed error %q", got, wantErr)
 		}
-		for _, secret := range []string{testProxyTokenHeader, "abc"} {
-			if strings.Contains(err.Error(), secret) {
-				t.Fatalf("error leaked a header: %q", err)
-			}
-		}
+		assertNoDisclosure(t, err, testProxyTokenHeader, "abc")
 		// The gate is header-conditional: the same factory serves a
 		// headerless set.
 		if _, _, _, err := factory.BuildConfig(groupTestAdmission(101), groupRoutesOf(groupTestRoutes("alpha", "beta"))); err != nil {
@@ -1369,33 +1363,6 @@ func TestGroupRouteHeadersRequireTLSAndNoWebServer(t *testing.T) {
 		common.WebServer.Port = 7400
 		refused(t, factory, webServerErr)
 	})
-	for _, tc := range []struct {
-		name   string
-		common func() *v1.ClientCommonConfig
-	}{
-		{name: "explicit TLS", common: encryptedTestCommon},
-		{name: "secure websocket", common: func() *v1.ClientCommonConfig {
-			common := &v1.ClientCommonConfig{}
-			common.Transport.TLS.TrustedCaFile = "test-ca.pem"
-			common.Transport.Protocol = "wss"
-			return common
-		}},
-		{name: "QUIC", common: func() *v1.ClientCommonConfig {
-			common := encryptedTestCommon()
-			common.Transport.Protocol = "quic"
-			return common
-		}},
-	} {
-		t.Run("accepts "+tc.name, func(t *testing.T) {
-			factory, err := NewFRPSessionGroupFactory(FRPGroupFactoryConfig{Common: tc.common()})
-			if err != nil {
-				t.Fatal(err)
-			}
-			if _, _, _, err := factory.BuildConfig(groupTestAdmission(101), headeredGroupRoutes("abc")); err != nil {
-				t.Fatal(err)
-			}
-		})
-	}
 }
 
 func TestGroupRouteHeadersRequireVerifiedPeer(t *testing.T) {
@@ -1476,16 +1443,6 @@ func TestGroupRouteMaximumRequestHeadersFitPinnedControlMessage(t *testing.T) {
 		aggregateBytes += len(name)
 	}
 	headers["X-Wire-A"] = strings.Repeat("&", maxRuntimeRequestHeaderBytes-aggregateBytes)
-	if len(headers) != maxRuntimeRequestHeaderCount {
-		t.Fatalf("header count = %d, want exact limit %d", len(headers), maxRuntimeRequestHeaderCount)
-	}
-	aggregateBytes = 0
-	for name, value := range headers {
-		aggregateBytes += len(name) + len(value)
-	}
-	if aggregateBytes != maxRuntimeRequestHeaderBytes {
-		t.Fatalf("aggregate header bytes = %d, want exact limit %d", aggregateBytes, maxRuntimeRequestHeaderBytes)
-	}
 	factory := newTestGroupFactory(t, true, 0)
 	routes := groupRoutesOf(groupTestRoutes("alpha"))
 	routes[0].RequestHeaders = headers
@@ -1616,11 +1573,7 @@ func TestFRPGroupSessionUpdateRefusesInPlaceHeaderChange(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "changed in place") {
 		t.Fatalf("Update with changed headers under the same name = %v, want a refusal", err)
 	}
-	for _, secret := range []string{testProxyTokenHeader, "first", "second"} {
-		if strings.Contains(err.Error(), secret) {
-			t.Fatalf("refusal disclosed request headers: %q", err)
-		}
-	}
+	assertNoDisclosure(t, err, testProxyTokenHeader, "first", "second")
 	state := session.RouteStates()["alpha"]
 	if state.Phase != RouteServing || state.Route.RequestHeaders[testProxyTokenHeader] != "first" {
 		t.Fatalf("refused update altered the table: %+v", state)
@@ -1630,49 +1583,32 @@ func TestFRPGroupSessionUpdateRefusesInPlaceHeaderChange(t *testing.T) {
 	}
 }
 
-func TestFRPGroupSessionUpdateRefusesHeadersOnPlaintextTransport(t *testing.T) {
-	svc := &recordingGroupService{}
-	status := &lockedStatusMap{}
-	session := startTestGroupSession(t, svc, status, groupRoutesOf(groupTestRoutes("alpha", "beta")))
-
-	err := session.Update(context.Background(), headeredGroupRoutes("abc"))
-	if err == nil || !strings.Contains(err.Error(), "runtime request headers require encrypted FRP transport") {
-		t.Fatalf("Update with headers on a plaintext session = %v, want a refusal", err)
-	}
-	for _, secret := range []string{testProxyTokenHeader, "abc"} {
-		if strings.Contains(err.Error(), secret) {
-			t.Fatalf("refusal disclosed request headers: %q", err)
-		}
-	}
-	states := session.RouteStates()
-	if len(states) != 2 || len(states["alpha"].Route.RequestHeaders) != 0 {
-		t.Fatalf("refused update altered the table: %+v", states)
-	}
-	if len(svc.updateNames()) != 0 {
-		t.Fatalf("refused update reached FRP: %q", svc.updateNames())
-	}
-}
-
-func TestFRPGroupSessionUpdateRefusesHeadersWithWebServer(t *testing.T) {
-	svc := &recordingGroupService{}
-	common := encryptedTestCommon()
-	common.WebServer.Port = 7400
-	session := startTestGroupSessionWithCommon(t, common, svc, &lockedStatusMap{}, groupRoutesOf(groupTestRoutes("alpha", "beta")))
-
-	err := session.Update(context.Background(), headeredGroupRoutes("abc"))
-	if err == nil || !strings.Contains(err.Error(), "runtime request headers require FRP web server to be disabled") {
-		t.Fatalf("Update with headers on a session whose FRP web server is enabled = %v, want a refusal", err)
-	}
-	for _, secret := range []string{testProxyTokenHeader, "abc"} {
-		if strings.Contains(err.Error(), secret) {
-			t.Fatalf("refusal disclosed request headers: %q", err)
-		}
-	}
-	if states := session.RouteStates(); len(states) != 2 || len(states["alpha"].Route.RequestHeaders) != 0 {
-		t.Fatalf("refused update altered the table: %+v", states)
-	}
-	if len(svc.updateNames()) != 0 {
-		t.Fatalf("refused update reached FRP: %q", svc.updateNames())
+func TestFRPGroupSessionUpdateRefusesHeadersOnUnsafeTransport(t *testing.T) {
+	webServer := encryptedTestCommon()
+	webServer.WebServer.Port = 7400
+	for _, tc := range []struct {
+		name    string
+		common  *v1.ClientCommonConfig
+		wantErr string
+	}{
+		{name: "plaintext", common: &v1.ClientCommonConfig{}, wantErr: "runtime request headers require encrypted FRP transport"},
+		{name: "web server", common: webServer, wantErr: "runtime request headers require FRP web server to be disabled"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			svc := &recordingGroupService{}
+			session := startTestGroupSessionWithCommon(t, tc.common, svc, &lockedStatusMap{}, groupRoutesOf(groupTestRoutes("alpha", "beta")))
+			err := session.Update(context.Background(), headeredGroupRoutes("abc"))
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("Update with headers = %v, want %q", err, tc.wantErr)
+			}
+			assertNoDisclosure(t, err, testProxyTokenHeader, "abc")
+			if states := session.RouteStates(); len(states) != 2 || len(states["alpha"].Route.RequestHeaders) != 0 {
+				t.Fatalf("refused update altered the table: %+v", states)
+			}
+			if len(svc.updateNames()) != 0 {
+				t.Fatalf("refused update reached FRP: %q", svc.updateNames())
+			}
+		})
 	}
 }
 

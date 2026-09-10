@@ -155,11 +155,7 @@ func TestValidateRequestHeadersRejectsInvalidWithoutDisclosingThem(t *testing.T)
 			if got := err.Error(); got != test.wantErr {
 				t.Fatalf("validation error = %q, want fixed error %q", got, test.wantErr)
 			}
-			for _, secret := range test.secrets {
-				if strings.Contains(err.Error(), secret) {
-					t.Fatalf("validation error disclosed request-header input: %q", err)
-				}
-			}
+			assertNoDisclosure(t, err, test.secrets...)
 		})
 	}
 }
@@ -258,10 +254,18 @@ func TestValidateRequestHeadersBoundsCountAndBytes(t *testing.T) {
 			if got := err.Error(); got != test.wantErr {
 				t.Fatalf("limit error = %q, want fixed error %q", got, test.wantErr)
 			}
-			if strings.Contains(err.Error(), aggregateName) || strings.Contains(err.Error(), "ssss") || strings.Contains(err.Error(), "XXXX") {
-				t.Fatalf("limit error disclosed request-header input: %q", err)
-			}
+			assertNoDisclosure(t, err, aggregateName, "ssss", "XXXX")
 		})
+	}
+}
+
+// assertNoDisclosure fails when an error message carries any header input.
+func assertNoDisclosure(t *testing.T, err error, secrets ...string) {
+	t.Helper()
+	for _, secret := range secrets {
+		if strings.Contains(err.Error(), secret) {
+			t.Fatalf("error disclosed request-header input: %q", err)
+		}
 	}
 }
 
@@ -277,11 +281,7 @@ func TestValidateRequestHeadersRejectsCaseInsensitiveDuplicateNames(t *testing.T
 	if got := err.Error(); got != wantErr {
 		t.Fatalf("validation error = %q, want fixed error %q", got, wantErr)
 	}
-	for _, secret := range []string{"X-QURL-Share-Token", "runtime-secret-value", "second-secret-value"} {
-		if strings.Contains(err.Error(), secret) {
-			t.Fatalf("validation error disclosed request-header input: %q", err)
-		}
-	}
+	assertNoDisclosure(t, err, "X-QURL-Share-Token", "runtime-secret-value", "second-secret-value")
 }
 
 func TestValidateRequestHeadersRejectsReservedNames(t *testing.T) {
@@ -314,11 +314,7 @@ func TestValidateRequestHeadersRejectsReservedNames(t *testing.T) {
 				if got := err.Error(); got != wantErr {
 					t.Fatalf("validation error = %q, want fixed error %q", got, wantErr)
 				}
-				for _, secret := range []string{spelled, "runtime-secret-value"} {
-					if strings.Contains(err.Error(), secret) {
-						t.Fatalf("validation error disclosed request-header input: %q", err)
-					}
-				}
+				assertNoDisclosure(t, err, spelled, "runtime-secret-value")
 			})
 		}
 	}
