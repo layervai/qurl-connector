@@ -214,7 +214,29 @@ func OpenNativeRuntime(ctx context.Context, cfg NativeRuntimeConfig) (_ *NativeR
 		return recoverNativeCredential(ctx, cfg, store, openErr, mode)
 	}
 	if !errors.Is(openErr, qurl.ErrAgentStateNotFound) {
-		return nil, openErr
+		if !errors.Is(openErr, qurl.ErrInvalidRegisterConfig) ||
+			(cfg.EnrollmentCredentialProvider == nil && cfg.EnrollmentCredential == "") {
+			return nil, openErr
+		}
+		// An interrupted enrollment can leave a valid identity without a
+		// registration time. Offline open cannot use it, but online enrollment
+		// must resume it rather than replace it. Reload through the SDK's
+		// validated store; the generic config error alone is not authority.
+		state, err := store.Handoff()
+		if err != nil {
+			return nil, errors.Join(openErr, err)
+		}
+		pending, err := state.LoadAgentState(ctx)
+		if err != nil {
+			return nil, errors.Join(openErr, err)
+		}
+		incomplete := pending != nil && pending.RegisteredAt == nil
+		if pending != nil {
+			*pending = qurl.AgentState{}
+		}
+		if !incomplete {
+			return nil, openErr
+		}
 	}
 
 	registerOptions := []qurl.AgentRuntimeRegistrationOption{
