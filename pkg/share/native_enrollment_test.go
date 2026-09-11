@@ -115,7 +115,7 @@ func TestOpenNativeRuntimeConfigErrorDoesNotReenrollCompletedIdentity(t *testing
 		DeviceAPIKey: "lv_live_" + strings.Repeat("a", 43), DeviceAPIKeyID: "key_DeviceKey123",
 		Assignment: &qurl.AgentAssignment{
 			CellID: "cell-test", AssignmentGeneration: 1, EndpointRevision: 1, LeaseExpiresAt: now.Add(time.Hour),
-			Endpoint: qurl.NHPUDPEndpoint{Host: "cell.test.layerv.ai", Port: 443, ServerPublicKeyB64: publicKey},
+			Endpoint: qurl.NHPUDPEndpoint{Host: "hub.nhp.layerv.ai", Port: 443, ServerPublicKeyB64: publicKey},
 		},
 	}
 	if err := errors.Join(store.SaveAgentState(context.Background(), completed), store.Close()); err != nil {
