@@ -192,7 +192,7 @@ func (s *fakeGroupSession) install(routes []share.GroupRoute) {
 	next := make(map[string]share.RouteState, len(routes))
 	for _, route := range routes {
 		name := fakeProxyName(route, s.admission.SessionID)
-		if current, ok := s.routes[route.RouteID]; ok && current.ProxyName == name && current.Route == route {
+		if current, ok := s.routes[route.RouteID]; ok && current.ProxyName == name && current.Route.Equal(route) {
 			next[route.RouteID] = current
 			continue
 		}

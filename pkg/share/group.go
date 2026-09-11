@@ -141,6 +141,20 @@ type groupCycle struct {
 	measured       bool
 }
 
+// validateDesiredRoutes is the runner's check on a route set before it
+// becomes the desired set: the group's own rules, then the factory's when
+// it has any (routeValidator), so a set the factory would refuse at the next
+// cycle is refused to the caller now instead of retiring every sibling then.
+func validateDesiredRoutes(sessions SessionGroupFactory, routes []LocalHTTPRoute) error {
+	if err := ValidateGroupRoutes(routes); err != nil {
+		return err
+	}
+	if validator, ok := sessions.(routeValidator); ok {
+		return validator.ValidateRoutes(routes)
+	}
+	return nil
+}
+
 func NewSessionGroupRunner(cfg SessionGroupConfig) (*SessionGroupRunner, error) {
 	if cfg.KnockResourceID == "" {
 		return nil, errors.New("build session group: knock resource ID is empty")
@@ -154,7 +168,7 @@ func NewSessionGroupRunner(cfg SessionGroupConfig) (*SessionGroupRunner, error) 
 	if cfg.Sessions == nil {
 		return nil, errors.New("build session group: session factory is nil")
 	}
-	if err := ValidateGroupRoutes(cfg.Routes); err != nil {
+	if err := validateDesiredRoutes(cfg.Sessions, cfg.Routes); err != nil {
 		return nil, fmt.Errorf("build session group: %w", err)
 	}
 	if cfg.MinBackoff < 0 || cfg.MaxBackoff < 0 || cfg.RotationLead < 0 || cfg.StopTimeout < 0 {
@@ -180,6 +194,7 @@ func NewSessionGroupRunner(cfg SessionGroupConfig) (*SessionGroupRunner, error) 
 		wake:     make(chan struct{}, 1),
 	}
 	for _, route := range cfg.Routes {
+		route.RequestHeaders = cloneRequestHeaders(route.RequestHeaders)
 		runner.desired[route.RouteID] = route
 	}
 	runner.cfg.Routes = nil
@@ -414,30 +429,38 @@ func (r *SessionGroupRunner) Run(ctx context.Context) (retErr error) {
 // apply to the live session immediately (no new admission); a replacement
 // that is still being built receives the new set as well, and the rotation
 // timer is re-armed for the new route count. A route that was removed and
-// later re-added, or whose local target changed, registers under a fresh
-// proxy name so the server sees a new NewProxy rather than the stale one; a
-// route's public resource ID and connector routing ID are immutable
-// identities and may not change in place (remove the route and add it
-// again). A session that ends
-// while the set is being applied is not an error: the desired set is
-// authoritative and the next cycle starts from it, and if applying fails for
-// any other reason (a canceled caller context, for instance) the error is
-// returned and Run re-applies the desired set under its own context. An
+// later re-added, or whose local target or runtime request headers changed,
+// registers under a fresh proxy name so the server sees a new NewProxy
+// rather than the stale one, and its siblings are untouched. New headers take
+// effect when the new registration reaches RouteServing (OnRouteServing or
+// RouteStates). During rotation the retiring session retains its previous
+// headers until the replacement is promoted and its drain grace ends: a
+// header change is replacement, not revocation. A route's
+// public resource ID and connector routing ID are immutable identities and
+// may not change in place (remove the route and add it again). Request
+// headers are copied on entry, so the caller keeps ownership of its map. A
+// set the session factory cannot carry (request headers over a transport
+// that would expose them) is refused before anything changes. A session
+// that ends while the set is being applied is not an error: the desired set
+// is authoritative and the next cycle starts from it, and if applying fails
+// for any other reason (a canceled caller context, for instance) the error
+// is returned and Run re-applies the desired set under its own context. An
 // empty set is not expressible here: a group always has at least one route,
 // and a group whose routes have all gone ends Run with ErrGroupEmpty.
 func (r *SessionGroupRunner) SetRoutes(ctx context.Context, routes []LocalHTTPRoute) error {
 	if ctx == nil {
 		return errors.New("set session group routes: context is nil")
 	}
-	if err := ValidateGroupRoutes(routes); err != nil {
+	if err := validateDesiredRoutes(r.cfg.Sessions, routes); err != nil {
 		return fmt.Errorf("set session group routes: %w", err)
 	}
 	r.mu.Lock()
 	next := make(map[string]LocalHTTPRoute, len(routes))
 	for _, route := range routes {
+		route.RequestHeaders = cloneRequestHeaders(route.RequestHeaders)
 		next[route.RouteID] = route
 		current, exists := r.desired[route.RouteID]
-		if !exists || current == route {
+		if !exists || current.Equal(route) {
 			continue
 		}
 		if current.ResourcePublicKey != route.ResourcePublicKey || current.ConnectorRoutingID != route.ConnectorRoutingID {
@@ -448,9 +471,10 @@ func (r *SessionGroupRunner) SetRoutes(ctx context.Context, routes []LocalHTTPRo
 	}
 	for routeID, current := range r.desired {
 		route, keep := next[routeID]
-		if !keep || current != route {
-			// Removed, or its local target changed: the next registration of
-			// this route ID must not reuse a name the server still holds.
+		if !keep || !current.Equal(route) {
+			// Removed, or its local target or request headers changed: the
+			// next registration of this route ID must not reuse a name the
+			// server still holds.
 			r.restarts[routeID]++
 		}
 	}

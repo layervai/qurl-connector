@@ -2,14 +2,20 @@ package share
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"maps"
 	"net"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	v1 "github.com/fatedier/frp/pkg/config/v1"
+	"golang.org/x/net/http/httpguts"
 
 	nhpconfig "github.com/layervai/qurl-connector/pkg/config"
 )
@@ -17,12 +23,51 @@ import (
 // LocalHTTPRoute is the exact local and platform identity of one managed HTTP
 // share. Public ResourcePublicKey is authorization metadata; ConnectorRoutingID is
 // the stable subdomain/load-balancer identity.
+//
+// The route holds a map, so it is not comparable with ==: compare
+// registrations with Equal and header sets alone with RequestHeadersDigest.
+// Its formatting methods redact the request headers and JSON/YAML encoding
+// omits them.
 type LocalHTTPRoute struct {
 	RouteID            string
 	LocalIP            string
 	LocalPort          int
 	ResourcePublicKey  string
 	ConnectorRoutingID string
+	// RequestHeaders are runtime-only values sent to frps in NewProxy and
+	// applied to requests reaching the local origin. They are never
+	// persisted or logged, and are returned to the owning caller only as a
+	// copy through RouteStates; the map is cloned on the way in and
+	// per rendered cycle. A non-empty map requires an encrypted FRP
+	// transport with TrustedCaFile configured (and TLS.Enable for QUIC),
+	// and the local FRP web/admin server disabled. At most 16
+	// entries and 1,024 aggregate name and value bytes. An empty value is
+	// allowed (a marker header) and still counts as an entry.
+	RequestHeaders map[string]string `json:"-" yaml:"-"`
+}
+
+// String keeps runtime request-header names and values out of logs,
+// assertions, and diagnostics.
+func (r LocalHTTPRoute) String() string {
+	return fmt.Sprintf(
+		"share.LocalHTTPRoute{RouteID:%q, LocalIP:%q, LocalPort:%d, ResourcePublicKey:%q, ConnectorRoutingID:%q, RequestHeaders:[REDACTED]}",
+		r.RouteID, r.LocalIP, r.LocalPort, r.ResourcePublicKey, r.ConnectorRoutingID,
+	)
+}
+
+// GoString applies the same redaction to %#v formatting.
+func (r LocalHTTPRoute) GoString() string { return r.String() }
+
+func (r LocalHTTPRoute) hasRequestHeaders() bool { return len(r.RequestHeaders) > 0 }
+
+// Equal reports whether two routes are the same registration: identity,
+// local target, and runtime request headers all match (nil and empty
+// headers are both headerless). TestLocalHTTPRouteEqualCoversEveryField
+// keeps it in step with the fields.
+func (r LocalHTTPRoute) Equal(other LocalHTTPRoute) bool {
+	return r.RouteID == other.RouteID && r.LocalIP == other.LocalIP && r.LocalPort == other.LocalPort &&
+		r.ResourcePublicKey == other.ResourcePublicKey && r.ConnectorRoutingID == other.ConnectorRoutingID &&
+		maps.Equal(r.RequestHeaders, other.RequestHeaders)
 }
 
 func validateLocalHTTPRoute(route LocalHTTPRoute) error {
@@ -32,7 +77,7 @@ func validateLocalHTTPRoute(route LocalHTTPRoute) error {
 	if route.LocalIP == "" || route.LocalPort < 1 || route.LocalPort > 65535 {
 		return errors.New("local target is invalid")
 	}
-	return nil
+	return ValidateRequestHeaders(route.RequestHeaders)
 }
 
 // buildAdmittedCommon renders the Login half of one admission: the admitted
@@ -69,7 +114,9 @@ func sessionProxyDiscriminator(sessionID uint64) string {
 
 // buildRouteProxy renders one HTTP proxy. Group, group key, subdomain, public
 // resource metadata, and the local target are the route's stable identity;
-// only the name changes between cycles.
+// only the name changes between cycles. A headerless route leaves the
+// header set nil so its NewProxy bytes are exactly what they were before
+// routes could carry headers.
 func buildRouteProxy(route LocalHTTPRoute, proxyName string) *v1.HTTPProxyConfig {
 	proxy := &v1.HTTPProxyConfig{}
 	proxy.Name = proxyName
@@ -80,6 +127,7 @@ func buildRouteProxy(route LocalHTTPRoute, proxyName string) *v1.HTTPProxyConfig
 	proxy.LoadBalancer.Group = route.ConnectorRoutingID
 	proxy.LoadBalancer.GroupKey = route.ConnectorRoutingID
 	proxy.Metadatas = map[string]string{nhpconfig.MetaResourceID: route.ResourcePublicKey}
+	proxy.RequestHeaders.Set = cloneRequestHeaders(route.RequestHeaders)
 	return proxy
 }
 
@@ -108,8 +156,16 @@ func proxyStartErrorTag(value string) string {
 	return tag
 }
 
+// cloneCommon copies the caller's config for one cycle. The TLS enablement
+// pointee is copied too, so the transport a cycle was checked against is the
+// transport it keeps: a caller flipping its own flag later cannot turn
+// encryption off under a session that carries request headers.
 func cloneCommon(in *v1.ClientCommonConfig) *v1.ClientCommonConfig {
 	out := *in
+	if in.Transport.TLS.Enable != nil {
+		enabled := *in.Transport.TLS.Enable
+		out.Transport.TLS.Enable = &enabled
+	}
 	if in.Metadatas != nil {
 		out.Metadatas = make(map[string]string, len(in.Metadatas))
 		for key, value := range in.Metadatas {
@@ -161,4 +217,147 @@ func tlsEnabled(common *v1.ClientCommonConfig) bool {
 	default:
 		return false
 	}
+}
+
+// requestHeaderTransportError fails closed when a route set carries runtime
+// request headers and the FRP transport would expose them: a plaintext
+// control connection sends NewProxy in the clear, unverified TLS permits
+// interception, and the local FRP
+// web/admin server reports every proxy's configuration to whoever reaches
+// it. A headerless set is never gated. The message names no header.
+func requestHeaderTransportError(common *v1.ClientCommonConfig, headered bool) error {
+	if !headered {
+		return nil
+	}
+	if !tlsEnabled(common) {
+		return errors.New("runtime request headers require encrypted FRP transport")
+	}
+	// The pinned fork skips peer verification without a CA file. QUIC also
+	// ignores that file unless TLS.Enable is true; wss enables TLS implicitly.
+	if common.Transport.TLS.TrustedCaFile == "" ||
+		(common.Transport.Protocol == "quic" &&
+			(common.Transport.TLS.Enable == nil || !*common.Transport.TLS.Enable)) {
+		return errors.New("runtime request headers require a verified FRP server certificate")
+	}
+	if common.WebServer.Port > 0 {
+		return errors.New("runtime request headers require FRP web server to be disabled")
+	}
+	return nil
+}
+
+// The pinned FRP JSON reader caps a control message at 10,240 bytes.
+// encoding/json can expand each raw string byte to six wire bytes, so the
+// count and aggregate caps leave roughly 4 KiB for the existing envelope.
+const (
+	maxRuntimeRequestHeaderCount = 16
+	maxRuntimeRequestHeaderBytes = 1024
+)
+
+// RequestHeadersDigest is a stable identity for a header set: the entries as
+// sorted len(name):len(value):name=value lines, SHA-256, lowercase hex. The
+// length prefixes keep the form injective whatever the entries hold, so two
+// distinct sets never share a digest. A nil and an empty map are the same
+// headerless set and digest to "". It lets a caller detect a change without
+// keeping the values; two sets with the same digest are the same
+// registration to SessionGroupRunner.SetRoutes.
+func RequestHeadersDigest(headers map[string]string) string {
+	if len(headers) == 0 {
+		return ""
+	}
+	names := slices.Sorted(maps.Keys(headers))
+	var canonical strings.Builder
+	for _, name := range names {
+		value := headers[name]
+		canonical.WriteString(strconv.Itoa(len(name)))
+		canonical.WriteByte(':')
+		canonical.WriteString(strconv.Itoa(len(value)))
+		canonical.WriteByte(':')
+		canonical.WriteString(name)
+		canonical.WriteByte('=')
+		canonical.WriteString(value)
+		canonical.WriteByte('\n')
+	}
+	sum := sha256.Sum256([]byte(canonical.String()))
+	return hex.EncodeToString(sum[:])
+}
+
+// ValidateRequestHeaders checks a runtime request-header set against the
+// runtime limits and HTTP's own rules: token names, valid UTF-8 values with
+// no control bytes, no hop-by-hop, forwarding, or framing names, and no two
+// names that differ only in case. The errors are fixed strings that never carry a
+// header, and the checks run in a deterministic order so the same input
+// always yields the same error. A nil or empty map is valid.
+func ValidateRequestHeaders(headers map[string]string) error {
+	if len(headers) > maxRuntimeRequestHeaderCount {
+		return errors.New("request headers exceed runtime limits")
+	}
+	aggregateBytes := 0
+	for name, value := range headers {
+		aggregateBytes += len(name) + len(value)
+	}
+	if aggregateBytes > maxRuntimeRequestHeaderBytes {
+		return errors.New("request headers exceed runtime limits")
+	}
+
+	names := slices.Sorted(maps.Keys(headers))
+	seen := make(map[string]struct{}, len(headers))
+	for _, name := range names {
+		value := headers[name]
+		if !httpguts.ValidHeaderFieldName(name) {
+			return errors.New("request header name is invalid")
+		}
+		canonicalName := strings.ToLower(name)
+		if reservedRequestHeaderName(canonicalName) {
+			return errors.New("request header name is reserved")
+		}
+		if _, ok := seen[canonicalName]; ok {
+			return errors.New("request header names are duplicated")
+		}
+		seen[canonicalName] = struct{}{}
+		if !validHTTPHeaderValue(value) {
+			return errors.New("request header value is invalid")
+		}
+	}
+	return nil
+}
+
+// cloneRequestHeaders copies a header map so a caller's later mutation cannot
+// reach a live cycle; a headerless map normalizes to nil.
+func cloneRequestHeaders(in map[string]string) map[string]string {
+	if len(in) == 0 {
+		return nil
+	}
+	return maps.Clone(in)
+}
+
+func reservedRequestHeaderName(canonicalName string) bool {
+	switch canonicalName {
+	case "host",
+		"content-length",
+		"connection",
+		"proxy-connection",
+		"keep-alive",
+		"proxy-authenticate",
+		"proxy-authorization",
+		"te",
+		"trailer",
+		"transfer-encoding",
+		"upgrade",
+		"forwarded",
+		"x-forwarded-for",
+		"x-forwarded-host",
+		"x-forwarded-proto",
+		"x-real-ip",
+		"x-forwarded-port":
+		return true
+	default:
+		return false
+	}
+}
+
+// validHTTPHeaderValue is Go's HTTP transport rule plus valid UTF-8: the FRP
+// control channel carries the value as JSON, which would rewrite any other
+// byte to U+FFFD before the origin saw it.
+func validHTTPHeaderValue(value string) bool {
+	return utf8.ValidString(value) && httpguts.ValidHeaderFieldValue(value)
 }

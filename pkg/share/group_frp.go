@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 	"strconv"
 	"sync"
@@ -119,6 +120,20 @@ type GroupRoute struct {
 	Generation uint64
 }
 
+// String formats the route with its request headers redacted and, unlike
+// the promoted LocalHTTPRoute.String, keeps the generation visible.
+func (g GroupRoute) String() string {
+	return fmt.Sprintf("share.GroupRoute{%s, Generation:%d}", g.LocalHTTPRoute, g.Generation)
+}
+
+// GoString applies the same redaction to %#v formatting.
+func (g GroupRoute) GoString() string { return g.String() }
+
+// Equal reports the same registration at the same generation.
+func (g GroupRoute) Equal(other GroupRoute) bool {
+	return g.Generation == other.Generation && g.LocalHTTPRoute.Equal(other.LocalHTTPRoute)
+}
+
 // RoutePhase is the observed serving state of one route on one session.
 type RoutePhase string
 
@@ -175,10 +190,19 @@ type SessionGroupFactory interface {
 	Start(context.Context, Admission, []GroupRoute) (GroupServingSession, error)
 }
 
+// routeValidator is an optional SessionGroupFactory refinement. A factory
+// whose transport cannot carry a route set refuses it here, before
+// SessionGroupRunner commits the set as desired, so a set the factory would
+// reject at the next cycle never takes the group's healthy routes down with
+// it.
+type routeValidator interface {
+	ValidateRoutes([]LocalHTTPRoute) error
+}
+
 // ValidateGroupRoutes checks the bound and the route identity uniqueness one
 // session group requires: route ID, public resource ID, and connector routing
-// ID must each be unique within the group, and every local target must be
-// dialable.
+// ID must each be unique within the group, every local target must be
+// dialable, and every request-header set must pass ValidateRequestHeaders.
 func ValidateGroupRoutes(routes []LocalHTTPRoute) error {
 	return validateGroupRouteIdentities(len(routes), func(i int) LocalHTTPRoute { return routes[i] })
 }
@@ -266,9 +290,19 @@ func NewFRPSessionGroupFactory(cfg FRPGroupFactoryConfig) (*FRPSessionGroupFacto
 	return &FRPSessionGroupFactory{cfg: cfg}, nil
 }
 
+// ValidateRoutes refuses a route set whose runtime request headers the
+// factory's transport cannot carry, so SessionGroupRunner never commits it
+// as desired. BuildConfig repeats the check on the config each cycle
+// actually renders.
+func (f *FRPSessionGroupFactory) ValidateRoutes(routes []LocalHTTPRoute) error {
+	return requestHeaderTransportError(f.cfg.Common, slices.ContainsFunc(routes, LocalHTTPRoute.hasRequestHeaders))
+}
+
 // BuildConfig renders one admission's Login config plus one proxy per route.
 // Proxy names change with the NHP SessionID and the route generation; every
-// other per-route identity is stable across cycles.
+// other per-route identity is stable across cycles. A set with runtime
+// request headers fails closed unless the rendered transport is encrypted
+// and the local FRP web server is off.
 func (f *FRPSessionGroupFactory) BuildConfig(admission Admission, routes []GroupRoute) (*v1.ClientCommonConfig, []v1.ProxyConfigurer, []string, error) {
 	if err := validateAdmission(admission, admission.KnockResourceID, admission.ResourcePublicKey); err != nil {
 		return nil, nil, nil, err
@@ -278,6 +312,11 @@ func (f *FRPSessionGroupFactory) BuildConfig(admission Admission, routes []Group
 	}
 	common, err := buildAdmittedCommon(f.cfg.Common, admission, f.cfg.ClientVersion)
 	if err != nil {
+		return nil, nil, nil, err
+	}
+	// cloneCommon copies the TLS enablement pointee and WebServer.Port is
+	// value-typed, so the check binds to the exact config handed to FRP.
+	if err := requestHeaderTransportError(common, slices.ContainsFunc(routes, GroupRoute.hasRequestHeaders)); err != nil {
 		return nil, nil, nil, err
 	}
 	proxies, names, err := renderGroupProxies(routes, admission.SessionID)
@@ -731,9 +770,11 @@ func errText(err error) string {
 
 // Update replaces the session's route set. Entries whose route and proxy name
 // are unchanged keep their observed state; everything else registers afresh.
-// A route whose target or identity changed must arrive under a new
-// Generation: its old registration is still running on the server under the
-// old name, so reusing that name would report the stale proxy as serving.
+// A route whose target, request headers, or identity changed must arrive
+// under a new Generation: its old registration is still running on the
+// server under the old name, so reusing that name would report the stale
+// proxy as serving. A set with request headers is refused on a session whose
+// transport cannot carry them (see BuildConfig); the table is untouched.
 // The route table is authoritative from the moment Update returns: if the
 // push to FRP fails, the error is returned and the session keeps retrying the
 // push on every poll until FRP accepts it, so RouteStates never reports a
@@ -762,6 +803,9 @@ func (s *frpGroupSession) Update(ctx context.Context, routes []GroupRoute) error
 			return err
 		}
 	}
+	if err := requestHeaderTransportError(s.common, slices.ContainsFunc(routes, GroupRoute.hasRequestHeaders)); err != nil {
+		return fmt.Errorf("update FRP session group: %w", err)
+	}
 	s.updateMu.Lock()
 	defer s.updateMu.Unlock()
 	s.mu.Lock()
@@ -773,7 +817,7 @@ func (s *frpGroupSession) Update(ctx context.Context, routes []GroupRoute) error
 	for _, route := range routes {
 		name := groupProxyName(route, s.sessionID)
 		if current, ok := s.routes[route.RouteID]; ok && current.name == name {
-			if current.route != route {
+			if !current.route.Equal(route) {
 				s.mu.Unlock()
 				return fmt.Errorf("update FRP session group: route %q changed in place under proxy name %q; a changed route needs a new generation", route.RouteID, name)
 			}
@@ -908,7 +952,8 @@ func (s *frpGroupSession) ServingRouteIDs() map[string]struct{} {
 
 // RouteStates reports every route's registration. While a push to FRP is
 // owed and the last attempt failed, pending routes without a more specific
-// start error carry that push error.
+// start error carry that push error. A reported route's header map is a
+// copy: nothing a caller does to it reaches the live table.
 func (s *frpGroupSession) RouteStates() map[string]RouteState {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -919,6 +964,7 @@ func (s *frpGroupSession) RouteStates() map[string]RouteState {
 	states := make(map[string]RouteState, len(s.routes))
 	for routeID, entry := range s.routes {
 		state := RouteState{Route: entry.route, ProxyName: entry.name, Phase: entry.phase, Err: entry.err}
+		state.Route.RequestHeaders = cloneRequestHeaders(entry.route.RequestHeaders)
 		if state.Phase == RoutePending && state.Err == nil {
 			state.Err = pushErr
 		}
