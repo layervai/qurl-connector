@@ -214,7 +214,8 @@ func OpenNativeRuntime(ctx context.Context, cfg NativeRuntimeConfig) (_ *NativeR
 		return recoverNativeCredential(ctx, cfg, store, openErr, mode)
 	}
 	if !errors.Is(openErr, qurl.ErrAgentStateNotFound) {
-		if !errors.Is(openErr, qurl.ErrInvalidRegisterConfig) {
+		if !errors.Is(openErr, qurl.ErrInvalidRegisterConfig) ||
+			(cfg.EnrollmentCredentialProvider == nil && cfg.EnrollmentCredential == "") {
 			return nil, openErr
 		}
 		// An interrupted enrollment can leave a valid identity without a
