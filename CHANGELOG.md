@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.13.1](https://github.com/layervai/qurl-connector/compare/v0.13.0...v0.13.1) (2026-09-11)
+
+
+### Bug Fixes
+
+* **share:** resume interrupted device enrollment ([#86](https://github.com/layervai/qurl-connector/issues/86)) ([d69cd29](https://github.com/layervai/qurl-connector/commit/d69cd293281fd8b89176571c3b3c8e645611b690))
+
 ## [0.13.0](https://github.com/layervai/qurl-connector/compare/v0.12.0...v0.13.0) (2026-09-07)
 
 
