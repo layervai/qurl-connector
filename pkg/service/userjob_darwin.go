@@ -20,6 +20,7 @@ type launchdUserJobManager struct {
 	plistPath      func(string) (string, error)
 	launchctlQuery func(...string) (string, error)
 	sleep          func(time.Duration)
+	now            func() time.Time
 }
 
 var errLaunchdShutdownTimeout = errors.New("launchd job did not finish stopping")
@@ -126,6 +127,13 @@ func (m *launchdUserJobManager) bootstrapWithLaunchdSettleRecovery(
 			return nil
 		}
 		if errors.Is(err, errLaunchdShutdownTimeout) {
+			// The old process still owns the label. Do not leave a replacement
+			// definition that a later Ensure could accept as its running job.
+			if definitionChanged {
+				if removeErr := os.Remove(plistPath); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+					return errors.Join(err, fmt.Errorf("remove unconverged launchd job definition: %w", removeErr))
+				}
+			}
 			return err
 		}
 		lastErr = err
@@ -212,17 +220,30 @@ func (m *launchdUserJobManager) bootstrapWithSettleRetry(domain, service, plistP
 // retried. launchd keeps the old job visible in SIGTERMed state during graceful
 // shutdown; treating it as a new ambiguous job exhausts the retry budget early.
 func (m *launchdUserJobManager) waitForStoppingJob(service string) (string, error) {
-	const shutdownWait = 20 * time.Second // Default ExitTimeOut (15s), plus launchd cleanup.
-	for waited := time.Duration(0); ; waited += launchdBootstrapRetryDelay {
-		output, err := m.launchctlQuery("print", service)
-		if err != nil || !launchdOutputStopping(output) {
-			return output, err
+	now := m.now
+	if now == nil {
+		now = time.Now
+	}
+	started := now()
+	output, err := m.launchctlQuery("print", service)
+	// Use the loaded job's timeout: its definition can differ from the new
+	// plist during an upgrade. Allow five seconds for launchd cleanup.
+	shutdownWait := 20 * time.Second
+	for _, line := range strings.Split(output, "\n") {
+		if value, found := strings.CutPrefix(strings.TrimSpace(line), "exit timeout = "); found {
+			if seconds, parseErr := strconv.Atoi(value); parseErr == nil && seconds >= 1 && seconds <= 300 {
+				shutdownWait = time.Duration(seconds+5) * time.Second
+			}
 		}
-		if waited >= shutdownWait {
+	}
+	for err == nil && launchdOutputStopping(output) {
+		if now().Sub(started) >= shutdownWait {
 			return "", fmt.Errorf("%w: %s after %s", errLaunchdShutdownTimeout, service, shutdownWait)
 		}
 		m.settle()
+		output, err = m.launchctlQuery("print", service)
 	}
+	return output, err
 }
 
 func launchdOutputStopping(output string) bool {

@@ -673,6 +673,7 @@ func TestLaunchdReplaceWaitsForSlowShutdown(t *testing.T) {
 			manager := &launchdUserJobManager{
 				plistPath: func(string) (string, error) { return filepath.Join(dir, "job.plist"), nil },
 				sleep:     func(d time.Duration) { waited += d },
+				now:       func() time.Time { return time.Unix(0, 0).Add(waited) },
 				launchctlQuery: func(args ...string) (string, error) {
 					switch args[0] {
 					case "print":
@@ -697,6 +698,9 @@ func TestLaunchdReplaceWaitsForSlowShutdown(t *testing.T) {
 			}
 			err := manager.Replace(job)
 			if stopAfter > 20*time.Second {
+				if _, statErr := os.Stat(filepath.Join(dir, "job.plist")); !errors.Is(statErr, os.ErrNotExist) {
+					t.Fatalf("timed-out replacement left a misleading job definition: %v", statErr)
+				}
 				if !errors.Is(err, errLaunchdShutdownTimeout) || waited > 21*time.Second {
 					t.Fatalf("err=%v waited=%s", err, waited)
 				}
@@ -705,6 +709,34 @@ func TestLaunchdReplaceWaitsForSlowShutdown(t *testing.T) {
 			}
 			if bootouts != 1 {
 				t.Fatalf("bootouts=%d, want one stop request", bootouts)
+			}
+		})
+	}
+}
+
+func TestLaunchdShutdownUsesLoadedTimeoutAndQueryTime(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		exitTimeout string
+		queryTime   time.Duration
+		wantWait    time.Duration
+	}{
+		{"custom timeout", "30", 0, 35 * time.Second},
+		{"query time counts", "15", 5 * time.Second, 20 * time.Second},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var elapsed time.Duration
+			m := &launchdUserJobManager{
+				now:   func() time.Time { return time.Unix(0, 0).Add(elapsed) },
+				sleep: func(d time.Duration) { elapsed += d },
+				launchctlQuery: func(...string) (string, error) {
+					elapsed += tc.queryTime
+					return "state = SIGTERMed\nexit timeout = " + tc.exitTimeout + "\n", nil
+				},
+			}
+			_, err := m.waitForStoppingJob("test")
+			if !errors.Is(err, errLaunchdShutdownTimeout) || elapsed < tc.wantWait || elapsed > tc.wantWait+tc.queryTime {
+				t.Fatalf("err=%v elapsed=%s want=%s", err, elapsed, tc.wantWait)
 			}
 		})
 	}
