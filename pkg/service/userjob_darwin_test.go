@@ -414,7 +414,7 @@ func TestLaunchdBootstrapJoinsAmbiguousInspectionFailure(t *testing.T) {
 			return "", inspectErr
 		},
 	}
-	stillLoaded, err := manager.bootstrapWithSettleRetry("gui/501", "gui/501/test", "/tmp/test.plist")
+	stillLoaded, err := manager.bootstrapWithSettleRetry("gui/501", "gui/501/test", "/tmp/test.plist", &time.Time{})
 	if !errors.Is(err, bootstrapErr) || !errors.Is(err, inspectErr) {
 		t.Fatalf("bootstrapWithSettleRetry() = %v, want joined bootstrap and inspection errors", err)
 	}
@@ -449,7 +449,7 @@ func TestLaunchdBootstrapReportsLoadedAfterRetryError(t *testing.T) {
 			}
 		},
 	}
-	possiblyLoaded, err := manager.bootstrapWithSettleRetry("gui/501", "gui/501/test", "/tmp/test.plist")
+	possiblyLoaded, err := manager.bootstrapWithSettleRetry("gui/501", "gui/501/test", "/tmp/test.plist", &time.Time{})
 	if !errors.Is(err, firstErr) || !errors.Is(err, retryErr) {
 		t.Fatalf("bootstrapWithSettleRetry() = %v, want both bootstrap errors", err)
 	}
@@ -734,10 +734,36 @@ func TestLaunchdShutdownUsesLoadedTimeoutAndQueryTime(t *testing.T) {
 					return "state = SIGTERMed\nexit timeout = " + tc.exitTimeout + "\n", nil
 				},
 			}
-			_, err := m.waitForStoppingJob("test")
+			_, err := m.waitForStoppingJob("test", &time.Time{})
 			if !errors.Is(err, errLaunchdShutdownTimeout) || elapsed < tc.wantWait || elapsed > tc.wantWait+tc.queryTime {
 				t.Fatalf("err=%v elapsed=%s want=%s", err, elapsed, tc.wantWait)
 			}
 		})
+	}
+}
+
+func TestLaunchdShutdownDeadlineIsSharedAcrossRetries(t *testing.T) {
+	var elapsed time.Duration
+	firstShutdown := true
+	m := &launchdUserJobManager{
+		now:   func() time.Time { return time.Unix(0, 0).Add(elapsed) },
+		sleep: func(d time.Duration) { elapsed += d },
+		launchctlQuery: func(...string) (string, error) {
+			if elapsed >= 19*time.Second && firstShutdown {
+				firstShutdown = false
+				return "", &launchctlError{output: "Could not find service", err: errors.New("absent")}
+			}
+			return "state = SIGTERMed\nexit timeout = 15\n", nil
+		},
+	}
+	var deadline time.Time
+	if _, err := m.waitForStoppingJob("test", &deadline); !isLaunchdNotFound(err) {
+		t.Fatalf("first shutdown: %v", err)
+	}
+	if _, err := m.waitForStoppingJob("test", &deadline); !errors.Is(err, errLaunchdShutdownTimeout) {
+		t.Fatalf("second shutdown: %v", err)
+	}
+	if elapsed != 20*time.Second {
+		t.Fatalf("elapsed=%s, want one 20s budget", elapsed)
 	}
 }
