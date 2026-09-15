@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.13.2](https://github.com/layervai/qurl-connector/compare/v0.13.1...v0.13.2) (2026-09-15)
+
+
+### Bug Fixes
+
+* **service:** wait for stopping launchd jobs before retrying bootstrap ([#92](https://github.com/layervai/qurl-connector/issues/92)) ([3b64d45](https://github.com/layervai/qurl-connector/commit/3b64d456cda5eab6a65a9d396f692169c23a8005))
+
 ## [0.13.1](https://github.com/layervai/qurl-connector/compare/v0.13.0...v0.13.1) (2026-09-11)
 
 
