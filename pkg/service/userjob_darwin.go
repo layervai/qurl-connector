@@ -22,6 +22,8 @@ type launchdUserJobManager struct {
 	sleep          func(time.Duration)
 }
 
+var errLaunchdShutdownTimeout = errors.New("launchd job did not finish stopping")
+
 const (
 	launchdBootstrapRetryDelay = 250 * time.Millisecond
 	// Each cycle can make two bootstrap attempts. The full failure budget is
@@ -123,6 +125,9 @@ func (m *launchdUserJobManager) bootstrapWithLaunchdSettleRecovery(
 		if err == nil {
 			return nil
 		}
+		if errors.Is(err, errLaunchdShutdownTimeout) {
+			return err
+		}
 		lastErr = err
 		if possiblyLoaded {
 			what := "ambiguous"
@@ -178,7 +183,7 @@ func (m *launchdUserJobManager) bootstrapWithSettleRetry(domain, service, plistP
 		return false, nil
 	}
 	m.settle()
-	if _, statusErr := m.launchctlQuery("print", service); statusErr == nil {
+	if _, statusErr := m.waitForStoppingJob(service); statusErr == nil {
 		return true, firstErr
 	} else if !isLaunchdNotFound(statusErr) {
 		// An unreadable service state is ambiguous, not absent. Tell the caller
@@ -190,7 +195,7 @@ func (m *launchdUserJobManager) bootstrapWithSettleRetry(domain, service, plistP
 		// bootstrap can return an error after launchd has accepted the job. Check
 		// the retry result exactly as we check the first attempt so the caller can
 		// unload an ambiguous replacement instead of reporting false convergence.
-		if _, statusErr := m.launchctlQuery("print", service); statusErr == nil {
+		if _, statusErr := m.waitForStoppingJob(service); statusErr == nil {
 			return true, errors.Join(firstErr, retryErr)
 		} else if !isLaunchdNotFound(statusErr) {
 			return true, errors.Join(
@@ -201,6 +206,32 @@ func (m *launchdUserJobManager) bootstrapWithSettleRetry(domain, service, plistP
 		return false, errors.Join(firstErr, retryErr)
 	}
 	return false, nil
+}
+
+// waitForStoppingJob lets an asynchronous bootout finish before bootstrap is
+// retried. launchd keeps the old job visible in SIGTERMed state during graceful
+// shutdown; treating it as a new ambiguous job exhausts the retry budget early.
+func (m *launchdUserJobManager) waitForStoppingJob(service string) (string, error) {
+	const shutdownWait = 20 * time.Second // Default ExitTimeOut (15s), plus launchd cleanup.
+	for waited := time.Duration(0); ; waited += launchdBootstrapRetryDelay {
+		output, err := m.launchctlQuery("print", service)
+		if err != nil || !launchdOutputStopping(output) {
+			return output, err
+		}
+		if waited >= shutdownWait {
+			return "", fmt.Errorf("%w: %s after %s", errLaunchdShutdownTimeout, service, shutdownWait)
+		}
+		m.settle()
+	}
+}
+
+func launchdOutputStopping(output string) bool {
+	for _, line := range strings.Split(output, "\n") {
+		if strings.TrimSpace(line) == "state = SIGTERMed" {
+			return true
+		}
+	}
+	return false
 }
 
 func (m *launchdUserJobManager) Remove(label string) error {

@@ -661,3 +661,51 @@ func userIDForTest() string {
 	// pinning a developer or CI runner's numeric uid in the assertion.
 	return strconv.Itoa(os.Getuid())
 }
+
+func TestLaunchdReplaceWaitsForSlowShutdown(t *testing.T) {
+	for _, stopAfter := range []time.Duration{3500 * time.Millisecond, 15 * time.Second, 25 * time.Second} {
+		t.Run(stopAfter.String(), func(t *testing.T) {
+			dir := t.TempDir()
+			job := testUserJob(dir, "daemon", "run")
+			var waited time.Duration
+			stopping := false
+			bootouts, bootstraps := 0, 0
+			manager := &launchdUserJobManager{
+				plistPath: func(string) (string, error) { return filepath.Join(dir, "job.plist"), nil },
+				sleep:     func(d time.Duration) { waited += d },
+				launchctlQuery: func(args ...string) (string, error) {
+					switch args[0] {
+					case "print":
+						if !stopping {
+							return "state = running\npid = 4242\n", nil
+						}
+						if waited < stopAfter {
+							return "state = SIGTERMed\npid = 4242\n", nil
+						}
+						return "", &launchctlError{output: "Could not find service", err: errors.New("not found")}
+					case "bootout":
+						bootouts++
+						stopping = true
+					case "bootstrap":
+						bootstraps++
+						if waited < stopAfter {
+							return "", errors.New("Bootstrap failed: 5: Input/output error")
+						}
+					}
+					return "", nil
+				},
+			}
+			err := manager.Replace(job)
+			if stopAfter > 20*time.Second {
+				if !errors.Is(err, errLaunchdShutdownTimeout) || waited > 21*time.Second {
+					t.Fatalf("err=%v waited=%s", err, waited)
+				}
+			} else if err != nil || waited < stopAfter || bootstraps != 2 {
+				t.Fatalf("err=%v waited=%s bootstraps=%d", err, waited, bootstraps)
+			}
+			if bootouts != 1 {
+				t.Fatalf("bootouts=%d, want one stop request", bootouts)
+			}
+		})
+	}
+}
