@@ -33,6 +33,14 @@ are serialized. Choose only `private-gateway-a` for the shared private gateway.
 
 ## Credential authority
 
+The older fileviewer targets also use `target=agent`. Although their enrollment
+request carries one optional connector claim, the current native producer
+classifies `agent_bootstrap` as `bootstrap` and does not retain that claim on the
+registered identity. Do not treat those targets as a narrower native authority
+boundary. The new target adds the reviewed owner/three-route preflight and avoids
+the legacy target's automatic sharing mutation; it does not create a new native
+privilege class.
+
 The API request is `kind=enrollment_token`, `target=agent`, `claims=[]`, and
 `expires_in=1h`, with no caller-specified scopes. Current native assignment
 classifies this as one-use `bootstrap`, owned by the selected account. It is

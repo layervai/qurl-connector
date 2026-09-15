@@ -21,7 +21,7 @@ on:
 
 concurrency:
   # Private gateway A and the old fileviewer A target share one bootstrap parameter.
-  # Serialize recovery to prevent one reviewed token from overwriting another.
+  # Serialize recovery to prevent interleaved writes to the shared parameter.
   group: rotate-sandbox-tunnel-enrollment
   cancel-in-progress: false
 
@@ -112,9 +112,14 @@ jobs:
           QURL_SANDBOX_API_ENDPOINT: ${{ secrets.QURL_SANDBOX_API_ENDPOINT }}
           QURL_SANDBOX_API_ENDPOINT_SHA256: ${{ secrets.QURL_SANDBOX_API_ENDPOINT_SHA256 }}
           QURL_TUNNEL_RECOVERY_ROLE_ARN: ${{ secrets.QURL_TUNNEL_RECOVERY_ROLE_ARN }}
+          QURL_PRIVATE_GATEWAY_CONFIG_JSON: ${{ secrets.QURL_PRIVATE_GATEWAY_CONFIG_JSON }}
+          RECOVERY_TARGET: ${{ inputs.target }}
         run: |
           set -euo pipefail
           missing=()
+          if [ "$RECOVERY_TARGET" = "private-gateway-a" ] && [ -z "$QURL_PRIVATE_GATEWAY_CONFIG_JSON" ]; then
+            missing+=(QURL_PRIVATE_GATEWAY_CONFIG_JSON)
+          fi
           [ -n "$QURL_SANDBOX_API_KEY" ] || missing+=(QURL_SANDBOX_API_KEY)
           [ -n "$QURL_SANDBOX_API_ENDPOINT" ] || missing+=(QURL_SANDBOX_API_ENDPOINT)
           [ -n "$QURL_SANDBOX_API_ENDPOINT_SHA256" ] || missing+=(QURL_SANDBOX_API_ENDPOINT_SHA256)

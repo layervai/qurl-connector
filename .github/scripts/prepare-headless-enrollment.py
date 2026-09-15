@@ -1271,6 +1271,7 @@ def main(
     api_key = os.environ.pop("QURL_SANDBOX_API_KEY", "")
     api_endpoint_value = os.environ.pop("QURL_SANDBOX_API_ENDPOINT", "")
     expected_endpoint_sha256 = os.environ.pop("QURL_SANDBOX_API_ENDPOINT_SHA256", "")
+    private_gateway_config = os.environ.pop("QURL_PRIVATE_GATEWAY_CONFIG_JSON", "")
     if not KEY.fullmatch(api_key):
         raise EnrollmentError("QURL_SANDBOX_API_KEY is missing or malformed")
     if not SHA256_HEX.fullmatch(expected_endpoint_sha256):
@@ -1288,7 +1289,7 @@ def main(
             args.target,
             args.generation,
             args.region,
-            os.environ.pop("QURL_PRIVATE_GATEWAY_CONFIG_JSON", ""),
+            private_gateway_config,
             deadline=deadline,
             on_install_complete=on_install_complete,
         )

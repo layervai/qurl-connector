@@ -3186,44 +3186,53 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
             },
         )
 
-    def test_main_pops_api_key_before_preparation(self) -> None:
-        argv = [
-            "prepare-headless-enrollment.py",
-            "--target",
-            "fileviewer-nhp-replica-a",
-            "--generation",
-            "attempt-1",
-            "--region",
-            "us-east-2",
-        ]
-        with (
-            mock.patch.object(MODULE.sys, "argv", argv),
-            mock.patch.dict(
-                MODULE.os.environ,
-                {
-                    "QURL_SANDBOX_API_KEY": "lv_live_account-key",
-                    "QURL_SANDBOX_API_ENDPOINT": "https://api.example.com",
-                    "QURL_SANDBOX_API_ENDPOINT_SHA256": MODULE.hashlib.sha256(
-                        b"https://api.example.com"
-                    ).hexdigest(),
-                },
-                clear=True,
-            ),
-            mock.patch.object(MODULE, "prepare_enrollment") as prepare,
-        ):
-            MODULE.main()
-            self.assertNotIn("QURL_SANDBOX_API_KEY", MODULE.os.environ)
-            self.assertNotIn("QURL_SANDBOX_API_ENDPOINT", MODULE.os.environ)
-            self.assertNotIn("QURL_SANDBOX_API_ENDPOINT_SHA256", MODULE.os.environ)
-        prepare.assert_called_once_with(
-            "https://api.example.com",
-            "lv_live_account-key",
-            "fileviewer-nhp-replica-a",
-            "attempt-1",
-            "us-east-2",
-            deadline=None,
-            on_install_complete=None,
-        )
+    def test_main_dispatches_and_pops_protected_environment_before_preparation(
+        self,
+    ) -> None:
+        for target, function in [
+            ("fileviewer-nhp-replica-a", "prepare_enrollment"),
+            ("private-gateway-a", "prepare_private_gateway_enrollment"),
+        ]:
+            argv = [
+                "prepare-headless-enrollment.py",
+                "--target",
+                target,
+                "--generation",
+                "attempt-1",
+                "--region",
+                "us-east-2",
+            ]
+            with (
+                mock.patch.object(MODULE.sys, "argv", argv),
+                mock.patch.dict(
+                    MODULE.os.environ,
+                    {
+                        "QURL_SANDBOX_API_KEY": "lv_live_account-key",
+                        "QURL_PRIVATE_GATEWAY_CONFIG_JSON": "protected-config",
+                        "QURL_SANDBOX_API_ENDPOINT": "https://api.example.com",
+                        "QURL_SANDBOX_API_ENDPOINT_SHA256": MODULE.hashlib.sha256(
+                            b"https://api.example.com"
+                        ).hexdigest(),
+                    },
+                    clear=True,
+                ),
+                mock.patch.object(MODULE, function) as prepare,
+            ):
+                MODULE.main()
+                self.assertNotIn("QURL_PRIVATE_GATEWAY_CONFIG_JSON", MODULE.os.environ)
+                self.assertNotIn("QURL_SANDBOX_API_KEY", MODULE.os.environ)
+                self.assertNotIn("QURL_SANDBOX_API_ENDPOINT", MODULE.os.environ)
+                self.assertNotIn("QURL_SANDBOX_API_ENDPOINT_SHA256", MODULE.os.environ)
+            prepare.assert_called_once_with(
+                "https://api.example.com",
+                "lv_live_account-key",
+                target,
+                "attempt-1",
+                "us-east-2",
+                *(["protected-config"] if target == "private-gateway-a" else []),
+                deadline=None,
+                on_install_complete=None,
+            )
 
     def test_main_rejects_bad_api_key_before_request(self) -> None:
         argv = [
