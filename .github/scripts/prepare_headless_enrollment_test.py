@@ -3,6 +3,7 @@ from __future__ import annotations
 import datetime as dt
 import http.server
 import importlib.util
+import json
 import pathlib
 import re
 import shutil
@@ -58,6 +59,200 @@ class FakeResponse:
 
 
 class PrepareHeadlessEnrollmentTest(unittest.TestCase):
+    def private_config(self):
+        return {
+            "owner_id": "owner-example",
+            "routes": {
+                surface: {
+                    "slug": surface + "-private-example",
+                    "crid": chr(97 + i) * 59 + "a",
+                    "connector_routing_id": "c-" + chr(97 + i) * 51 + "a",
+                    "knock_resource_id": "qurl-tunnel",
+                }
+                for i, surface in enumerate(("uploader", "fileviewer", "detect"))
+            },
+        }
+
+    def private_responses(self, config):
+        responses = [
+            {
+                "owner_id": config["owner_id"],
+                "auth_type": "api_key",
+                "api_key": {"kind": "api_key", "scopes": ["qurl:agent"]},
+            }
+        ]
+        for route in config["routes"].values():
+            responses += [
+                [route | {"type": "tunnel", "status": "active"}],
+                {"desired_state": "on", "serving_epoch": 1},
+            ]
+        return responses
+
+    def test_private_gateway_preflights_exact_routes_then_mints_one_unbound_token(self):
+        config = self.private_config()
+        credential = {
+            "kind": "enrollment_token",
+            "target": "agent",
+            "api_key": "lv_live_test-token",
+            "expires_at": VALID_EXPIRY,
+        }
+        with (
+            mock.patch.object(
+                MODULE,
+                "api_request",
+                side_effect=self.private_responses(config) + [credential],
+            ) as request,
+            mock.patch.object(MODULE, "put_parameter") as put,
+        ):
+            MODULE.prepare_private_gateway_enrollment(
+                "https://api.example.com",
+                "lv_live_account-key",
+                "private-gateway-a",
+                "test-generation",
+                "us-east-2",
+                json.dumps(config),
+                now=FIXED_NOW,
+            )
+        mint = request.call_args_list[-1]
+        self.assertEqual(mint.kwargs["body"]["claims"], [])
+        self.assertEqual(mint.kwargs["body"]["target"], "agent")
+        self.assertEqual(mint.kwargs["body"]["expires_in"], "1h")
+        self.assertNotIn("scopes", mint.kwargs["body"])
+        self.assertEqual(put.call_args.args[1], MODULE.TARGETS["private-gateway-a"][1])
+
+    def test_private_gateway_rejects_unreviewed_config_fields_before_network(self):
+        for config in [[], self.private_config() | {"extra": True}]:
+            with (
+                self.subTest(config=config),
+                mock.patch.object(MODULE, "api_request") as request,
+            ):
+                with self.assertRaises(MODULE.EnrollmentError):
+                    MODULE.prepare_private_gateway_enrollment(
+                        "https://api.example.com",
+                        "lv_live_account-key",
+                        "private-gateway-a",
+                        "test-generation",
+                        "us-east-2",
+                        json.dumps(config),
+                        now=FIXED_NOW,
+                    )
+                request.assert_not_called()
+
+    def test_private_gateway_rejects_bound_mint_response_without_installing(self):
+        config = self.private_config()
+        credential = {
+            "kind": "enrollment_token",
+            "target": "agent",
+            "claims": [{"type": "connector", "id": "other-example"}],
+            "api_key": "lv_live_test-token",
+            "expires_at": VALID_EXPIRY,
+        }
+        with (
+            mock.patch.object(
+                MODULE,
+                "api_request",
+                side_effect=self.private_responses(config) + [credential],
+            ),
+            mock.patch.object(MODULE, "put_parameter") as put,
+        ):
+            with self.assertRaises(MODULE.EnrollmentError):
+                MODULE.prepare_private_gateway_enrollment(
+                    "https://api.example.com",
+                    "lv_live_account-key",
+                    "private-gateway-a",
+                    "test-generation",
+                    "us-east-2",
+                    json.dumps(config),
+                    now=FIXED_NOW,
+                )
+            put.assert_not_called()
+
+    def test_private_gateway_rejects_wrong_owner_route_and_inactive_sharing_before_mint(
+        self,
+    ):
+        config = self.private_config()
+        for index, replacement in [
+            (
+                0,
+                {
+                    "owner_id": config["owner_id"],
+                    "auth_type": "api_key",
+                    "api_key": {"kind": "api_key", "scopes": "qurl:agent"},
+                },
+            ),
+            (
+                1,
+                [
+                    config["routes"]["uploader"]
+                    | {
+                        "type": "tunnel",
+                        "status": "active",
+                        "tombstoned_at": "2026-01-01T00:00:00Z",
+                    }
+                ],
+            ),
+            (0, {"owner_id": "wrong"}),
+            (
+                1,
+                [
+                    config["routes"]["uploader"]
+                    | {"type": "tunnel", "status": "active", "crid": "wrong"}
+                ],
+            ),
+            (2, {"desired_state": "off", "serving_epoch": 1}),
+        ]:
+            responses = self.private_responses(config)
+            responses[index] = replacement
+            with (
+                self.subTest(index=index),
+                mock.patch.object(
+                    MODULE, "api_request", side_effect=responses
+                ) as request,
+                mock.patch.object(MODULE, "put_parameter") as put,
+            ):
+                with self.assertRaises(MODULE.EnrollmentError):
+                    MODULE.prepare_private_gateway_enrollment(
+                        "https://api.example.com",
+                        "lv_live_account-key",
+                        "private-gateway-a",
+                        "test-generation",
+                        "us-east-2",
+                        json.dumps(config),
+                        now=FIXED_NOW,
+                    )
+                self.assertTrue(
+                    all(
+                        c.kwargs.get("method", "GET") == "GET"
+                        for c in request.call_args_list
+                    )
+                )
+                put.assert_not_called()
+
+    def test_private_gateway_rejects_standby_and_live_slug_before_network(self):
+        for target, slug in [
+            ("private-gateway-b", "new-example"),
+            ("private-gateway-c", "new-example"),
+            ("private-gateway-a", "fileviewer-sandbox"),
+            ("private-gateway-a", "detect-sandbox"),
+        ]:
+            config = self.private_config()
+            config["routes"]["fileviewer"]["slug"] = slug
+            with (
+                self.subTest(target=target, slug=slug),
+                mock.patch.object(MODULE, "api_request") as request,
+            ):
+                with self.assertRaises(MODULE.EnrollmentError):
+                    MODULE.prepare_private_gateway_enrollment(
+                        "https://api.example.com",
+                        "lv_live_account-key",
+                        target,
+                        "test-generation",
+                        "us-east-2",
+                        json.dumps(config),
+                        now=FIXED_NOW,
+                    )
+                request.assert_not_called()
+
     def test_generated_python_tool_directories_are_ignored(self) -> None:
         entries = set(GITIGNORE.read_text().splitlines())
         self.assertTrue({".ruff_cache/", ".venv/", "/venv/"} <= entries)
@@ -84,10 +279,8 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
         self.assertNotIn("--api-endpoint", workflow)
         self.assertIn("RECOVERY_TARGET: ${{ inputs.target }}", workflow)
         self.assertIn("name: Rotate ${{ inputs.target }}", workflow)
-        self.assertIn(
-            "group: rotate-sandbox-tunnel-enrollment-${{ inputs.target }}", workflow
-        )
-        self.assertIn("not to its serving epoch", workflow)
+        self.assertIn("group: rotate-sandbox-tunnel-enrollment", workflow)
+        self.assertIn("Serialize recovery", workflow)
         self.assertIn("reuse for immediate retries", workflow)
         self.assertIn("less than 45 minutes left", workflow)
         self.assertNotIn("matrix:", workflow)
@@ -250,9 +443,13 @@ class PrepareHeadlessEnrollmentTest(unittest.TestCase):
         self.assertIn("AWS CLI v2, but aws is unavailable", aws_cli_requirement)
         self.assertIn('[[ ! "$aws_version" =~ ^aws-cli/2\\. ]]', aws_cli_requirement)
 
-    def test_every_target_has_a_distinct_parameter(self) -> None:
+    def test_only_private_gateway_a_shares_the_existing_a_parameter(self) -> None:
         parameters = [parameter for _slug, parameter in MODULE.TARGETS.values()]
-        self.assertEqual(len(parameters), len(set(parameters)))
+        self.assertEqual(len(parameters) - 1, len(set(parameters)))
+        self.assertEqual(
+            MODULE.TARGETS["private-gateway-a"][1],
+            MODULE.TARGETS["fileviewer-nhp-replica-a"][1],
+        )
 
         allowlist = re.search(
             r"(?s)reviewedOperationalPaths := map\[string\]bool\{(.*?)\n\t\}",

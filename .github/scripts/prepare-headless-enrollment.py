@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Mint one bound agent enrollment token and store it without printing it."""
+"""Mint one reviewed agent enrollment token and store it without printing it."""
 
 from __future__ import annotations
 
@@ -113,6 +113,7 @@ ENROLLMENT_COMPLETION_RESERVE_SECONDS = (
 MAX_RETRY_AFTER_SECONDS = 30
 SCRIPT_DEADLINE_SECONDS = 8 * 60
 TARGETS = {
+    "private-gateway-a": ("", "/qurl-s3-connector/fileviewer-nhp/replica-a/bootstrap"),
     "fileviewer-nhp-replica-a": (
         "fileviewer-sandbox",
         "/qurl-s3-connector/fileviewer-nhp/replica-a/bootstrap",
@@ -691,7 +692,7 @@ def mint_and_install_enrollment(
         "kind": "enrollment_token",
         "name": f"Sandbox {target} headless enrollment {generation}",
         "target": "agent",
-        "claims": [{"type": "connector", "id": slug}],
+        "claims": [{"type": "connector", "id": slug}] if slug else [],
         "expires_in": "1h",
     }
     # POST /v1/api-keys stores each idempotency response atomically with the key
@@ -787,7 +788,7 @@ def mint_and_install_enrollment(
                 "remain live; the installed credential ID is unavailable"
             )
     try:
-        expected_claims = [{"type": "connector", "id": slug}]
+        expected_claims = [{"type": "connector", "id": slug}] if slug else []
         # Claims are the credential authority boundary. Reject extra claims and
         # additive claim fields until this recovery contract is reviewed again.
         # The wrapper below reports the live key ID and revocation guidance.
@@ -795,7 +796,7 @@ def mint_and_install_enrollment(
             not isinstance(credential, dict)
             or credential.get("kind") != "enrollment_token"
             or credential.get("target") != "agent"
-            or credential.get("claims") != expected_claims
+            or credential.get("claims", []) != expected_claims
         ):
             raise EnrollmentError(
                 "qURL API did not confirm the exact enrollment authority"
@@ -841,6 +842,132 @@ def mint_and_install_enrollment(
             + possible_extra_suffix
         ) from exc
     return expiry, mint_warning
+
+
+def prepare_private_gateway_enrollment(
+    api_endpoint: str,
+    api_key: str,
+    target: str,
+    generation: str,
+    region: str,
+    config_json: str,
+    *,
+    now: dt.datetime | None = None,
+    deadline: float | None = None,
+    on_install_complete: Callable[[], None] | None = None,
+) -> None:
+    """Preflight the protected route pins, then install one owner-bound token."""
+    validate_inputs(target, generation, region)
+    if target != "private-gateway-a":
+        raise EnrollmentError("private gateway enrollment is limited to A")
+    try:
+        config = json.loads(config_json)
+        if not isinstance(config, dict) or set(config) != {"owner_id", "routes"}:
+            raise ValueError
+        owner = config["owner_id"]
+        routes = config["routes"]
+        if (
+            not isinstance(owner, str)
+            or not owner
+            or set(routes) != {"uploader", "fileviewer", "detect"}
+        ):
+            raise ValueError
+        for route in routes.values():
+            if (
+                not isinstance(route, dict)
+                or set(route)
+                != {"slug", "crid", "connector_routing_id", "knock_resource_id"}
+                or not all(isinstance(v, str) and v for v in route.values())
+                or not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,62}", route["slug"])
+                or route["slug"] in {"fileviewer-sandbox", "detect-sandbox"}
+                or not re.fullmatch(
+                    r"(?:[a-z2-7]{59}[aq]|[a-z2-7]{46}[aiqy])", route["crid"]
+                )
+                or not re.fullmatch(
+                    r"c-[a-z2-7]{51}[aq]", route["connector_routing_id"]
+                )
+            ):
+                raise ValueError
+        if any(
+            len({route[key] for route in routes.values()}) != 3
+            for key in ("slug", "crid", "connector_routing_id")
+        ):
+            raise ValueError
+        if len({route["knock_resource_id"] for route in routes.values()}) != 1:
+            raise ValueError
+    except (ValueError, TypeError, KeyError, AttributeError) as exc:
+        raise EnrollmentError(
+            "protected private gateway owner/route configuration is invalid"
+        ) from exc
+
+    operation_deadline = _operation_deadline(deadline)
+    identity = api_read_before_deadline(
+        operation_deadline, api_endpoint, api_key, "/v1/me"
+    )
+    if (
+        not isinstance(identity, dict)
+        or identity.get("owner_id") != owner
+        or identity.get("auth_type") != "api_key"
+        or not isinstance(identity.get("api_key"), dict)
+        or identity["api_key"].get("kind") != "api_key"
+        or not isinstance(identity["api_key"].get("scopes"), list)
+        or not all(isinstance(scope, str) for scope in identity["api_key"]["scopes"])
+        or "qurl:agent" not in identity["api_key"]["scopes"]
+    ):
+        raise EnrollmentError(
+            "private gateway credential is not the reviewed owner account"
+        )
+    for route in routes.values():
+        records = api_read_before_deadline(
+            operation_deadline,
+            api_endpoint,
+            api_key,
+            "/v1/resources?" + urllib.parse.urlencode({"slug": route["slug"]}),
+        )
+        if (
+            not isinstance(records, list)
+            or len(records) != 1
+            or not isinstance(records[0], dict)
+            or records[0].get("type") != "tunnel"
+            or records[0].get("status") != "active"
+            or records[0].get("tombstoned_at") is not None
+            or any(records[0].get(key) != value for key, value in route.items())
+        ):
+            raise EnrollmentError(
+                "private gateway resource does not match the reviewed identity pins"
+            )
+        sharing = api_read_before_deadline(
+            operation_deadline,
+            api_endpoint,
+            api_key,
+            "/v1/resources/" + route["crid"] + "/sharing",
+        )
+        if (
+            not isinstance(sharing, dict)
+            or sharing.get("desired_state") != "on"
+            or type(sharing.get("serving_epoch")) is not int
+            or sharing["serving_epoch"] <= 0
+        ):
+            raise EnrollmentError(
+                "private gateway route must already have reviewed sharing enabled"
+            )
+    expiry, warning = mint_and_install_enrollment(
+        api_endpoint,
+        api_key,
+        target,
+        generation,
+        region,
+        "",
+        TARGETS[target][1],
+        now=now,
+        deadline=operation_deadline,
+        on_install_complete=on_install_complete,
+    )
+    if warning:
+        print(f"::warning::{warning}", file=sys.stderr)
+    print(
+        f"prepared one-use owner-bound enrollment for {target}; expires {expiry.isoformat()}"
+    )
 
 
 def prepare_enrollment(
@@ -1154,6 +1281,18 @@ def main(
         api_endpoint_value, expected_sha256=expected_endpoint_sha256
     )
     validate_inputs(args.target, args.generation, args.region)
+    if args.target == "private-gateway-a":
+        prepare_private_gateway_enrollment(
+            api_endpoint,
+            api_key,
+            args.target,
+            args.generation,
+            args.region,
+            os.environ.pop("QURL_PRIVATE_GATEWAY_CONFIG_JSON", ""),
+            deadline=deadline,
+            on_install_complete=on_install_complete,
+        )
+        return
     prepare_enrollment(
         api_endpoint,
         api_key,
