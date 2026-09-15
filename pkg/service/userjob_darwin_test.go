@@ -414,7 +414,7 @@ func TestLaunchdBootstrapJoinsAmbiguousInspectionFailure(t *testing.T) {
 			return "", inspectErr
 		},
 	}
-	stillLoaded, err := manager.bootstrapWithSettleRetry("gui/501", "gui/501/test", "/tmp/test.plist")
+	stillLoaded, err := manager.bootstrapWithSettleRetry("gui/501", "gui/501/test", "/tmp/test.plist", &launchdShutdownWait{})
 	if !errors.Is(err, bootstrapErr) || !errors.Is(err, inspectErr) {
 		t.Fatalf("bootstrapWithSettleRetry() = %v, want joined bootstrap and inspection errors", err)
 	}
@@ -449,7 +449,7 @@ func TestLaunchdBootstrapReportsLoadedAfterRetryError(t *testing.T) {
 			}
 		},
 	}
-	possiblyLoaded, err := manager.bootstrapWithSettleRetry("gui/501", "gui/501/test", "/tmp/test.plist")
+	possiblyLoaded, err := manager.bootstrapWithSettleRetry("gui/501", "gui/501/test", "/tmp/test.plist", &launchdShutdownWait{})
 	if !errors.Is(err, firstErr) || !errors.Is(err, retryErr) {
 		t.Fatalf("bootstrapWithSettleRetry() = %v, want both bootstrap errors", err)
 	}
@@ -660,4 +660,137 @@ func userIDForTest() string {
 	// The production service identifier is deliberately per-user. Avoid
 	// pinning a developer or CI runner's numeric uid in the assertion.
 	return strconv.Itoa(os.Getuid())
+}
+
+func TestLaunchdReplaceWaitsForSlowShutdown(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		stopAfter   time.Duration
+		exitTimeout int
+		matching    bool
+	}{
+		{"observed shutdown", 3500 * time.Millisecond, 0, false},
+		{"default shutdown", 15 * time.Second, 0, false},
+		{"changed timeout", 25 * time.Second, 0, false},
+		{"matching timeout", 25 * time.Second, 0, true},
+		{"configured timeout without launchd field", 40 * time.Second, 60, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			stopAfter := tc.stopAfter
+			dir := t.TempDir()
+			job := testUserJob(dir, "daemon", "run")
+			job.ExitTimeout = tc.exitTimeout
+			if tc.matching {
+				content, renderErr := RenderLaunchdUserJob(job)
+				if renderErr != nil {
+					t.Fatal(renderErr)
+				}
+				if writeErr := os.WriteFile(filepath.Join(dir, "job.plist"), []byte(content), 0o600); writeErr != nil {
+					t.Fatal(writeErr)
+				}
+			}
+			var waited time.Duration
+			stopping := false
+			bootouts, bootstraps := 0, 0
+			manager := &launchdUserJobManager{
+				plistPath: func(string) (string, error) { return filepath.Join(dir, "job.plist"), nil },
+				sleep:     func(d time.Duration) { waited += d },
+				now:       func() time.Time { return time.Unix(0, 0).Add(waited) },
+				launchctlQuery: func(args ...string) (string, error) {
+					switch args[0] {
+					case "print":
+						if !stopping {
+							return "state = running\npid = 4242\n", nil
+						}
+						if waited < stopAfter {
+							return "state = SIGTERMed\npid = 4242\n", nil
+						}
+						return "", &launchctlError{output: "Could not find service", err: errors.New("not found")}
+					case "bootout":
+						bootouts++
+						stopping = true
+					case "bootstrap":
+						bootstraps++
+						if waited < stopAfter {
+							return "", errors.New("Bootstrap failed: 5: Input/output error")
+						}
+					}
+					return "", nil
+				},
+			}
+			err := manager.Replace(job)
+			if tc.exitTimeout == 0 && stopAfter > 20*time.Second {
+				_, statErr := os.Stat(filepath.Join(dir, "job.plist"))
+				if tc.matching {
+					if statErr != nil {
+						t.Fatalf("matching definition was lost: %v", statErr)
+					}
+				} else if !errors.Is(statErr, os.ErrNotExist) || err == nil || !strings.Contains(err.Error(), "retry the command to reinstall it") {
+					t.Fatalf("changed definition timeout: stat=%v err=%v", statErr, err)
+				}
+				if !errors.Is(err, errLaunchdShutdownTimeout) || waited > 21*time.Second {
+					t.Fatalf("err=%v waited=%s", err, waited)
+				}
+			} else if err != nil || waited < stopAfter || bootstraps != 2 {
+				t.Fatalf("err=%v waited=%s bootstraps=%d", err, waited, bootstraps)
+			}
+			if bootouts != 1 {
+				t.Fatalf("bootouts=%d, want one stop request", bootouts)
+			}
+		})
+	}
+}
+
+func TestLaunchdShutdownUsesLoadedTimeoutAndQueryTime(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		exitTimeout string
+		queryTime   time.Duration
+		wantWait    time.Duration
+	}{
+		{"custom timeout", "30", 0, 35 * time.Second},
+		{"query time counts", "15", 5 * time.Second, 20 * time.Second},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var elapsed time.Duration
+			m := &launchdUserJobManager{
+				now:   func() time.Time { return time.Unix(0, 0).Add(elapsed) },
+				sleep: func(d time.Duration) { elapsed += d },
+				launchctlQuery: func(...string) (string, error) {
+					elapsed += tc.queryTime
+					return "state = SIGTERMed\nexit timeout = " + tc.exitTimeout + "\n", nil
+				},
+			}
+			_, err := m.waitForStoppingJob("test", &launchdShutdownWait{})
+			if !errors.Is(err, errLaunchdShutdownTimeout) || elapsed < tc.wantWait || elapsed > tc.wantWait+tc.queryTime {
+				t.Fatalf("err=%v elapsed=%s want=%s", err, elapsed, tc.wantWait)
+			}
+		})
+	}
+}
+
+func TestLaunchdShutdownDeadlineIsSharedAcrossRetries(t *testing.T) {
+	var elapsed time.Duration
+	firstShutdown := true
+	m := &launchdUserJobManager{
+		now:   func() time.Time { return time.Unix(0, 0).Add(elapsed) },
+		sleep: func(d time.Duration) { elapsed += d },
+		launchctlQuery: func(...string) (string, error) {
+			if elapsed >= 19*time.Second && firstShutdown {
+				firstShutdown = false
+				return "", &launchctlError{output: "Could not find service", err: errors.New("absent")}
+			}
+			return "state = SIGTERMed\nexit timeout = 15\n", nil
+		},
+	}
+	var shutdown launchdShutdownWait
+	if _, err := m.waitForStoppingJob("test", &shutdown); !isLaunchdNotFound(err) {
+		t.Fatalf("first shutdown: %v", err)
+	}
+	if _, err := m.waitForStoppingJob("test", &shutdown); !errors.Is(err, errLaunchdShutdownTimeout) {
+		t.Fatalf("second shutdown: %v", err)
+	}
+	if elapsed != 20*time.Second {
+		t.Fatalf("elapsed=%s, want one 20s budget", elapsed)
+	}
 }

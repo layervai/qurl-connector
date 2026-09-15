@@ -20,12 +20,21 @@ type launchdUserJobManager struct {
 	plistPath      func(string) (string, error)
 	launchctlQuery func(...string) (string, error)
 	sleep          func(time.Duration)
+	now            func() time.Time
 }
+
+type launchdShutdownWait struct {
+	deadline time.Time
+	timeout  time.Duration
+}
+
+var errLaunchdShutdownTimeout = errors.New("launchd job did not finish stopping")
 
 const (
 	launchdBootstrapRetryDelay = 250 * time.Millisecond
 	// Each cycle can make two bootstrap attempts. The full failure budget is
-	// therefore eight attempts and seven waits, or 1.75 seconds of settle time.
+	// therefore eight attempts and seven short waits. Slow shutdowns share
+	// one additional deadline across all cycles, based on the loaded job.
 	launchdBootstrapMaxCycles = 4
 )
 
@@ -94,7 +103,7 @@ func (m *launchdUserJobManager) ensure(job UserJob, forceReplace bool) error {
 			return fmt.Errorf("write launchd job %s: %w", job.Label, err)
 		}
 	}
-	err = m.bootstrapWithLaunchdSettleRecovery(domain, service, plistPath, definitionChanged)
+	err = m.bootstrapWithLaunchdSettleRecovery(domain, service, plistPath, definitionChanged, &launchdShutdownWait{timeout: time.Duration(job.ExitTimeout) * time.Second})
 	if err != nil {
 		return fmt.Errorf("bootstrap launchd job %s: %w", job.Label, err)
 	}
@@ -116,12 +125,24 @@ func (m *launchdUserJobManager) ensure(job UserJob, forceReplace bool) error {
 func (m *launchdUserJobManager) bootstrapWithLaunchdSettleRecovery(
 	domain, service, plistPath string,
 	definitionChanged bool,
+	shutdown *launchdShutdownWait,
 ) error {
 	var lastErr error
 	for cycle := 0; cycle < launchdBootstrapMaxCycles; cycle++ {
-		possiblyLoaded, err := m.bootstrapWithSettleRetry(domain, service, plistPath)
+		possiblyLoaded, err := m.bootstrapWithSettleRetry(domain, service, plistPath, shutdown)
 		if err == nil {
 			return nil
+		}
+		if errors.Is(err, errLaunchdShutdownTimeout) {
+			// The old process still owns the label. Do not leave a replacement
+			// definition that a later Ensure could accept as its running job.
+			if definitionChanged {
+				if removeErr := os.Remove(plistPath); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+					return errors.Join(err, fmt.Errorf("remove unconverged launchd job definition: %w", removeErr))
+				}
+				return fmt.Errorf("%w; removed the replacement job definition; retry the command to reinstall it", err)
+			}
+			return err
 		}
 		lastErr = err
 		if possiblyLoaded {
@@ -172,13 +193,13 @@ func (m *launchdUserJobManager) unloadAmbiguous(service, plistPath, what string,
 // is absent. macOS can briefly return EIO after a successful bootout while it
 // finishes removing the prior job. The read between attempts also tells the
 // caller when a loaded or unreadable service state makes the result ambiguous.
-func (m *launchdUserJobManager) bootstrapWithSettleRetry(domain, service, plistPath string) (bool, error) {
+func (m *launchdUserJobManager) bootstrapWithSettleRetry(domain, service, plistPath string, shutdown *launchdShutdownWait) (bool, error) {
 	_, firstErr := m.launchctlQuery("bootstrap", domain, plistPath)
 	if firstErr == nil {
 		return false, nil
 	}
 	m.settle()
-	if _, statusErr := m.launchctlQuery("print", service); statusErr == nil {
+	if _, statusErr := m.waitForStoppingJob(service, shutdown); statusErr == nil {
 		return true, firstErr
 	} else if !isLaunchdNotFound(statusErr) {
 		// An unreadable service state is ambiguous, not absent. Tell the caller
@@ -190,7 +211,7 @@ func (m *launchdUserJobManager) bootstrapWithSettleRetry(domain, service, plistP
 		// bootstrap can return an error after launchd has accepted the job. Check
 		// the retry result exactly as we check the first attempt so the caller can
 		// unload an ambiguous replacement instead of reporting false convergence.
-		if _, statusErr := m.launchctlQuery("print", service); statusErr == nil {
+		if _, statusErr := m.waitForStoppingJob(service, shutdown); statusErr == nil {
 			return true, errors.Join(firstErr, retryErr)
 		} else if !isLaunchdNotFound(statusErr) {
 			return true, errors.Join(
@@ -201,6 +222,53 @@ func (m *launchdUserJobManager) bootstrapWithSettleRetry(domain, service, plistP
 		return false, errors.Join(firstErr, retryErr)
 	}
 	return false, nil
+}
+
+// waitForStoppingJob lets an asynchronous bootout finish before bootstrap is
+// retried. launchd keeps the old job visible in SIGTERMed state during graceful
+// shutdown; treating it as a new ambiguous job exhausts the retry budget early.
+func (m *launchdUserJobManager) waitForStoppingJob(service string, shutdown *launchdShutdownWait) (string, error) {
+	now := m.now
+	if now == nil {
+		now = time.Now
+	}
+	started := now()
+	output, err := m.launchctlQuery("print", service)
+	if shutdown.deadline.IsZero() && err == nil && launchdOutputStopping(output) {
+		// The configured timeout is the floor if launchd omits its field.
+		// A longer loaded timeout wins during an upgrade.
+		// All bootstrap cycles share this deadline, including query time.
+		shutdownWait := shutdown.timeout
+		if shutdownWait == 0 {
+			shutdownWait = 15 * time.Second
+		}
+		shutdownWait += 5 * time.Second
+		for _, line := range strings.Split(output, "\n") {
+			if value, found := strings.CutPrefix(strings.TrimSpace(line), "exit timeout = "); found {
+				if seconds, parseErr := strconv.Atoi(value); parseErr == nil && seconds >= 1 && seconds <= 300 {
+					shutdownWait = max(shutdownWait, time.Duration(seconds+5)*time.Second)
+				}
+			}
+		}
+		shutdown.deadline = started.Add(shutdownWait)
+	}
+	for err == nil && launchdOutputStopping(output) {
+		if !now().Before(shutdown.deadline) {
+			return "", fmt.Errorf("%w before its shutdown deadline: %s", errLaunchdShutdownTimeout, service)
+		}
+		m.settle()
+		output, err = m.launchctlQuery("print", service)
+	}
+	return output, err
+}
+
+func launchdOutputStopping(output string) bool {
+	for _, line := range strings.Split(output, "\n") {
+		if strings.TrimSpace(line) == "state = SIGTERMed" {
+			return true
+		}
+	}
+	return false
 }
 
 func (m *launchdUserJobManager) Remove(label string) error {
