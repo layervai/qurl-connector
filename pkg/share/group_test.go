@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -17,6 +18,16 @@ type fakeGroupFactory struct {
 	sessions []*fakeGroupSession
 	starts   int
 	hold     func(sessionIndex int, routeID string) bool
+	// validate stands in for the FRP factory's transport check on a route
+	// set; nil accepts every set.
+	validate func([]LocalHTTPRoute) error
+}
+
+func (f *fakeGroupFactory) ValidateRoutes(routes []LocalHTTPRoute) error {
+	if f.validate == nil {
+		return nil
+	}
+	return f.validate(routes)
 }
 
 func (f *fakeGroupFactory) Start(_ context.Context, admission Admission, routes []GroupRoute) (GroupServingSession, error) {
@@ -73,7 +84,7 @@ func (s *fakeGroupSession) install(routes []GroupRoute) {
 	next := make(map[string]RouteState, len(routes))
 	for _, route := range routes {
 		name := groupProxyName(route, s.admission.SessionID)
-		if current, ok := s.routes[route.RouteID]; ok && current.ProxyName == name && current.Route == route {
+		if current, ok := s.routes[route.RouteID]; ok && current.ProxyName == name && current.Route.Equal(route) {
 			next[route.RouteID] = current
 			continue
 		}
@@ -534,7 +545,7 @@ func TestSessionGroupRunnerRegeneratesChangedTargetAndRejectsIdentityChange(t *t
 			t.Fatalf("SetRoutes changing b's %s in place = %v, want a refusal", name, err)
 		}
 	}
-	if after := session.RouteStates(); after["b"].ProxyName != "b-nhp1" || after["b"].Route.LocalHTTPRoute != groupTestRoutes("a", "b")[1] {
+	if after := session.RouteStates(); after["b"].ProxyName != "b-nhp1" || !after["b"].Route.LocalHTTPRoute.Equal(groupTestRoutes("a", "b")[1]) {
 		t.Fatalf("refused identity change still reached the session: %+v", after["b"])
 	}
 }
@@ -1135,5 +1146,216 @@ func TestSessionGroupRunnerSingleRouteCycleKeepsPriorMeasurement(t *testing.T) {
 	runner.observeRegistration(partial, serving("a", "b"), now)
 	if runner.measuredPerRoute != 0 || !partial.measured {
 		t.Fatalf("after both routes served at once: measured = %s (want 0), frozen = %t (want true)", runner.measuredPerRoute, partial.measured)
+	}
+}
+
+func TestGroupRouteHeaderChangeReRegistersOnlyThatRoute(t *testing.T) {
+	h := startGroupHarness(t, time.Hour, 0, nil, "a", "b")
+	h.waitServing(t, 1, "a", "b")
+	session := h.factory.session(1)
+	withHeader := func(value string) []LocalHTTPRoute {
+		routes := groupTestRoutes("a", "b")
+		routes[0].RequestHeaders = map[string]string{testProxyTokenHeader: value}
+		return routes
+	}
+	expectRegistration := func(t *testing.T, name, value string, servingReports int) {
+		t.Helper()
+		waitUntil(t, time.Second, func() bool { return h.events.servingCount("a", 1) == servingReports },
+			fmt.Sprintf("route a serving under registration %s", name))
+		state := session.RouteStates()["a"]
+		if state.ProxyName != name || state.Route.RequestHeaders[testProxyTokenHeader] != value {
+			t.Fatalf("route a = %+v, want proxy %q carrying the current headers", state, name)
+		}
+	}
+
+	// Adding a header re-registers a alone; changing its value does again.
+	if err := h.runner.SetRoutes(context.Background(), withHeader("first")); err != nil {
+		t.Fatal(err)
+	}
+	expectRegistration(t, "a-nhp1-r1", "first", 2)
+	if err := h.runner.SetRoutes(context.Background(), withHeader("second")); err != nil {
+		t.Fatal(err)
+	}
+	expectRegistration(t, "a-nhp1-r2", "second", 3)
+
+	// The same headers again are not a change.
+	if err := h.runner.SetRoutes(context.Background(), withHeader("second")); err != nil {
+		t.Fatal(err)
+	}
+	if got := session.RouteStates()["a"].ProxyName; got != "a-nhp1-r2" {
+		t.Fatalf("unchanged headers re-registered route a as %q", got)
+	}
+
+	// Dropping the header is a change too.
+	if err := h.runner.SetRoutes(context.Background(), groupTestRoutes("a", "b")); err != nil {
+		t.Fatal(err)
+	}
+	expectRegistration(t, "a-nhp1-r3", "", 4)
+
+	if state := session.RouteStates()["b"]; state.ProxyName != "b-nhp1" || h.events.servingCount("b", 1) != 1 {
+		t.Fatalf("sibling b after a's header changes = %+v (serving reports %d), want untouched", state, h.events.servingCount("b", 1))
+	}
+	if got := h.admissions(); got != 1 {
+		t.Fatalf("admissions = %d, want no knock for a header change", got)
+	}
+	if got := h.factory.startCount(); got != 1 {
+		t.Fatalf("FRP session starts = %d, want the same live session", got)
+	}
+}
+
+func TestGroupRouteHeaderChangeDuringRotationRetainsOldHeaders(t *testing.T) {
+	hold := func(sessionIndex int, _ string) bool { return sessionIndex == 2 }
+	h := startGroupHarness(t, 2*time.Second, 0, hold, "a", "b")
+	h.waitServing(t, 1, "a", "b")
+	routes := groupTestRoutes("a", "b")
+	routes[0].RequestHeaders = map[string]string{testProxyTokenHeader: "first"}
+	if err := h.runner.SetRoutes(context.Background(), routes); err != nil {
+		t.Fatal(err)
+	}
+	first := h.factory.session(1)
+	old := first.RouteStates()["a"]
+	waitUntil(t, 2*time.Second, func() bool { return h.factory.startCount() == 2 }, "replacement session start")
+	second := h.factory.session(2)
+	routes[0].RequestHeaders = map[string]string{testProxyTokenHeader: "second"}
+	if err := h.runner.SetRoutes(context.Background(), routes); err != nil {
+		t.Fatal(err)
+	}
+	retained := first.RouteStates()["a"]
+	if retained.ProxyName != old.ProxyName || !retained.Route.Equal(old.Route) {
+		t.Fatal("rotating session changed its previous registration")
+	}
+	replacement := second.RouteStates()["a"]
+	if replacement.Route.RequestHeaders[testProxyTokenHeader] != "second" || replacement.ProxyName != "a-nhp2-r2" {
+		t.Fatal("replacement did not receive the new header generation")
+	}
+	if first.isDrained() || first.isStopped() {
+		t.Fatal("old session retired before replacement served")
+	}
+	second.serve("a")
+	second.serve("b")
+	waitUntil(t, time.Second, func() bool { return len(h.events.promotions()) == 2 }, "replacement promotion")
+	h.waitServing(t, 2, "a", "b")
+	if retained := first.RouteStates()["a"]; !retained.Route.Equal(old.Route) {
+		t.Fatal("retiring session changed its previous headers")
+	}
+}
+
+func TestSessionGroupRunnerClonesRequestHeadersOnEntry(t *testing.T) {
+	want := map[string]string{testProxyTokenHeader: "original"}
+	mutate := func(headers map[string]string) {
+		headers[testProxyTokenHeader] = "mutated"
+		headers["X-Added-Later"] = "unexpected"
+	}
+
+	initial := map[string]string{testProxyTokenHeader: "original"}
+	routes := groupTestRoutes("a")
+	routes[0].RequestHeaders = initial
+	runner, err := NewSessionGroupRunner(SessionGroupConfig{
+		KnockResourceID: "q_catalog_key", ResourcePublicKey: "group-resource", Routes: routes,
+		Admitter: &rotatingAdmitter{openTime: time.Hour}, Sessions: &fakeGroupFactory{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mutate(initial)
+	if got := runner.desiredRoutes()[0].RequestHeaders; !reflect.DeepEqual(got, want) {
+		t.Fatalf("constructor kept the caller's header map: %#v", got)
+	}
+
+	h := startGroupHarness(t, time.Hour, 0, nil, "a")
+	h.waitServing(t, 1, "a")
+	live := map[string]string{testProxyTokenHeader: "original"}
+	routes = groupTestRoutes("a")
+	routes[0].RequestHeaders = live
+	if err := h.runner.SetRoutes(context.Background(), routes); err != nil {
+		t.Fatal(err)
+	}
+	mutate(live)
+	if got := h.factory.session(1).RouteStates()["a"].Route.RequestHeaders; !reflect.DeepEqual(got, want) {
+		t.Fatalf("SetRoutes kept the caller's header map: %#v", got)
+	}
+}
+
+// The FRP factory is the routeValidator in production: a headered set on a
+// transport it cannot carry is refused by the runner before the desired set
+// or any route generation changes.
+func TestSessionGroupRunnerRefusesHeadersTheFRPFactoryCannotCarry(t *testing.T) {
+	headered := groupTestRoutes("a", "b")
+	headered[0].RequestHeaders = map[string]string{testProxyTokenHeader: "abc"}
+	for _, tc := range []struct {
+		name    string
+		factory *FRPSessionGroupFactory
+		wantErr string
+	}{
+		{name: "plaintext", factory: newTestGroupFactory(t, false, 0), wantErr: "runtime request headers require encrypted FRP transport"},
+		{name: "web server", factory: newTestGroupFactory(t, true, 7400), wantErr: "runtime request headers require FRP web server to be disabled"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := SessionGroupConfig{
+				KnockResourceID: "q_catalog_key", ResourcePublicKey: "group-resource", Routes: headered,
+				Admitter: &rotatingAdmitter{openTime: time.Hour}, Sessions: tc.factory,
+			}
+			if _, err := NewSessionGroupRunner(cfg); err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("NewSessionGroupRunner with headers = %v, want %q", err, tc.wantErr)
+			}
+			cfg.Routes = groupTestRoutes("a", "b")
+			runner, err := NewSessionGroupRunner(cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			before := runner.desiredRoutes()
+			if err := runner.SetRoutes(context.Background(), headered); err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("SetRoutes with headers = %v, want %q", err, tc.wantErr)
+			}
+			after := runner.desiredRoutes()
+			if len(after) != len(before) || !after[0].Equal(before[0]) || !after[1].Equal(before[1]) {
+				t.Fatalf("refused set changed the desired routes: before %v, after %v", before, after)
+			}
+		})
+	}
+}
+
+func TestSessionGroupRunnerRefusesRoutesTheFactoryCannotServe(t *testing.T) {
+	refuse := func(routes []LocalHTTPRoute) error {
+		for _, route := range routes {
+			if len(route.RequestHeaders) > 0 {
+				return errors.New("fake transport cannot carry request headers")
+			}
+		}
+		return nil
+	}
+	headered := groupTestRoutes("a", "b")
+	headered[0].RequestHeaders = map[string]string{testProxyTokenHeader: "abc"}
+
+	_, err := NewSessionGroupRunner(SessionGroupConfig{
+		KnockResourceID: "q_catalog_key", ResourcePublicKey: "group-resource", Routes: headered,
+		Admitter: &rotatingAdmitter{openTime: time.Hour}, Sessions: &fakeGroupFactory{validate: refuse},
+	})
+	if err == nil || !strings.Contains(err.Error(), "fake transport cannot carry request headers") {
+		t.Fatalf("NewSessionGroupRunner with routes the factory refuses = %v, want that refusal", err)
+	}
+
+	h := startGroupHarness(t, time.Hour, 0, nil, "a", "b")
+	h.factory.validate = refuse
+	h.waitServing(t, 1, "a", "b")
+	session := h.factory.session(1)
+	err = h.runner.SetRoutes(context.Background(), headered)
+	if err == nil || !strings.Contains(err.Error(), "fake transport cannot carry request headers") {
+		t.Fatalf("SetRoutes with routes the factory refuses = %v, want that refusal", err)
+	}
+	// The desired set is untouched: siblings keep serving and a later valid
+	// change applies to the set from before the refusal.
+	if err := h.runner.SetRoutes(context.Background(), groupTestRoutes("a", "b", "c")); err != nil {
+		t.Fatal(err)
+	}
+	h.waitServing(t, 1, "c")
+	states := session.RouteStates()
+	for _, routeID := range []string{"a", "b"} {
+		if states[routeID].ProxyName != routeID+"-nhp1" || len(states[routeID].Route.RequestHeaders) != 0 {
+			t.Fatalf("route %q after the refused set = %+v, want untouched", routeID, states[routeID])
+		}
+	}
+	if got := h.admissions(); got != 1 {
+		t.Fatalf("admissions = %d, want one", got)
 	}
 }
