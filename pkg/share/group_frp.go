@@ -186,6 +186,9 @@ type GroupServingSession interface {
 // SessionGroupFactory starts one FRP session carrying every given route from
 // one immutable admission. The same contract as SessionFactory applies to the
 // Login half; each proxy stamps its own route's public resource ID.
+// A factory with transport restrictions must implement ValidateRoutes([]LocalHTTPRoute)
+// error so invalid live updates are rejected before the desired set changes.
+// Wrappers must forward that method as well as Start.
 type SessionGroupFactory interface {
 	Start(context.Context, Admission, []GroupRoute) (GroupServingSession, error)
 }

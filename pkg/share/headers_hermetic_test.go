@@ -136,7 +136,27 @@ func TestHermeticRuntimeHeadersReachOnlyTheirOrigin(t *testing.T) {
 			t.Error("header session did not stop")
 		}
 	}()
+	assertProtectedRequest := func() {
+		t.Helper()
+		request, err := http.NewRequest(http.MethodGet, "http://127.0.0.1:"+strconv.Itoa(port)+"/", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		request.Host = "routing-alpha.example.test"
+		request.Header.Set(testProxyTokenHeader, "forged-client-token")
+		client := &http.Client{Timeout: time.Second}
+		response, err := client.Do(request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, readErr := io.ReadAll(response.Body)
+		_ = response.Body.Close()
+		if readErr != nil || response.StatusCode != http.StatusOK || string(body) != "protected-file" {
+			t.Fatalf("protected request did not use the configured token: status=%d read=%v", response.StatusCode, readErr)
+		}
+	}
 	pollHermeticRoute(t, port, "routing-alpha.example.test", "protected-file", result)
+	assertProtectedRequest()
 	pollHermeticRoute(t, port, "routing-beta.example.test", "sibling", result)
 	expected.Store("replacement-token")
 	routes[0].RequestHeaders = map[string]string{testProxyTokenHeader: "replacement-token"}
@@ -145,6 +165,11 @@ func TestHermeticRuntimeHeadersReachOnlyTheirOrigin(t *testing.T) {
 	}
 	pollHermeticRoute(t, port, "routing-alpha.example.test", "protected-file", result)
 	pollHermeticRoute(t, port, "routing-beta.example.test", "sibling", result)
+	// After registration converges, every request must use the replacement.
+	// Do not retry through a stale proxy's unauthorized response here.
+	for range 10 {
+		assertProtectedRequest()
+	}
 	if got := admitter.admissionCount(); got != 1 {
 		t.Fatalf("token replacement used %d admissions, want one", got)
 	}
