@@ -10,6 +10,7 @@ on:
         # prepare_headless_enrollment_test.py checks exact equality with the
         # Python TARGETS map and the Go public-source allowlist.
         options:
+          - private-gateway-a
           - fileviewer-nhp-replica-a
           - fileviewer-nhp-replica-b
           - fileviewer-nhp-replica-c
@@ -19,11 +20,9 @@ on:
         type: string
 
 concurrency:
-  # Replica targets for one route can run together. Sharing updates are
-  # idempotent, and each run requires an adequate serving epoch. The current
-  # control-plane contract binds an enrollment token to its Connector slug,
-  # not to its serving epoch, and token idempotency keys remain target-specific.
-  group: rotate-sandbox-tunnel-enrollment-${{ inputs.target }}
+  # Private gateway A and the old fileviewer A target share one bootstrap parameter.
+  # Serialize recovery to prevent interleaved writes to the shared parameter.
+  group: rotate-sandbox-tunnel-enrollment
   cancel-in-progress: false
 
 permissions: {}
@@ -113,9 +112,14 @@ jobs:
           QURL_SANDBOX_API_ENDPOINT: ${{ secrets.QURL_SANDBOX_API_ENDPOINT }}
           QURL_SANDBOX_API_ENDPOINT_SHA256: ${{ secrets.QURL_SANDBOX_API_ENDPOINT_SHA256 }}
           QURL_TUNNEL_RECOVERY_ROLE_ARN: ${{ secrets.QURL_TUNNEL_RECOVERY_ROLE_ARN }}
+          QURL_PRIVATE_GATEWAY_CONFIG_JSON: ${{ secrets.QURL_PRIVATE_GATEWAY_CONFIG_JSON }}
+          RECOVERY_TARGET: ${{ inputs.target }}
         run: |
           set -euo pipefail
           missing=()
+          if [ "$RECOVERY_TARGET" = "private-gateway-a" ] && [ -z "$QURL_PRIVATE_GATEWAY_CONFIG_JSON" ]; then
+            missing+=(QURL_PRIVATE_GATEWAY_CONFIG_JSON)
+          fi
           [ -n "$QURL_SANDBOX_API_KEY" ] || missing+=(QURL_SANDBOX_API_KEY)
           [ -n "$QURL_SANDBOX_API_ENDPOINT" ] || missing+=(QURL_SANDBOX_API_ENDPOINT)
           [ -n "$QURL_SANDBOX_API_ENDPOINT_SHA256" ] || missing+=(QURL_SANDBOX_API_ENDPOINT_SHA256)
@@ -156,6 +160,7 @@ jobs:
           QURL_SANDBOX_API_KEY: ${{ secrets.QURL_SANDBOX_API_KEY }}
           QURL_SANDBOX_API_ENDPOINT: ${{ secrets.QURL_SANDBOX_API_ENDPOINT }}
           QURL_SANDBOX_API_ENDPOINT_SHA256: ${{ secrets.QURL_SANDBOX_API_ENDPOINT_SHA256 }}
+          QURL_PRIVATE_GATEWAY_CONFIG_JSON: ${{ secrets.QURL_PRIVATE_GATEWAY_CONFIG_JSON }}
           RECOVERY_GENERATION: ${{ inputs.generation }}
           RECOVERY_TARGET: ${{ inputs.target }}
         run: |
