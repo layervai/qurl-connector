@@ -261,6 +261,8 @@ func groupProxyName(route GroupRoute, sessionID uint64) string {
 // of the factory: SessionGroupRunner owns the route set and passes it to
 // Start and Update.
 type FRPGroupFactoryConfig struct {
+	// Common and its referenced values must remain immutable after construction.
+	// The runner can validate routes and build sessions concurrently.
 	Common        *v1.ClientCommonConfig
 	ClientVersion string
 	ConfigPath    string

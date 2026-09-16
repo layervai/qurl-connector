@@ -253,13 +253,10 @@ const (
 	maxRuntimeRequestHeaderBytes = 1024
 )
 
-// RequestHeadersDigest is a stable identity for a header set: the entries as
-// sorted len(name):len(value):name=value lines, SHA-256, lowercase hex. The
-// length prefixes keep the form injective whatever the entries hold, so two
-// distinct sets never share a digest. A nil and an empty map are the same
-// headerless set and digest to "". It lets a caller detect a change without
-// keeping the values; two sets with the same digest are the same
-// registration to SessionGroupRunner.SetRoutes.
+// RequestHeadersDigest hashes the sorted, length-prefixed header entries with
+// SHA-256. Nil and empty maps both return "". Treat the digest as secret:
+// low-entropy values can be recovered by guessing. Never log or persist it.
+// Use Equal when both routes are available.
 func RequestHeadersDigest(headers map[string]string) string {
 	if len(headers) == 0 {
 		return ""

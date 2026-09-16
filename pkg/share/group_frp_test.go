@@ -1340,8 +1340,8 @@ func TestGroupRouteHeadersRequireTLSAndNoWebServer(t *testing.T) {
 		}
 		refused(t, factory, plaintextErr)
 	})
-	// The gate reads the config every cycle, so a change after the factory
-	// was built cannot slip headers onto an exposed transport.
+	// Defense in depth: these sequential mutations exercise the per-cycle
+	// gate. Mutating Common while a factory is in use is not supported.
 	t.Run("late TLS disablement", func(t *testing.T) {
 		common := encryptedTestCommon()
 		factory, err := NewFRPSessionGroupFactory(FRPGroupFactoryConfig{Common: common})
@@ -1378,14 +1378,22 @@ func TestGroupRouteHeadersRequireVerifiedPeer(t *testing.T) {
 					if err != nil {
 						t.Fatal(err)
 					}
-					wantAllowed := ca != "" && (enabled || protocol == "wss")
-					err = factory.ValidateRoutes([]LocalHTTPRoute{headeredTestRoute()})
-					if (err == nil) != wantAllowed {
-						t.Fatalf("ValidateRoutes error = %v, allowed = %t", err, wantAllowed)
+					wantErr := ""
+					switch {
+					case !enabled && protocol != "wss" && protocol != "quic":
+						wantErr = "runtime request headers require encrypted FRP transport"
+					case ca == "" || (protocol == "quic" && !enabled):
+						wantErr = "runtime request headers require a verified FRP server certificate"
 					}
-					_, _, _, err = factory.BuildConfig(groupTestAdmission(101), headeredGroupRoutes("abc"))
-					if (err == nil) != wantAllowed {
-						t.Fatalf("BuildConfig error = %v, allowed = %t", err, wantAllowed)
+					validateErr := factory.ValidateRoutes([]LocalHTTPRoute{headeredTestRoute()})
+					_, _, _, buildErr := factory.BuildConfig(groupTestAdmission(101), headeredGroupRoutes("abc"))
+					for name, got := range map[string]error{"ValidateRoutes": validateErr, "BuildConfig": buildErr} {
+						if errText(got) != wantErr {
+							t.Fatalf("%s error = %v, want %q", name, got, wantErr)
+						}
+						if got != nil {
+							assertNoDisclosure(t, got, testProxyTokenHeader, "abc")
+						}
 					}
 				})
 			}
@@ -1584,6 +1592,8 @@ func TestFRPGroupSessionUpdateRefusesInPlaceHeaderChange(t *testing.T) {
 }
 
 func TestFRPGroupSessionUpdateRefusesHeadersOnUnsafeTransport(t *testing.T) {
+	unverified := encryptedTestCommon()
+	unverified.Transport.TLS.TrustedCaFile = ""
 	webServer := encryptedTestCommon()
 	webServer.WebServer.Port = 7400
 	for _, tc := range []struct {
@@ -1593,6 +1603,7 @@ func TestFRPGroupSessionUpdateRefusesHeadersOnUnsafeTransport(t *testing.T) {
 	}{
 		{name: "plaintext", common: &v1.ClientCommonConfig{}, wantErr: "runtime request headers require encrypted FRP transport"},
 		{name: "web server", common: webServer, wantErr: "runtime request headers require FRP web server to be disabled"},
+		{name: "unverified peer", common: unverified, wantErr: "runtime request headers require a verified FRP server certificate"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			svc := &recordingGroupService{}
