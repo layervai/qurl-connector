@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.14.0](https://github.com/layervai/qurl-connector/compare/v0.13.2...v0.14.0) (2026-09-16)
+
+
+### ⚠ BREAKING CHANGES
+
+* **share:** LocalHTTPRoute is no longer comparable (map field); compare routes with the new Equal method on LocalHTTPRoute and GroupRoute.
+
+### Features
+
+* **share:** add runtime request headers to group routes ([#85](https://github.com/layervai/qurl-connector/issues/85)) ([e836f74](https://github.com/layervai/qurl-connector/commit/e836f746daf9b6af77b1e6d6d4bea197975b788c))
+
+
+### Bug Fixes
+
+* **ci:** enroll one private gateway for the reviewed owner routes ([#94](https://github.com/layervai/qurl-connector/issues/94)) ([4e6f29f](https://github.com/layervai/qurl-connector/commit/4e6f29f6d16a675e353e32bf0fabf56cf5887f78))
+* **ci:** revert deployment-specific private gateway enrollment ([#96](https://github.com/layervai/qurl-connector/issues/96)) ([ad7c1a7](https://github.com/layervai/qurl-connector/commit/ad7c1a710c0a1f979a0d902b8299460b7fccf7d9))
+
 ## [0.13.2](https://github.com/layervai/qurl-connector/compare/v0.13.1...v0.13.2) (2026-09-15)
 
 
