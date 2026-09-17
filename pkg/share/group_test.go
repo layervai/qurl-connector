@@ -1359,3 +1359,92 @@ func TestSessionGroupRunnerRefusesRoutesTheFactoryCannotServe(t *testing.T) {
 		t.Fatalf("admissions = %d, want one", got)
 	}
 }
+
+func TestSessionGroupRunnerAddedRoutesSizeFirstRotationWithoutIdleTime(t *testing.T) {
+	runner := &SessionGroupRunner{desired: map[string]LocalHTTPRoute{"initial": {}}}
+	start := time.Now()
+	cycle := &groupCycle{admission: Admission{OpenTime: time.Hour}, expiresAt: start.Add(time.Hour), initial: map[string]struct{}{"initial": {}}}
+	states := map[string]RouteState{"initial": {Phase: RouteServing}}
+	runner.observeRegistration(cycle, states, start)
+	// The original single route finishes, then the caller is idle for twelve
+	// minutes before adding 1000 routes. That idle time is not registration.
+	batchStart := start.Add(12 * time.Minute)
+	for i := 0; i < 1000; i++ {
+		id := fmt.Sprint(i)
+		runner.desired[id] = LocalHTTPRoute{}
+		states[id] = RouteState{Phase: RoutePending}
+	}
+	runner.observeRegistration(cycle, states, batchStart)
+	for i := 0; i < 1000; i++ {
+		states[fmt.Sprint(i)] = RouteState{Phase: RouteServing}
+		runner.observeRegistration(cycle, states, batchStart.Add(time.Duration(i+1)*63*time.Millisecond))
+	}
+	want := 63 * time.Millisecond * 3 / 2
+	if runner.measuredPerRoute != want {
+		t.Fatalf("measured %s, want %s without idle time", runner.measuredPerRoute, want)
+	}
+	if got := cycle.expiresAt.Sub(runner.rotateAt(cycle)); got != 1001*want {
+		t.Fatalf("lead %s, want %s to cover the 63-second replacement", got, 1001*want)
+	}
+	if !cycle.expiresAt.Equal(start.Add(time.Hour)) || len(cycle.added) != 0 {
+		t.Fatal("measurement changed deadline or retained completed batch")
+	}
+	// An unrelated later singleton must neither include the idle interval nor
+	// erase the measured cost of the large batch.
+	states["later"] = RouteState{Phase: RoutePending}
+	runner.observeRegistration(cycle, states, start.Add(30*time.Minute))
+	states["later"] = RouteState{Phase: RouteServing}
+	runner.observeRegistration(cycle, states, start.Add(30*time.Minute+time.Millisecond))
+	if runner.measuredPerRoute != want {
+		t.Fatalf("later cheap batch erased measured cost: %s", runner.measuredPerRoute)
+	}
+}
+
+func TestSessionGroupRunnerAddedEstimateSurvivesInitialCompletion(t *testing.T) {
+	runner := &SessionGroupRunner{}
+	start := time.Now()
+	cycle := &groupCycle{initial: map[string]struct{}{"a": {}, "b": {}}}
+	states := map[string]RouteState{"a": {Phase: RoutePending}, "b": {Phase: RoutePending}, "added": {Phase: RoutePending}}
+	runner.observeRegistration(cycle, states, start)
+	states["added"] = RouteState{Phase: RouteServing}
+	states["a"] = RouteState{Phase: RouteServing}
+	states["b"] = RouteState{Phase: RouteServing}
+	runner.observeRegistration(cycle, states, start.Add(time.Second))
+	if runner.measuredPerRoute != 1500*time.Millisecond {
+		t.Fatalf("initial completion erased added cost: %s", runner.measuredPerRoute)
+	}
+	// A later full replacement can recalibrate the previous cycle's cost.
+	next := &groupCycle{initial: map[string]struct{}{"a": {}, "b": {}}}
+	runner.observeRegistration(next, states, start.Add(time.Minute))
+	if runner.measuredPerRoute != 0 {
+		t.Fatalf("replacement did not recalibrate: %s", runner.measuredPerRoute)
+	}
+}
+
+func TestSessionGroupRunnerRemovedOrRefusedAddedBatchReleasesIDs(t *testing.T) {
+	for _, removed := range []bool{false, true} {
+		t.Run(fmt.Sprint(removed), func(t *testing.T) {
+			runner := &SessionGroupRunner{}
+			start := time.Now()
+			cycle := &groupCycle{initial: map[string]struct{}{}, measured: true}
+			states := map[string]RouteState{"added": {Phase: RoutePending}}
+			runner.observeRegistration(cycle, states, start)
+			if removed {
+				delete(states, "added")
+			} else {
+				states["added"] = RouteState{Phase: RoutePending, Err: errors.New("refused")}
+			}
+			runner.observeRegistration(cycle, states, start.Add(time.Second))
+			if len(cycle.added) != 0 || runner.measuredPerRoute != 0 {
+				t.Fatal("abandoned batch retained IDs or produced a measurement")
+			}
+			states["healthy"] = RouteState{Phase: RoutePending}
+			runner.observeRegistration(cycle, states, start.Add(time.Hour))
+			states["healthy"] = RouteState{Phase: RouteServing}
+			runner.observeRegistration(cycle, states, start.Add(time.Hour+100*time.Millisecond))
+			if runner.measuredPerRoute != 150*time.Millisecond {
+				t.Fatalf("later batch included abandoned idle time: %s", runner.measuredPerRoute)
+			}
+		})
+	}
+}
