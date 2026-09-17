@@ -114,8 +114,8 @@ type SessionGroupRunner struct {
 	// active cycle, so a promotion or restart re-reports while flaps do not.
 	reported map[string]string
 	// measuredPerRoute is the per-route registration cost measured on the
-	// latest cycle, margin included; zero until a cycle has registered at
-	// least two routes. See groupRotationLead and observeRegistration.
+	// latest initial batch plus the current cycle's slower additions, margin
+	// included. See groupRotationLead and observeRegistration.
 	measuredPerRoute time.Duration
 }
 
@@ -139,6 +139,14 @@ type groupCycle struct {
 	firstServingAt time.Time
 	highWater      int
 	measured       bool
+	// Added-route spacing is measured independently of the initial batch.
+	// These fields are touched only by the Run goroutine.
+	added          map[string]struct{}
+	addedStarted   time.Time
+	addedSingleton time.Time
+	addedHighWater int
+	addedFirst     int
+	addedPerRoute  time.Duration
 }
 
 // validateDesiredRoutes is the runner's check on a route set before it
@@ -269,9 +277,9 @@ func (r *SessionGroupRunner) rotateAt(cycle *groupCycle) time.Time {
 // number, so it is defined from the second route on and a route the server
 // keeps refusing does not leave the lead sized from the a-priori guess, and
 // it is frozen once every route of the initial set has registered. A route
-// added to the group later is never counted, so it can neither stand in for
+// added to the group later is measured separately, so it cannot stand in for
 // an initial route that never registered nor stretch the spacing to the
-// wall-clock age of the cycle. The latest cycle wins: a slow platform
+// wall-clock age of the cycle. The latest initial batch wins: a slow platform
 // lengthens the next lead and a recovered one shortens it again. A cycle
 // promoted at the old admission's expiry with routes still queued keeps
 // measuring as they come up, which is exactly the cost the next lead must
@@ -280,6 +288,7 @@ func (r *SessionGroupRunner) rotateAt(cycle *groupCycle) time.Time {
 // the whole set; that errs toward an earlier replacement, is clamped by the
 // openTime/2 cap, and is replaced by the next cycle.
 func (r *SessionGroupRunner) observeRegistration(cycle *groupCycle, states map[string]RouteState, now time.Time) {
+	r.observeAddedRegistration(cycle, states, now)
 	if cycle.measured {
 		return
 	}
@@ -316,8 +325,82 @@ func (r *SessionGroupRunner) observeRegistration(cycle *groupCycle, states map[s
 		perRoute = spacing * groupLeadMarginNum / groupLeadMarginDen / time.Duration(serving-1)
 	}
 	r.mu.Lock()
-	r.measuredPerRoute = perRoute
+	r.measuredPerRoute = max(perRoute, cycle.addedPerRoute)
 	r.mu.Unlock()
+}
+
+// observeAddedRegistration measures a bounded snapshot of pending additions.
+// Like the initial estimator, it measures spacing from the first success,
+// excluding fixed startup/polling delay and the initial registration backlog.
+// Newly pending additions start a fresh snapshot, including stalled additions;
+// idle caller pacing is never charged to registration.
+func (r *SessionGroupRunner) observeAddedRegistration(cycle *groupCycle, states map[string]RouteState, now time.Time) {
+	newPending := false
+	for id, state := range states {
+		_, initial := cycle.initial[id]
+		_, captured := cycle.added[id]
+		if !initial && !captured && state.Phase == RoutePending {
+			newPending = true
+			break
+		}
+	}
+	if newPending {
+		cycle.added = nil
+		for id, state := range states {
+			if _, initial := cycle.initial[id]; initial || state.Phase != RoutePending {
+				continue
+			}
+			if cycle.added == nil {
+				cycle.added = make(map[string]struct{})
+			}
+			cycle.added[id] = struct{}{}
+		}
+		cycle.addedStarted, cycle.addedHighWater, cycle.addedFirst = time.Time{}, 0, 0
+		cycle.addedSingleton = time.Time{}
+		// A lone addition behind no other pending work has no spacing to
+		// observe. Its pending-to-serving cost is conservative, including one
+		// poll delay, but excludes any initial or older registration backlog.
+		if len(cycle.added) == 1 {
+			pendingWork := 0
+			for _, state := range states {
+				if state.Phase == RoutePending {
+					pendingWork++
+				}
+			}
+			if pendingWork == 1 {
+				cycle.addedSingleton = now
+			}
+		}
+	}
+	serving, pending := 0, 0
+	for id := range cycle.added {
+		state := states[id]
+		if state.Phase == RouteServing {
+			serving++
+		} else if state.Phase == RoutePending {
+			pending++
+		}
+	}
+	if serving > cycle.addedHighWater {
+		cycle.addedHighWater = serving
+		if cycle.addedStarted.IsZero() {
+			cycle.addedStarted = now
+			cycle.addedFirst = serving
+		}
+		var perRoute time.Duration
+		if serving > cycle.addedFirst {
+			perRoute = now.Sub(cycle.addedStarted) * groupLeadMarginNum / groupLeadMarginDen / time.Duration(serving-cycle.addedFirst)
+		} else if !cycle.addedSingleton.IsZero() {
+			perRoute = now.Sub(cycle.addedSingleton) * groupLeadMarginNum / groupLeadMarginDen
+		}
+		r.mu.Lock()
+		cycle.addedPerRoute = max(cycle.addedPerRoute, perRoute)
+		r.measuredPerRoute = max(r.measuredPerRoute, cycle.addedPerRoute)
+		r.mu.Unlock()
+	}
+	if pending == 0 {
+		cycle.added = nil
+	}
 }
 
 // Run serves until ctx ends. Admission and connection failures retry forever
