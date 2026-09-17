@@ -1377,7 +1377,7 @@ func TestSessionGroupRunnerAddedRoutesSizeFirstRotationWithoutIdleTime(t *testin
 	runner.observeRegistration(cycle, states, batchStart)
 	for i := 0; i < 1000; i++ {
 		states[fmt.Sprint(i)] = RouteState{Phase: RouteServing}
-		runner.observeRegistration(cycle, states, batchStart.Add(time.Duration(i+1)*63*time.Millisecond))
+		runner.observeRegistration(cycle, states, batchStart.Add(100*time.Millisecond+time.Duration(i+1)*63*time.Millisecond))
 	}
 	want := 63 * time.Millisecond * 3 / 2
 	if runner.measuredPerRoute != want {
@@ -1400,28 +1400,47 @@ func TestSessionGroupRunnerAddedRoutesSizeFirstRotationWithoutIdleTime(t *testin
 	}
 }
 
-func TestSessionGroupRunnerAddedEstimateSurvivesInitialCompletion(t *testing.T) {
+func TestSessionGroupRunnerAddedEstimateExcludesInitialBacklog(t *testing.T) {
 	runner := &SessionGroupRunner{}
 	start := time.Now()
 	cycle := &groupCycle{initial: map[string]struct{}{"a": {}, "b": {}}}
 	states := map[string]RouteState{"a": {Phase: RoutePending}, "b": {Phase: RoutePending}, "added": {Phase: RoutePending}}
 	runner.observeRegistration(cycle, states, start)
-	states["added"] = RouteState{Phase: RouteServing}
 	states["a"] = RouteState{Phase: RouteServing}
 	states["b"] = RouteState{Phase: RouteServing}
-	runner.observeRegistration(cycle, states, start.Add(time.Second))
-	if runner.measuredPerRoute != 1500*time.Millisecond {
-		t.Fatalf("initial completion erased added cost: %s", runner.measuredPerRoute)
+	runner.observeRegistration(cycle, states, start.Add(time.Minute))
+	if runner.measuredPerRoute != 0 {
+		t.Fatal("added estimate charged the initial registration backlog")
 	}
-	// A later full replacement can recalibrate the previous cycle's cost.
+	runner.observeRegistration(cycle, states, start.Add(time.Minute+time.Second))
+	states["added"] = RouteState{Phase: RouteServing}
+	runner.observeRegistration(cycle, states, start.Add(2*time.Minute))
+	if runner.measuredPerRoute != 0 {
+		t.Fatal("singleton startup delay became a per-route estimate")
+	}
+	// Two added successes must survive an initial batch that first appears
+	// fully serving at the second observation (zero initial spacing).
+	cycle = &groupCycle{initial: map[string]struct{}{"a": {}, "b": {}}}
+	states = map[string]RouteState{"a": {Phase: RoutePending}, "b": {Phase: RoutePending}, "x": {Phase: RoutePending}, "y": {Phase: RoutePending}}
+	runner.observeRegistration(cycle, states, start)
+	states["x"] = RouteState{Phase: RouteServing}
+	runner.observeRegistration(cycle, states, start.Add(time.Second))
+	states["y"] = RouteState{Phase: RouteServing}
+	states["a"] = RouteState{Phase: RouteServing}
+	states["b"] = RouteState{Phase: RouteServing}
+	runner.observeRegistration(cycle, states, start.Add(time.Second+100*time.Millisecond))
+	if runner.measuredPerRoute != 150*time.Millisecond {
+		t.Fatalf("initial completion erased added spacing: %s", runner.measuredPerRoute)
+	}
 	next := &groupCycle{initial: map[string]struct{}{"a": {}, "b": {}}}
 	runner.observeRegistration(next, states, start.Add(time.Minute))
 	if runner.measuredPerRoute != 0 {
-		t.Fatalf("replacement did not recalibrate: %s", runner.measuredPerRoute)
+		t.Fatalf("next cycle did not recalibrate: %s", runner.measuredPerRoute)
 	}
+
 }
 
-func TestSessionGroupRunnerRemovedOrRefusedAddedBatchReleasesIDs(t *testing.T) {
+func TestSessionGroupRunnerRemovedOrFailedAddedBatchReleasesIDs(t *testing.T) {
 	for _, removed := range []bool{false, true} {
 		t.Run(fmt.Sprint(removed), func(t *testing.T) {
 			runner := &SessionGroupRunner{}
@@ -1432,19 +1451,67 @@ func TestSessionGroupRunnerRemovedOrRefusedAddedBatchReleasesIDs(t *testing.T) {
 			if removed {
 				delete(states, "added")
 			} else {
-				states["added"] = RouteState{Phase: RoutePending, Err: errors.New("refused")}
+				states["added"] = RouteState{Phase: RouteFailed, Err: errors.New("gone")}
 			}
 			runner.observeRegistration(cycle, states, start.Add(time.Second))
 			if len(cycle.added) != 0 || runner.measuredPerRoute != 0 {
 				t.Fatal("abandoned batch retained IDs or produced a measurement")
 			}
 			states["healthy"] = RouteState{Phase: RoutePending}
+			states["healthy2"] = RouteState{Phase: RoutePending}
 			runner.observeRegistration(cycle, states, start.Add(time.Hour))
 			states["healthy"] = RouteState{Phase: RouteServing}
+			runner.observeRegistration(cycle, states, start.Add(time.Hour))
+			states["healthy2"] = RouteState{Phase: RouteServing}
 			runner.observeRegistration(cycle, states, start.Add(time.Hour+100*time.Millisecond))
 			if runner.measuredPerRoute != 150*time.Millisecond {
 				t.Fatalf("later batch included abandoned idle time: %s", runner.measuredPerRoute)
 			}
 		})
+	}
+}
+
+func TestSessionGroupRunnerStalledRoutesDoNotSuppressAddedEstimate(t *testing.T) {
+	runner := &SessionGroupRunner{}
+	start := time.Now()
+	cycle := &groupCycle{initial: map[string]struct{}{"initial": {}}}
+	states := map[string]RouteState{
+		"initial": {Phase: RoutePending, Err: errors.New("refused")},
+		"stalled": {Phase: RoutePending},
+	}
+	runner.observeRegistration(cycle, states, start)
+	for i := 0; i < 1000; i++ {
+		states[fmt.Sprint(i)] = RouteState{Phase: RoutePending, Err: errors.New("temporary push error")}
+	}
+	batchStart := start.Add(12 * time.Minute)
+	runner.observeRegistration(cycle, states, batchStart)
+	for i := 0; i < 1000; i++ {
+		states[fmt.Sprint(i)] = RouteState{Phase: RouteServing}
+		runner.observeRegistration(cycle, states, batchStart.Add(100*time.Millisecond+time.Duration(i+1)*63*time.Millisecond))
+	}
+	if runner.measuredPerRoute != 63*time.Millisecond*3/2 {
+		t.Fatalf("stalled or temporarily errored routes suppressed growth measurement: %s", runner.measuredPerRoute)
+	}
+}
+
+func TestSessionGroupRunnerAddedEstimateUsesObservedServingBaseline(t *testing.T) {
+	runner := &SessionGroupRunner{}
+	cycle := &groupCycle{measured: true}
+	states := map[string]RouteState{}
+	for i := 0; i < 20; i++ {
+		states[fmt.Sprint(i)] = RouteState{Phase: RoutePending}
+	}
+	start := time.Now()
+	runner.observeRegistration(cycle, states, start)
+	for i := 0; i < 10; i++ {
+		states[fmt.Sprint(i)] = RouteState{Phase: RouteServing}
+	}
+	runner.observeRegistration(cycle, states, start.Add(time.Second))
+	for i := 10; i < 20; i++ {
+		states[fmt.Sprint(i)] = RouteState{Phase: RouteServing}
+	}
+	runner.observeRegistration(cycle, states, start.Add(2*time.Second))
+	if runner.measuredPerRoute != 150*time.Millisecond {
+		t.Fatalf("coarse polling changed observed spacing: %s", runner.measuredPerRoute)
 	}
 }

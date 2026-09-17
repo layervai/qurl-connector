@@ -139,11 +139,12 @@ type groupCycle struct {
 	firstServingAt time.Time
 	highWater      int
 	measured       bool
-	// Added routes are timed only while their registration batch is pending,
-	// so a long idle interval before growth is never charged to registration.
+	// Added-route spacing is measured independently of the initial batch.
+	// These fields are touched only by the Run goroutine.
 	added          map[string]struct{}
 	addedStarted   time.Time
 	addedHighWater int
+	addedFirst     int
 	addedPerRoute  time.Duration
 }
 
@@ -328,13 +329,24 @@ func (r *SessionGroupRunner) observeRegistration(cycle *groupCycle, states map[s
 }
 
 // observeAddedRegistration measures a bounded snapshot of pending additions.
-// It uses enqueue-to-serving time, including the first registration, because
-// Login is already complete. Completed batches release their route IDs; later
-// batches start a new clock instead of including caller pacing between them.
+// Like the initial estimator, it measures spacing from the first success,
+// excluding fixed startup/polling delay and the initial registration backlog.
+// Newly pending additions start a fresh snapshot, including stalled additions;
+// idle caller pacing is never charged to registration.
 func (r *SessionGroupRunner) observeAddedRegistration(cycle *groupCycle, states map[string]RouteState, now time.Time) {
-	if len(cycle.added) == 0 {
+	newPending := false
+	for id, state := range states {
+		_, initial := cycle.initial[id]
+		_, captured := cycle.added[id]
+		if !initial && !captured && state.Phase == RoutePending {
+			newPending = true
+			break
+		}
+	}
+	if newPending {
+		cycle.added = nil
 		for id, state := range states {
-			if _, initial := cycle.initial[id]; initial || state.Phase != RoutePending || state.Err != nil {
+			if _, initial := cycle.initial[id]; initial || state.Phase != RoutePending {
 				continue
 			}
 			if cycle.added == nil {
@@ -342,24 +354,30 @@ func (r *SessionGroupRunner) observeAddedRegistration(cycle *groupCycle, states 
 			}
 			cycle.added[id] = struct{}{}
 		}
-		cycle.addedStarted, cycle.addedHighWater = now, 0
+		cycle.addedStarted, cycle.addedHighWater, cycle.addedFirst = time.Time{}, 0, 0
 	}
 	serving, pending := 0, 0
 	for id := range cycle.added {
 		state := states[id]
 		if state.Phase == RouteServing {
 			serving++
-		} else if state.Phase == RoutePending && state.Err == nil {
+		} else if state.Phase == RoutePending {
 			pending++
 		}
 	}
 	if serving > cycle.addedHighWater {
 		cycle.addedHighWater = serving
-		perRoute := now.Sub(cycle.addedStarted) * groupLeadMarginNum / groupLeadMarginDen / time.Duration(serving)
-		r.mu.Lock()
-		cycle.addedPerRoute = max(cycle.addedPerRoute, perRoute)
-		r.measuredPerRoute = max(r.measuredPerRoute, cycle.addedPerRoute)
-		r.mu.Unlock()
+		if cycle.addedStarted.IsZero() {
+			cycle.addedStarted = now
+			cycle.addedFirst = serving
+		}
+		if serving > cycle.addedFirst {
+			perRoute := now.Sub(cycle.addedStarted) * groupLeadMarginNum / groupLeadMarginDen / time.Duration(serving-cycle.addedFirst)
+			r.mu.Lock()
+			cycle.addedPerRoute = max(cycle.addedPerRoute, perRoute)
+			r.measuredPerRoute = max(r.measuredPerRoute, cycle.addedPerRoute)
+			r.mu.Unlock()
+		}
 	}
 	if pending == 0 {
 		cycle.added = nil
