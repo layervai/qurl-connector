@@ -143,6 +143,7 @@ type groupCycle struct {
 	// These fields are touched only by the Run goroutine.
 	added          map[string]struct{}
 	addedStarted   time.Time
+	addedSingleton time.Time
 	addedHighWater int
 	addedFirst     int
 	addedPerRoute  time.Duration
@@ -355,6 +356,21 @@ func (r *SessionGroupRunner) observeAddedRegistration(cycle *groupCycle, states 
 			cycle.added[id] = struct{}{}
 		}
 		cycle.addedStarted, cycle.addedHighWater, cycle.addedFirst = time.Time{}, 0, 0
+		cycle.addedSingleton = time.Time{}
+		// A lone addition behind no other pending work has no spacing to
+		// observe. Its pending-to-serving cost is conservative, including one
+		// poll delay, but excludes any initial or older registration backlog.
+		if len(cycle.added) == 1 {
+			pendingWork := 0
+			for _, state := range states {
+				if state.Phase == RoutePending {
+					pendingWork++
+				}
+			}
+			if pendingWork == 1 {
+				cycle.addedSingleton = now
+			}
+		}
 	}
 	serving, pending := 0, 0
 	for id := range cycle.added {
@@ -371,13 +387,16 @@ func (r *SessionGroupRunner) observeAddedRegistration(cycle *groupCycle, states 
 			cycle.addedStarted = now
 			cycle.addedFirst = serving
 		}
+		var perRoute time.Duration
 		if serving > cycle.addedFirst {
-			perRoute := now.Sub(cycle.addedStarted) * groupLeadMarginNum / groupLeadMarginDen / time.Duration(serving-cycle.addedFirst)
-			r.mu.Lock()
-			cycle.addedPerRoute = max(cycle.addedPerRoute, perRoute)
-			r.measuredPerRoute = max(r.measuredPerRoute, cycle.addedPerRoute)
-			r.mu.Unlock()
+			perRoute = now.Sub(cycle.addedStarted) * groupLeadMarginNum / groupLeadMarginDen / time.Duration(serving-cycle.addedFirst)
+		} else if !cycle.addedSingleton.IsZero() {
+			perRoute = now.Sub(cycle.addedSingleton) * groupLeadMarginNum / groupLeadMarginDen
 		}
+		r.mu.Lock()
+		cycle.addedPerRoute = max(cycle.addedPerRoute, perRoute)
+		r.measuredPerRoute = max(r.measuredPerRoute, cycle.addedPerRoute)
+		r.mu.Unlock()
 	}
 	if pending == 0 {
 		cycle.added = nil
