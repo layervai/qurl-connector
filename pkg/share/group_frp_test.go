@@ -1351,7 +1351,7 @@ func TestGroupRouteHeadersRequireTLSAndNoWebServer(t *testing.T) {
 		if _, _, _, err := factory.BuildConfig(groupTestAdmission(101), headeredGroupRoutes("abc")); err != nil {
 			t.Fatal(err)
 		}
-		*common.Transport.TLS.Enable = false
+		*factory.cfg.Common.Transport.TLS.Enable = false
 		refused(t, factory, plaintextErr)
 	})
 	t.Run("late web server enablement", func(t *testing.T) {
@@ -1360,7 +1360,7 @@ func TestGroupRouteHeadersRequireTLSAndNoWebServer(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		common.WebServer.Port = 7400
+		factory.cfg.Common.WebServer.Port = 7400
 		refused(t, factory, webServerErr)
 	})
 }
@@ -1382,8 +1382,6 @@ func TestGroupRouteHeadersRequireVerifiedPeer(t *testing.T) {
 					switch {
 					case !enabled && protocol != "wss" && protocol != "quic":
 						wantErr = "runtime request headers require encrypted FRP transport"
-					case ca == "" || (protocol == "quic" && !enabled):
-						wantErr = "runtime request headers require a verified FRP server certificate"
 					}
 					validateErr := factory.ValidateRoutes([]LocalHTTPRoute{headeredTestRoute()})
 					_, _, _, buildErr := factory.BuildConfig(groupTestAdmission(101), headeredGroupRoutes("abc"))

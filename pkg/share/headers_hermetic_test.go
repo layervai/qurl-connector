@@ -92,31 +92,37 @@ func TestHermeticRuntimeHeadersReachOnlyTheirOrigin(t *testing.T) {
 	routes[0].LocalPort = origin.Listener.Addr().(*net.TCPAddr).Port
 	routes[0].RequestHeaders = map[string]string{testProxyTokenHeader: "first-token"}
 	routes[1].LocalPort = sibling.Listener.Addr().(*net.TCPAddr).Port
-	// A certificate for another name must fail before any route can serve.
-	wrongName := cloneCommon(common)
-	wrongName.Transport.TLS.ServerName = "untrusted.example.test"
-	untrusted, err := NewFRPSessionGroupFactory(FRPGroupFactoryConfig{Common: wrongName})
-	if err != nil {
-		t.Fatal(err)
-	}
-	session, err := untrusted.Start(context.Background(), admission, groupRoutesOf(routes))
-	if err != nil {
-		t.Fatal(err)
-	}
-	select {
-	case <-session.Done():
-		if session.Err() == nil {
-			t.Fatal("wrong-name TLS session ended without an error")
+	// Unknown issuers and wrong names must fail before any route can serve.
+	for _, unknownIssuer := range []bool{true, false} {
+		wrongName := cloneCommon(common)
+		if unknownIssuer {
+			wrongName.Transport.TLS.TrustedCaFile = ""
+		} else {
+			wrongName.Transport.TLS.ServerName = "untrusted.example.test"
 		}
-		for _, state := range session.RouteStates() {
-			if state.Phase == RouteServing {
-				t.Fatal("wrong-name TLS session registered a route")
+		untrusted, err := NewFRPSessionGroupFactory(FRPGroupFactoryConfig{Common: wrongName})
+		if err != nil {
+			t.Fatal(err)
+		}
+		session, err := untrusted.Start(context.Background(), admission, groupRoutesOf(routes))
+		if err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case <-session.Done():
+			if session.Err() == nil {
+				t.Fatal("untrusted TLS session ended without an error")
 			}
+			for _, state := range session.RouteStates() {
+				if state.Phase == RouteServing {
+					t.Fatal("untrusted TLS session registered a route")
+				}
+			}
+		case <-session.Ready():
+			t.Fatal("untrusted TLS session served a route")
+		case <-time.After(5 * time.Second):
+			t.Fatal("untrusted TLS session did not fail")
 		}
-	case <-session.Ready():
-		t.Fatal("wrong-name TLS session served a route")
-	case <-time.After(5 * time.Second):
-		t.Fatal("wrong-name TLS session did not fail")
 	}
 	runner, err := NewSessionGroupRunner(SessionGroupConfig{
 		KnockResourceID: admission.KnockResourceID, ResourcePublicKey: admission.ResourcePublicKey,

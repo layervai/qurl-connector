@@ -289,6 +289,10 @@ func NewFRPSessionGroupFactory(cfg FRPGroupFactoryConfig) (*FRPSessionGroupFacto
 	if len(cfg.Common.Start) > 0 {
 		return nil, errors.New("build FRP session group factory: common config must not set a proxy start filter")
 	}
+	cfg.Common = cloneCommon(cfg.Common)
+	if cfg.Common.Transport.TLS.Enable == nil || tlsEnabled(cfg.Common) {
+		cfg.Common.Transport.TLS.VerifyServerCertificate = true
+	}
 	if cfg.ReadyPoll <= 0 {
 		cfg.ReadyPoll = 100 * time.Millisecond
 	}
