@@ -39,9 +39,8 @@ type LocalHTTPRoute struct {
 	// persisted or logged, and are returned to the owning caller only as a
 	// copy through RouteStates; the map is cloned on the way in and
 	// per rendered cycle. A non-empty map requires an encrypted FRP
-	// transport with certificate verification enabled,
-	// and the local FRP web/admin server disabled. At most 16
-	// entries and 1,024 aggregate name and value bytes. An empty value is
+	// transport with certificate verification enabled and the local FRP
+	// web/admin server disabled. At most 16 entries and 1,024 aggregate name and value bytes. An empty value is
 	// allowed (a marker header) and still counts as an entry.
 	RequestHeaders map[string]string `json:"-" yaml:"-"`
 }

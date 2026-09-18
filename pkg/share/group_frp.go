@@ -294,6 +294,9 @@ func NewFRPSessionGroupFactory(cfg FRPGroupFactoryConfig) (*FRPSessionGroupFacto
 		enabled := true
 		cfg.Common.Transport.TLS.Enable = &enabled
 	}
+	if cfg.Common.Transport.TLS.VerifyServerCertificate && !tlsEnabled(cfg.Common) {
+		return nil, errors.New("build FRP session group factory: certificate verification requires encrypted FRP transport")
+	}
 	if tlsEnabled(cfg.Common) {
 		cfg.Common.Transport.TLS.VerifyServerCertificate = true
 	}

@@ -1654,3 +1654,14 @@ func TestFRPGroupSessionRouteStatesDoNotAliasRequestHeaders(t *testing.T) {
 		t.Fatalf("a caller's mutation of a reported map reached the rendered proxy: %#v", got)
 	}
 }
+
+func TestFRPSessionGroupFactoryRejectsVerificationWithoutTLS(t *testing.T) {
+	disabled := false
+	common := &v1.ClientCommonConfig{}
+	common.Transport.TLS.Enable = &disabled
+	common.Transport.TLS.VerifyServerCertificate = true
+	factory, err := NewFRPSessionGroupFactory(FRPGroupFactoryConfig{Common: common})
+	if factory != nil || err == nil || !strings.Contains(err.Error(), "requires encrypted FRP transport") {
+		t.Fatalf("factory = %v, error = %v; want verification configuration rejected", factory, err)
+	}
+}
