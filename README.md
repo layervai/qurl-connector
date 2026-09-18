@@ -43,6 +43,9 @@ embedded; the command fails closed unless an explicit trusted key is supplied.
 
 ## Security model
 
+- Tunnel TLS verifies the admitted server hostname with system CA certificates
+  by default. A custom CA file remains available for private deployments.
+  Certificate and key renewal do not require client updates.
 - NHP admission is resource-specific. A token or session issued for one
   resource cannot register a different resource.
 - The managed daemon does not retain an account bearer. Account-authorized

@@ -266,6 +266,9 @@ func groupProxyName(route GroupRoute, sessionID uint64) string {
 type FRPGroupFactoryConfig struct {
 	// Common and its referenced values must remain immutable after construction.
 	// The runner can validate routes and build sessions concurrently.
+	// The factory copies Common, defaults nil TLS.Enable to true, and requires
+	// certificate verification for encrypted transports. Verification with
+	// plaintext is rejected. A custom CA or server name remains supported.
 	Common        *v1.ClientCommonConfig
 	ClientVersion string
 	ConfigPath    string
@@ -288,6 +291,17 @@ func NewFRPSessionGroupFactory(cfg FRPGroupFactoryConfig) (*FRPSessionGroupFacto
 	// routes on the floor as permanently pending.
 	if len(cfg.Common.Start) > 0 {
 		return nil, errors.New("build FRP session group factory: common config must not set a proxy start filter")
+	}
+	cfg.Common = cloneCommon(cfg.Common)
+	if cfg.Common.Transport.TLS.Enable == nil {
+		enabled := true
+		cfg.Common.Transport.TLS.Enable = &enabled
+	}
+	if cfg.Common.Transport.TLS.VerifyServerCertificate && !tlsEnabled(cfg.Common) {
+		return nil, errors.New("build FRP session group factory: certificate verification requires encrypted FRP transport")
+	}
+	if tlsEnabled(cfg.Common) {
+		cfg.Common.Transport.TLS.VerifyServerCertificate = true
 	}
 	if cfg.ReadyPoll <= 0 {
 		cfg.ReadyPoll = 100 * time.Millisecond

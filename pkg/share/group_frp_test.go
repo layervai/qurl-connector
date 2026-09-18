@@ -68,6 +68,12 @@ func TestFRPSessionGroupFactoryBuildsOneSessionForManyRoutes(t *testing.T) {
 		cycleCommon.Metadatas[nhpconfig.MetaClientVersion] != "v1.2.3" {
 		t.Fatalf("Login metadata = %#v", cycleCommon.Metadatas)
 	}
+	if !tlsEnabled(cycleCommon) || !cycleCommon.Transport.TLS.VerifyServerCertificate || common.Transport.TLS.Enable != nil {
+		t.Fatal("default TLS was not normalized without changing the caller config")
+	}
+	if err := factory.ValidateRoutes([]LocalHTTPRoute{headeredTestRoute()}); err != nil {
+		t.Fatalf("default verified TLS refused runtime headers: %v", err)
+	}
 	if cycleCommon.LoginFailExit == nil || !*cycleCommon.LoginFailExit {
 		t.Fatal("group Login is not fail-fast")
 	}
@@ -116,12 +122,10 @@ func TestFRPSessionGroupFactoryRejectsUnsafeAdmittedHosts(t *testing.T) {
 			t.Errorf("unsafe admitted host %q was accepted", host)
 		}
 	}
-	tlsOn := true
 	tlsFactory, err := NewFRPSessionGroupFactory(FRPGroupFactoryConfig{Common: &v1.ClientCommonConfig{}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	tlsFactory.cfg.Common.Transport.TLS.Enable = &tlsOn
 	admission := groupTestAdmission(1)
 	admission.ResourceHost = "127.0.0.1:7000"
 	if _, _, _, err := tlsFactory.BuildConfig(admission, routes); err == nil {
@@ -1231,6 +1235,7 @@ func newTestGroupFactory(t *testing.T, tls bool, webServerPort int) *FRPSessionG
 	if tls {
 		common = encryptedTestCommon()
 	}
+	common.Transport.TLS.Enable = &tls
 	common.WebServer.Port = webServerPort
 	factory, err := NewFRPSessionGroupFactory(FRPGroupFactoryConfig{Common: common})
 	if err != nil {
@@ -1351,7 +1356,7 @@ func TestGroupRouteHeadersRequireTLSAndNoWebServer(t *testing.T) {
 		if _, _, _, err := factory.BuildConfig(groupTestAdmission(101), headeredGroupRoutes("abc")); err != nil {
 			t.Fatal(err)
 		}
-		*common.Transport.TLS.Enable = false
+		*factory.cfg.Common.Transport.TLS.Enable = false
 		refused(t, factory, plaintextErr)
 	})
 	t.Run("late web server enablement", func(t *testing.T) {
@@ -1360,7 +1365,7 @@ func TestGroupRouteHeadersRequireTLSAndNoWebServer(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		common.WebServer.Port = 7400
+		factory.cfg.Common.WebServer.Port = 7400
 		refused(t, factory, webServerErr)
 	})
 }
@@ -1378,12 +1383,12 @@ func TestGroupRouteHeadersRequireVerifiedPeer(t *testing.T) {
 					if err != nil {
 						t.Fatal(err)
 					}
+					if tlsEnabled(factory.cfg.Common) != factory.cfg.Common.Transport.TLS.VerifyServerCertificate {
+						t.Fatal("encrypted transport did not enable certificate verification")
+					}
 					wantErr := ""
-					switch {
-					case !enabled && protocol != "wss" && protocol != "quic":
+					if !enabled && protocol != "wss" && protocol != "quic" {
 						wantErr = "runtime request headers require encrypted FRP transport"
-					case ca == "" || (protocol == "quic" && !enabled):
-						wantErr = "runtime request headers require a verified FRP server certificate"
 					}
 					validateErr := factory.ValidateRoutes([]LocalHTTPRoute{headeredTestRoute()})
 					_, _, _, buildErr := factory.BuildConfig(groupTestAdmission(101), headeredGroupRoutes("abc"))
@@ -1594,6 +1599,10 @@ func TestFRPGroupSessionUpdateRefusesInPlaceHeaderChange(t *testing.T) {
 func TestFRPGroupSessionUpdateRefusesHeadersOnUnsafeTransport(t *testing.T) {
 	unverified := encryptedTestCommon()
 	unverified.Transport.TLS.TrustedCaFile = ""
+	quicUnverified := encryptedTestCommon()
+	quicUnverified.Transport.Protocol = "quic"
+	disabled := false
+	quicUnverified.Transport.TLS.Enable = &disabled
 	webServer := encryptedTestCommon()
 	webServer.WebServer.Port = 7400
 	for _, tc := range []struct {
@@ -1604,6 +1613,7 @@ func TestFRPGroupSessionUpdateRefusesHeadersOnUnsafeTransport(t *testing.T) {
 		{name: "plaintext", common: &v1.ClientCommonConfig{}, wantErr: "runtime request headers require encrypted FRP transport"},
 		{name: "web server", common: webServer, wantErr: "runtime request headers require FRP web server to be disabled"},
 		{name: "unverified peer", common: unverified, wantErr: "runtime request headers require a verified FRP server certificate"},
+		{name: "ignored QUIC CA", common: quicUnverified, wantErr: "runtime request headers require a verified FRP server certificate"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			svc := &recordingGroupService{}
@@ -1642,5 +1652,35 @@ func TestFRPGroupSessionRouteStatesDoNotAliasRequestHeaders(t *testing.T) {
 	}
 	if got := proxies[0].(*v1.HTTPProxyConfig).RequestHeaders.Set; !reflect.DeepEqual(got, want) {
 		t.Fatalf("a caller's mutation of a reported map reached the rendered proxy: %#v", got)
+	}
+}
+
+func TestFRPSessionGroupFactoryRejectsVerificationWithoutTLS(t *testing.T) {
+	disabled := false
+	common := &v1.ClientCommonConfig{}
+	common.Transport.TLS.Enable = &disabled
+	common.Transport.TLS.VerifyServerCertificate = true
+	factory, err := NewFRPSessionGroupFactory(FRPGroupFactoryConfig{Common: common})
+	if factory != nil || err == nil || !strings.Contains(err.Error(), "requires encrypted FRP transport") {
+		t.Fatalf("factory = %v, error = %v; want verification configuration rejected", factory, err)
+	}
+}
+
+func TestFRPSessionGroupFactoryCopiesTLSFraming(t *testing.T) {
+	disabled := true
+	common := &v1.ClientCommonConfig{}
+	common.Transport.TLS.DisableCustomTLSFirstByte = &disabled
+	factory, err := NewFRPSessionGroupFactory(FRPGroupFactoryConfig{Common: common})
+	if err != nil {
+		t.Fatal(err)
+	}
+	disabled = false
+	if !*factory.cfg.Common.Transport.TLS.DisableCustomTLSFirstByte {
+		t.Fatal("caller changed factory TLS framing")
+	}
+	cycle := cloneCommon(factory.cfg.Common)
+	*factory.cfg.Common.Transport.TLS.DisableCustomTLSFirstByte = false
+	if !*cycle.Transport.TLS.DisableCustomTLSFirstByte {
+		t.Fatal("factory changed cycle TLS framing")
 	}
 }

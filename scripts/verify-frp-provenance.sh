@@ -13,8 +13,8 @@ readonly repository='https://github.com/layervai/frp.git'
 
 # Reviewed dependency head and signed release merge on layerv/main. They have
 # the same tree; the pseudo-version avoids the generic new-release quarantine.
-readonly dependency_commit='9a0e4ee61964140e58f9cedd482c8f32b19acbd9'
-readonly release_commit='03712d9a51a9e72b1d0263ce3a116b4f7f1d294c'
+readonly dependency_commit='d97c77893b28bf6206a66a6219d8276b445e3272'
+readonly release_commit='0a12d05047ed7742626fb47f9a2a78fc7d448376'
 
 module_re="${module//./\\.}"
 replace_line="$(grep -E "^replace github\\.com/fatedier/frp => ${module_re} v" go.mod || true)"
