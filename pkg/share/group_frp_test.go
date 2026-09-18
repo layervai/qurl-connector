@@ -1665,3 +1665,22 @@ func TestFRPSessionGroupFactoryRejectsVerificationWithoutTLS(t *testing.T) {
 		t.Fatalf("factory = %v, error = %v; want verification configuration rejected", factory, err)
 	}
 }
+
+func TestFRPSessionGroupFactoryCopiesTLSFraming(t *testing.T) {
+	disabled := true
+	common := &v1.ClientCommonConfig{}
+	common.Transport.TLS.DisableCustomTLSFirstByte = &disabled
+	factory, err := NewFRPSessionGroupFactory(FRPGroupFactoryConfig{Common: common})
+	if err != nil {
+		t.Fatal(err)
+	}
+	disabled = false
+	if !*factory.cfg.Common.Transport.TLS.DisableCustomTLSFirstByte {
+		t.Fatal("caller changed factory TLS framing")
+	}
+	cycle := cloneCommon(factory.cfg.Common)
+	*factory.cfg.Common.Transport.TLS.DisableCustomTLSFirstByte = false
+	if !*cycle.Transport.TLS.DisableCustomTLSFirstByte {
+		t.Fatal("factory changed cycle TLS framing")
+	}
+}
