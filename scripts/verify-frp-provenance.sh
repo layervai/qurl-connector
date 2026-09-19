@@ -13,7 +13,7 @@ readonly repository='https://github.com/layervai/frp.git'
 
 # Reviewed dependency head and signed release merge on layerv/main. They have
 # the same tree; the pseudo-version avoids the generic new-release quarantine.
-readonly dependency_commit='d97c77893b28bf6206a66a6219d8276b445e3272'
+readonly dependency_commit='e9587c6ee0499715d7ec83ddbbbcfcd63396a81d'
 readonly release_commit='0a12d05047ed7742626fb47f9a2a78fc7d448376'
 
 module_re="${module//./\\.}"

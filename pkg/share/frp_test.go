@@ -7,10 +7,12 @@ import (
 	"fmt"
 	"maps"
 	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 
 	v1 "github.com/fatedier/frp/pkg/config/v1"
+	"github.com/fatedier/frp/pkg/msg"
 	"gopkg.in/yaml.v3"
 )
 
@@ -415,5 +417,52 @@ func TestBuildAdmittedCommonClonesTransportEncryptionSetting(t *testing.T) {
 	*common.Transport.TLS.Enable = false
 	if rendered.Transport.TLS.Enable == nil || !*rendered.Transport.TLS.Enable {
 		t.Fatal("caller mutation disabled transport encryption after config rendering")
+	}
+}
+
+func TestUnixHTTPRouteIsExclusiveLocalAndPrivate(t *testing.T) {
+	route := headeredTestRoute()
+	route.LocalIP, route.LocalPort, route.LocalSocketPath = "", 0, "/private-origin/file.sock"
+	if runtime.GOOS == "windows" {
+		if validateLocalHTTPRoute(route) == nil {
+			t.Fatal("Windows accepted Unix origin")
+		}
+		return
+	}
+	if err := validateLocalHTTPRoute(route); err != nil {
+		t.Fatal(err)
+	}
+	proxy := buildRouteProxy(route, "private-origin")
+	options, ok := proxy.Plugin.ClientPluginOptions.(*v1.UnixDomainSocketPluginOptions)
+	if !ok || proxy.Plugin.Type != v1.PluginUnixDomainSocket || options.UnixPath != route.LocalSocketPath || proxy.LocalIP != "" || proxy.LocalPort != 0 {
+		t.Fatal("Unix route did not select exclusive Unix plugin transport")
+	}
+	if proxy.RequestHeaders.Set[testProxyTokenHeader] != testProxyTokenValue {
+		t.Fatal("Unix route lost request headers")
+	}
+	var message msg.NewProxy
+	proxy.MarshalToMsg(&message)
+	encoded, err := json.Marshal(message)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(encoded), route.LocalSocketPath) || strings.Contains(fmt.Sprintf("%#v", route), route.LocalSocketPath) {
+		t.Fatal("Unix origin path escaped the local transport")
+	}
+	for _, change := range []func(*LocalHTTPRoute){
+		func(r *LocalHTTPRoute) { r.LocalIP = "127.0.0.1" },
+		func(r *LocalHTTPRoute) { r.LocalPort = 8080 },
+		func(r *LocalHTTPRoute) { r.LocalSocketPath = "relative.sock" },
+		func(r *LocalHTTPRoute) { r.LocalSocketPath = "/a/../b" },
+		func(r *LocalHTTPRoute) { r.LocalSocketPath = "/" + strings.Repeat("x", 101) },
+		func(r *LocalHTTPRoute) { r.LocalSocketPath = "/private/\x00.sock" },
+	} {
+		invalid := route
+		change(&invalid)
+		if err := validateLocalHTTPRoute(invalid); err == nil {
+			t.Fatal("invalid Unix target accepted")
+		} else if strings.Contains(err.Error(), invalid.LocalSocketPath) {
+			t.Fatal("invalid Unix target path leaked")
+		}
 	}
 }

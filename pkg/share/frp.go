@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"maps"
 	"net"
+	"path/filepath"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -29,9 +31,11 @@ import (
 // Its formatting methods redact the request headers and JSON/YAML encoding
 // omits them.
 type LocalHTTPRoute struct {
-	RouteID            string
-	LocalIP            string
-	LocalPort          int
+	RouteID   string
+	LocalIP   string
+	LocalPort int
+	// LocalSocketPath selects a private Unix HTTP origin instead of TCP.
+	LocalSocketPath    string `json:"-" yaml:"-"`
 	ResourcePublicKey  string
 	ConnectorRoutingID string
 	// RequestHeaders are runtime-only values sent to frps in NewProxy and
@@ -50,7 +54,7 @@ type LocalHTTPRoute struct {
 // assertions, and diagnostics.
 func (r LocalHTTPRoute) String() string {
 	return fmt.Sprintf(
-		"share.LocalHTTPRoute{RouteID:%q, LocalIP:%q, LocalPort:%d, ResourcePublicKey:%q, ConnectorRoutingID:%q, RequestHeaders:[REDACTED]}",
+		"share.LocalHTTPRoute{RouteID:%q, LocalIP:%q, LocalPort:%d, ResourcePublicKey:%q, ConnectorRoutingID:%q, LocalSocketPath:[REDACTED], RequestHeaders:[REDACTED]}",
 		r.RouteID, r.LocalIP, r.LocalPort, r.ResourcePublicKey, r.ConnectorRoutingID,
 	)
 }
@@ -65,7 +69,7 @@ func (r LocalHTTPRoute) hasRequestHeaders() bool { return len(r.RequestHeaders) 
 // headers are both headerless). TestLocalHTTPRouteEqualCoversEveryField
 // keeps it in step with the fields.
 func (r LocalHTTPRoute) Equal(other LocalHTTPRoute) bool {
-	return r.RouteID == other.RouteID && r.LocalIP == other.LocalIP && r.LocalPort == other.LocalPort &&
+	return r.RouteID == other.RouteID && r.LocalIP == other.LocalIP && r.LocalPort == other.LocalPort && r.LocalSocketPath == other.LocalSocketPath &&
 		r.ResourcePublicKey == other.ResourcePublicKey && r.ConnectorRoutingID == other.ConnectorRoutingID &&
 		maps.Equal(r.RequestHeaders, other.RequestHeaders)
 }
@@ -74,7 +78,13 @@ func validateLocalHTTPRoute(route LocalHTTPRoute) error {
 	if route.RouteID == "" || route.ResourcePublicKey == "" || route.ConnectorRoutingID == "" {
 		return errors.New("route identities are incomplete")
 	}
-	if route.LocalIP == "" || route.LocalPort < 1 || route.LocalPort > 65535 {
+	if route.LocalSocketPath != "" {
+		if runtime.GOOS == "windows" || route.LocalIP != "" || route.LocalPort != 0 ||
+			!filepath.IsAbs(route.LocalSocketPath) || filepath.Clean(route.LocalSocketPath) != route.LocalSocketPath ||
+			len(route.LocalSocketPath) > 100 || strings.ContainsAny(route.LocalSocketPath, "\x00\r\n") {
+			return errors.New("local Unix socket target is invalid")
+		}
+	} else if route.LocalIP == "" || route.LocalPort < 1 || route.LocalPort > 65535 {
 		return errors.New("local target is invalid")
 	}
 	return ValidateRequestHeaders(route.RequestHeaders)
@@ -123,6 +133,12 @@ func buildRouteProxy(route LocalHTTPRoute, proxyName string) *v1.HTTPProxyConfig
 	proxy.Type = string(v1.ProxyTypeHTTP)
 	proxy.LocalIP = route.LocalIP
 	proxy.LocalPort = route.LocalPort
+	if route.LocalSocketPath != "" {
+		proxy.Plugin = v1.TypedClientPluginOptions{
+			Type:                v1.PluginUnixDomainSocket,
+			ClientPluginOptions: &v1.UnixDomainSocketPluginOptions{Type: v1.PluginUnixDomainSocket, UnixPath: route.LocalSocketPath},
+		}
+	}
 	proxy.SubDomain = route.ConnectorRoutingID
 	proxy.LoadBalancer.Group = route.ConnectorRoutingID
 	proxy.LoadBalancer.GroupKey = route.ConnectorRoutingID
