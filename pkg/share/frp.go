@@ -22,6 +22,9 @@ import (
 	nhpconfig "github.com/layervai/qurl-connector/pkg/config"
 )
 
+// Unix sockaddr paths have a 104-byte ceiling on macOS; leave room for the NUL.
+const maxLocalSocketPathBytes = 100
+
 // LocalHTTPRoute is the exact local and platform identity of one managed HTTP
 // share. Public ResourcePublicKey is authorization metadata; ConnectorRoutingID is
 // the stable subdomain/load-balancer identity.
@@ -35,6 +38,10 @@ type LocalHTTPRoute struct {
 	LocalIP   string
 	LocalPort int
 	// LocalSocketPath selects a private Unix HTTP origin instead of TCP.
+	// It is runtime-only: JSON/YAML and formatting omit the pathname, so
+	// callers must restore it before loading a serialized route. The local
+	// supervisor owns the socket directory, permissions and listener lifetime;
+	// this library validates syntax and never unlinks or replaces the socket.
 	LocalSocketPath    string `json:"-" yaml:"-"`
 	ResourcePublicKey  string
 	ConnectorRoutingID string
@@ -81,7 +88,7 @@ func validateLocalHTTPRoute(route LocalHTTPRoute) error {
 	if route.LocalSocketPath != "" {
 		if runtime.GOOS == "windows" || route.LocalIP != "" || route.LocalPort != 0 ||
 			!filepath.IsAbs(route.LocalSocketPath) || filepath.Clean(route.LocalSocketPath) != route.LocalSocketPath ||
-			len(route.LocalSocketPath) > 100 || strings.ContainsAny(route.LocalSocketPath, "\x00\r\n") {
+			len(route.LocalSocketPath) > maxLocalSocketPathBytes || strings.ContainsAny(route.LocalSocketPath, "\x00\r\n") {
 			return errors.New("local Unix socket target is invalid")
 		}
 	} else if route.LocalIP == "" || route.LocalPort < 1 || route.LocalPort > 65535 {

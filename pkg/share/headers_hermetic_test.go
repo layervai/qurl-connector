@@ -61,7 +61,7 @@ func testHermeticRuntimeHeadersReachOnlyTheirOrigin(t *testing.T, unixOrigin boo
 	}))
 	var socketPath string
 	if unixOrigin {
-		socketDir, err := os.MkdirTemp("/tmp", "qo-")
+		socketDir, err := os.MkdirTemp("/tmp", "qo-") // macOS t.TempDir paths can exceed sun_path.
 		if err != nil {
 			t.Fatal(err)
 		}

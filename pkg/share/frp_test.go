@@ -449,13 +449,29 @@ func TestUnixHTTPRouteIsExclusiveLocalAndPrivate(t *testing.T) {
 	if strings.Contains(string(encoded), route.LocalSocketPath) || strings.Contains(fmt.Sprintf("%#v", route), route.LocalSocketPath) {
 		t.Fatal("Unix origin path escaped the local transport")
 	}
+	for _, marshal := range []func(any) ([]byte, error){json.Marshal, yaml.Marshal} {
+		serialized, err := marshal(route)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(string(serialized), route.LocalSocketPath) || strings.Contains(string(serialized), "LocalSocketPath") || strings.Contains(string(serialized), "localsocketpath") {
+			t.Fatal("route serialization disclosed the runtime socket")
+		}
+	}
+	boundary := route
+	boundary.LocalSocketPath = "/" + strings.Repeat("x", maxLocalSocketPathBytes-1)
+	if err := validateLocalHTTPRoute(boundary); err != nil {
+		t.Fatal("maximum supported socket path rejected")
+	}
 	for _, change := range []func(*LocalHTTPRoute){
 		func(r *LocalHTTPRoute) { r.LocalIP = "127.0.0.1" },
 		func(r *LocalHTTPRoute) { r.LocalPort = 8080 },
 		func(r *LocalHTTPRoute) { r.LocalSocketPath = "relative.sock" },
 		func(r *LocalHTTPRoute) { r.LocalSocketPath = "/a/../b" },
-		func(r *LocalHTTPRoute) { r.LocalSocketPath = "/" + strings.Repeat("x", 101) },
+		func(r *LocalHTTPRoute) { r.LocalSocketPath = "/" + strings.Repeat("x", maxLocalSocketPathBytes) },
 		func(r *LocalHTTPRoute) { r.LocalSocketPath = "/private/\x00.sock" },
+		func(r *LocalHTTPRoute) { r.LocalSocketPath = "/private/\r.sock" },
+		func(r *LocalHTTPRoute) { r.LocalSocketPath = "/private/\n.sock" },
 	} {
 		invalid := route
 		change(&invalid)
