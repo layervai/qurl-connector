@@ -105,4 +105,4 @@ replace github.com/hashicorp/yamux => github.com/fatedier/yamux v0.0.0-202508250
 
 // LayerV's signed FRP release supports system CA verification and the
 // InitialRunID hook that binds native NHP admission to the matching FRP Login.
-replace github.com/fatedier/frp => github.com/layervai/frp v1.0.3-0.20260919225356-e9587c6ee049
+replace github.com/fatedier/frp => github.com/layervai/frp v1.0.3-0.20260919230857-69553e26571b
