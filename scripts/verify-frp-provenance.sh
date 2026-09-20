@@ -11,10 +11,10 @@ set -euo pipefail
 readonly module='github.com/layervai/frp'
 readonly repository='https://github.com/layervai/frp.git'
 
-# Reviewed candidate dependency head; the release commit remains the prior
+# Reviewed file-origin-only candidate dependency head; the release commit remains the prior
 # release until v1.0.3 is reviewed and tagged. Provenance intentionally fails
 # until that tag and its exact reviewed tree are recorded here.
-readonly dependency_commit='69553e26571bac0235d7beb140588bc645c1908b'
+readonly dependency_commit='55c3b7c5e0b9e9a35c91016a49067aecdd95b47c'
 readonly release_commit='0a12d05047ed7742626fb47f9a2a78fc7d448376'
 
 module_re="${module//./\\.}"

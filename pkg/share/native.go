@@ -612,11 +612,10 @@ func (r *NativeRuntime) ClearRegistrationRefreshMarker() error {
 }
 
 // RecoverCredentialAfterDeviceAuthorizationFailure performs the one recovery
-// attempt allowed after explicit login has established recovery authority, a
-// credential-free warm open succeeded, and the first registered-device REST
-// request returned HTTP 401 with problem code api_key_invalid. provider returns
-// either the same validated account key or an explicit owner/device-bound OAuth
-// recovery capability; the Hub validates that authority for this native identity.
+// attempt allowed after explicit login has already validated an account key,
+// a credential-free warm open succeeded, and the first registered-device REST
+// request returned HTTP 401 with problem code api_key_invalid. provider must
+// return that same validated account key.
 //
 // The method rejects every other status, problem code, open kind, and repeated
 // call before reading provider or touching durable state. It never retries the
