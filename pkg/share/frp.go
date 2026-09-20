@@ -40,7 +40,8 @@ type LocalHTTPRoute struct {
 	// LocalSocketPath selects a private Unix HTTP origin instead of TCP.
 	// It is runtime-only: JSON/YAML and formatting omit the pathname, so
 	// callers must restore it before loading a serialized route. The local
-	// supervisor owns the socket directory, permissions and listener lifetime;
+	// supervisor must provide an owner-only socket directory whose ancestors
+	// untrusted principals cannot replace, and owns the listener lifetime;
 	// this library validates syntax and never unlinks or replaces the socket.
 	LocalSocketPath    string `json:"-" yaml:"-"`
 	ResourcePublicKey  string
@@ -70,6 +71,7 @@ func (r LocalHTTPRoute) String() string {
 func (r LocalHTTPRoute) GoString() string { return r.String() }
 
 func (r LocalHTTPRoute) hasRequestHeaders() bool { return len(r.RequestHeaders) > 0 }
+func (r LocalHTTPRoute) hasUnixOrigin() bool     { return r.LocalSocketPath != "" }
 
 // Equal reports whether two routes are the same registration: identity,
 // local target, and runtime request headers all match (nil and empty
@@ -244,13 +246,17 @@ func tlsEnabled(common *v1.ClientCommonConfig) bool {
 	}
 }
 
-// requestHeaderTransportError fails closed when a route set carries runtime
+// routeTransportError fails closed when a route set carries runtime
 // request headers and the FRP transport would expose them: a plaintext
 // control connection sends NewProxy in the clear, unverified TLS permits
 // interception, and the local FRP
 // web/admin server reports every proxy's configuration to whoever reaches
-// it. A headerless set is never gated. The message names no header.
-func requestHeaderTransportError(common *v1.ClientCommonConfig, headered bool) error {
+// it. Unix origins also require the web/admin server disabled because proxy
+// configuration includes their private pathname. Messages disclose neither.
+func routeTransportError(common *v1.ClientCommonConfig, headered, unixOrigin bool) error {
+	if unixOrigin && common != nil && common.WebServer.Port > 0 {
+		return errors.New("Unix origins require FRP web server to be disabled")
+	}
 	if !headered {
 		return nil
 	}
