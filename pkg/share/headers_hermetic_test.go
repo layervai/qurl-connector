@@ -60,6 +60,7 @@ func testHermeticRuntimeHeadersReachOnlyTheirOrigin(t *testing.T, unixOrigin boo
 		_, _ = io.WriteString(w, "protected-file")
 	}))
 	var socketPath string
+	previewAddress := origin.Listener.Addr().String()
 	if unixOrigin {
 		socketDir, err := os.MkdirTemp("/tmp", "qo-") // macOS t.TempDir paths can exceed sun_path.
 		if err != nil {
@@ -219,18 +220,37 @@ func testHermeticRuntimeHeadersReachOnlyTheirOrigin(t *testing.T, unixOrigin boo
 	}
 	if unixOrigin {
 		origin.Close()
-		request, err := http.NewRequest(http.MethodGet, "http://127.0.0.1:"+strconv.Itoa(port)+"/", nil)
+		// Reuse the former TCP preview port while the real FRP client remains
+		// alive. No request (including its private headers) may reach this app.
+		var occupantRequests atomic.Int64
+		occupant := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			occupantRequests.Add(1)
+			w.WriteHeader(http.StatusCreated)
+			_, _ = io.WriteString(w, "unrelated-app")
+		}))
+		_ = occupant.Listener.Close()
+		occupant.Listener, err = net.Listen("tcp", previewAddress)
 		if err != nil {
 			t.Fatal(err)
 		}
-		request.Host = "routing-alpha.example.test"
-		response, err := (&http.Client{Timeout: time.Second}).Do(request)
-		if err == nil {
-			body, _ := io.ReadAll(response.Body)
-			_ = response.Body.Close()
-			if response.StatusCode == http.StatusOK || string(body) == "protected-file" {
-				t.Fatal("missing Unix origin still serves")
+		occupant.Start()
+		defer occupant.Close()
+		for range 10 {
+			request, err := http.NewRequest(http.MethodGet, "http://127.0.0.1:"+strconv.Itoa(port)+"/", nil)
+			if err != nil {
+				t.Fatal(err)
 			}
+			request.Host = "routing-alpha.example.test"
+			response, err := (&http.Client{Timeout: time.Second}).Do(request)
+			if err == nil {
+				_ = response.Body.Close()
+				if response.StatusCode < 400 || response.StatusCode > 599 {
+					t.Fatalf("missing Unix origin returned nonfailure status: %d", response.StatusCode)
+				}
+			}
+		}
+		if got := occupantRequests.Load(); got != 0 {
+			t.Fatalf("missing Unix origin forwarded %d requests to the TCP occupant", got)
 		}
 		pollHermeticRoute(t, port, "routing-beta.example.test", "sibling", result)
 	}
