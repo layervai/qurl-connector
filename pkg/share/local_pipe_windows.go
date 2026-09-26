@@ -36,15 +36,14 @@ func dialLocalPipe(ctx context.Context, name string, verify func(net.Conn) error
 }
 
 // localPipeOpenError keeps the failure class operators need (a stopped origin
-// versus a foreign or busy pipe) as a fixed string that never names the pipe.
+// versus a foreign pipe) as a fixed string that never names the pipe. go-winio
+// retries a busy pipe until the deadline, so busy surfaces as timeout.
 func localPipeOpenError(err error) error {
 	switch {
 	case errors.Is(err, windows.ERROR_FILE_NOT_FOUND):
 		return errors.New("open local named-pipe origin failed: not found")
 	case errors.Is(err, windows.ERROR_ACCESS_DENIED):
 		return errors.New("open local named-pipe origin failed: access denied")
-	case errors.Is(err, windows.ERROR_PIPE_BUSY):
-		return errors.New("open local named-pipe origin failed: busy")
 	case errors.Is(err, winio.ErrTimeout), errors.Is(err, context.DeadlineExceeded):
 		return errors.New("open local named-pipe origin failed: timeout")
 	case errors.Is(err, context.Canceled):

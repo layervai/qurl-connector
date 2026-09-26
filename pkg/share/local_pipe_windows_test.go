@@ -76,12 +76,14 @@ func TestLocalPipeOwnerAndMissingOrigin(t *testing.T) {
 		t.Fatal("verification sent bytes")
 	}
 	_ = listener.Close()
-	if conn, err := DialLocalPipe(ctx, listener.Addr().String()); conn != nil || err == nil || strings.Contains(err.Error(), listener.Addr().String()) || !strings.HasSuffix(err.Error(), ": not found") {
+	// The read deadline above spent ctx; a missing pipe must report not found, not timeout.
+	missingCtx, missingCancel := context.WithTimeout(context.Background(), time.Second)
+	defer missingCancel()
+	if conn, err := DialLocalPipe(missingCtx, listener.Addr().String()); conn != nil || err == nil || strings.Contains(err.Error(), listener.Addr().String()) || !strings.HasSuffix(err.Error(), ": not found") {
 		t.Fatalf("missing pipe did not fail closed as not found: %v", err)
 	}
 	for cause, class := range map[error]string{
 		windows.ERROR_ACCESS_DENIED: ": access denied",
-		windows.ERROR_PIPE_BUSY:     ": busy",
 		winio.ErrTimeout:            ": timeout",
 		context.DeadlineExceeded:    ": timeout",
 		context.Canceled:            ": canceled",
