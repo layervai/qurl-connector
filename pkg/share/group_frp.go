@@ -314,7 +314,7 @@ func NewFRPSessionGroupFactory(cfg FRPGroupFactoryConfig) (*FRPSessionGroupFacto
 // as desired. BuildConfig repeats the check on the config each cycle
 // actually renders.
 func (f *FRPSessionGroupFactory) ValidateRoutes(routes []LocalHTTPRoute) error {
-	return routeTransportError(f.cfg.Common, slices.ContainsFunc(routes, LocalHTTPRoute.hasRequestHeaders), slices.ContainsFunc(routes, LocalHTTPRoute.hasUnixOrigin))
+	return routeTransportError(f.cfg.Common, slices.ContainsFunc(routes, LocalHTTPRoute.hasRequestHeaders), slices.ContainsFunc(routes, LocalHTTPRoute.hasPrivateOrigin))
 }
 
 // BuildConfig renders one admission's Login config plus one proxy per route.
@@ -335,7 +335,7 @@ func (f *FRPSessionGroupFactory) BuildConfig(admission Admission, routes []Group
 	}
 	// cloneCommon copies the TLS enablement pointee and WebServer.Port is
 	// value-typed, so the check binds to the exact config handed to FRP.
-	if err := routeTransportError(common, slices.ContainsFunc(routes, GroupRoute.hasRequestHeaders), slices.ContainsFunc(routes, GroupRoute.hasUnixOrigin)); err != nil {
+	if err := routeTransportError(common, slices.ContainsFunc(routes, GroupRoute.hasRequestHeaders), slices.ContainsFunc(routes, GroupRoute.hasPrivateOrigin)); err != nil {
 		return nil, nil, nil, err
 	}
 	proxies, names, err := renderGroupProxies(routes, admission.SessionID)
@@ -823,7 +823,7 @@ func (s *frpGroupSession) Update(ctx context.Context, routes []GroupRoute) error
 			return err
 		}
 	}
-	if err := routeTransportError(s.common, slices.ContainsFunc(routes, GroupRoute.hasRequestHeaders), slices.ContainsFunc(routes, GroupRoute.hasUnixOrigin)); err != nil {
+	if err := routeTransportError(s.common, slices.ContainsFunc(routes, GroupRoute.hasRequestHeaders), slices.ContainsFunc(routes, GroupRoute.hasPrivateOrigin)); err != nil {
 		return fmt.Errorf("update FRP session group: %w", err)
 	}
 	s.updateMu.Lock()
