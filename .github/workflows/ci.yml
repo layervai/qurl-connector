@@ -135,15 +135,20 @@ jobs:
           node --version # Default-DACL named-pipe interoperability fixture.
           go build ./...
           go vet ./pkg/agentstate ./pkg/config ./pkg/share ./pkg/service ./internal/pinnedfs
-          CGO_ENABLED=0 go test -count=1 ./pkg/agentstate ./pkg/config ./pkg/share ./pkg/service ./internal/pinnedfs
+          # The private-origin outcomes below run once, verbosely, in their own step.
+          CGO_ENABLED=0 go test -count=1 -skip '^(TestLocalPipeNodeDefaultSecurity|TestHermeticNamedPipeOriginHeadersAndMissingOrigin)$' ./pkg/agentstate ./pkg/config ./pkg/share ./pkg/service ./internal/pinnedfs
       - name: Record native private-origin outcomes
         shell: bash
         run: |
           set -euo pipefail
-          CGO_ENABLED=0 go test -count=1 -v -run '^(TestLocalPipeNodeDefaultSecurity|TestHermeticNamedPipeOriginHeadersAndMissingOrigin)$' ./pkg/share | tee "$RUNNER_TEMP/windows-private-origin.log"
-          grep -F -- '--- PASS: TestLocalPipeNodeDefaultSecurity (' "$RUNNER_TEMP/windows-private-origin.log"
-          grep -F -- 'verified Node HTTP request succeeded' "$RUNNER_TEMP/windows-private-origin.log"
-          grep -F -- '--- PASS: TestHermeticNamedPipeOriginHeadersAndMissingOrigin (' "$RUNNER_TEMP/windows-private-origin.log"
+          log="$RUNNER_TEMP/windows-private-origin.log"
+          CGO_ENABLED=0 go test -count=1 -v -run '^(TestLocalPipeNodeDefaultSecurity|TestHermeticNamedPipeOriginHeadersAndMissingOrigin)$' ./pkg/share | tee "$log"
+          require() {
+            grep -qF -- "$1" "$log" || { echo "::error::missing private-origin evidence: $1 (a skipped Node test or an elevated runner whose pipes are Administrators-owned passes go test but proves nothing)"; exit 1; }
+          }
+          require '--- PASS: TestLocalPipeNodeDefaultSecurity ('
+          require 'verified Node HTTP request succeeded'
+          require '--- PASS: TestHermeticNamedPipeOriginHeadersAndMissingOrigin ('
 
   # The race detector requires cgo, so this lane builds with CGO_ENABLED=1 —
   # the only place in CI that does. `make test` keeps proving the CGO_ENABLED=0

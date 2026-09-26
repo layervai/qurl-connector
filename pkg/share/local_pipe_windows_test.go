@@ -11,6 +11,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"os"
 	"os/exec"
 	"strings"
 	"testing"
@@ -75,8 +76,20 @@ func TestLocalPipeOwnerAndMissingOrigin(t *testing.T) {
 		t.Fatal("verification sent bytes")
 	}
 	_ = listener.Close()
-	if conn, err := DialLocalPipe(ctx, listener.Addr().String()); conn != nil || err == nil || strings.Contains(err.Error(), listener.Addr().String()) {
-		t.Fatal("missing pipe did not fail closed")
+	if conn, err := DialLocalPipe(ctx, listener.Addr().String()); conn != nil || err == nil || strings.Contains(err.Error(), listener.Addr().String()) || !strings.HasSuffix(err.Error(), ": not found") {
+		t.Fatalf("missing pipe did not fail closed as not found: %v", err)
+	}
+	for cause, class := range map[error]string{
+		windows.ERROR_ACCESS_DENIED: ": access denied",
+		windows.ERROR_PIPE_BUSY:     ": busy",
+		winio.ErrTimeout:            ": timeout",
+		context.DeadlineExceeded:    ": timeout",
+		context.Canceled:            ": canceled",
+		errors.New("other"):         "open local named-pipe origin failed",
+	} {
+		if got := localPipeOpenError(cause).Error(); !strings.HasSuffix(got, class) {
+			t.Fatalf("open error class for %v = %q", cause, got)
+		}
 	}
 	user, err := windows.GetCurrentProcessToken().GetTokenUser()
 	if err != nil {
@@ -159,7 +172,10 @@ func TestLocalPipeRejectedOwnerSendsNoBytes(t *testing.T) {
 // current-user check. Node is supplied by the Windows CI lane.
 func TestLocalPipeNodeDefaultSecurity(t *testing.T) {
 	if _, err := exec.LookPath("node"); err != nil {
-		t.Fatal("Node is required for Windows private-origin interoperability tests")
+		if os.Getenv("CI") != "" {
+			t.Fatal("Node is required for Windows private-origin interoperability tests in CI")
+		}
+		t.Skip("Node is not installed; the Windows CI lane runs this interoperability test")
 	}
 	nonce := make([]byte, 16)
 	if _, err := rand.Read(nonce); err != nil {

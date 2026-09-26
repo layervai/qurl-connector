@@ -21,15 +21,37 @@ func dialLocalPipe(ctx context.Context, name string, verify func(net.Conn) error
 	if err := ValidateLocalPipeName(name); err != nil {
 		return nil, err
 	}
-	conn, err := winio.DialPipeAccess(ctx, name, windows.GENERIC_READ|windows.GENERIC_WRITE|windows.READ_CONTROL)
+	// Anonymous SQOS is pinned here, not inherited from go-winio's default: the
+	// owner check runs after connect, so an unverified server must never be
+	// able to impersonate this client.
+	conn, err := winio.DialPipeAccessImpLevel(ctx, name, windows.GENERIC_READ|windows.GENERIC_WRITE|windows.READ_CONTROL, winio.PipeImpLevelAnonymous)
 	if err != nil {
-		return nil, errors.New("open local named-pipe origin failed")
+		return nil, localPipeOpenError(err)
 	}
 	if err := verify(conn); err != nil {
 		_ = conn.Close()
 		return nil, err
 	}
 	return conn, nil
+}
+
+// localPipeOpenError keeps the failure class operators need (a stopped origin
+// versus a foreign or busy pipe) as a fixed string that never names the pipe.
+func localPipeOpenError(err error) error {
+	switch {
+	case errors.Is(err, windows.ERROR_FILE_NOT_FOUND):
+		return errors.New("open local named-pipe origin failed: not found")
+	case errors.Is(err, windows.ERROR_ACCESS_DENIED):
+		return errors.New("open local named-pipe origin failed: access denied")
+	case errors.Is(err, windows.ERROR_PIPE_BUSY):
+		return errors.New("open local named-pipe origin failed: busy")
+	case errors.Is(err, winio.ErrTimeout), errors.Is(err, context.DeadlineExceeded):
+		return errors.New("open local named-pipe origin failed: timeout")
+	case errors.Is(err, context.Canceled):
+		return errors.New("open local named-pipe origin failed: canceled")
+	default:
+		return errors.New("open local named-pipe origin failed")
+	}
 }
 
 func verifyLocalPipeOwner(conn net.Conn) error {

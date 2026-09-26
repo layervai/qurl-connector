@@ -16,18 +16,28 @@ import (
 const localPipePluginName = "layerv_private_named_pipe"
 const localPipePrefix = `\\.\pipe\layerv-qurl-file-`
 
+// The canonical suffix is <64 hex>-<32 hex>.
+const (
+	localPipeHeadLen   = 64
+	localPipeNonceLen  = 32
+	localPipeSuffixLen = localPipeHeadLen + 1 + localPipeNonceLen
+)
+
 // ValidateLocalPipeName accepts only canonical private file-origin pipe names
-// on Windows. Errors never include the supplied name.
+// on Windows: localPipePrefix followed by 64 lowercase hex digits, '-', and 32
+// lowercase hex digits. Windows compares pipe names case-insensitively, but
+// this grammar is deliberately lowercase-only so producers (Desktop, the CLI)
+// have exactly one spelling. Errors never include the supplied name.
 func ValidateLocalPipeName(name string) error {
 	if runtime.GOOS != "windows" {
 		return errors.New("local named-pipe origins require Windows")
 	}
 	suffix, ok := strings.CutPrefix(name, localPipePrefix)
-	if !ok || len(suffix) != 97 || suffix[64] != '-' {
+	if !ok || len(suffix) != localPipeSuffixLen || suffix[localPipeHeadLen] != '-' {
 		return errors.New("local named-pipe target is invalid")
 	}
 	for i, ch := range suffix {
-		if i == 64 {
+		if i == localPipeHeadLen {
 			continue
 		}
 		if !(ch >= '0' && ch <= '9' || ch >= 'a' && ch <= 'f') {

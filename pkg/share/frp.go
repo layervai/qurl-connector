@@ -160,13 +160,17 @@ func buildRouteProxy(route LocalHTTPRoute, proxyName string) *v1.HTTPProxyConfig
 	proxy.Type = string(v1.ProxyTypeHTTP)
 	proxy.LocalIP = route.LocalIP
 	proxy.LocalPort = route.LocalPort
-	if route.LocalSocketPath != "" {
+	// validateLocalHTTPRoute rejects routes naming both; the switch keeps a
+	// bypassed validator from silently letting one transport overwrite the other.
+	switch {
+	case route.LocalSocketPath != "" && route.LocalPipeName != "":
+		// Leave the plugin unset and the TCP target empty: the route cannot serve.
+	case route.LocalSocketPath != "":
 		proxy.Plugin = v1.TypedClientPluginOptions{
 			Type:                v1.PluginUnixDomainSocket,
 			ClientPluginOptions: &v1.UnixDomainSocketPluginOptions{Type: v1.PluginUnixDomainSocket, UnixPath: route.LocalSocketPath},
 		}
-	}
-	if route.LocalPipeName != "" {
+	case route.LocalPipeName != "":
 		proxy.Plugin = v1.TypedClientPluginOptions{Type: localPipePluginName, ClientPluginOptions: &localPipeOptions{PipeName: route.LocalPipeName}}
 	}
 	proxy.SubDomain = route.ConnectorRoutingID

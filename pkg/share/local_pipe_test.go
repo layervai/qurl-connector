@@ -45,6 +45,11 @@ func TestLocalPipeRouteContract(t *testing.T) {
 	if route.Equal(other) {
 		t.Fatal("pipe replacement ignored")
 	}
+	both := route
+	both.LocalSocketPath = "/tmp/file.sock"
+	if rendered := buildRouteProxy(both, "both").Plugin; rendered.ClientPluginOptions != nil || rendered.Type != "" {
+		t.Fatal("renderer let one private transport overwrite the other")
+	}
 	proxy := buildRouteProxy(route, "pipe-test")
 	var message msg.NewProxy
 	proxy.MarshalToMsg(&message)
