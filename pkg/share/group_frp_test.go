@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -1682,5 +1683,39 @@ func TestFRPSessionGroupFactoryCopiesTLSFraming(t *testing.T) {
 	*factory.cfg.Common.Transport.TLS.DisableCustomTLSFirstByte = false
 	if !*cycle.Transport.TLS.DisableCustomTLSFirstByte {
 		t.Fatal("factory changed cycle TLS framing")
+	}
+}
+
+func TestHeaderlessUnixOriginRefusesAdminExposure(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Unix origins are unsupported on Windows")
+	}
+	factory := newTestGroupFactory(t, true, 7400)
+	tcpRoutes := groupTestRoutes("alpha", "beta")
+	socketRoutes := groupTestRoutes("alpha", "beta")
+	socketRoutes[0].LocalSocketPath = "/private-owner/file.sock"
+	socketRoutes[0].LocalIP, socketRoutes[0].LocalPort = "", 0
+	if err := factory.ValidateRoutes(tcpRoutes); err != nil {
+		t.Fatalf("ordinary TCP route refused: %v", err)
+	}
+	_, _, _, buildErr := factory.BuildConfig(groupTestAdmission(101), groupRoutesOf(socketRoutes))
+	svc := &recordingGroupService{}
+	session := startTestGroupSessionWithCommon(t, factory.cfg.Common, svc, &lockedStatusMap{}, groupRoutesOf(tcpRoutes))
+	for name, err := range map[string]error{
+		"desired routes":  factory.ValidateRoutes(socketRoutes),
+		"rendered config": buildErr,
+		"live update":     session.Update(context.Background(), groupRoutesOf(socketRoutes)),
+	} {
+		if err == nil || !strings.Contains(err.Error(), "Unix origins require FRP web server to be disabled") {
+			t.Fatalf("%s error=%v", name, err)
+		}
+		assertNoDisclosure(t, err, "private-owner", "file.sock")
+	}
+	if len(svc.updateNames()) != 0 || session.RouteStates()["alpha"].Route.LocalSocketPath != "" {
+		t.Fatal("refused Unix update altered live TCP routes")
+	}
+	privateFactory := newTestGroupFactory(t, true, 0)
+	if _, _, _, err := privateFactory.BuildConfig(groupTestAdmission(101), groupRoutesOf(socketRoutes)); err != nil {
+		t.Fatalf("private Unix route refused with admin disabled: %v", err)
 	}
 }

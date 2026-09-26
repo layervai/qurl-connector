@@ -309,12 +309,12 @@ func NewFRPSessionGroupFactory(cfg FRPGroupFactoryConfig) (*FRPSessionGroupFacto
 	return &FRPSessionGroupFactory{cfg: cfg}, nil
 }
 
-// ValidateRoutes refuses a route set whose runtime request headers the
-// factory's transport cannot carry, so SessionGroupRunner never commits it
+// ValidateRoutes refuses a route set whose private runtime configuration the
+// factory's transport would expose, so SessionGroupRunner never commits it
 // as desired. BuildConfig repeats the check on the config each cycle
 // actually renders.
 func (f *FRPSessionGroupFactory) ValidateRoutes(routes []LocalHTTPRoute) error {
-	return requestHeaderTransportError(f.cfg.Common, slices.ContainsFunc(routes, LocalHTTPRoute.hasRequestHeaders))
+	return routeTransportError(f.cfg.Common, slices.ContainsFunc(routes, LocalHTTPRoute.hasRequestHeaders), slices.ContainsFunc(routes, LocalHTTPRoute.hasUnixOrigin))
 }
 
 // BuildConfig renders one admission's Login config plus one proxy per route.
@@ -335,7 +335,7 @@ func (f *FRPSessionGroupFactory) BuildConfig(admission Admission, routes []Group
 	}
 	// cloneCommon copies the TLS enablement pointee and WebServer.Port is
 	// value-typed, so the check binds to the exact config handed to FRP.
-	if err := requestHeaderTransportError(common, slices.ContainsFunc(routes, GroupRoute.hasRequestHeaders)); err != nil {
+	if err := routeTransportError(common, slices.ContainsFunc(routes, GroupRoute.hasRequestHeaders), slices.ContainsFunc(routes, GroupRoute.hasUnixOrigin)); err != nil {
 		return nil, nil, nil, err
 	}
 	proxies, names, err := renderGroupProxies(routes, admission.SessionID)
@@ -793,7 +793,8 @@ func errText(err error) string {
 // under a new Generation: its old registration is still running on the
 // server under the old name, so reusing that name would report the stale
 // proxy as serving. A set with request headers is refused on a session whose
-// transport cannot carry them (see BuildConfig); the table is untouched.
+// transport cannot carry them, and a set with Unix origins is refused while
+// the FRP web server is enabled (see BuildConfig); the table is untouched.
 // The route table is authoritative from the moment Update returns: if the
 // push to FRP fails, the error is returned and the session keeps retrying the
 // push on every poll until FRP accepts it, so RouteStates never reports a
@@ -822,7 +823,7 @@ func (s *frpGroupSession) Update(ctx context.Context, routes []GroupRoute) error
 			return err
 		}
 	}
-	if err := requestHeaderTransportError(s.common, slices.ContainsFunc(routes, GroupRoute.hasRequestHeaders)); err != nil {
+	if err := routeTransportError(s.common, slices.ContainsFunc(routes, GroupRoute.hasRequestHeaders), slices.ContainsFunc(routes, GroupRoute.hasUnixOrigin)); err != nil {
 		return fmt.Errorf("update FRP session group: %w", err)
 	}
 	s.updateMu.Lock()

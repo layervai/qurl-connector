@@ -7,10 +7,12 @@ import (
 	"fmt"
 	"maps"
 	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 
 	v1 "github.com/fatedier/frp/pkg/config/v1"
+	"github.com/fatedier/frp/pkg/msg"
 	"gopkg.in/yaml.v3"
 )
 
@@ -49,6 +51,9 @@ func TestLocalHTTPRouteStringRedactsHeaders(t *testing.T) {
 				formatted := fmt.Sprintf(format, test.value)
 				if !strings.Contains(formatted, "RequestHeaders:[REDACTED]") {
 					t.Fatalf("%s omitted the redaction marker: %s", format, formatted)
+				}
+				if strings.Contains(formatted, "LocalSocketPath") {
+					t.Fatalf("%s marked a TCP route with a socket path: %s", format, formatted)
 				}
 				for _, secret := range []string{testProxyTokenHeader, testProxyTokenValue} {
 					if strings.Contains(formatted, secret) {
@@ -415,5 +420,71 @@ func TestBuildAdmittedCommonClonesTransportEncryptionSetting(t *testing.T) {
 	*common.Transport.TLS.Enable = false
 	if rendered.Transport.TLS.Enable == nil || !*rendered.Transport.TLS.Enable {
 		t.Fatal("caller mutation disabled transport encryption after config rendering")
+	}
+}
+
+func TestUnixHTTPRouteIsExclusiveLocalAndPrivate(t *testing.T) {
+	route := headeredTestRoute()
+	route.LocalIP, route.LocalPort, route.LocalSocketPath = "", 0, "/private-origin/file.sock"
+	if runtime.GOOS == "windows" {
+		if validateLocalHTTPRoute(route) == nil {
+			t.Fatal("Windows accepted Unix origin")
+		}
+		return
+	}
+	if err := validateLocalHTTPRoute(route); err != nil {
+		t.Fatal(err)
+	}
+	proxy := buildRouteProxy(route, "private-origin")
+	options, ok := proxy.Plugin.ClientPluginOptions.(*v1.UnixDomainSocketPluginOptions)
+	if !ok || proxy.Plugin.Type != v1.PluginUnixDomainSocket || options.UnixPath != route.LocalSocketPath || proxy.LocalIP != "" || proxy.LocalPort != 0 {
+		t.Fatal("Unix route did not select exclusive Unix plugin transport")
+	}
+	if proxy.RequestHeaders.Set[testProxyTokenHeader] != testProxyTokenValue {
+		t.Fatal("Unix route lost request headers")
+	}
+	var message msg.NewProxy
+	proxy.MarshalToMsg(&message)
+	encoded, err := json.Marshal(message)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(encoded), route.LocalSocketPath) || strings.Contains(fmt.Sprintf("%#v", route), route.LocalSocketPath) {
+		t.Fatal("Unix origin path escaped the local transport")
+	}
+	if !strings.Contains(route.String(), "LocalSocketPath:[REDACTED]") {
+		t.Fatalf("Unix origin omitted the redaction marker: %s", route)
+	}
+	for _, marshal := range []func(any) ([]byte, error){json.Marshal, yaml.Marshal} {
+		serialized, err := marshal(route)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(string(serialized), route.LocalSocketPath) || strings.Contains(string(serialized), "LocalSocketPath") || strings.Contains(string(serialized), "localsocketpath") {
+			t.Fatal("route serialization disclosed the runtime socket")
+		}
+	}
+	boundary := route
+	boundary.LocalSocketPath = "/" + strings.Repeat("x", maxLocalSocketPathBytes-1)
+	if err := validateLocalHTTPRoute(boundary); err != nil {
+		t.Fatal("maximum supported socket path rejected")
+	}
+	for _, change := range []func(*LocalHTTPRoute){
+		func(r *LocalHTTPRoute) { r.LocalIP = "127.0.0.1" },
+		func(r *LocalHTTPRoute) { r.LocalPort = 8080 },
+		func(r *LocalHTTPRoute) { r.LocalSocketPath = "relative.sock" },
+		func(r *LocalHTTPRoute) { r.LocalSocketPath = "/a/../b" },
+		func(r *LocalHTTPRoute) { r.LocalSocketPath = "/" + strings.Repeat("x", maxLocalSocketPathBytes) },
+		func(r *LocalHTTPRoute) { r.LocalSocketPath = "/private/\x00.sock" },
+		func(r *LocalHTTPRoute) { r.LocalSocketPath = "/private/\r.sock" },
+		func(r *LocalHTTPRoute) { r.LocalSocketPath = "/private/\n.sock" },
+	} {
+		invalid := route
+		change(&invalid)
+		if err := validateLocalHTTPRoute(invalid); err == nil {
+			t.Fatal("invalid Unix target accepted")
+		} else if strings.Contains(err.Error(), invalid.LocalSocketPath) {
+			t.Fatal("invalid Unix target path leaked")
+		}
 	}
 }

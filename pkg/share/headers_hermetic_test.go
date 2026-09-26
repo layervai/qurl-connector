@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"sync/atomic"
 	"testing"
@@ -21,6 +22,17 @@ import (
 // Exercise the actual TLS connection, NewProxy registration and HTTP request
 // path. Fake session tests alone cannot establish that the origin gets the token.
 func TestHermeticRuntimeHeadersReachOnlyTheirOrigin(t *testing.T) {
+	testHermeticRuntimeHeadersReachOnlyTheirOrigin(t, false)
+}
+
+func TestHermeticUnixOriginHeadersAndMissingOrigin(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Unix file origin is not supported on Windows")
+	}
+	testHermeticRuntimeHeadersReachOnlyTheirOrigin(t, true)
+}
+
+func testHermeticRuntimeHeadersReachOnlyTheirOrigin(t *testing.T, unixOrigin bool) {
 	certificate := httptest.NewTLSServer(http.NotFoundHandler())
 	pair := certificate.TLS.Certificates[0]
 	certificate.Close()
@@ -40,13 +52,33 @@ func TestHermeticRuntimeHeadersReachOnlyTheirOrigin(t *testing.T) {
 	}
 	var expected atomic.Value
 	expected.Store("first-token")
-	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	origin := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get(testProxyTokenHeader) != expected.Load().(string) {
 			w.WriteHeader(http.StatusUnauthorized)
 			return
 		}
 		_, _ = io.WriteString(w, "protected-file")
 	}))
+	var socketPath string
+	// Keep the former TCP preview port bound until the occupant takes it, so no
+	// other process can claim it mid-test.
+	var previewListener net.Listener
+	if unixOrigin {
+		socketDir, err := os.MkdirTemp("/tmp", "qo-") // macOS t.TempDir paths can exceed sun_path.
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.RemoveAll(socketDir) })
+		socketPath = filepath.Join(socketDir, "f.sock")
+		listener, err := net.Listen("unix", socketPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		previewListener = origin.Listener
+		t.Cleanup(func() { _ = previewListener.Close() })
+		origin.Listener = listener
+	}
+	origin.Start()
 	defer origin.Close()
 	sibling := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get(testProxyTokenHeader) != "" {
@@ -56,7 +88,15 @@ func TestHermeticRuntimeHeadersReachOnlyTheirOrigin(t *testing.T) {
 		_, _ = io.WriteString(w, "sibling")
 	}))
 	defer sibling.Close()
-	response, err := http.Get(origin.URL)
+	originClient := &http.Client{Timeout: time.Second}
+	originURL := origin.URL
+	if unixOrigin {
+		originURL = "http://localhost/"
+		originClient.Transport = &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, "unix", socketPath)
+		}}
+	}
+	response, err := originClient.Get(originURL)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -89,7 +129,12 @@ func TestHermeticRuntimeHeadersReachOnlyTheirOrigin(t *testing.T) {
 	admission.OpenTime = 5 * time.Minute
 	admitter := &hermeticAdmitter{admissions: []Admission{admission}}
 	routes := groupTestRoutes("alpha", "beta")
-	routes[0].LocalPort = origin.Listener.Addr().(*net.TCPAddr).Port
+	if unixOrigin {
+		routes[0].LocalSocketPath = socketPath
+		routes[0].LocalIP, routes[0].LocalPort = "", 0
+	} else {
+		routes[0].LocalPort = origin.Listener.Addr().(*net.TCPAddr).Port
+	}
 	routes[0].RequestHeaders = map[string]string{testProxyTokenHeader: "first-token"}
 	routes[1].LocalPort = sibling.Listener.Addr().(*net.TCPAddr).Port
 	// Unknown issuers and wrong names must fail before any route can serve.
@@ -175,6 +220,39 @@ func TestHermeticRuntimeHeadersReachOnlyTheirOrigin(t *testing.T) {
 	// Do not retry through a stale proxy's unauthorized response here.
 	for range 10 {
 		assertProtectedRequest()
+	}
+	if unixOrigin {
+		origin.Close()
+		// Reuse the former TCP preview port while the real FRP client remains
+		// alive. No request (including its private headers) may reach this app.
+		var occupantRequests atomic.Int64
+		occupant := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			occupantRequests.Add(1)
+			w.WriteHeader(http.StatusCreated)
+			_, _ = io.WriteString(w, "unrelated-app")
+		}))
+		_ = occupant.Listener.Close()
+		occupant.Listener = previewListener
+		occupant.Start()
+		defer occupant.Close()
+		for range 10 {
+			request, err := http.NewRequest(http.MethodGet, "http://127.0.0.1:"+strconv.Itoa(port)+"/", nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			request.Host = "routing-alpha.example.test"
+			response, err := (&http.Client{Timeout: time.Second}).Do(request)
+			if err == nil {
+				_ = response.Body.Close()
+				if response.StatusCode < 400 || response.StatusCode > 599 {
+					t.Fatalf("missing Unix origin returned nonfailure status: %d", response.StatusCode)
+				}
+			}
+		}
+		if got := occupantRequests.Load(); got != 0 {
+			t.Fatalf("missing Unix origin forwarded %d requests to the TCP occupant", got)
+		}
+		pollHermeticRoute(t, port, "routing-beta.example.test", "sibling", result)
 	}
 	if got := admitter.admissionCount(); got != 1 {
 		t.Fatalf("token replacement used %d admissions, want one", got)
