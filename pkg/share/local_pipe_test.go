@@ -47,8 +47,12 @@ func TestLocalPipeRouteContract(t *testing.T) {
 	}
 	both := route
 	both.LocalSocketPath = "/tmp/file.sock"
-	if rendered := buildRouteProxy(both, "both").Plugin; rendered.ClientPluginOptions != nil || rendered.Type != "" {
-		t.Fatal("renderer let one private transport overwrite the other")
+	both.LocalIP, both.LocalPort = "127.0.0.1", 8080 // a bypassed validator must not fall back to TCP
+	if rendered := buildRouteProxy(both, "both"); rendered.Plugin.ClientPluginOptions != nil || rendered.Plugin.Type != "" || rendered.LocalIP != "" || rendered.LocalPort != 0 {
+		t.Fatal("renderer let a conflicting private route serve")
+	}
+	if formatted := both.String(); !strings.Contains(formatted, "LocalSocketPath:[REDACTED], LocalPipeName:[REDACTED]") || strings.Contains(formatted, name) {
+		t.Fatalf("both private origins not redacted: %s", formatted)
 	}
 	proxy := buildRouteProxy(route, "pipe-test")
 	var message msg.NewProxy

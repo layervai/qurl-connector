@@ -50,6 +50,8 @@ type LocalHTTPRoute struct {
 	// pipe is owned by this process's user and refuses it otherwise, so the
 	// producer must create the pipe unelevated: an elevated producer's pipe is
 	// owned by BUILTIN\Administrators and every request to it fails closed.
+	// The owner check does not restrict who else may open the producer's pipe;
+	// the producer owns that DACL (the default pipe DACL grants Everyone read).
 	LocalPipeName      string `json:"-" yaml:"-"`
 	ResourcePublicKey  string
 	ConnectorRoutingID string
@@ -169,7 +171,8 @@ func buildRouteProxy(route LocalHTTPRoute, proxyName string) *v1.HTTPProxyConfig
 	// bypassed validator from silently letting one transport overwrite the other.
 	switch {
 	case route.LocalSocketPath != "" && route.LocalPipeName != "":
-		// Leave the plugin unset and the TCP target empty: the route cannot serve.
+		// No plugin and no TCP target: FRP rejects the proxy rather than serving it.
+		proxy.LocalIP, proxy.LocalPort = "", 0
 	case route.LocalSocketPath != "":
 		proxy.Plugin = v1.TypedClientPluginOptions{
 			Type:                v1.PluginUnixDomainSocket,
