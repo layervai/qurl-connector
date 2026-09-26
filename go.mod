@@ -4,11 +4,13 @@ go 1.26.6
 
 require (
 	cloud.google.com/go/kms v1.33.0
+	github.com/Microsoft/go-winio v0.6.2
 	github.com/aws/aws-sdk-go-v2 v1.46.0
 	github.com/aws/aws-sdk-go-v2/config v1.33.3
 	github.com/aws/aws-sdk-go-v2/service/kms v1.59.0
 	github.com/denisbrodbeck/machineid v1.0.1
 	github.com/fatedier/frp v0.71.0
+	github.com/fatedier/golib v0.8.2
 	github.com/googleapis/gax-go/v2 v2.24.1
 	github.com/layervai/qurl-go v0.14.0
 	github.com/spf13/cobra v1.10.2
@@ -44,7 +46,6 @@ require (
 	github.com/beorn7/perks v1.0.1 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/coreos/go-oidc/v3 v3.18.0 // indirect
-	github.com/fatedier/golib v0.8.2 // indirect
 	github.com/felixge/httpsnoop v1.0.4 // indirect
 	github.com/go-jose/go-jose/v4 v4.1.4 // indirect
 	github.com/go-logr/logr v1.4.3 // indirect
