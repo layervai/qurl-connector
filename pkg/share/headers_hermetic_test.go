@@ -32,7 +32,7 @@ func TestHermeticUnixOriginHeadersAndMissingOrigin(t *testing.T) {
 	testHermeticRuntimeHeadersReachOnlyTheirOrigin(t, true)
 }
 
-func testHermeticRuntimeHeadersReachOnlyTheirOrigin(t *testing.T, unixOrigin bool) {
+func testHermeticRuntimeHeadersReachOnlyTheirOrigin(t *testing.T, privateOrigin bool, pipeListeners ...net.Listener) {
 	certificate := httptest.NewTLSServer(http.NotFoundHandler())
 	pair := certificate.TLS.Certificates[0]
 	certificate.Close()
@@ -63,20 +63,25 @@ func testHermeticRuntimeHeadersReachOnlyTheirOrigin(t *testing.T, unixOrigin boo
 	// Keep the former TCP preview port bound until the occupant takes it, so no
 	// other process can claim it mid-test.
 	var previewListener net.Listener
-	if unixOrigin {
-		socketDir, err := os.MkdirTemp("/tmp", "qo-") // macOS t.TempDir paths can exceed sun_path.
-		if err != nil {
-			t.Fatal(err)
-		}
-		t.Cleanup(func() { _ = os.RemoveAll(socketDir) })
-		socketPath = filepath.Join(socketDir, "f.sock")
-		listener, err := net.Listen("unix", socketPath)
-		if err != nil {
-			t.Fatal(err)
-		}
+	if privateOrigin {
 		previewListener = origin.Listener
 		t.Cleanup(func() { _ = previewListener.Close() })
-		origin.Listener = listener
+		if len(pipeListeners) > 0 {
+			origin.Listener = pipeListeners[0]
+			socketPath = origin.Listener.Addr().String()
+		} else {
+			socketDir, err := os.MkdirTemp("/tmp", "qo-") // macOS t.TempDir paths can exceed sun_path.
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = os.RemoveAll(socketDir) })
+			socketPath = filepath.Join(socketDir, "f.sock")
+			listener, err := net.Listen("unix", socketPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			origin.Listener = listener
+		}
 	}
 	origin.Start()
 	defer origin.Close()
@@ -90,9 +95,12 @@ func testHermeticRuntimeHeadersReachOnlyTheirOrigin(t *testing.T, unixOrigin boo
 	defer sibling.Close()
 	originClient := &http.Client{Timeout: time.Second}
 	originURL := origin.URL
-	if unixOrigin {
+	if privateOrigin {
 		originURL = "http://localhost/"
 		originClient.Transport = &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			if len(pipeListeners) > 0 {
+				return DialLocalPipe(ctx, socketPath)
+			}
 			return (&net.Dialer{}).DialContext(ctx, "unix", socketPath)
 		}}
 	}
@@ -129,8 +137,12 @@ func testHermeticRuntimeHeadersReachOnlyTheirOrigin(t *testing.T, unixOrigin boo
 	admission.OpenTime = 5 * time.Minute
 	admitter := &hermeticAdmitter{admissions: []Admission{admission}}
 	routes := groupTestRoutes("alpha", "beta")
-	if unixOrigin {
-		routes[0].LocalSocketPath = socketPath
+	if privateOrigin {
+		if len(pipeListeners) > 0 {
+			routes[0].LocalPipeName = socketPath
+		} else {
+			routes[0].LocalSocketPath = socketPath
+		}
 		routes[0].LocalIP, routes[0].LocalPort = "", 0
 	} else {
 		routes[0].LocalPort = origin.Listener.Addr().(*net.TCPAddr).Port
@@ -221,7 +233,7 @@ func testHermeticRuntimeHeadersReachOnlyTheirOrigin(t *testing.T, unixOrigin boo
 	for range 10 {
 		assertProtectedRequest()
 	}
-	if unixOrigin {
+	if privateOrigin {
 		origin.Close()
 		// Reuse the former TCP preview port while the real FRP client remains
 		// alive. No request (including its private headers) may reach this app.
@@ -245,12 +257,12 @@ func testHermeticRuntimeHeadersReachOnlyTheirOrigin(t *testing.T, unixOrigin boo
 			if err == nil {
 				_ = response.Body.Close()
 				if response.StatusCode < 400 || response.StatusCode > 599 {
-					t.Fatalf("missing Unix origin returned nonfailure status: %d", response.StatusCode)
+					t.Fatalf("missing private origin returned nonfailure status: %d", response.StatusCode)
 				}
 			}
 		}
 		if got := occupantRequests.Load(); got != 0 {
-			t.Fatalf("missing Unix origin forwarded %d requests to the TCP occupant", got)
+			t.Fatalf("missing private origin forwarded %d requests to the TCP occupant", got)
 		}
 		pollHermeticRoute(t, port, "routing-beta.example.test", "sibling", result)
 	}

@@ -1706,7 +1706,7 @@ func TestHeaderlessUnixOriginRefusesAdminExposure(t *testing.T) {
 		"rendered config": buildErr,
 		"live update":     session.Update(context.Background(), groupRoutesOf(socketRoutes)),
 	} {
-		if err == nil || !strings.Contains(err.Error(), "Unix origins require FRP web server to be disabled") {
+		if err == nil || !strings.Contains(err.Error(), "private origins require FRP web server to be disabled") {
 			t.Fatalf("%s error=%v", name, err)
 		}
 		assertNoDisclosure(t, err, "private-owner", "file.sock")
