@@ -144,7 +144,7 @@ jobs:
           log="$RUNNER_TEMP/windows-private-origin.log"
           CGO_ENABLED=0 go test -count=1 -v -run '^(TestLocalPipeNodeDefaultSecurity|TestHermeticNamedPipeOriginHeadersAndMissingOrigin)$' ./pkg/share | tee "$log"
           require() {
-            grep -qF -- "$1" "$log" || { echo "::error::missing private-origin evidence: $1 (a skipped Node test or an elevated runner whose pipes are Administrators-owned passes go test but proves nothing)"; exit 1; }
+            grep -qF -- "$1" "$log" || { echo "::error::missing private-origin evidence: $1 (a skipped Node test or an elevated runner whose default-owner policy makes pipes Administrators-owned passes go test but proves nothing)"; exit 1; }
           }
           require '--- PASS: TestLocalPipeNodeDefaultSecurity ('
           require 'verified Node HTTP request succeeded'

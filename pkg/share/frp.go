@@ -47,8 +47,9 @@ type LocalHTTPRoute struct {
 	// LocalPipeName selects a private Windows named-pipe HTTP origin instead
 	// of TCP, in the canonical form ValidateLocalPipeName accepts. It is
 	// runtime-only like LocalSocketPath. Every dial checks that the connected
-	// pipe is owned by this process's user and refuses it otherwise, so the
-	// producer must create the pipe unelevated: an elevated producer's pipe is
+	// pipe is owned by this process's user and refuses it otherwise. Where
+	// the "Default owner for objects created by members of the Administrators
+	// group" policy is set to Administrators, an elevated producer's pipe is
 	// owned by BUILTIN\Administrators and every request to it fails closed.
 	// The owner check does not restrict who else may open the producer's pipe;
 	// the producer owns that DACL (the default pipe DACL grants Everyone read).

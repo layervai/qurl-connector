@@ -88,7 +88,6 @@ func TestLocalPipeOwnerAndMissingOrigin(t *testing.T) {
 	}
 	for cause, class := range map[error]string{
 		windows.ERROR_ACCESS_DENIED: ": access denied",
-		winio.ErrTimeout:            ": timeout",
 		context.DeadlineExceeded:    ": timeout",
 		context.Canceled:            ": canceled",
 		errors.New("other"):         "open local named-pipe origin failed",
@@ -174,7 +173,7 @@ func TestLocalPipeRejectedOwnerSendsNoBytes(t *testing.T) {
 }
 
 // Node uses libuv's default pipe DACL, as Desktop does. Elevated accounts may
-// create an Administrators-owned pipe; those must fail closed, never waive the
+// create an Administrators-owned pipe (per the default-owner policy); those must fail closed, never waive the
 // current-user check. Node is supplied by the Windows CI lane.
 func TestLocalPipeNodeDefaultSecurity(t *testing.T) {
 	if _, err := exec.LookPath("node"); err != nil {

@@ -44,7 +44,7 @@ func localPipeOpenError(err error) error {
 		return errors.New("open local named-pipe origin failed: not found")
 	case errors.Is(err, windows.ERROR_ACCESS_DENIED):
 		return errors.New("open local named-pipe origin failed: access denied")
-	case errors.Is(err, winio.ErrTimeout), errors.Is(err, context.DeadlineExceeded):
+	case errors.Is(err, context.DeadlineExceeded):
 		return errors.New("open local named-pipe origin failed: timeout")
 	case errors.Is(err, context.Canceled):
 		return errors.New("open local named-pipe origin failed: canceled")
