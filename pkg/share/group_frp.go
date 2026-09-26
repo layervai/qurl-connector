@@ -793,7 +793,8 @@ func errText(err error) string {
 // under a new Generation: its old registration is still running on the
 // server under the old name, so reusing that name would report the stale
 // proxy as serving. A set with request headers is refused on a session whose
-// transport cannot carry them (see BuildConfig); the table is untouched.
+// transport cannot carry them, and a set with Unix origins is refused while
+// the FRP web server is enabled (see BuildConfig); the table is untouched.
 // The route table is authoritative from the moment Update returns: if the
 // push to FRP fails, the error is returned and the session keeps retrying the
 // push on every poll until FRP accepts it, so RouteStates never reports a

@@ -52,6 +52,9 @@ func TestLocalHTTPRouteStringRedactsHeaders(t *testing.T) {
 				if !strings.Contains(formatted, "RequestHeaders:[REDACTED]") {
 					t.Fatalf("%s omitted the redaction marker: %s", format, formatted)
 				}
+				if strings.Contains(formatted, "LocalSocketPath") {
+					t.Fatalf("%s marked a TCP route with a socket path: %s", format, formatted)
+				}
 				for _, secret := range []string{testProxyTokenHeader, testProxyTokenValue} {
 					if strings.Contains(formatted, secret) {
 						t.Fatalf("%s disclosed runtime request headers: %s", format, formatted)
@@ -448,6 +451,9 @@ func TestUnixHTTPRouteIsExclusiveLocalAndPrivate(t *testing.T) {
 	}
 	if strings.Contains(string(encoded), route.LocalSocketPath) || strings.Contains(fmt.Sprintf("%#v", route), route.LocalSocketPath) {
 		t.Fatal("Unix origin path escaped the local transport")
+	}
+	if !strings.Contains(route.String(), "LocalSocketPath:[REDACTED]") {
+		t.Fatalf("Unix origin omitted the redaction marker: %s", route)
 	}
 	for _, marshal := range []func(any) ([]byte, error){json.Marshal, yaml.Marshal} {
 		serialized, err := marshal(route)

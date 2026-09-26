@@ -60,7 +60,9 @@ func testHermeticRuntimeHeadersReachOnlyTheirOrigin(t *testing.T, unixOrigin boo
 		_, _ = io.WriteString(w, "protected-file")
 	}))
 	var socketPath string
-	previewAddress := origin.Listener.Addr().String()
+	// Keep the former TCP preview port bound until the occupant takes it, so no
+	// other process can claim it mid-test.
+	var previewListener net.Listener
 	if unixOrigin {
 		socketDir, err := os.MkdirTemp("/tmp", "qo-") // macOS t.TempDir paths can exceed sun_path.
 		if err != nil {
@@ -72,7 +74,8 @@ func testHermeticRuntimeHeadersReachOnlyTheirOrigin(t *testing.T, unixOrigin boo
 		if err != nil {
 			t.Fatal(err)
 		}
-		_ = origin.Listener.Close()
+		previewListener = origin.Listener
+		t.Cleanup(func() { _ = previewListener.Close() })
 		origin.Listener = listener
 	}
 	origin.Start()
@@ -229,10 +232,7 @@ func testHermeticRuntimeHeadersReachOnlyTheirOrigin(t *testing.T, unixOrigin boo
 			_, _ = io.WriteString(w, "unrelated-app")
 		}))
 		_ = occupant.Listener.Close()
-		occupant.Listener, err = net.Listen("tcp", previewAddress)
-		if err != nil {
-			t.Fatal(err)
-		}
+		occupant.Listener = previewListener
 		occupant.Start()
 		defer occupant.Close()
 		for range 10 {

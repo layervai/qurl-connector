@@ -525,7 +525,8 @@ func (r *SessionGroupRunner) Run(ctx context.Context) (retErr error) {
 // may not change in place (remove the route and add it again). Request
 // headers are copied on entry, so the caller keeps ownership of its map. A
 // set the session factory cannot carry (request headers over a transport
-// that would expose them) is refused before anything changes. A session
+// that would expose them, or Unix origins while the FRP web server is
+// enabled) is refused before anything changes. A session
 // that ends while the set is being applied is not an error: the desired set
 // is authoritative and the next cycle starts from it, and if applying fails
 // for any other reason (a canceled caller context, for instance) the error

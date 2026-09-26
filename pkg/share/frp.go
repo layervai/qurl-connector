@@ -61,9 +61,13 @@ type LocalHTTPRoute struct {
 // String keeps runtime request-header names and values out of logs,
 // assertions, and diagnostics.
 func (r LocalHTTPRoute) String() string {
+	socketPath := ""
+	if r.hasUnixOrigin() {
+		socketPath = ", LocalSocketPath:[REDACTED]"
+	}
 	return fmt.Sprintf(
-		"share.LocalHTTPRoute{RouteID:%q, LocalIP:%q, LocalPort:%d, ResourcePublicKey:%q, ConnectorRoutingID:%q, LocalSocketPath:[REDACTED], RequestHeaders:[REDACTED]}",
-		r.RouteID, r.LocalIP, r.LocalPort, r.ResourcePublicKey, r.ConnectorRoutingID,
+		"share.LocalHTTPRoute{RouteID:%q, LocalIP:%q, LocalPort:%d, ResourcePublicKey:%q, ConnectorRoutingID:%q%s, RequestHeaders:[REDACTED]}",
+		r.RouteID, r.LocalIP, r.LocalPort, r.ResourcePublicKey, r.ConnectorRoutingID, socketPath,
 	)
 }
 
