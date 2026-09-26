@@ -94,6 +94,28 @@ func TestLocalPipeRouteContract(t *testing.T) {
 	}
 }
 
+// The FRP registry is the only path from a route to a running pipe plugin.
+func TestLocalPipePluginCreator(t *testing.T) {
+	name := testLocalPipeName()
+	for _, options := range []v1.ClientPluginOptions{
+		nil,
+		(*localPipeOptions)(nil),
+		&v1.UnixDomainSocketPluginOptions{Type: v1.PluginUnixDomainSocket, UnixPath: "/tmp/file.sock"},
+		&localPipeOptions{PipeName: strings.ToUpper(name)},
+	} {
+		if p, err := plugin.Create(localPipePluginName, plugin.PluginContext{}, options); err == nil || p != nil || strings.Contains(err.Error(), name) {
+			t.Fatalf("creator accepted invalid options %T", options)
+		}
+	}
+	p, err := plugin.Create(localPipePluginName, plugin.PluginContext{}, &localPipeOptions{PipeName: name})
+	if (err == nil) != (runtime.GOOS == "windows") {
+		t.Fatalf("platform creation: %v", err)
+	}
+	if err == nil && (p.Name() != localPipePluginName || p.(*localPipePlugin).name != name) {
+		t.Fatal("creator lost the pipe target")
+	}
+}
+
 func TestLocalPipeHandleLogsRedactedDialFailure(t *testing.T) {
 	var logs bytes.Buffer
 	previous := slog.Default()

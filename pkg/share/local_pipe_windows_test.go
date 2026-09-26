@@ -76,11 +76,15 @@ func TestLocalPipeOwnerAndMissingOrigin(t *testing.T) {
 		t.Fatal("verification sent bytes")
 	}
 	_ = listener.Close()
-	// The read deadline above spent ctx; a missing pipe must report not found, not timeout.
-	missingCtx, missingCancel := context.WithTimeout(context.Background(), time.Second)
-	defer missingCancel()
-	if conn, err := DialLocalPipe(missingCtx, listener.Addr().String()); conn != nil || err == nil || strings.Contains(err.Error(), listener.Addr().String()) || !strings.HasSuffix(err.Error(), ": not found") {
-		t.Fatalf("missing pipe did not fail closed as not found: %v", err)
+	// The accepted instance keeps the closed pipe busy, so this surfaces as timeout.
+	if conn, err := DialLocalPipe(ctx, listener.Addr().String()); conn != nil || err == nil || strings.Contains(err.Error(), listener.Addr().String()) {
+		t.Fatal("missing pipe did not fail closed")
+	}
+	neverCtx, neverCancel := context.WithTimeout(context.Background(), time.Second)
+	defer neverCancel()
+	never := localPipePrefix + strings.Repeat("d", 64) + "-" + strings.Repeat("e", 32)
+	if conn, err := DialLocalPipe(neverCtx, never); conn != nil || err == nil || strings.Contains(err.Error(), never) || !strings.HasSuffix(err.Error(), ": not found") {
+		t.Fatalf("never-created pipe did not fail closed as not found: %v", err)
 	}
 	for cause, class := range map[error]string{
 		windows.ERROR_ACCESS_DENIED: ": access denied",

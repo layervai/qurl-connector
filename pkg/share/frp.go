@@ -44,7 +44,12 @@ type LocalHTTPRoute struct {
 	// untrusted principals cannot replace, and owns the listener lifetime;
 	// this library validates syntax and never unlinks or replaces the socket.
 	LocalSocketPath string `json:"-" yaml:"-"`
-	// LocalPipeName selects a current-user-owned Windows named pipe. Runtime-only.
+	// LocalPipeName selects a private Windows named-pipe HTTP origin instead
+	// of TCP, in the canonical form ValidateLocalPipeName accepts. It is
+	// runtime-only like LocalSocketPath. Every dial checks that the connected
+	// pipe is owned by this process's user and refuses it otherwise, so the
+	// producer must create the pipe unelevated: an elevated producer's pipe is
+	// owned by BUILTIN\Administrators and every request to it fails closed.
 	LocalPipeName      string `json:"-" yaml:"-"`
 	ResourcePublicKey  string
 	ConnectorRoutingID string
