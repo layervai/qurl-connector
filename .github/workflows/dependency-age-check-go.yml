@@ -55,6 +55,7 @@ jobs:
       exempt_module_prefixes: |
         github.com/layervai/qurl-go
         github.com/layervai/qurl-conformance
+        github.com/layervai/frp
       # Post a sticky PR comment when an age-check fails, listing each
       # pin with its eligible-after date and days remaining. The PR
       # author / reviewer sees the retry-after date inline on the PR
