@@ -21,9 +21,9 @@ func dialLocalPipe(ctx context.Context, name string, verify func(net.Conn) error
 	if err := ValidateLocalPipeName(name); err != nil {
 		return nil, err
 	}
-	// Anonymous SQOS is pinned here, not inherited from go-winio's default: the
-	// owner check runs after connect, so an unverified server must never be
-	// able to impersonate this client.
+	// Anonymous SQOS is pinned explicitly rather than relying on go-winio's
+	// (currently identical) default: the owner check runs after connect, so an
+	// unverified server must never be able to impersonate this client.
 	conn, err := winio.DialPipeAccessImpLevel(ctx, name, windows.GENERIC_READ|windows.GENERIC_WRITE|windows.READ_CONTROL, winio.PipeImpLevelAnonymous)
 	if err != nil {
 		return nil, localPipeOpenError(err)

@@ -51,6 +51,10 @@ func TestLocalPipeRouteContract(t *testing.T) {
 	if rendered := buildRouteProxy(both, "both"); rendered.Plugin.ClientPluginOptions != nil || rendered.Plugin.Type != "" || rendered.LocalIP != "" || rendered.LocalPort != 0 {
 		t.Fatal("renderer let a conflicting private route serve")
 	}
+	// FRP accepts port 0, so the rejection is ours: the route never reaches the renderer.
+	if validateLocalHTTPRoute(both) == nil {
+		t.Fatal("conflicting private route validated")
+	}
 	if formatted := both.String(); !strings.Contains(formatted, "LocalSocketPath:[REDACTED], LocalPipeName:[REDACTED]") || strings.Contains(formatted, name) {
 		t.Fatalf("both private origins not redacted: %s", formatted)
 	}

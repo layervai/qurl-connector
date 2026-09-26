@@ -171,7 +171,8 @@ func buildRouteProxy(route LocalHTTPRoute, proxyName string) *v1.HTTPProxyConfig
 	// bypassed validator from silently letting one transport overwrite the other.
 	switch {
 	case route.LocalSocketPath != "" && route.LocalPipeName != "":
-		// No plugin and no TCP target: FRP rejects the proxy rather than serving it.
+		// validateLocalHTTPRoute rejects this first. If bypassed, render no plugin
+		// and port 0: FRP accepts it, but 127.0.0.1:0 can never be dialed.
 		proxy.LocalIP, proxy.LocalPort = "", 0
 	case route.LocalSocketPath != "":
 		proxy.Plugin = v1.TypedClientPluginOptions{
