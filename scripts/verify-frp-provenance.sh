@@ -12,7 +12,8 @@ readonly module='github.com/layervai/frp'
 readonly repository='https://github.com/layervai/frp.git'
 
 # Signed v1.0.5 release on layerv/main (squash of reviewed head e6700eae, same
-# tree). The tag is pinned directly, so dependency and release are one commit.
+# tree). The pseudo-version names the release commit itself, avoiding the
+# generic new-release quarantine while this script proves it is the signed tag.
 readonly dependency_commit='5570a4205458a17f6f6d57c15348d72cbcb0a3b2'
 readonly release_commit='5570a4205458a17f6f6d57c15348d72cbcb0a3b2'
 
