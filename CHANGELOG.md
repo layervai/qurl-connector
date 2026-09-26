@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.14.1](https://github.com/layervai/qurl-connector/compare/v0.14.0...v0.14.1) (2026-09-26)
+
+
+### Features
+
+* **share:** support private Unix HTTP origins ([#101](https://github.com/layervai/qurl-connector/issues/101)) ([6807403](https://github.com/layervai/qurl-connector/commit/6807403b99f933ac6a1fb6385bfb5af88946b31f))
+
+
+### Bug Fixes
+
+* **share:** learn rotation lead from added route batches ([#98](https://github.com/layervai/qurl-connector/issues/98)) ([9bf80ef](https://github.com/layervai/qurl-connector/commit/9bf80efa95ffd68a904686aa84b9553bb86cee73))
+* **share:** verify tunnel server certificates by default ([#100](https://github.com/layervai/qurl-connector/issues/100)) ([530cdf7](https://github.com/layervai/qurl-connector/commit/530cdf70bb1f47f55182c1c491998d7afcde325f))
+
 ## [0.14.0](https://github.com/layervai/qurl-connector/compare/v0.13.2...v0.14.0) (2026-09-16)
 
 
