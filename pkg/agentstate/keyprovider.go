@@ -24,6 +24,11 @@ const (
 	// The key bytes arrive through an inherited anonymous descriptor and never
 	// belong in argv, environment values, or a disk file.
 	KeyProviderLocalKey = "local-key"
+	// KeyProviderTPM seals the qurl-go state DEK to this machine's TPM 2.0.
+	// It needs nothing from the environment, so a namespace whose sealed
+	// envelope names it opens with LAYERV_KEY_PROVIDER unset, and a fresh
+	// namespace selects it by default whenever ProbeTPM succeeds.
+	KeyProviderTPM = "tpm"
 
 	// EnvLocalKeyFD names the inherited pipe or connected local socket
 	// containing exactly one 32-byte local wrapping key. The external qURL
@@ -67,17 +72,42 @@ type SealedPrivateKey struct {
 	CreatedAt         string            `json:"created_at"`
 }
 
-func selectedKeyProviderName() (string, error) {
+// explicitKeyProviderName returns the provider LAYERV_KEY_PROVIDER names, or
+// "" when it is unset and the namespace decides.
+func explicitKeyProviderName() (string, error) {
 	name := strings.ToLower(strings.TrimSpace(os.Getenv(EnvKeyProvider)))
 	if name == "" {
-		return KeyProviderFile, nil
+		return "", nil
 	}
 	switch name {
-	case KeyProviderFile, KeyProviderAWSKMS, KeyProviderGCPKMS, KeyProviderAWSNitro, KeyProviderGCPConfidentialSpace, KeyProviderLocalKey:
+	case KeyProviderFile, KeyProviderAWSKMS, KeyProviderGCPKMS, KeyProviderAWSNitro, KeyProviderGCPConfidentialSpace, KeyProviderLocalKey, KeyProviderTPM:
 		return name, nil
 	default:
-		return "", fmt.Errorf("%s must be one of %s, %s, %s, %s, %s, %s; got %q", EnvKeyProvider, KeyProviderFile, KeyProviderAWSKMS, KeyProviderGCPKMS, KeyProviderAWSNitro, KeyProviderGCPConfidentialSpace, KeyProviderLocalKey, name)
+		return "", fmt.Errorf("%s must be one of %s, %s, %s, %s, %s, %s, %s; got %q", EnvKeyProvider, KeyProviderFile, KeyProviderAWSKMS, KeyProviderGCPKMS, KeyProviderAWSNitro, KeyProviderGCPConfidentialSpace, KeyProviderLocalKey, KeyProviderTPM, name)
 	}
+}
+
+// KeyProviderRequiresEnvironment reports whether a provider can only be
+// constructed from LAYERV_KEY_PROVIDER and its companion variables. The file
+// and tpm providers carry no key material in the environment, so a namespace
+// using them can be served by a credential-free managed daemon.
+func KeyProviderRequiresEnvironment(name string) bool {
+	switch name {
+	case KeyProviderFile, KeyProviderTPM:
+		return false
+	default:
+		return true
+	}
+}
+
+// defaultFreshKeyProvider is the provider a namespace holding no envelope uses
+// when LAYERV_KEY_PROVIDER is unset: the TPM when this process can use one,
+// otherwise the plaintext file. Tests replace it to stay hermetic.
+var defaultFreshKeyProvider = func() string {
+	if ProbeTPM() == nil {
+		return KeyProviderTPM
+	}
+	return KeyProviderFile
 }
 
 func defaultKeyProviderForName(name string) (KeyProvider, error) {
@@ -92,6 +122,8 @@ func defaultKeyProviderForName(name string) (KeyProvider, error) {
 		return newGCPConfidentialSpaceKeyProviderFromEnv()
 	case KeyProviderLocalKey:
 		return newLocalKeyProviderFromEnv()
+	case KeyProviderTPM:
+		return newTPMKeyProvider()
 	default:
 		return nil, fmt.Errorf("unsupported envelope key provider %q", name)
 	}
