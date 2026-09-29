@@ -227,3 +227,22 @@ func TestProbeTPMCachesItsFirstResult(t *testing.T) {
 		t.Fatalf("ProbeTPM opened the TPM %d times, want 1", calls)
 	}
 }
+
+// TestResolveKeyProviderFollowsSymlinkedAncestors pins that resolution does not
+// impose the Connector namespace's ancestor rules: embedders open the plaintext
+// envelope with qurl-go's own capability, which accepts a state directory
+// reached through a symlinked home or temporary directory.
+func TestResolveKeyProviderFollowsSymlinkedAncestors(t *testing.T) {
+	setFreshKeyProviderForTest(t, KeyProviderFile)
+	t.Setenv(EnvKeyProvider, "")
+	real := secureSDKStateDir(t)
+	writePinnedSDKTestFile(t, real, SealedAgentStateFile, []byte(`{"provider_id":"tpm"}`), 0o600)
+	link := filepath.Join(realSDKTempDir(t), "linked")
+	if err := os.Symlink(filepath.Dir(real), link); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	got, err := ResolveKeyProvider(filepath.Join(link, filepath.Base(real)))
+	if err != nil || got != KeyProviderTPM {
+		t.Fatalf("ResolveKeyProvider through a symlinked ancestor = %q, %v; want tpm", got, err)
+	}
+}
