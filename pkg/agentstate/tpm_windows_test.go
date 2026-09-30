@@ -28,3 +28,11 @@ func TestTBSStartupErrorsAreTransient(t *testing.T) {
 		}
 	}
 }
+
+// TestWindowsPrefersTheProvisionedSRK pins the order that keeps the owner
+// hierarchy, whose authorization Windows discards, from being asked first.
+func TestWindowsPrefersTheProvisionedSRK(t *testing.T) {
+	if tpmParentOrder[0] != tpmParentPersistentSRK {
+		t.Fatalf("Windows parent order = %v, want the persistent SRK first", tpmParentOrder)
+	}
+}

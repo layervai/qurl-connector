@@ -60,6 +60,7 @@ func TestResolveKeyProviderSelectsByEnvironmentThenEnvelopeThenDefault(t *testin
 		{name: "sealed envelope naming an unknown provider", files: map[string]string{SealedAgentStateFile: `{"provider_id":"hsm"}`}, wantErr: "unknown key provider \"hsm\""},
 		{name: "sealed envelope without a provider id", files: map[string]string{SealedAgentStateFile: `{}`}, wantErr: "does not name its key provider"},
 		{name: "explicit tpm over plaintext is not a migration", env: KeyProviderTPM, files: map[string]string{AgentStateFile: `{}`}, wantErr: "provider changes are not an in-place migration"},
+		{name: "explicit provider over another sealed provider is not a migration", env: KeyProviderLocalKey, files: map[string]string{SealedAgentStateFile: `{"provider_id":"tpm"}`}, wantErr: `sealed by "tpm"`},
 		{name: "explicit file over a tpm envelope is not a migration", env: KeyProviderFile, files: map[string]string{SealedAgentStateFile: `{"provider_id":"tpm"}`}, wantErr: "provider changes are not an in-place migration"},
 		{name: "unknown provider names tpm among the choices", env: "hsm", wantErr: "local-key, tpm; got \"hsm\""},
 	}

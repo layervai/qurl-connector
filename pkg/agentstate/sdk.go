@@ -503,9 +503,8 @@ type envelopeView interface {
 }
 
 // resolveKeyProvider selects the envelope provider for a namespace.
-// LAYERV_KEY_PROVIDER wins when set; here it is only checked against the kind
-// of the existing envelope (plaintext or sealed), and qurl-go rejects a sealed
-// envelope whose provider_id differs from the one it is opened with.
+// LAYERV_KEY_PROVIDER wins when set and must match the existing envelope: its
+// kind (plaintext or sealed) and, for a sealed one, its provider_id.
 // Unset, an existing envelope decides: plaintext is the file provider, and a
 // sealed envelope opens only when its provider needs nothing from the
 // environment (tpm); any other sealed provider must be named explicitly. A
@@ -556,6 +555,17 @@ func resolveKeyProvider(view envelopeView, probe bool) (string, error) {
 	}
 	if explicit == KeyProviderFile && sealedStateExists {
 		return "", fmt.Errorf("%s=%s conflicts with existing %s; provider changes are not an in-place migration", EnvKeyProvider, explicit, SealedAgentStateFile)
+	}
+	if sealedStateExists {
+		// Fail closed here rather than leave a provider mismatch to qurl-go,
+		// with a message that names both providers.
+		sealedProvider, err := sealedEnvelopeProvider(view)
+		if err != nil {
+			return "", err
+		}
+		if sealedProvider != explicit {
+			return "", fmt.Errorf("%s=%s conflicts with %s sealed by %q; provider changes are not an in-place migration", EnvKeyProvider, explicit, SealedAgentStateFile, sealedProvider)
+		}
 	}
 	if explicit != KeyProviderFile && fileStateExists {
 		return "", fmt.Errorf("%s=%s conflicts with existing %s; provider changes are not an in-place migration", EnvKeyProvider, explicit, AgentStateFile)
