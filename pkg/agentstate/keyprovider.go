@@ -3,8 +3,11 @@ package agentstate
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
+	"log/slog"
 	"os"
+	"slices"
 	"strings"
 	"time"
 )
@@ -24,6 +27,11 @@ const (
 	// The key bytes arrive through an inherited anonymous descriptor and never
 	// belong in argv, environment values, or a disk file.
 	KeyProviderLocalKey = "local-key"
+	// KeyProviderTPM seals the qurl-go state DEK to this machine's TPM 2.0.
+	// It needs nothing from the environment, so a namespace whose sealed
+	// envelope names it opens with LAYERV_KEY_PROVIDER unset, and a fresh
+	// namespace selects it by default whenever ProbeTPM succeeds.
+	KeyProviderTPM = "tpm"
 
 	// EnvLocalKeyFD names the inherited pipe or connected local socket
 	// containing exactly one 32-byte local wrapping key. The external qURL
@@ -67,16 +75,58 @@ type SealedPrivateKey struct {
 	CreatedAt         string            `json:"created_at"`
 }
 
-func selectedKeyProviderName() (string, error) {
+// keyProviderNames lists every accepted LAYERV_KEY_PROVIDER value, in the
+// order the error message names them. defaultKeyProviderForName must handle
+// every name here except file.
+var keyProviderNames = []string{
+	KeyProviderFile, KeyProviderAWSKMS, KeyProviderGCPKMS, KeyProviderAWSNitro,
+	KeyProviderGCPConfidentialSpace, KeyProviderLocalKey, KeyProviderTPM,
+}
+
+// explicitKeyProviderName returns the provider LAYERV_KEY_PROVIDER names, or
+// "" when it is unset and the namespace decides.
+func explicitKeyProviderName() (string, error) {
 	name := strings.ToLower(strings.TrimSpace(os.Getenv(EnvKeyProvider)))
-	if name == "" {
-		return KeyProviderFile, nil
-	}
-	switch name {
-	case KeyProviderFile, KeyProviderAWSKMS, KeyProviderGCPKMS, KeyProviderAWSNitro, KeyProviderGCPConfidentialSpace, KeyProviderLocalKey:
+	if name == "" || knownKeyProvider(name) {
 		return name, nil
+	}
+	return "", fmt.Errorf("%s must be one of %s; got %q", EnvKeyProvider, strings.Join(keyProviderNames, ", "), name)
+}
+
+func knownKeyProvider(name string) bool { return slices.Contains(keyProviderNames, name) }
+
+// KeyProviderRequiresEnvironment reports whether a provider can only be
+// constructed from LAYERV_KEY_PROVIDER and its companion variables. The file
+// and tpm providers carry no key material in the environment, so a namespace
+// using them can be served by a credential-free managed daemon.
+func KeyProviderRequiresEnvironment(name string) bool {
+	switch name {
+	case KeyProviderFile, KeyProviderTPM:
+		return false
 	default:
-		return "", fmt.Errorf("%s must be one of %s, %s, %s, %s, %s, %s; got %q", EnvKeyProvider, KeyProviderFile, KeyProviderAWSKMS, KeyProviderGCPKMS, KeyProviderAWSNitro, KeyProviderGCPConfidentialSpace, KeyProviderLocalKey, name)
+		return true
+	}
+}
+
+// defaultFreshKeyProvider is the provider a namespace holding no envelope uses
+// when LAYERV_KEY_PROVIDER is unset: the TPM when this process can use one,
+// otherwise the plaintext file. A TPM that exists but is not responding is an
+// error rather than a plaintext fallback, because the choice is permanent for
+// the namespace. Tests replace it to stay hermetic.
+var defaultFreshKeyProvider = func() (string, error) {
+	err := ProbeTPM()
+	switch {
+	case err == nil:
+		return KeyProviderTPM, nil
+	case errors.Is(err, ErrTPMNotResponding):
+		return "", fmt.Errorf("%w; retry, or set %s=%s to create plaintext state", err, EnvKeyProvider, KeyProviderFile)
+	case errors.Is(err, ErrTPMUnavailable):
+		slog.Debug("no usable TPM; new agent state will be plaintext", "reason", err)
+		return KeyProviderFile, nil
+	default:
+		// Plaintext is permanent for the namespace, so only a failure known to
+		// be structural may choose it; anything unclassified fails closed.
+		return "", err
 	}
 }
 
@@ -92,6 +142,8 @@ func defaultKeyProviderForName(name string) (KeyProvider, error) {
 		return newGCPConfidentialSpaceKeyProviderFromEnv()
 	case KeyProviderLocalKey:
 		return newLocalKeyProviderFromEnv()
+	case KeyProviderTPM:
+		return newTPMKeyProvider()
 	default:
 		return nil, fmt.Errorf("unsupported envelope key provider %q", name)
 	}

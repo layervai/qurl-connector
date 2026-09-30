@@ -33,6 +33,49 @@ path must use a local filesystem under a user-owned namespace where Windows can
 flush directory updates. Network paths and system-owned parents are not
 supported state locations.
 
+### Agent state key storage
+
+A new state directory is sealed to the machine's TPM 2.0 when the process can
+use one: the Linux resource manager `/dev/tpmrm0` (usually `tss` group
+membership) or TPM Base Services on Windows. macOS, and machines without a
+usable TPM, keep the owner-only plaintext envelope. A TPM that is present but
+not responding (busy, starting, timing out, or self-testing) fails the
+operation instead of falling back, because the choice is permanent for the
+directory. The TPM holds a random key that never leaves it; the state's data
+key is encrypted under that key. The choice is fixed when the directory is
+created:
+
+- `LAYERV_KEY_PROVIDER=file` keeps a new directory plaintext; `tpm` requires
+  the TPM. The cloud and `local-key` providers are unchanged. An empty or
+  whitespace value counts as unset, so a new directory then takes the TPM when
+  one is usable; set `file` explicitly to pin plaintext.
+- A TPM-sealed directory reopens with no environment, so the managed daemon
+  serves it like a plaintext one.
+- Existing directories keep their envelope. There is no migration in either
+  direction.
+- A TPM-sealed directory cannot be restored from backup onto other hardware,
+  carried by a VM clone or image, or read after the TPM is cleared. The error
+  says the storage root key changed. Recovery is to move the state directory
+  aside and enroll again. Enroll after cloning, or set
+  `LAYERV_KEY_PROVIDER=file` when building images.
+- Where the key is held under the owner hierarchy (the default outside
+  Windows), a TPM-sealed directory also stops opening if another component
+  later takes ownership of the TPM, most commonly booting Windows on a
+  dual-boot machine. The error names this cause; recovery is the same.
+- Each state load, and each save (which seals and then verifies), re-derives
+  the TPM storage key and runs one sealing command. That is fast on firmware
+  TPMs but can take a few seconds on discrete TPM chips. Saves and loads
+  happen on lifecycle events (enrollment, refresh, session changes), not per
+  request.
+
+Sealing binds the state to the machine; it does not protect it from other
+users of that machine. The sealed key has no password or boot-state policy,
+so anyone who can read the state file and reach the TPM on the same machine
+can unseal it. The owner-only file permissions remain the access boundary.
+What the TPM removes is the ability to copy the file and read it elsewhere.
+Sealing also does not authenticate the envelope: someone who can write the
+state directory can replace it, exactly as with plaintext state.
+
 `cmd/frpc` is retained for development and diagnostics. It is not a supported
 customer distribution, Homebrew formula, release binary, or container image.
 
@@ -50,6 +93,8 @@ embedded; the command fails closed unless an explicit trusted key is supplied.
   resource cannot register a different resource.
 - The managed daemon does not retain an account bearer. Account-authorized
   lifecycle changes remain in the foreground `qurl` command.
+- New agent state is sealed to the local TPM 2.0 when one is usable; see
+  [Agent state key storage](#agent-state-key-storage).
 - Connector state is owner-only and fails closed on unsafe permissions,
   symlinks, contradictory identity, or malformed persisted data.
 - Session renewal is make-before-break: a replacement must reach FRP's running

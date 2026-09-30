@@ -157,6 +157,7 @@ jobs:
   race:
     name: Race
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
@@ -164,6 +165,20 @@ jobs:
           go-version-file: go.mod
       - name: Run tests under the race detector
         run: make test-race
+      # The TPM simulator suite is cgo-only, so this is the one lane that can
+      # prove the tpm key provider against real TPM 2.0 commands. Require its
+      # PASS lines so a lost build tag or cgo toolchain cannot go green empty.
+      # It is an evidence gate only: make test-race above already ran these
+      # tests under -race, so do not add it here.
+      - name: Require TPM simulator evidence
+        run: |
+          set -euo pipefail
+          log="$(mktemp)"
+          tpm_tests="TestTPMProviderSealsToTheSimulator TestProbeTPMSucceedsOnTheSimulatorWithoutLeakingHandles TestTPMProviderFallsBackToThePersistentSRK TestSDKStoreDefaultsFreshNamespacesToTheTPM"
+          CGO_ENABLED=1 go test -count=1 -v -run "^($(echo "$tpm_tests" | tr ' ' '|'))$" ./pkg/agentstate | tee "$log"
+          for test_name in $tpm_tests; do
+            grep -qF -- "--- PASS: ${test_name} (" "$log" || { echo "::error::missing TPM simulator evidence: ${test_name}"; exit 1; }
+          done
 
   security:
     name: Security
