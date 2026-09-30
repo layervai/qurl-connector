@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.14.2](https://github.com/layervai/qurl-connector/compare/v0.14.1...v0.14.2) (2026-09-30)
+
+
+### Features
+
+* **agent:** seal native agent state to the local TPM ([#110](https://github.com/layervai/qurl-connector/issues/110)) ([0445261](https://github.com/layervai/qurl-connector/commit/04452618d47965bd0fd5625c13aca8abb7382b2c))
+
 ## [0.14.1](https://github.com/layervai/qurl-connector/compare/v0.14.0...v0.14.1) (2026-09-26)
 
 
