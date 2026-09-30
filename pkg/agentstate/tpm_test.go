@@ -472,3 +472,36 @@ func TestTPMCommandErrorKeepsRecordFailuresUnclassified(t *testing.T) {
 		t.Fatalf("retry warning = %v, want ErrTPMNotResponding", err)
 	}
 }
+
+// TestReadOnlyEntryPointsNeverProbeTheTPM pins that only a caller about to
+// create an envelope asks the TPM anything: display and validation paths on
+// an empty namespace must neither pay the probe nor fail on its result.
+func TestReadOnlyEntryPointsNeverProbeTheTPM(t *testing.T) {
+	t.Setenv(EnvKeyProvider, "")
+	original := defaultFreshKeyProvider
+	probed := 0
+	defaultFreshKeyProvider = func() (string, error) {
+		probed++
+		return "", ErrTPMNotResponding
+	}
+	t.Cleanup(func() { defaultFreshKeyProvider = original })
+
+	dir := secureSDKStateDir(t)
+	if err := ValidateSDKStoreLayoutReadOnly(dir); err != nil {
+		t.Fatalf("ValidateSDKStoreLayoutReadOnly: %v", err)
+	}
+	if err := ValidateSDKStoreLayout(dir); err != nil {
+		t.Fatalf("ValidateSDKStoreLayout: %v", err)
+	}
+	if reader, err := OpenSDKStateReader(dir, ""); err == nil {
+		_ = reader.Close()
+	} else if errors.Is(err, ErrTPMNotResponding) {
+		t.Fatalf("OpenSDKStateReader failed on the probe: %v", err)
+	}
+	if probed != 0 {
+		t.Fatalf("read-only entry points probed the TPM %d times", probed)
+	}
+	if _, err := NewSDKStore(dir, ""); !errors.Is(err, ErrTPMNotResponding) || probed != 1 {
+		t.Fatalf("NewSDKStore = %v after %d probes, want the create path to probe once and refuse", err, probed)
+	}
+}

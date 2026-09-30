@@ -233,7 +233,7 @@ func ValidateSDKStoreLayout(dir string) (retErr error) {
 	defer func() {
 		retErr = errors.Join(retErr, namespace.Close())
 	}()
-	_, err = validateSDKStoreLayoutInNamespace(namespace)
+	_, err = validateSDKStoreLayoutInNamespace(namespace, false)
 	return err
 }
 
@@ -249,7 +249,7 @@ func ValidateSDKStoreLayoutReadOnly(dir string) (retErr error) {
 	defer func() {
 		retErr = errors.Join(retErr, namespace.Close())
 	}()
-	_, err = validateSDKStoreLayoutInNamespace(namespace)
+	_, err = validateSDKStoreLayoutInNamespace(namespace, false)
 	return err
 }
 
@@ -270,7 +270,7 @@ func OpenSDKStateReader(dir, configuredAgentID string) (_ qurl.AgentStateReader,
 		}
 	}()
 
-	providerName, err := validateSDKStoreLayoutInNamespace(namespace)
+	providerName, err := validateSDKStoreLayoutInNamespace(namespace, false)
 	if err != nil {
 		return nil, err
 	}
@@ -439,7 +439,7 @@ func NewSDKStore(dir, configuredAgentID string) (_ *SDKStore, retErr error) {
 		}
 	}()
 
-	providerName, err := validateSDKStoreLayoutInNamespace(namespace)
+	providerName, err := validateSDKStoreLayoutInNamespace(namespace, true)
 	if err != nil {
 		return nil, err
 	}
@@ -474,7 +474,11 @@ func NewSDKStore(dir, configuredAgentID string) (_ *SDKStore, retErr error) {
 	return finishSDKStore(namespace, store, store)
 }
 
-func validateSDKStoreLayoutInNamespace(namespace *pinnedfs.Directory) (string, error) {
+// validateSDKStoreLayoutInNamespace checks the namespace and resolves its
+// provider. Only a caller about to create an envelope passes probe: for the
+// read-only and validate-only callers an empty namespace resolves to the file
+// provider without touching the TPM, since there is nothing to read or seal.
+func validateSDKStoreLayoutInNamespace(namespace *pinnedfs.Directory, probe bool) (string, error) {
 	legacy, err := legacyArtifactsInNamespace(namespace)
 	if err != nil {
 		return "", err
@@ -482,13 +486,13 @@ func validateSDKStoreLayoutInNamespace(namespace *pinnedfs.Directory) (string, e
 	if len(legacy) != 0 {
 		return "", fmt.Errorf("legacy pre-native agent state found in %s (%s); this greenfield cutover does not migrate split key/TOML state: stop the Connector, clear the state directory, and enroll again", namespace.Path(), strings.Join(legacy, ", "))
 	}
-	return resolveKeyProviderInNamespace(namespace)
+	return resolveKeyProviderInNamespace(namespace, probe)
 }
 
 // resolveKeyProviderInNamespace resolves the provider inside the retained
 // Connector namespace capability.
-func resolveKeyProviderInNamespace(namespace *pinnedfs.Directory) (string, error) {
-	return resolveKeyProvider(pinnedEnvelopeView{namespace: namespace})
+func resolveKeyProviderInNamespace(namespace *pinnedfs.Directory, probe bool) (string, error) {
+	return resolveKeyProvider(pinnedEnvelopeView{namespace: namespace}, probe)
 }
 
 // envelopeView is the narrow read surface provider resolution needs: whether
@@ -504,7 +508,7 @@ type envelopeView interface {
 // sealed envelope opens only when its provider needs nothing from the
 // environment (tpm); any other sealed provider must be named explicitly. A
 // namespace holding no envelope takes defaultFreshKeyProvider.
-func resolveKeyProvider(view envelopeView) (string, error) {
+func resolveKeyProvider(view envelopeView, probe bool) (string, error) {
 	explicit, err := explicitKeyProviderName()
 	if err != nil {
 		return "", err
@@ -539,6 +543,8 @@ func resolveKeyProvider(view envelopeView) (string, error) {
 				return "", fmt.Errorf("%s is sealed by the %q key provider; set %s=%s and its companion variables to open it", SealedAgentStateFile, sealedProvider, EnvKeyProvider, sealedProvider)
 			}
 			return sealedProvider, nil
+		case !probe:
+			return KeyProviderFile, nil
 		default:
 			return defaultFreshKeyProvider()
 		}
@@ -645,7 +651,7 @@ func readBoundedSealedEnvelope(file io.Reader) ([]byte, error) {
 // selection; NewSDKStore additionally enforces the pinned namespace and the
 // legacy-artifact cutover.
 func ResolveKeyProvider(dir string) (string, error) {
-	return resolveKeyProvider(pathEnvelopeView{dir: ResolveDir(dir)})
+	return resolveKeyProvider(pathEnvelopeView{dir: ResolveDir(dir)}, true)
 }
 
 func finishSDKStore(namespace *pinnedfs.Directory, state qurl.AgentStateStore, continuity qurl.AgentStateContinuity) (*SDKStore, error) {

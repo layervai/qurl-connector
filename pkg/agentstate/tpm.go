@@ -11,7 +11,6 @@ import (
 	"fmt"
 	"io"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/google/go-tpm/tpm2"
@@ -106,9 +105,10 @@ func probeTPMOnce(open func() (tpmCloser, error)) (retErr error) {
 }
 
 // tpmOpenError marks a failure to open the device. Missing devices, missing
-// permission, and platforms without a TPM are structural; a busy device is not.
+// permission, and platforms without a TPM are structural; a busy device or a
+// resource manager that is still starting (tpmOpenTransient) is not.
 func tpmOpenError(err error) error {
-	if errors.Is(err, syscall.EBUSY) || errors.Is(err, syscall.EAGAIN) || errors.Is(err, syscall.EINTR) {
+	if tpmOpenTransient(err) {
 		return fmt.Errorf("%w: open TPM: %w", ErrTPMNotResponding, err)
 	}
 	return fmt.Errorf("%w: %w", ErrTPMUnavailable, err)
