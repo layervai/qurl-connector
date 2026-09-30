@@ -598,6 +598,9 @@ type tpmRecord struct {
 func (r tpmRecord) marshal() ([]byte, error) {
 	var out bytes.Buffer
 	out.WriteByte(byte(r.parent))
+	if len(r.sealed) == 0 {
+		return nil, errors.New("TPM record has no ciphertext")
+	}
 	for _, field := range [][]byte{r.parentName, r.public, r.private} {
 		if len(field) == 0 || len(field) > tpmMaxBlobBytes {
 			return nil, fmt.Errorf("TPM record field has %d bytes", len(field))

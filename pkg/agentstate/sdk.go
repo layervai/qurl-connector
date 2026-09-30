@@ -651,8 +651,11 @@ func readBoundedSealedEnvelope(file io.Reader) ([]byte, error) {
 }
 
 // ResolveKeyProvider reports which envelope provider NewSDKStore would use for
-// dir, without creating, repairing, or writing anything. A directory that
-// does not exist yet resolves like an empty one. It checks only provider
+// dir. It has no filesystem side effects, and a directory that does not exist
+// yet resolves like an empty one. For an empty namespace with
+// LAYERV_KEY_PROVIDER unset it probes the TPM: it may run TPM commands, it
+// fills the process-wide probe cache, and it returns ErrTPMNotResponding when
+// a TPM is present but does not answer. It checks only provider
 // selection; NewSDKStore additionally enforces the pinned namespace and the
 // legacy-artifact cutover.
 func ResolveKeyProvider(dir string) (string, error) {

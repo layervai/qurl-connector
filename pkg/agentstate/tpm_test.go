@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -189,6 +190,11 @@ func TestTPMRecordRoundTripAndRejectsMalformedRecords(t *testing.T) {
 	}
 	if _, err := (tpmRecord{parent: tpmParentTransientECCSRK}).marshal(); err == nil {
 		t.Error("marshal accepted empty TPM fields")
+	}
+	noCiphertext := record
+	noCiphertext.sealed = nil
+	if _, err := noCiphertext.marshal(); err == nil {
+		t.Error("marshal emitted a record without ciphertext, which parseTPMRecord refuses")
 	}
 }
 
@@ -572,5 +578,42 @@ func TestSelectTPMParentTreatsAnyTransientAttemptAsTransient(t *testing.T) {
 	}
 	if got := classifyTPMError(err); !errors.Is(got, ErrTPMNotResponding) {
 		t.Fatalf("classifyTPMError reclassified the mixed failure as %v", got)
+	}
+}
+
+// TestRunTPMBoundedConcurrentAbandonAndComplete drives the result handshake
+// from many goroutines at once, some finishing inside their deadline and some
+// abandoned, so the race lane can prove the abandoned/done accounting.
+func TestRunTPMBoundedConcurrentAbandonAndComplete(t *testing.T) {
+	originalBackoff := tpmWedgeBackoff
+	tpmWedgeBackoff = 0
+	t.Cleanup(func() { tpmWedgeBackoff = originalBackoff })
+	var wg sync.WaitGroup
+	for i := range 32 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			delay := time.Duration(i%4) * 5 * time.Millisecond
+			ctx, cancel := context.WithTimeout(context.Background(), 8*time.Millisecond)
+			defer cancel()
+			_, _ = runTPMBounded(ctx, func() ([]byte, error) {
+				time.Sleep(delay)
+				return []byte{1}, nil
+			}, scrubBytes)
+		}()
+	}
+	wg.Wait()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		tpmAbandoned.Lock()
+		n := tpmAbandoned.count
+		tpmAbandoned.Unlock()
+		if n == 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%d abandoned operations never drained", n)
+		}
+		time.Sleep(time.Millisecond)
 	}
 }
