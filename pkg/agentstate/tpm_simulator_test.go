@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"encoding/binary"
 	"errors"
 	"path/filepath"
 	"strings"
@@ -206,6 +207,7 @@ func TestTPMProviderFallsBackToThePersistentSRK(t *testing.T) {
 		}.Execute(sim)
 	})
 
+	lockoutBefore := tpmLockoutCounter(t, sim)
 	provider := tpmKeyProvider{}
 	dek := bytes.Repeat([]byte{0x33}, StateDEKSize)
 	sealed, err := provider.Seal(context.Background(), dek, map[string]string{"agent_id": "agent-a"})
@@ -230,6 +232,59 @@ func TestTPMProviderFallsBackToThePersistentSRK(t *testing.T) {
 	if remembered != tpmParentPersistentSRK {
 		t.Fatalf("remembered parent = %v, want the persistent SRK so later seals skip the refused owner hierarchy", remembered)
 	}
+	// With owner authorization set, the empty-password CreatePrimary on the
+	// owner hierarchy is never sent. The reference TPM does not charge its
+	// lockout counter for that refusal, so the proof is the command stream.
+	resetTPMParentMemo(t)
+	recorder := &commandRecorder{TPM: sim}
+	openTPM = func() (tpmCloser, error) { return recorder, nil }
+	if _, err := provider.Seal(context.Background(), dek, map[string]string{"agent_id": "agent-a"}); err != nil {
+		t.Fatalf("Seal without a remembered parent: %v", err)
+	}
+	if recorder.sent(tpm2.TPMCCCreatePrimary) {
+		t.Fatal("Seal asked the owner hierarchy for an authorization TPMA_PERMANENT says it refuses")
+	}
+	if after := tpmLockoutCounter(t, sim); after != lockoutBefore {
+		t.Fatalf("lockout counter went from %d to %d", lockoutBefore, after)
+	}
+}
+
+// commandRecorder records the command code of every command it forwards.
+type commandRecorder struct {
+	transport.TPM
+	codes []tpm2.TPMCC
+}
+
+// Close keeps the shared simulator alive across the provider's own cycles.
+func (*commandRecorder) Close() error { return nil }
+
+func (r *commandRecorder) Send(cmd []byte) ([]byte, error) {
+	if len(cmd) >= 10 {
+		r.codes = append(r.codes, tpm2.TPMCC(binary.BigEndian.Uint32(cmd[6:10])))
+	}
+	return r.TPM.Send(cmd)
+}
+
+func (r *commandRecorder) sent(code tpm2.TPMCC) bool {
+	for _, c := range r.codes {
+		if c == code {
+			return true
+		}
+	}
+	return false
+}
+
+func tpmLockoutCounter(t *testing.T, tpm transport.TPM) uint32 {
+	t.Helper()
+	rsp, err := tpm2.GetCapability{Capability: tpm2.TPMCapTPMProperties, Property: uint32(tpm2.TPMPTLockoutCounter), PropertyCount: 1}.Execute(tpm)
+	if err != nil {
+		t.Fatalf("read lockout counter: %v", err)
+	}
+	props, err := rsp.CapabilityData.Data.TPMProperties()
+	if err != nil || len(props.TPMProperty) == 0 || props.TPMProperty[0].Property != tpm2.TPMPTLockoutCounter {
+		t.Fatalf("decode lockout counter: %v", err)
+	}
+	return props.TPMProperty[0].Value
 }
 
 func TestSDKStoreDefaultsFreshNamespacesToTheTPM(t *testing.T) {

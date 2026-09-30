@@ -551,9 +551,42 @@ func (k tpmParent) String() string {
 	}
 }
 
+// tpmOwnerAuthSet reads TPMA_PERMANENT.ownerAuthSet, an unauthenticated
+// query. Where owner authorization is set, creating the transient SRK with an
+// empty password is an authorization failure, and hierarchy authorizations are
+// dictionary-attack protected: each attempt would charge the lockout counter
+// every other TPM consumer on the machine shares. An unreadable property is
+// treated as unset, the normal case outside Windows.
+func tpmOwnerAuthSet(tpm transport.TPM) bool {
+	rsp, err := tpm2.GetCapability{
+		Capability:    tpm2.TPMCapTPMProperties,
+		Property:      uint32(tpm2.TPMPTPermanent),
+		PropertyCount: 1,
+	}.Execute(tpm)
+	if err != nil {
+		return false
+	}
+	props, err := rsp.CapabilityData.Data.TPMProperties()
+	if err != nil {
+		return false
+	}
+	for _, prop := range props.TPMProperty {
+		if prop.Property == tpm2.TPMPTPermanent {
+			return prop.Value&tpmaPermanentOwnerAuthSet != 0
+		}
+	}
+	return false
+}
+
+// tpmaPermanentOwnerAuthSet is TPMA_PERMANENT bit 0 (TPM 2.0 Part 2 §8.6).
+const tpmaPermanentOwnerAuthSet = 1
+
 func openTPMParent(tpm transport.TPM, kind tpmParent) (tpmParentKey, error) {
 	switch kind {
 	case tpmParentTransientECCSRK:
+		if tpmOwnerAuthSet(tpm) {
+			return tpmParentKey{}, fmt.Errorf("%w: owner hierarchy has an authorization value", errTPMParentUnusable)
+		}
 		created, err := tpm2.CreatePrimary{
 			PrimaryHandle: tpm2.TPMRHOwner,
 			InPublic:      tpm2.New2B(tpmECCSRKTemplate()),
