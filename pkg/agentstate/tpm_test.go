@@ -53,6 +53,7 @@ func TestResolveKeyProviderSelectsByEnvironmentThenEnvelopeThenDefault(t *testin
 	}{
 		{name: "fresh namespace takes a usable TPM", freshDefault: KeyProviderTPM, want: KeyProviderTPM},
 		{name: "fresh namespace without a TPM stays plaintext", freshDefault: KeyProviderFile, want: KeyProviderFile},
+		{name: "set-but-empty provider counts as unset", env: "  ", freshDefault: KeyProviderTPM, want: KeyProviderTPM},
 		{name: "explicit file opts out of the TPM", env: KeyProviderFile, freshDefault: KeyProviderTPM, want: KeyProviderFile},
 		{name: "explicit tpm on a fresh namespace without a TPM", env: KeyProviderTPM, freshDefault: KeyProviderFile, wantErr: "LAYERV_KEY_PROVIDER=tpm: TPM 2.0 is unavailable"},
 		{name: "existing plaintext never migrates", freshDefault: KeyProviderTPM, files: map[string]string{AgentStateFile: `{}`}, want: KeyProviderFile},

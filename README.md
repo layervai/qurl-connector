@@ -46,7 +46,9 @@ key is encrypted under that key. The choice is fixed when the directory is
 created:
 
 - `LAYERV_KEY_PROVIDER=file` keeps a new directory plaintext; `tpm` requires
-  the TPM. The cloud and `local-key` providers are unchanged.
+  the TPM. The cloud and `local-key` providers are unchanged. An empty or
+  whitespace value counts as unset, so a new directory then takes the TPM when
+  one is usable; set `file` explicitly to pin plaintext.
 - A TPM-sealed directory reopens with no environment, so the managed daemon
   serves it like a plaintext one.
 - Existing directories keep their envelope. There is no migration in either
