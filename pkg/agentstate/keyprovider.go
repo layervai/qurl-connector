@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"slices"
 	"strings"
 	"time"
 )
@@ -73,29 +74,25 @@ type SealedPrivateKey struct {
 	CreatedAt         string            `json:"created_at"`
 }
 
+// keyProviderNames lists every accepted LAYERV_KEY_PROVIDER value, in the
+// order the error message names them. defaultKeyProviderForName must handle
+// every name here except file.
+var keyProviderNames = []string{
+	KeyProviderFile, KeyProviderAWSKMS, KeyProviderGCPKMS, KeyProviderAWSNitro,
+	KeyProviderGCPConfidentialSpace, KeyProviderLocalKey, KeyProviderTPM,
+}
+
 // explicitKeyProviderName returns the provider LAYERV_KEY_PROVIDER names, or
 // "" when it is unset and the namespace decides.
 func explicitKeyProviderName() (string, error) {
 	name := strings.ToLower(strings.TrimSpace(os.Getenv(EnvKeyProvider)))
-	if name == "" {
-		return "", nil
-	}
-	switch {
-	case knownKeyProvider(name):
+	if name == "" || knownKeyProvider(name) {
 		return name, nil
-	default:
-		return "", fmt.Errorf("%s must be one of %s, %s, %s, %s, %s, %s, %s; got %q", EnvKeyProvider, KeyProviderFile, KeyProviderAWSKMS, KeyProviderGCPKMS, KeyProviderAWSNitro, KeyProviderGCPConfidentialSpace, KeyProviderLocalKey, KeyProviderTPM, name)
 	}
+	return "", fmt.Errorf("%s must be one of %s; got %q", EnvKeyProvider, strings.Join(keyProviderNames, ", "), name)
 }
 
-func knownKeyProvider(name string) bool {
-	switch name {
-	case KeyProviderFile, KeyProviderAWSKMS, KeyProviderGCPKMS, KeyProviderAWSNitro, KeyProviderGCPConfidentialSpace, KeyProviderLocalKey, KeyProviderTPM:
-		return true
-	default:
-		return false
-	}
-}
+func knownKeyProvider(name string) bool { return slices.Contains(keyProviderNames, name) }
 
 // KeyProviderRequiresEnvironment reports whether a provider can only be
 // constructed from LAYERV_KEY_PROVIDER and its companion variables. The file

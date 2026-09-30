@@ -127,7 +127,7 @@ func TestTPMProviderSealsToTheSimulator(t *testing.T) {
 		}
 		tampered := sealed
 		tampered.CiphertextBase64 = base64.StdEncoding.EncodeToString(foreign)
-		if _, err := provider.Unseal(context.Background(), tampered); err == nil || !strings.Contains(err.Error(), "TPM was cleared") {
+		if _, err := provider.Unseal(context.Background(), tampered); !errors.Is(err, ErrTPMUnavailable) || !strings.Contains(err.Error(), "TPM was cleared") {
 			t.Fatalf("Unseal under another storage root = %v, want the TPM-cleared diagnosis", err)
 		}
 		requireNoTransientHandles(t, sim)

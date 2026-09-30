@@ -317,7 +317,7 @@ func unsealWithTPM(open func() (tpmCloser, error), record tpmRecord, public *tpm
 	}
 	defer func() { retErr = unsealCleanup(retErr, "flush storage parent", parent.flush(tpm)) }()
 	if !bytes.Equal(parent.name.Buffer, record.parentName) {
-		return nil, errors.New("TPM storage root key does not match the one this state was sealed under; the TPM was cleared or this state belongs to another machine")
+		return nil, fmt.Errorf("%w: TPM storage root key does not match the one this state was sealed under; the TPM was cleared or this state belongs to another machine", ErrTPMUnavailable)
 	}
 
 	loaded, err := tpm2.Load{

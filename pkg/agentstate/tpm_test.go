@@ -733,3 +733,17 @@ func TestExplicitTPMOnAFreshNamespaceFailsAtResolution(t *testing.T) {
 		t.Fatalf("explicit tpm over an existing tpm envelope = %q, %v; want it resolved without probing", got, err)
 	}
 }
+
+// TestEveryListedProviderIsConstructible pins that keyProviderNames and
+// defaultKeyProviderForName agree: a name accepted from the environment but
+// unknown to the factory would pass resolution and fail at first use.
+func TestEveryListedProviderIsConstructible(t *testing.T) {
+	for _, name := range keyProviderNames {
+		if name == KeyProviderFile {
+			continue
+		}
+		if _, err := defaultKeyProviderForName(name); err != nil && strings.Contains(err.Error(), "unsupported envelope key provider") {
+			t.Errorf("provider %q is accepted but the factory does not know it", name)
+		}
+	}
+}
