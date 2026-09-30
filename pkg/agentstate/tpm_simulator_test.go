@@ -8,6 +8,7 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -380,6 +381,56 @@ func TestTPMStateSealedUnderAMissingPersistentSRKNamesTheCause(t *testing.T) {
 	_, err = tpmKeyProvider{}.Unseal(context.Background(), sealed)
 	if !errors.Is(err, ErrTPMUnavailable) || !strings.Contains(err.Error(), "TPM was cleared or this state belongs to another machine") {
 		t.Fatalf("Unseal under a missing persistent SRK = %v, want the cleared-TPM diagnosis", err)
+	}
+	requireNoTransientHandles(t, sim)
+}
+
+// TestTPMProviderRefusesASymmetricPersistentSRK pins that a restricted
+// decrypt parent salted sessions cannot use is structural, not "retry".
+func TestTPMProviderRefusesASymmetricPersistentSRK(t *testing.T) {
+	sim := useTPMSimulator(t)
+	created, err := tpm2.CreatePrimary{
+		PrimaryHandle: tpm2.TPMRHOwner,
+		InPublic: tpm2.New2B(tpm2.TPMTPublic{
+			Type:    tpm2.TPMAlgSymCipher,
+			NameAlg: tpm2.TPMAlgSHA256,
+			ObjectAttributes: tpm2.TPMAObject{
+				FixedTPM: true, FixedParent: true, SensitiveDataOrigin: true,
+				UserWithAuth: true, NoDA: true, Restricted: true, Decrypt: true,
+			},
+			Parameters: tpm2.NewTPMUPublicParms(tpm2.TPMAlgSymCipher, &tpm2.TPMSSymCipherParms{
+				Sym: tpm2.TPMTSymDefObject{
+					Algorithm: tpm2.TPMAlgAES,
+					KeyBits:   tpm2.NewTPMUSymKeyBits(tpm2.TPMAlgAES, tpm2.TPMKeyBits(128)),
+					Mode:      tpm2.NewTPMUSymMode(tpm2.TPMAlgAES, tpm2.TPMAlgCFB),
+				},
+			}),
+		}),
+	}.Execute(sim)
+	if err != nil {
+		t.Fatalf("create symmetric storage key: %v", err)
+	}
+	if _, err := (tpm2.EvictControl{
+		Auth:             tpm2.TPMRHOwner,
+		ObjectHandle:     &tpm2.NamedHandle{Handle: created.ObjectHandle, Name: created.Name},
+		PersistentHandle: tpmPersistentSRKHandle,
+	}).Execute(sim); err != nil {
+		t.Fatalf("persist symmetric storage key: %v", err)
+	}
+	if err := flushTPMHandle(sim, created.ObjectHandle); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = tpm2.EvictControl{
+			Auth:             tpm2.TPMRHOwner,
+			ObjectHandle:     &tpm2.NamedHandle{Handle: tpmPersistentSRKHandle, Name: created.Name},
+			PersistentHandle: tpmPersistentSRKHandle,
+		}.Execute(sim)
+	})
+	resetTPMParentMemo(t)
+	_, err = openTPMParent(sim, tpmParentPersistentSRK)
+	if !errors.Is(classifyTPMError(err), ErrTPMUnavailable) || !strings.Contains(fmt.Sprint(err), "not an asymmetric storage key") {
+		t.Fatalf("persistent symmetric SRK = %v, want a structural refusal", err)
 	}
 	requireNoTransientHandles(t, sim)
 }

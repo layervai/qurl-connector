@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -439,9 +440,18 @@ func NewSDKStore(dir, configuredAgentID string) (_ *SDKStore, retErr error) {
 		}
 	}()
 
+	sealedExisted, err := pathExistsInNamespace(namespace, SealedAgentStateFile)
+	if err != nil {
+		return nil, err
+	}
 	providerName, err := validateSDKStoreLayoutInNamespace(namespace, true)
 	if err != nil {
 		return nil, err
+	}
+	if providerName == KeyProviderTPM && !sealedExisted {
+		// Logged where the sealed store is actually created, not in
+		// resolution, which also serves pure queries.
+		slog.Info("new agent state in this directory will be sealed to the local TPM; it will not be readable on other hardware or after a TPM clear", "key_provider", KeyProviderTPM)
 	}
 	// The pinned qurl-go dependency writes both plaintext and sealed envelopes
 	// through its protected-ACL Windows pinned-state implementation.

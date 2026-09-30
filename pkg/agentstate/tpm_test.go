@@ -29,6 +29,9 @@ var originalDefaultFreshKeyProvider = defaultFreshKeyProvider
 
 func TestMain(m *testing.M) {
 	defaultFreshKeyProvider = func() (string, error) { return KeyProviderFile, nil }
+	// Close the explicit-tpm route to the host TPM too; tests that need a
+	// TPM install their own opener and restore this one.
+	openTPM = func() (tpmCloser, error) { return nil, os.ErrNotExist }
 	os.Exit(m.Run())
 }
 

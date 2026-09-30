@@ -656,6 +656,11 @@ func openTPMParent(tpm transport.TPM, kind tpmParent) (tpmParentKey, error) {
 		if err != nil {
 			return tpmParentKey{}, fmt.Errorf("%w: decode persistent SRK public area: %w", errTPMParentUnusable, err)
 		}
+		// tpm2.Salted only supports RSA and ECC parents; any other type would
+		// pass the probe and then fail every seal as if the TPM were busy.
+		if public.Type != tpm2.TPMAlgRSA && public.Type != tpm2.TPMAlgECC {
+			return tpmParentKey{}, fmt.Errorf("%w: persistent SRK is not an asymmetric storage key", errTPMParentUnusable)
+		}
 		attrs := public.ObjectAttributes
 		if !attrs.FixedTPM || !attrs.FixedParent || !attrs.Restricted || !attrs.Decrypt || attrs.SignEncrypt {
 			return tpmParentKey{}, fmt.Errorf("%w: persistent SRK is not a restricted storage key", errTPMParentUnusable)
