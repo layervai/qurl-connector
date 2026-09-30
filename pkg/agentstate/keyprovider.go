@@ -3,6 +3,7 @@ package agentstate
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -102,12 +103,19 @@ func KeyProviderRequiresEnvironment(name string) bool {
 
 // defaultFreshKeyProvider is the provider a namespace holding no envelope uses
 // when LAYERV_KEY_PROVIDER is unset: the TPM when this process can use one,
-// otherwise the plaintext file. Tests replace it to stay hermetic.
-var defaultFreshKeyProvider = func() string {
-	if ProbeTPM() == nil {
-		return KeyProviderTPM
+// otherwise the plaintext file. A TPM that exists but is not responding is an
+// error rather than a plaintext fallback, because the choice is permanent for
+// the namespace. Tests replace it to stay hermetic.
+var defaultFreshKeyProvider = func() (string, error) {
+	err := ProbeTPM()
+	switch {
+	case err == nil:
+		return KeyProviderTPM, nil
+	case errors.Is(err, ErrTPMNotResponding):
+		return "", fmt.Errorf("%w; retry, or set %s=%s to create plaintext state", err, EnvKeyProvider, KeyProviderFile)
+	default:
+		return KeyProviderFile, nil
 	}
-	return KeyProviderFile
 }
 
 func defaultKeyProviderForName(name string) (KeyProvider, error) {

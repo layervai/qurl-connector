@@ -4,26 +4,31 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
+	"github.com/google/go-tpm/tpm2"
 	qurl "github.com/layervai/qurl-go/qurl"
 )
 
 // TestMain pins the fresh-namespace default to the plaintext file so no test
 // touches the host's TPM. Tests that exercise the default replace it again.
+var originalDefaultFreshKeyProvider = defaultFreshKeyProvider
+
 func TestMain(m *testing.M) {
-	defaultFreshKeyProvider = func() string { return KeyProviderFile }
+	defaultFreshKeyProvider = func() (string, error) { return KeyProviderFile, nil }
 	os.Exit(m.Run())
 }
 
 func setFreshKeyProviderForTest(t *testing.T, name string) {
 	t.Helper()
 	original := defaultFreshKeyProvider
-	defaultFreshKeyProvider = func() string { return name }
+	defaultFreshKeyProvider = func() (string, error) { return name, nil }
 	t.Cleanup(func() { defaultFreshKeyProvider = original })
 }
 
@@ -261,7 +266,132 @@ func blockingTPM(t *testing.T) {
 	t.Cleanup(func() {
 		close(release)
 		openTPM = original
+		// Abandoned operations drain asynchronously; later tests must not
+		// start against a TPM this one left looking wedged.
+		deadline := time.Now().Add(5 * time.Second)
+		for {
+			tpmAbandoned.Lock()
+			n := tpmAbandoned.count
+			tpmAbandoned.Unlock()
+			if n == 0 {
+				return
+			}
+			if time.Now().After(deadline) {
+				t.Errorf("%d abandoned TPM operations never finished", n)
+				return
+			}
+			time.Sleep(time.Millisecond)
+		}
 	})
+}
+
+func resetTPMProbeForTest(t *testing.T) {
+	t.Helper()
+	reset := func() {
+		tpmProbe.Lock()
+		tpmProbe.done, tpmProbe.err = false, nil
+		tpmProbe.Unlock()
+	}
+	reset()
+	t.Cleanup(reset)
+}
+
+func TestTPMProviderFailsFastWhileAnEarlierOperationIsWedged(t *testing.T) {
+	blockingTPM(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	if _, err := (tpmKeyProvider{}).Seal(ctx, make([]byte, StateDEKSize), nil); !errors.Is(err, ErrTPMNotResponding) {
+		t.Fatalf("first Seal = %v, want ErrTPMNotResponding", err)
+	}
+	start := time.Now()
+	_, err := tpmKeyProvider{}.Seal(context.Background(), make([]byte, StateDEKSize), nil)
+	if !errors.Is(err, ErrTPMNotResponding) || !strings.Contains(err.Error(), "has not returned") {
+		t.Fatalf("second Seal = %v, want an immediate not-responding refusal", err)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("second Seal waited %s behind a wedged TPM", elapsed)
+	}
+}
+
+func TestProbeTPMIsBoundedAndDoesNotCacheATransientFailure(t *testing.T) {
+	resetTPMProbeForTest(t)
+	originalTimeout := tpmProbeTimeout
+	tpmProbeTimeout = 20 * time.Millisecond
+	t.Cleanup(func() { tpmProbeTimeout = originalTimeout })
+	blockingTPM(t)
+	if err := ProbeTPM(); !errors.Is(err, ErrTPMNotResponding) {
+		t.Fatalf("ProbeTPM against a wedged TPM = %v, want ErrTPMNotResponding", err)
+	}
+	tpmProbe.Lock()
+	cached := tpmProbe.done
+	tpmProbe.Unlock()
+	if cached {
+		t.Fatal("ProbeTPM cached a transient failure")
+	}
+}
+
+func TestProbeTPMRetriesABusyDeviceAndCachesAMissingOne(t *testing.T) {
+	resetTPMProbeForTest(t)
+	original := openTPM
+	t.Cleanup(func() { openTPM = original })
+	calls := 0
+	openErr := error(syscall.EBUSY)
+	openTPM = func() (tpmCloser, error) {
+		calls++
+		return nil, &os.PathError{Op: "open", Path: "/dev/tpmrm0", Err: openErr}
+	}
+	for range 2 {
+		if err := ProbeTPM(); !errors.Is(err, ErrTPMNotResponding) {
+			t.Fatalf("ProbeTPM on a busy device = %v, want ErrTPMNotResponding", err)
+		}
+	}
+	openErr = syscall.ENOENT
+	for range 2 {
+		if err := ProbeTPM(); !errors.Is(err, ErrTPMUnavailable) {
+			t.Fatalf("ProbeTPM on a missing device = %v, want ErrTPMUnavailable", err)
+		}
+	}
+	if calls != 3 {
+		t.Fatalf("ProbeTPM opened the device %d times, want 3 (two busy retries, one cached miss)", calls)
+	}
+}
+
+func TestFreshNamespaceRefusesPlaintextWhileTheTPMIsNotResponding(t *testing.T) {
+	resetTPMProbeForTest(t)
+	t.Setenv(EnvKeyProvider, "")
+	original := defaultFreshKeyProvider
+	defaultFreshKeyProvider = originalDefaultFreshKeyProvider
+	t.Cleanup(func() { defaultFreshKeyProvider = original })
+	originalOpen := openTPM
+	t.Cleanup(func() { openTPM = originalOpen })
+	openTPM = func() (tpmCloser, error) { return nil, syscall.EBUSY }
+	_, err := ResolveKeyProvider(secureSDKStateDir(t))
+	if !errors.Is(err, ErrTPMNotResponding) || !strings.Contains(err.Error(), EnvKeyProvider+"="+KeyProviderFile) {
+		t.Fatalf("ResolveKeyProvider with a busy TPM = %v, want a not-responding error naming the opt-out", err)
+	}
+	openTPM = func() (tpmCloser, error) { return nil, os.ErrPermission }
+	if got, err := ResolveKeyProvider(secureSDKStateDir(t)); err != nil || got != KeyProviderFile {
+		t.Fatalf("ResolveKeyProvider without TPM permission = %q, %v; want the plaintext fallback", got, err)
+	}
+}
+
+func TestClassifyTPMErrorSeparatesStructuralFromTransient(t *testing.T) {
+	for name, tc := range map[string]struct {
+		err  error
+		want error
+	}{
+		"auth failure":       {err: tpm2.TPMRCBadAuth, want: ErrTPMUnavailable},
+		"handle not found":   {err: tpm2.TPMFmt1Error{}, want: ErrTPMUnavailable},
+		"retry warning":      {err: tpm2.TPMRCRetry, want: ErrTPMNotResponding},
+		"testing warning":    {err: tpm2.TPMRCTesting, want: ErrTPMNotResponding},
+		"device i/o":         {err: io.ErrUnexpectedEOF, want: ErrTPMNotResponding},
+		"deadline":           {err: context.DeadlineExceeded, want: ErrTPMNotResponding},
+		"already classified": {err: ErrTPMUnavailable, want: ErrTPMUnavailable},
+	} {
+		if got := classifyTPMError(tc.err); !errors.Is(got, tc.want) {
+			t.Errorf("%s: classifyTPMError(%v) = %v, want %v", name, tc.err, got, tc.want)
+		}
+	}
 }
 
 func TestTPMProviderSealHonorsTheCallerDeadline(t *testing.T) {

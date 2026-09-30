@@ -38,7 +38,9 @@ supported state locations.
 A new state directory is sealed to the machine's TPM 2.0 when the process can
 use one: the Linux resource manager `/dev/tpmrm0` (usually `tss` group
 membership) or TPM Base Services on Windows. macOS, and machines without a
-usable TPM, keep the owner-only plaintext envelope. The TPM holds a random key
+usable TPM, keep the owner-only plaintext envelope. A TPM that is present but
+not responding (busy, timing out, or self-testing) fails the operation instead
+of falling back, because the choice is permanent for the directory. The TPM holds a random key
 that never leaves it; the state's data key is encrypted under that key. The
 choice is fixed when the directory is created:
 

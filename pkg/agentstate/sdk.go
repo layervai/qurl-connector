@@ -540,7 +540,7 @@ func resolveKeyProvider(view envelopeView) (string, error) {
 			}
 			return sealedProvider, nil
 		default:
-			return defaultFreshKeyProvider(), nil
+			return defaultFreshKeyProvider()
 		}
 	}
 	if explicit == KeyProviderFile && sealedStateExists {

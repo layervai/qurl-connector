@@ -229,12 +229,7 @@ func TestSDKStoreDefaultsFreshNamespacesToTheTPM(t *testing.T) {
 	sim := useTPMSimulator(t)
 	t.Setenv(EnvKeyProvider, "")
 	original := defaultFreshKeyProvider
-	defaultFreshKeyProvider = func() string {
-		if ProbeTPM() == nil {
-			return KeyProviderTPM
-		}
-		return KeyProviderFile
-	}
+	defaultFreshKeyProvider = originalDefaultFreshKeyProvider
 	t.Cleanup(func() {
 		defaultFreshKeyProvider = original
 		tpmProbe.Lock()

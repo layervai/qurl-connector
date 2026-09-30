@@ -11,6 +11,8 @@ import (
 	"fmt"
 	"io"
 	"sync"
+	"syscall"
+	"time"
 
 	"github.com/google/go-tpm/tpm2"
 	"github.com/google/go-tpm/tpm2/transport"
@@ -51,6 +53,16 @@ type tpmCloser = transport.TPMCloser
 // simulator.
 var openTPM func() (tpmCloser, error) = openSystemTPM
 
+// ErrTPMNotResponding reports a TPM that is present but did not complete an
+// operation: a timeout, device I/O failure, or a TPM warning (retry, testing,
+// out of memory). Unlike ErrTPMUnavailable it is not a reason to fall back to
+// plaintext, because the TPM may answer on the next attempt.
+var ErrTPMNotResponding = errors.New("TPM 2.0 is not responding")
+
+// tpmProbeTimeout bounds ProbeTPM, which runs on the path that opens a fresh
+// namespace and has no caller context.
+var tpmProbeTimeout = 10 * time.Second
+
 var tpmProbe struct {
 	sync.Mutex
 	done bool
@@ -58,32 +70,67 @@ var tpmProbe struct {
 }
 
 // ProbeTPM reports whether this process can seal state under the local TPM:
-// it opens the TPM, prepares the storage root key, and releases both. The
-// first result is cached for the process lifetime.
+// it opens the TPM, prepares the storage root key, and releases both, within
+// tpmProbeTimeout. A nil result or an ErrTPMUnavailable one (no device, no
+// permission, no usable storage root key) is structural and cached for the
+// process lifetime. An ErrTPMNotResponding result is transient and is not
+// cached, so the next call probes again.
 func ProbeTPM() error {
 	tpmProbe.Lock()
 	defer tpmProbe.Unlock()
-	if !tpmProbe.done {
-		tpmProbe.err = probeTPMOnce()
-		tpmProbe.done = true
+	if tpmProbe.done {
+		return tpmProbe.err
 	}
-	return tpmProbe.err
+	ctx, cancel := context.WithTimeout(context.Background(), tpmProbeTimeout)
+	defer cancel()
+	open := openTPM
+	_, err := runTPMBounded(ctx, func() (struct{}, error) { return struct{}{}, probeTPMOnce(open) }, nil)
+	err = classifyTPMError(err)
+	if !errors.Is(err, ErrTPMNotResponding) {
+		tpmProbe.err, tpmProbe.done = err, true
+	}
+	return err
 }
 
-func probeTPMOnce() (retErr error) {
-	tpm, err := openTPM()
+func probeTPMOnce(open func() (tpmCloser, error)) (retErr error) {
+	tpm, err := open()
 	if err != nil {
-		return fmt.Errorf("%w: %w", ErrTPMUnavailable, err)
+		return tpmOpenError(err)
 	}
 	defer func() { retErr = errors.Join(retErr, tpm.Close()) }()
 	parent, err := selectTPMParent(tpm)
 	if err != nil {
+		return err
+	}
+	return parent.flush(tpm)
+}
+
+// tpmOpenError marks a failure to open the device. Missing devices, missing
+// permission, and platforms without a TPM are structural; a busy device is not.
+func tpmOpenError(err error) error {
+	if errors.Is(err, syscall.EBUSY) || errors.Is(err, syscall.EAGAIN) || errors.Is(err, syscall.EINTR) {
+		return fmt.Errorf("%w: open TPM: %w", ErrTPMNotResponding, err)
+	}
+	return fmt.Errorf("%w: %w", ErrTPMUnavailable, err)
+}
+
+// classifyTPMError sorts a probe failure into ErrTPMUnavailable (structural:
+// retrying cannot help) or ErrTPMNotResponding (transient). Errors already
+// carrying either sentinel keep it. A TPM error response is structural unless
+// it is a warning; anything else (a deadline, device I/O) is transient.
+func classifyTPMError(err error) error {
+	if err == nil || errors.Is(err, ErrTPMUnavailable) || errors.Is(err, ErrTPMNotResponding) {
+		return err
+	}
+	var rc tpm2.TPMRC
+	if errors.As(err, &rc) && !rc.IsWarning() {
 		return fmt.Errorf("%w: %w", ErrTPMUnavailable, err)
 	}
-	if err := parent.flush(tpm); err != nil {
+	var fmt1 tpm2.TPMFmt1Error
+	if errors.As(err, &fmt1) {
 		return fmt.Errorf("%w: %w", ErrTPMUnavailable, err)
 	}
-	return nil
+	return fmt.Errorf("%w: %w", ErrTPMNotResponding, err)
 }
 
 // tpmKeyProvider seals the qurl-go state DEK to this machine's TPM. The TPM
@@ -263,32 +310,68 @@ func unsealWithTPM(open func() (tpmCloser, error), record tpmRecord, public *tpm
 	return plaintext, nil
 }
 
+// tpmAbandoned counts TPM operations whose caller gave up while they were
+// still blocked in the device. While one is outstanding the TPM is presumed
+// wedged and new operations fail fast instead of each parking another
+// goroutine and descriptor behind it.
+var tpmAbandoned struct {
+	sync.Mutex
+	count int
+}
+
 // runTPMBounded runs one TPM round trip under ctx. TPM commands are blocking
 // device I/O with no deadline of their own, so a wedged TPM or a long command
 // queued ahead of this one would otherwise hang the caller past the key
-// provider timeout. On expiry the caller gets ctx's error while op finishes in
-// the background on its own transport; discard then scrubs a late result.
+// provider timeout. On expiry the caller gets ErrTPMNotResponding while op
+// finishes in the background on its own transport; discard then scrubs a late
+// result. At most the operations already in flight when the TPM wedged are
+// ever abandoned: later calls fail immediately until those finish.
 func runTPMBounded[T any](ctx context.Context, op func() (T, error), discard func(T)) (T, error) {
+	var zero T
+	tpmAbandoned.Lock()
+	wedged := tpmAbandoned.count > 0
+	tpmAbandoned.Unlock()
+	if wedged {
+		return zero, fmt.Errorf("%w: an earlier TPM operation has not returned", ErrTPMNotResponding)
+	}
 	type result struct {
 		value T
 		err   error
 	}
+	var mu sync.Mutex
+	abandoned := false
 	done := make(chan result, 1)
 	go func() {
 		value, err := op()
-		done <- result{value: value, err: err}
+		mu.Lock()
+		defer mu.Unlock()
+		if !abandoned {
+			done <- result{value: value, err: err}
+			return
+		}
+		if err == nil && discard != nil {
+			discard(value)
+		}
+		tpmAbandoned.Lock()
+		tpmAbandoned.count--
+		tpmAbandoned.Unlock()
 	}()
 	select {
 	case r := <-done:
 		return r.value, r.err
 	case <-ctx.Done():
-		go func() {
-			if r := <-done; r.err == nil && discard != nil {
-				discard(r.value)
-			}
-		}()
-		var zero T
-		return zero, fmt.Errorf("TPM operation abandoned: %w", ctx.Err())
+		mu.Lock()
+		defer mu.Unlock()
+		select {
+		case r := <-done:
+			return r.value, r.err
+		default:
+		}
+		abandoned = true
+		tpmAbandoned.Lock()
+		tpmAbandoned.count++
+		tpmAbandoned.Unlock()
+		return zero, fmt.Errorf("%w: operation abandoned: %w", ErrTPMNotResponding, ctx.Err())
 	}
 }
 
