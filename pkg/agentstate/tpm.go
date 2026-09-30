@@ -506,6 +506,7 @@ func selectTPMParent(tpm transport.TPM) (tpmParentKey, error) {
 		}
 	}
 	var errs []error
+	transient := false
 	for _, kind := range order {
 		parent, err := openTPMParent(tpm, kind)
 		if err == nil {
@@ -514,9 +515,19 @@ func selectTPMParent(tpm transport.TPM) (tpmParentKey, error) {
 			tpmParentMemo.Unlock()
 			return parent, nil
 		}
+		transient = transient || errors.Is(classifyTPMError(err), ErrTPMNotResponding)
 		errs = append(errs, fmt.Errorf("%s: %w", kind, err))
 	}
-	return tpmParentKey{}, fmt.Errorf("no usable storage root key: %w", errors.Join(errs...))
+	// Classify here, per attempt, rather than letting a caller run errors.As
+	// over the join: when one parent failed transiently and the other
+	// structurally, the first match in the tree would decide, and a transient
+	// failure read as structural is cached as "no TPM" for the process. Any
+	// transient attempt makes the whole failure transient.
+	sentinel := ErrTPMUnavailable
+	if transient {
+		sentinel = ErrTPMNotResponding
+	}
+	return tpmParentKey{}, fmt.Errorf("%w: no usable storage root key: %w", sentinel, errors.Join(errs...))
 }
 
 func (k tpmParent) String() string {

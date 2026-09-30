@@ -3,6 +3,7 @@ package agentstate
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"io"
@@ -448,7 +449,11 @@ func TestTPMWedgeGateReopensAfterItsBackoff(t *testing.T) {
 	if _, err := (tpmKeyProvider{}).Seal(ctx, make([]byte, StateDEKSize), nil); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("first Seal = %v, want an abandoned deadline", err)
 	}
-	if _, err := (tpmKeyProvider{}).Seal(context.Background(), make([]byte, StateDEKSize), nil); err == nil || !strings.Contains(err.Error(), "has not returned") {
+	// Bounded so a scheduler delay past the short backoff fails the test
+	// instead of hanging it on the never-returning TPM.
+	refuseCtx, refuseCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer refuseCancel()
+	if _, err := (tpmKeyProvider{}).Seal(refuseCtx, make([]byte, StateDEKSize), nil); err == nil || !strings.Contains(err.Error(), "has not returned") {
 		t.Fatalf("Seal inside the backoff = %v, want an immediate refusal", err)
 	}
 	time.Sleep(60 * time.Millisecond)
@@ -536,4 +541,36 @@ func TestSealedEnvelopeReadsAreBoundedAndOwnerOnly(t *testing.T) {
 			t.Fatal("pinned resolution accepted a group/world-readable sealed envelope")
 		}
 	})
+}
+
+// mixedParentTPM answers the transient ECC SRK attempt with a TPM warning and
+// the persistent SRK attempt with a structural error.
+type mixedParentTPM struct{}
+
+func (mixedParentTPM) Send(cmd []byte) ([]byte, error) {
+	code := tpm2.TPMRCRetry
+	if len(cmd) >= 10 && binary.BigEndian.Uint32(cmd[6:10]) == uint32(tpm2.TPMCCReadPublic) {
+		code = tpm2.TPMRCHandle
+	}
+	rsp := make([]byte, 10)
+	binary.BigEndian.PutUint16(rsp[0:2], uint16(tpm2.TPMSTNoSessions))
+	binary.BigEndian.PutUint32(rsp[2:6], 10)
+	binary.BigEndian.PutUint32(rsp[6:10], uint32(code))
+	return rsp, nil
+}
+
+func (mixedParentTPM) Close() error { return nil }
+
+// TestSelectTPMParentTreatsAnyTransientAttemptAsTransient pins that a mixed
+// failure is not cached as "no TPM": one parent answering with a retry warning
+// means the TPM may yet work.
+func TestSelectTPMParentTreatsAnyTransientAttemptAsTransient(t *testing.T) {
+	resetTPMParentMemo(t)
+	_, err := selectTPMParent(mixedParentTPM{})
+	if !errors.Is(err, ErrTPMNotResponding) || errors.Is(err, ErrTPMUnavailable) {
+		t.Fatalf("selectTPMParent with one transient attempt = %v, want only ErrTPMNotResponding", err)
+	}
+	if got := classifyTPMError(err); !errors.Is(got, ErrTPMNotResponding) {
+		t.Fatalf("classifyTPMError reclassified the mixed failure as %v", got)
+	}
 }
