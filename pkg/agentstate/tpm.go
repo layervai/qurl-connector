@@ -204,6 +204,9 @@ func (p tpmKeyProvider) sealWithTPM(open func() (tpmCloser, error), plaintext []
 	if err != nil {
 		return SealedPrivateKey{}, tpmOpenError(err)
 	}
+	// Seal deliberately fails closed on cleanup errors, unlike tpmCleanup's
+	// unseal and probe callers: a seal is cheap to retry with a fresh KEK,
+	// while committing a record whose cleanup failed has no upside.
 	defer func() { retErr = errors.Join(retErr, tpm.Close()) }()
 	parent, err := selectTPMParent(tpm)
 	if err != nil {
@@ -300,7 +303,7 @@ func tpmCleanup(opErr error, label string, cleanupErr error) error {
 	if opErr != nil {
 		return errors.Join(opErr, fmt.Errorf("%s: %w", label, cleanupErr))
 	}
-	slog.Debug("TPM cleanup after a successful unseal failed", "step", label, "err", cleanupErr)
+	slog.Debug("TPM cleanup after a successful operation failed", "step", label, "err", cleanupErr)
 	return nil
 }
 
