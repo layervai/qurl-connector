@@ -58,6 +58,7 @@ func TestResolveKeyProviderSelectsByEnvironmentThenEnvelopeThenDefault(t *testin
 		{name: "local-key envelope still needs its environment", files: map[string]string{SealedAgentStateFile: `{"provider_id":"local-key"}`}, wantErr: "set LAYERV_KEY_PROVIDER=local-key"},
 		{name: "sealed envelope claiming the file provider is corrupt", freshDefault: KeyProviderTPM, files: map[string]string{SealedAgentStateFile: `{"provider_id":"file"}`}, wantErr: "never seals state"},
 		{name: "sealed envelope naming an unknown provider", files: map[string]string{SealedAgentStateFile: `{"provider_id":"hsm"}`}, wantErr: "unknown key provider \"hsm\""},
+		{name: "explicit provider over a sealed envelope without a provider id", env: KeyProviderTPM, files: map[string]string{SealedAgentStateFile: `{}`}, wantErr: "has no provider_id; the envelope is corrupt"},
 		{name: "sealed envelope without a provider id", files: map[string]string{SealedAgentStateFile: `{}`}, wantErr: "does not name its key provider"},
 		{name: "explicit tpm over plaintext is not a migration", env: KeyProviderTPM, files: map[string]string{AgentStateFile: `{}`}, wantErr: "provider changes are not an in-place migration"},
 		{name: "explicit provider over another sealed provider is not a migration", env: KeyProviderLocalKey, files: map[string]string{SealedAgentStateFile: `{"provider_id":"tpm"}`}, wantErr: `sealed by "tpm"`},
@@ -673,5 +674,40 @@ func TestSelectTPMParentTreatsItsOwnRejectionsAsStructural(t *testing.T) {
 	}
 	if !errors.Is(err, ErrTPMUnavailable) || errors.Is(err, ErrTPMNotResponding) {
 		t.Fatalf("selectTPMParent = %v, want only ErrTPMUnavailable", err)
+	}
+}
+
+func TestUnsealCleanupNeverFailsARecoveredKey(t *testing.T) {
+	cleanup := errors.New("flush failed")
+	if err := unsealCleanup(nil, "flush", cleanup); err != nil {
+		t.Fatalf("cleanup failure after a successful unseal = %v, want nil", err)
+	}
+	op := errors.New("unseal failed")
+	if err := unsealCleanup(op, "flush", cleanup); !errors.Is(err, op) || !errors.Is(err, cleanup) {
+		t.Fatalf("cleanup failure after a failed unseal = %v, want both errors", err)
+	}
+}
+
+func TestRunTPMBoundedScrubsALateResultReturnedWithAnError(t *testing.T) {
+	release := make(chan struct{})
+	scrubbed := make(chan []byte, 1)
+	late := []byte{7, 7, 7}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Millisecond)
+	defer cancel()
+	_, err := runTPMBounded(ctx, func() ([]byte, error) {
+		<-release
+		return late, errors.New("cleanup failed after unseal")
+	}, func(b []byte) { scrubBytes(b); scrubbed <- b })
+	if !errors.Is(err, ErrTPMNotResponding) {
+		t.Fatalf("runTPMBounded = %v, want abandonment", err)
+	}
+	close(release)
+	select {
+	case b := <-scrubbed:
+		if !bytes.Equal(b, []byte{0, 0, 0}) {
+			t.Fatalf("late result = %v, want scrubbed", b)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("late result returned with an error was never scrubbed")
 	}
 }

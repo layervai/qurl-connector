@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"sync"
 	"time"
 
@@ -279,17 +280,31 @@ func (p tpmKeyProvider) Unseal(ctx context.Context, sealed SealedPrivateKey) ([]
 	}, scrubBytes)
 }
 
+// unsealCleanup folds a cleanup failure into a failed unseal but only logs it
+// after a successful one: the DEK is already recovered and authenticated, and
+// a housekeeping hiccup must not make a healthy namespace look unreadable.
+func unsealCleanup(opErr error, label string, cleanupErr error) error {
+	if cleanupErr == nil {
+		return opErr
+	}
+	if opErr != nil {
+		return errors.Join(opErr, fmt.Errorf("%s: %w", label, cleanupErr))
+	}
+	slog.Debug("TPM cleanup after a successful unseal failed", "step", label, "err", cleanupErr)
+	return nil
+}
+
 func unsealWithTPM(open func() (tpmCloser, error), record tpmRecord, public *tpm2.TPM2BPublic, private *tpm2.TPM2BPrivate, aad []byte) (_ []byte, retErr error) {
 	tpm, err := open()
 	if err != nil {
 		return nil, tpmOpenError(err)
 	}
-	defer func() { retErr = errors.Join(retErr, tpm.Close()) }()
+	defer func() { retErr = unsealCleanup(retErr, "close TPM", tpm.Close()) }()
 	parent, err := openTPMParent(tpm, record.parent)
 	if err != nil {
 		return nil, classifyTPMError(err)
 	}
-	defer func() { retErr = errors.Join(retErr, parent.flush(tpm)) }()
+	defer func() { retErr = unsealCleanup(retErr, "flush storage parent", parent.flush(tpm)) }()
 	if !bytes.Equal(parent.name.Buffer, record.parentName) {
 		return nil, errors.New("TPM storage root key does not match the one this state was sealed under; the TPM was cleared or this state belongs to another machine")
 	}
@@ -302,7 +317,7 @@ func unsealWithTPM(open func() (tpmCloser, error), record tpmRecord, public *tpm
 	if err != nil {
 		return nil, tpmCommandError("load TPM sealed KEK", err)
 	}
-	defer func() { retErr = errors.Join(retErr, flushTPMHandle(tpm, loaded.ObjectHandle)) }()
+	defer func() { retErr = unsealCleanup(retErr, "flush sealed KEK", flushTPMHandle(tpm, loaded.ObjectHandle)) }()
 
 	unsealed, err := tpm2.Unseal{
 		ItemHandle: tpm2.AuthHandle{
@@ -380,7 +395,9 @@ func runTPMBounded[T any](ctx context.Context, op func() (T, error), discard fun
 			done <- result{value: value, err: err}
 			return
 		}
-		if err == nil && discard != nil {
+		// Scrub whatever came back, even alongside an error: a late result
+		// nobody will read must not outlive this goroutine unscrubbed.
+		if discard != nil {
 			discard(value)
 		}
 		tpmAbandoned.Lock()

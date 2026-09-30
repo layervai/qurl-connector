@@ -530,7 +530,7 @@ func resolveKeyProvider(view envelopeView, probe bool) (string, error) {
 		case fileStateExists:
 			return KeyProviderFile, nil
 		case sealedStateExists:
-			sealedProvider, err := sealedEnvelopeProvider(view)
+			sealedProvider, err := sealedEnvelopeProvider(view, false)
 			if err != nil {
 				return "", err
 			}
@@ -559,7 +559,7 @@ func resolveKeyProvider(view envelopeView, probe bool) (string, error) {
 	if sealedStateExists {
 		// Fail closed here rather than leave a provider mismatch to qurl-go,
 		// with a message that names both providers.
-		sealedProvider, err := sealedEnvelopeProvider(view)
+		sealedProvider, err := sealedEnvelopeProvider(view, true)
 		if err != nil {
 			return "", err
 		}
@@ -582,7 +582,7 @@ const maxSealedEnvelopeBytes = 2 << 20
 //
 // TODO(upstream-contract): mirrors qurl-go's sealedAgentStateEnvelope
 // provider_id field and its 2 MiB envelope bound.
-func sealedEnvelopeProvider(view envelopeView) (string, error) {
+func sealedEnvelopeProvider(view envelopeView, explicit bool) (string, error) {
 	raw, err := view.readSealed()
 	if err != nil {
 		return "", err
@@ -591,6 +591,11 @@ func sealedEnvelopeProvider(view envelopeView) (string, error) {
 		ProviderID string `json:"provider_id"`
 	}
 	if err := json.Unmarshal(raw, &header); err != nil || header.ProviderID == "" {
+		if explicit {
+			// The operator already named a provider; pointing them at the
+			// variable again would send them in a circle.
+			return "", fmt.Errorf("%s has no provider_id; the envelope is corrupt", SealedAgentStateFile)
+		}
 		return "", fmt.Errorf("%s does not name its key provider; set %s to the provider that sealed it", SealedAgentStateFile, EnvKeyProvider)
 	}
 	return header.ProviderID, nil
