@@ -6,9 +6,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"errors"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/go-tpm/tpm2"
 	"github.com/google/go-tpm/tpm2/transport"
@@ -91,6 +93,15 @@ func TestTPMProviderSealsToTheSimulator(t *testing.T) {
 	if !bytes.Equal(got, dek) {
 		t.Fatalf("Unseal = %x, want %x", got, dek)
 	}
+
+	t.Run("deadline", func(t *testing.T) {
+		blockingTPM(t)
+		ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+		defer cancel()
+		if _, err := provider.Unseal(ctx, sealed); !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("Unseal against a wedged TPM = %v, want DeadlineExceeded", err)
+		}
+	})
 
 	t.Run("binding tamper", func(t *testing.T) {
 		tampered := sealed

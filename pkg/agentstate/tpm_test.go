@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	qurl "github.com/layervai/qurl-go/qurl"
 )
@@ -43,6 +44,7 @@ func TestResolveKeyProviderSelectsByEnvironmentThenEnvelopeThenDefault(t *testin
 		{name: "tpm envelope opens without the environment", freshDefault: KeyProviderFile, files: map[string]string{SealedAgentStateFile: `{"provider_id":"tpm"}`}, want: KeyProviderTPM},
 		{name: "tpm envelope with explicit tpm", env: "TPM", files: map[string]string{SealedAgentStateFile: `{"provider_id":"tpm"}`}, want: KeyProviderTPM},
 		{name: "local-key envelope still needs its environment", files: map[string]string{SealedAgentStateFile: `{"provider_id":"local-key"}`}, wantErr: "set LAYERV_KEY_PROVIDER=local-key"},
+		{name: "sealed envelope claiming the file provider is corrupt", freshDefault: KeyProviderTPM, files: map[string]string{SealedAgentStateFile: `{"provider_id":"file"}`}, wantErr: "never seals state"},
 		{name: "sealed envelope without a provider id", files: map[string]string{SealedAgentStateFile: `{}`}, wantErr: "does not name its key provider"},
 		{name: "explicit tpm over plaintext is not a migration", env: KeyProviderTPM, files: map[string]string{AgentStateFile: `{}`}, wantErr: "provider changes are not an in-place migration"},
 		{name: "explicit file over a tpm envelope is not a migration", env: KeyProviderFile, files: map[string]string{SealedAgentStateFile: `{"provider_id":"tpm"}`}, wantErr: "provider changes are not an in-place migration"},
@@ -244,5 +246,34 @@ func TestResolveKeyProviderFollowsSymlinkedAncestors(t *testing.T) {
 	got, err := ResolveKeyProvider(filepath.Join(link, filepath.Base(real)))
 	if err != nil || got != KeyProviderTPM {
 		t.Fatalf("ResolveKeyProvider through a symlinked ancestor = %q, %v; want tpm", got, err)
+	}
+}
+
+// blockingTPM stands in for a wedged TPM: opening it blocks until release.
+func blockingTPM(t *testing.T) {
+	t.Helper()
+	release := make(chan struct{})
+	original := openTPM
+	openTPM = func() (tpmCloser, error) {
+		<-release
+		return nil, ErrTPMUnavailable
+	}
+	t.Cleanup(func() {
+		close(release)
+		openTPM = original
+	})
+}
+
+func TestTPMProviderSealHonorsTheCallerDeadline(t *testing.T) {
+	blockingTPM(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	_, err := tpmKeyProvider{}.Seal(ctx, make([]byte, StateDEKSize), map[string]string{"agent_id": "a"})
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Seal against a wedged TPM = %v, want DeadlineExceeded", err)
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Fatalf("Seal returned after %s, want promptly after the deadline", elapsed)
 	}
 }

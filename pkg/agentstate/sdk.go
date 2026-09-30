@@ -529,6 +529,12 @@ func resolveKeyProvider(view envelopeView) (string, error) {
 			if err != nil {
 				return "", err
 			}
+			if sealedProvider == KeyProviderFile {
+				// The file provider never writes a sealed envelope; resolving to it
+				// here would write plaintext beside this one and wedge the
+				// namespace behind the both-envelopes check for good.
+				return "", fmt.Errorf("%s names the %q provider, which never seals state; the envelope is corrupt", SealedAgentStateFile, sealedProvider)
+			}
 			if KeyProviderRequiresEnvironment(sealedProvider) {
 				return "", fmt.Errorf("%s is sealed by the %q key provider; set %s=%s and its companion variables to open it", SealedAgentStateFile, sealedProvider, EnvKeyProvider, sealedProvider)
 			}

@@ -80,7 +80,10 @@ func probeTPMOnce() (retErr error) {
 	if err != nil {
 		return fmt.Errorf("%w: %w", ErrTPMUnavailable, err)
 	}
-	return parent.flush(tpm)
+	if err := parent.flush(tpm); err != nil {
+		return fmt.Errorf("%w: %w", ErrTPMUnavailable, err)
+	}
+	return nil
 }
 
 // tpmKeyProvider seals the qurl-go state DEK to this machine's TPM. The TPM
@@ -95,10 +98,19 @@ func newTPMKeyProvider() (KeyProvider, error) { return tpmKeyProvider{}, nil }
 
 func (tpmKeyProvider) Name() string { return KeyProviderTPM }
 
-func (p tpmKeyProvider) Seal(ctx context.Context, plaintext []byte, encContext map[string]string) (_ SealedPrivateKey, retErr error) {
+func (p tpmKeyProvider) Seal(ctx context.Context, plaintext []byte, encContext map[string]string) (SealedPrivateKey, error) {
 	if err := ctx.Err(); err != nil {
 		return SealedPrivateKey{}, err
 	}
+	plaintext = append([]byte(nil), plaintext...)
+	open := openTPM
+	return runTPMBounded(ctx, func() (SealedPrivateKey, error) {
+		defer scrubBytes(plaintext)
+		return p.sealWithTPM(open, plaintext, encContext)
+	}, nil)
+}
+
+func (p tpmKeyProvider) sealWithTPM(open func() (tpmCloser, error), plaintext []byte, encContext map[string]string) (_ SealedPrivateKey, retErr error) {
 	aad, err := encryptionContextAAD(encContext)
 	if err != nil {
 		return SealedPrivateKey{}, err
@@ -109,7 +121,7 @@ func (p tpmKeyProvider) Seal(ctx context.Context, plaintext []byte, encContext m
 		return SealedPrivateKey{}, fmt.Errorf("generate TPM KEK: %w", err)
 	}
 
-	tpm, err := openTPM()
+	tpm, err := open()
 	if err != nil {
 		return SealedPrivateKey{}, fmt.Errorf("%w: %w", ErrTPMUnavailable, err)
 	}
@@ -161,7 +173,7 @@ func (p tpmKeyProvider) Seal(ctx context.Context, plaintext []byte, encContext m
 	return sealedCiphertextRecord(p.Name(), tpmRecordKeyID, raw, encContext), nil
 }
 
-func (p tpmKeyProvider) Unseal(ctx context.Context, sealed SealedPrivateKey) (_ []byte, retErr error) {
+func (p tpmKeyProvider) Unseal(ctx context.Context, sealed SealedPrivateKey) ([]byte, error) {
 	if sealed.Provider != p.Name() {
 		return nil, fmt.Errorf("sealed key provider %q does not match selected provider %q", sealed.Provider, p.Name())
 	}
@@ -191,8 +203,14 @@ func (p tpmKeyProvider) Unseal(ctx context.Context, sealed SealedPrivateKey) (_ 
 	if err != nil {
 		return nil, fmt.Errorf("decode TPM sealed object private area: %w", err)
 	}
+	open := openTPM
+	return runTPMBounded(ctx, func() ([]byte, error) {
+		return unsealWithTPM(open, record, public, private, aad)
+	}, scrubBytes)
+}
 
-	tpm, err := openTPM()
+func unsealWithTPM(open func() (tpmCloser, error), record tpmRecord, public *tpm2.TPM2BPublic, private *tpm2.TPM2BPrivate, aad []byte) (_ []byte, retErr error) {
+	tpm, err := open()
 	if err != nil {
 		return nil, fmt.Errorf("%w: %w", ErrTPMUnavailable, err)
 	}
@@ -243,6 +261,35 @@ func (p tpmKeyProvider) Unseal(ctx context.Context, sealed SealedPrivateKey) (_ 
 		return nil, fmt.Errorf("TPM record AES-GCM authentication failed: %w", err)
 	}
 	return plaintext, nil
+}
+
+// runTPMBounded runs one TPM round trip under ctx. TPM commands are blocking
+// device I/O with no deadline of their own, so a wedged TPM or a long command
+// queued ahead of this one would otherwise hang the caller past the key
+// provider timeout. On expiry the caller gets ctx's error while op finishes in
+// the background on its own transport; discard then scrubs a late result.
+func runTPMBounded[T any](ctx context.Context, op func() (T, error), discard func(T)) (T, error) {
+	type result struct {
+		value T
+		err   error
+	}
+	done := make(chan result, 1)
+	go func() {
+		value, err := op()
+		done <- result{value: value, err: err}
+	}()
+	select {
+	case r := <-done:
+		return r.value, r.err
+	case <-ctx.Done():
+		go func() {
+			if r := <-done; r.err == nil && discard != nil {
+				discard(r.value)
+			}
+		}()
+		var zero T
+		return zero, fmt.Errorf("TPM operation abandoned: %w", ctx.Err())
+	}
 }
 
 // tpmSealedKEKTemplate is a keyed-hash data object that only this TPM can

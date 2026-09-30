@@ -33,6 +33,29 @@ path must use a local filesystem under a user-owned namespace where Windows can
 flush directory updates. Network paths and system-owned parents are not
 supported state locations.
 
+### Agent state key storage
+
+A new state directory is sealed to the machine's TPM 2.0 when the process can
+use one: the Linux resource manager `/dev/tpmrm0` (usually `tss` group
+membership) or TPM Base Services on Windows. macOS, and machines without a
+usable TPM, keep the owner-only plaintext envelope. The TPM holds a random key
+that never leaves it; the state's data key is encrypted under that key. The
+choice is fixed when the directory is created:
+
+- `LAYERV_KEY_PROVIDER=file` keeps a new directory plaintext; `tpm` requires
+  the TPM. The cloud and `local-key` providers are unchanged.
+- A TPM-sealed directory reopens with no environment, so the managed daemon
+  serves it like a plaintext one.
+- Existing directories keep their envelope. There is no migration in either
+  direction.
+- A TPM-sealed directory cannot be restored from backup onto other hardware,
+  carried by a VM clone or image, or read after the TPM is cleared. The error
+  says the storage root key changed. Recovery is to move the state directory
+  aside and enroll again. Enroll after cloning, or set
+  `LAYERV_KEY_PROVIDER=file` when building images.
+- Each state save and load performs a TPM round trip. These happen on
+  lifecycle writes (enrollment, refresh, session changes), not per request.
+
 `cmd/frpc` is retained for development and diagnostics. It is not a supported
 customer distribution, Homebrew formula, release binary, or container image.
 
@@ -50,6 +73,8 @@ embedded; the command fails closed unless an explicit trusted key is supplied.
   resource cannot register a different resource.
 - The managed daemon does not retain an account bearer. Account-authorized
   lifecycle changes remain in the foreground `qurl` command.
+- New agent state is sealed to the local TPM 2.0 when one is usable; see
+  [Agent state key storage](#agent-state-key-storage).
 - Connector state is owner-only and fails closed on unsafe permissions,
   symlinks, contradictory identity, or malformed persisted data.
 - Session renewal is make-before-break: a replacement must reach FRP's running
