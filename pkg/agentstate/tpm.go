@@ -392,6 +392,10 @@ var tpmAbandoned struct {
 
 var tpmWedgeBackoff = 30 * time.Second
 
+// tpmOperationTimeout bounds a TPM round trip whose caller supplied no
+// deadline; it matches the key-provider budget qurl-go normally applies.
+var tpmOperationTimeout = keyProviderTimeout
+
 // runTPMBounded runs one TPM round trip under ctx. TPM commands are blocking
 // device I/O with no deadline of their own, so a wedged TPM or a long command
 // queued ahead of this one would otherwise hang the caller past the key
@@ -402,6 +406,13 @@ var tpmWedgeBackoff = 30 * time.Second
 // caller prepared for it; see tpmAbandoned.
 func runTPMBounded[T any](ctx context.Context, op func() (T, error), discard func(T), notStarted func()) (T, error) {
 	var zero T
+	// A caller context without a deadline would leave a wedged TPM unbounded,
+	// and nothing abandoned means the wedge gate never engages either.
+	if _, ok := ctx.Deadline(); !ok {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, tpmOperationTimeout)
+		defer cancel()
+	}
 	tpmAbandoned.Lock()
 	wedged := tpmAbandoned.count > 0 && time.Since(tpmAbandoned.last) < tpmWedgeBackoff
 	tpmAbandoned.Unlock()

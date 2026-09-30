@@ -796,3 +796,23 @@ func TestSealScrubsItsKeyCopyWhenTheWedgeGateRefusesIt(t *testing.T) {
 		t.Fatalf("refused call left its prepared key unscrubbed: %v", copyOwned)
 	}
 }
+
+func TestTPMOperationWithoutACallerDeadlineIsStillBounded(t *testing.T) {
+	blockingTPM(t)
+	original := tpmOperationTimeout
+	tpmOperationTimeout = 20 * time.Millisecond
+	t.Cleanup(func() { tpmOperationTimeout = original })
+	done := make(chan error, 1)
+	go func() {
+		_, err := tpmKeyProvider{}.Seal(context.Background(), make([]byte, StateDEKSize), nil)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if !errors.Is(err, ErrTPMNotResponding) {
+			t.Fatalf("Seal without a deadline against a wedged TPM = %v, want ErrTPMNotResponding", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Seal without a caller deadline hung on a wedged TPM")
+	}
+}

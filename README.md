@@ -56,6 +56,10 @@ created:
   says the storage root key changed. Recovery is to move the state directory
   aside and enroll again. Enroll after cloning, or set
   `LAYERV_KEY_PROVIDER=file` when building images.
+- Where the key is held under the owner hierarchy (the default outside
+  Windows), a TPM-sealed directory also stops opening if another component
+  later takes ownership of the TPM, most commonly booting Windows on a
+  dual-boot machine. The error names this cause; recovery is the same.
 - Each state load, and each save (which seals and then verifies), re-derives
   the TPM storage key and runs one sealing command. That is fast on firmware
   TPMs but can take a few seconds on discrete TPM chips. Saves and loads
