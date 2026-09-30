@@ -56,8 +56,11 @@ created:
   says the storage root key changed. Recovery is to move the state directory
   aside and enroll again. Enroll after cloning, or set
   `LAYERV_KEY_PROVIDER=file` when building images.
-- Each state save and load performs a TPM round trip. These happen on
-  lifecycle writes (enrollment, refresh, session changes), not per request.
+- Each state load, and each save (which seals and then verifies), re-derives
+  the TPM storage key and runs one sealing command. That is fast on firmware
+  TPMs but can take a few seconds on discrete TPM chips. Saves and loads
+  happen on lifecycle events (enrollment, refresh, session changes), not per
+  request.
 
 Sealing binds the state to the machine; it does not protect it from other
 users of that machine. The sealed key has no password or boot-state policy,

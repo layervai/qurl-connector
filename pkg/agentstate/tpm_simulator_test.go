@@ -323,3 +323,32 @@ func TestSDKStoreDefaultsFreshNamespacesToTheTPM(t *testing.T) {
 	}
 	requireNoTransientHandles(t, sim)
 }
+
+// TestTPMStateSealedBeforeOwnershipNamesTheCause covers the asymmetric case: a
+// record sealed under the owner-hierarchy SRK while owner authorization was
+// empty, after which another component set it.
+func TestTPMStateSealedBeforeOwnershipNamesTheCause(t *testing.T) {
+	sim := useTPMSimulator(t)
+	provider := tpmKeyProvider{}
+	sealed, err := provider.Seal(context.Background(), bytes.Repeat([]byte{0x44}, StateDEKSize), map[string]string{"agent_id": "agent-a"})
+	if err != nil {
+		t.Fatalf("Seal: %v", err)
+	}
+	if _, err := (tpm2.HierarchyChangeAuth{
+		AuthHandle: tpm2.TPMRHOwner,
+		NewAuth:    tpm2.TPM2BAuth{Buffer: []byte("taken-by-another-owner")},
+	}).Execute(sim); err != nil {
+		t.Fatalf("set owner auth: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = tpm2.HierarchyChangeAuth{
+			AuthHandle: tpm2.AuthHandle{Handle: tpm2.TPMRHOwner, Auth: tpm2.PasswordAuth([]byte("taken-by-another-owner"))},
+			NewAuth:    tpm2.TPM2BAuth{},
+		}.Execute(sim)
+	})
+	_, err = provider.Unseal(context.Background(), sealed)
+	if !errors.Is(err, ErrTPMUnavailable) || !strings.Contains(err.Error(), "owner authorization has since been set") {
+		t.Fatalf("Unseal after ownership changed = %v, want the ownership diagnosis", err)
+	}
+	requireNoTransientHandles(t, sim)
+}

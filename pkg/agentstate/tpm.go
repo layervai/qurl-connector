@@ -22,6 +22,8 @@ const (
 	tpmRecordKeyID  = "tpm:v1"
 	tpmKEKSize      = 32
 	tpmMaxBlobBytes = 4 << 10
+	// tpmMinSealedBytes is an AES-GCM nonce plus tag with an empty plaintext.
+	tpmMinSealedBytes = 12 + 16
 
 	// tpmPersistentSRKHandle is the TCG-reserved storage root key handle.
 	// Windows provisions an SRK there and does not retain owner authorization,
@@ -121,6 +123,10 @@ func tpmOpenError(err error) error {
 // classifiers would read it as device trouble; it is structural, because the
 // TPM answered and the answer will not change on retry.
 var errTPMParentUnusable = errors.New("unusable TPM storage parent")
+
+// errTPMOwnerAuthSet reports that the owner hierarchy now has an
+// authorization value, so the empty-password ECC SRK cannot be recreated.
+var errTPMOwnerAuthSet = errors.New("owner hierarchy has an authorization value")
 
 // tpmCommandError labels a failed TPM command. A warning or device I/O failure
 // is transient and carries ErrTPMNotResponding; any other TPM response (for
@@ -302,6 +308,11 @@ func unsealWithTPM(open func() (tpmCloser, error), record tpmRecord, public *tpm
 	defer func() { retErr = unsealCleanup(retErr, "close TPM", tpm.Close()) }()
 	parent, err := openTPMParent(tpm, record.parent)
 	if err != nil {
+		if errors.Is(err, errTPMOwnerAuthSet) {
+			// Sealed while owner authorization was empty; something has since
+			// taken ownership of the TPM. Name that, not "TPM unavailable".
+			return nil, fmt.Errorf("%w: this state was sealed under the owner-hierarchy storage key, and owner authorization has since been set on this TPM, so it can no longer be opened here; move the state directory aside and enroll again", ErrTPMUnavailable)
+		}
 		return nil, classifyTPMError(err)
 	}
 	defer func() { retErr = unsealCleanup(retErr, "flush storage parent", parent.flush(tpm)) }()
@@ -602,7 +613,7 @@ func openTPMParent(tpm transport.TPM, kind tpmParent) (tpmParentKey, error) {
 	switch kind {
 	case tpmParentTransientECCSRK:
 		if tpmOwnerAuthSet(tpm) {
-			return tpmParentKey{}, fmt.Errorf("%w: owner hierarchy has an authorization value", errTPMParentUnusable)
+			return tpmParentKey{}, fmt.Errorf("%w: %w", errTPMParentUnusable, errTPMOwnerAuthSet)
 		}
 		created, err := tpm2.CreatePrimary{
 			PrimaryHandle: tpm2.TPMRHOwner,
@@ -695,7 +706,9 @@ func parseTPMRecord(raw []byte) (tpmRecord, error) {
 		*field = rest[:size:size]
 		rest = rest[size:]
 	}
-	if len(rest) == 0 {
+	// nonce (12) plus the GCM tag (16): anything shorter cannot authenticate,
+	// so refuse it before any TPM work.
+	if len(rest) < tpmMinSealedBytes {
 		return tpmRecord{}, invalid
 	}
 	record.sealed = rest

@@ -570,6 +570,14 @@ func resolveKeyProvider(view envelopeView, probe bool) (string, error) {
 	if explicit != KeyProviderFile && fileStateExists {
 		return "", fmt.Errorf("%s=%s conflicts with existing %s; provider changes are not an in-place migration", EnvKeyProvider, explicit, AgentStateFile)
 	}
+	if explicit == KeyProviderTPM && probe && !fileStateExists && !sealedStateExists {
+		// Asked for the TPM on a namespace about to be created: diagnose it
+		// now rather than at the first state write. An existing tpm envelope
+		// skips this; its Unseal is the real check.
+		if err := ProbeTPM(); err != nil {
+			return "", fmt.Errorf("%s=%s: %w", EnvKeyProvider, explicit, err)
+		}
+	}
 	return explicit, nil
 }
 

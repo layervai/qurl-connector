@@ -51,7 +51,7 @@ func TestResolveKeyProviderSelectsByEnvironmentThenEnvelopeThenDefault(t *testin
 		{name: "fresh namespace takes a usable TPM", freshDefault: KeyProviderTPM, want: KeyProviderTPM},
 		{name: "fresh namespace without a TPM stays plaintext", freshDefault: KeyProviderFile, want: KeyProviderFile},
 		{name: "explicit file opts out of the TPM", env: KeyProviderFile, freshDefault: KeyProviderTPM, want: KeyProviderFile},
-		{name: "explicit tpm on a fresh namespace", env: KeyProviderTPM, freshDefault: KeyProviderFile, want: KeyProviderTPM},
+		{name: "explicit tpm on a fresh namespace without a TPM", env: KeyProviderTPM, freshDefault: KeyProviderFile, wantErr: "LAYERV_KEY_PROVIDER=tpm: TPM 2.0 is unavailable"},
 		{name: "existing plaintext never migrates", freshDefault: KeyProviderTPM, files: map[string]string{AgentStateFile: `{}`}, want: KeyProviderFile},
 		{name: "tpm envelope opens without the environment", freshDefault: KeyProviderFile, files: map[string]string{SealedAgentStateFile: `{"provider_id":"tpm"}`}, want: KeyProviderTPM},
 		{name: "tpm envelope with explicit tpm", env: "TPM", files: map[string]string{SealedAgentStateFile: `{"provider_id":"tpm"}`}, want: KeyProviderTPM},
@@ -69,6 +69,11 @@ func TestResolveKeyProviderSelectsByEnvironmentThenEnvelopeThenDefault(t *testin
 		t.Run(tt.name, func(t *testing.T) {
 			setFreshKeyProviderForTest(t, tt.freshDefault)
 			t.Setenv(EnvKeyProvider, tt.env)
+			// Rows never reach the host TPM: an explicit tpm probe sees none.
+			resetTPMProbeForTest(t)
+			originalOpen := openTPM
+			openTPM = func() (tpmCloser, error) { return nil, os.ErrNotExist }
+			t.Cleanup(func() { openTPM = originalOpen })
 			dir := secureSDKStateDir(t)
 			for name, raw := range tt.files {
 				writePinnedSDKTestFile(t, dir, name, []byte(raw), 0o600)
@@ -163,7 +168,7 @@ func TestTPMRecordRoundTripAndRejectsMalformedRecords(t *testing.T) {
 		parentName: []byte("name"),
 		public:     []byte("public"),
 		private:    []byte("private"),
-		sealed:     []byte("nonce-and-ciphertext"),
+		sealed:     []byte("twelve-nonce-and-a-sixteen-byte-tag"),
 	}
 	raw, err := record.marshal()
 	if err != nil {
@@ -180,12 +185,13 @@ func TestTPMRecordRoundTripAndRejectsMalformedRecords(t *testing.T) {
 	}
 
 	for name, bad := range map[string][]byte{
-		"empty":             nil,
-		"unknown parent":    append([]byte{9}, raw[1:]...),
-		"truncated length":  raw[:2],
-		"truncated field":   raw[:6],
-		"missing sealed":    raw[:len(raw)-len(record.sealed)],
-		"zero-length field": {byte(tpmParentTransientECCSRK), 0, 0},
+		"empty":                       nil,
+		"unknown parent":              append([]byte{9}, raw[1:]...),
+		"truncated length":            raw[:2],
+		"truncated field":             raw[:6],
+		"missing sealed":              raw[:len(raw)-len(record.sealed)],
+		"sealed below nonce plus tag": raw[:len(raw)-len(record.sealed)+tpmMinSealedBytes-1],
+		"zero-length field":           {byte(tpmParentTransientECCSRK), 0, 0},
 	} {
 		if _, err := parseTPMRecord(bad); err == nil {
 			t.Errorf("%s: parseTPMRecord accepted %x", name, bad)
@@ -709,5 +715,21 @@ func TestRunTPMBoundedScrubsALateResultReturnedWithAnError(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("late result returned with an error was never scrubbed")
+	}
+}
+
+func TestExplicitTPMOnAFreshNamespaceFailsAtResolution(t *testing.T) {
+	resetTPMProbeForTest(t)
+	t.Setenv(EnvKeyProvider, KeyProviderTPM)
+	original := openTPM
+	t.Cleanup(func() { openTPM = original })
+	openTPM = func() (tpmCloser, error) { return nil, os.ErrNotExist }
+	if _, err := ResolveKeyProvider(secureSDKStateDir(t)); !errors.Is(err, ErrTPMUnavailable) || !strings.Contains(err.Error(), EnvKeyProvider+"=tpm") {
+		t.Fatalf("explicit tpm without a TPM = %v, want ErrTPMUnavailable naming the setting", err)
+	}
+	dir := secureSDKStateDir(t)
+	writePinnedSDKTestFile(t, dir, SealedAgentStateFile, []byte(`{"provider_id":"tpm"}`), 0o600)
+	if got, err := ResolveKeyProvider(dir); err != nil || got != KeyProviderTPM {
+		t.Fatalf("explicit tpm over an existing tpm envelope = %q, %v; want it resolved without probing", got, err)
 	}
 }
