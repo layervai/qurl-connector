@@ -608,7 +608,11 @@ func sealedEnvelopeProvider(view envelopeView, explicit bool) (string, error) {
 	var header struct {
 		ProviderID string `json:"provider_id"`
 	}
-	if err := json.Unmarshal(raw, &header); err != nil || header.ProviderID == "" {
+	if err := json.Unmarshal(raw, &header); err != nil {
+		// Interrupted write or truncated restore: no variable can fix this.
+		return "", fmt.Errorf("%s is not valid JSON; the envelope is corrupt: %w", SealedAgentStateFile, err)
+	}
+	if header.ProviderID == "" {
 		if explicit {
 			// The operator already named a provider; pointing them at the
 			// variable again would send them in a circle.
