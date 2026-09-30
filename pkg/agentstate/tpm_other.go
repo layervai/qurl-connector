@@ -13,3 +13,5 @@ import (
 func openSystemTPM() (transport.TPMCloser, error) {
 	return nil, errors.New("no TPM 2.0 interface on this platform")
 }
+
+var tpmParentOrder = []tpmParent{tpmParentTransientECCSRK, tpmParentPersistentSRK}

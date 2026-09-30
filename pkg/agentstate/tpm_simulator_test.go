@@ -33,6 +33,7 @@ func useTPMSimulator(t *testing.T) transport.TPM {
 	}
 	original := openTPM
 	openTPM = func() (tpmCloser, error) { return sharedSimulator{sim}, nil }
+	resetTPMParentMemo(t)
 	t.Cleanup(func() {
 		openTPM = original
 		if err := sim.Close(); err != nil {
@@ -223,6 +224,12 @@ func TestTPMProviderFallsBackToThePersistentSRK(t *testing.T) {
 		t.Fatalf("Unseal = %x, %v", got, err)
 	}
 	requireNoTransientHandles(t, sim)
+	tpmParentMemo.Lock()
+	remembered := tpmParentMemo.kind
+	tpmParentMemo.Unlock()
+	if remembered != tpmParentPersistentSRK {
+		t.Fatalf("remembered parent = %v, want the persistent SRK so later seals skip the refused owner hierarchy", remembered)
+	}
 }
 
 func TestSDKStoreDefaultsFreshNamespacesToTheTPM(t *testing.T) {

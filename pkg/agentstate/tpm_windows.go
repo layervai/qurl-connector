@@ -12,3 +12,7 @@ import (
 func openSystemTPM() (transport.TPMCloser, error) {
 	return windowstpm.Open()
 }
+
+// tpmParentOrder prefers the SRK Windows provisions: Windows discards owner
+// authorization, so a transient SRK under the owner hierarchy is refused.
+var tpmParentOrder = []tpmParent{tpmParentPersistentSRK, tpmParentTransientECCSRK}

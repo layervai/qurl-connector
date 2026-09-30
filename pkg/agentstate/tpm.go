@@ -114,6 +114,19 @@ func tpmOpenError(err error) error {
 	return fmt.Errorf("%w: %w", ErrTPMUnavailable, err)
 }
 
+// tpmCommandError labels a failed TPM command. A warning or device I/O failure
+// is transient and carries ErrTPMNotResponding; any other TPM response (for
+// example an integrity failure on a tampered record) stays unclassified,
+// because it describes the record rather than the TPM.
+func tpmCommandError(label string, err error) error {
+	var rc tpm2.TPMRC
+	var fmt1 tpm2.TPMFmt1Error
+	if (errors.As(err, &rc) && !rc.IsWarning()) || errors.As(err, &fmt1) {
+		return fmt.Errorf("%s: %w", label, err)
+	}
+	return fmt.Errorf("%w: %s: %w", ErrTPMNotResponding, label, err)
+}
+
 // classifyTPMError sorts a probe failure into ErrTPMUnavailable (structural:
 // retrying cannot help) or ErrTPMNotResponding (transient). Errors already
 // carrying either sentinel keep it. A TPM error response is structural unless
@@ -170,12 +183,12 @@ func (p tpmKeyProvider) sealWithTPM(open func() (tpmCloser, error), plaintext []
 
 	tpm, err := open()
 	if err != nil {
-		return SealedPrivateKey{}, fmt.Errorf("%w: %w", ErrTPMUnavailable, err)
+		return SealedPrivateKey{}, tpmOpenError(err)
 	}
 	defer func() { retErr = errors.Join(retErr, tpm.Close()) }()
 	parent, err := selectTPMParent(tpm)
 	if err != nil {
-		return SealedPrivateKey{}, fmt.Errorf("%w: %w", ErrTPMUnavailable, err)
+		return SealedPrivateKey{}, classifyTPMError(err)
 	}
 	defer func() { retErr = errors.Join(retErr, parent.flush(tpm)) }()
 
@@ -195,7 +208,7 @@ func (p tpmKeyProvider) sealWithTPM(open func() (tpmCloser, error), plaintext []
 		InPublic: tpm2.New2B(tpmSealedKEKTemplate()),
 	}.Execute(tpm)
 	if err != nil {
-		return SealedPrivateKey{}, fmt.Errorf("seal KEK to TPM: %w", err)
+		return SealedPrivateKey{}, tpmCommandError("seal KEK to TPM", err)
 	}
 
 	aead, err := tpmAEAD(kek)
@@ -259,12 +272,12 @@ func (p tpmKeyProvider) Unseal(ctx context.Context, sealed SealedPrivateKey) ([]
 func unsealWithTPM(open func() (tpmCloser, error), record tpmRecord, public *tpm2.TPM2BPublic, private *tpm2.TPM2BPrivate, aad []byte) (_ []byte, retErr error) {
 	tpm, err := open()
 	if err != nil {
-		return nil, fmt.Errorf("%w: %w", ErrTPMUnavailable, err)
+		return nil, tpmOpenError(err)
 	}
 	defer func() { retErr = errors.Join(retErr, tpm.Close()) }()
 	parent, err := openTPMParent(tpm, record.parent)
 	if err != nil {
-		return nil, fmt.Errorf("%w: %w", ErrTPMUnavailable, err)
+		return nil, classifyTPMError(err)
 	}
 	defer func() { retErr = errors.Join(retErr, parent.flush(tpm)) }()
 	if !bytes.Equal(parent.name.Buffer, record.parentName) {
@@ -277,7 +290,7 @@ func unsealWithTPM(open func() (tpmCloser, error), record tpmRecord, public *tpm
 		InPublic:     *public,
 	}.Execute(tpm)
 	if err != nil {
-		return nil, fmt.Errorf("load TPM sealed KEK: %w", err)
+		return nil, tpmCommandError("load TPM sealed KEK", err)
 	}
 	defer func() { retErr = errors.Join(retErr, flushTPMHandle(tpm, loaded.ObjectHandle)) }()
 
@@ -289,7 +302,7 @@ func unsealWithTPM(open func() (tpmCloser, error), record tpmRecord, public *tpm
 		},
 	}.Execute(tpm)
 	if err != nil {
-		return nil, fmt.Errorf("unseal TPM KEK: %w", err)
+		return nil, tpmCommandError("unseal TPM KEK", err)
 	}
 	kek := unsealed.OutData.Buffer
 	defer scrubBytes(kek)
@@ -310,26 +323,31 @@ func unsealWithTPM(open func() (tpmCloser, error), record tpmRecord, public *tpm
 	return plaintext, nil
 }
 
-// tpmAbandoned counts TPM operations whose caller gave up while they were
-// still blocked in the device. While one is outstanding the TPM is presumed
-// wedged and new operations fail fast instead of each parking another
-// goroutine and descriptor behind it.
+// tpmAbandoned tracks TPM operations whose caller gave up while they were
+// still blocked in the device. For tpmWedgeBackoff after an abandonment the
+// TPM is presumed wedged and new operations fail fast instead of each parking
+// another goroutine and descriptor behind it. After the backoff one operation
+// is let through, so a TPM that recovers is used again and a wedged one costs
+// at most one parked operation per backoff period.
 var tpmAbandoned struct {
 	sync.Mutex
 	count int
+	last  time.Time
 }
+
+var tpmWedgeBackoff = 30 * time.Second
 
 // runTPMBounded runs one TPM round trip under ctx. TPM commands are blocking
 // device I/O with no deadline of their own, so a wedged TPM or a long command
 // queued ahead of this one would otherwise hang the caller past the key
 // provider timeout. On expiry the caller gets ErrTPMNotResponding while op
 // finishes in the background on its own transport; discard then scrubs a late
-// result. At most the operations already in flight when the TPM wedged are
-// ever abandoned: later calls fail immediately until those finish.
+// result. While a recent abandonment is outstanding, later calls fail
+// immediately; see tpmAbandoned.
 func runTPMBounded[T any](ctx context.Context, op func() (T, error), discard func(T)) (T, error) {
 	var zero T
 	tpmAbandoned.Lock()
-	wedged := tpmAbandoned.count > 0
+	wedged := tpmAbandoned.count > 0 && time.Since(tpmAbandoned.last) < tpmWedgeBackoff
 	tpmAbandoned.Unlock()
 	if wedged {
 		return zero, fmt.Errorf("%w: an earlier TPM operation has not returned", ErrTPMNotResponding)
@@ -370,8 +388,43 @@ func runTPMBounded[T any](ctx context.Context, op func() (T, error), discard fun
 		abandoned = true
 		tpmAbandoned.Lock()
 		tpmAbandoned.count++
+		tpmAbandoned.last = time.Now()
 		tpmAbandoned.Unlock()
 		return zero, fmt.Errorf("%w: operation abandoned: %w", ErrTPMNotResponding, ctx.Err())
+	}
+}
+
+// tpmECCSRKTemplate is the TCG reference ECC P-256 SRK template (TCG TPM v2.0
+// Provisioning Guidance). The recreated SRK's Name, which every sealed record
+// persists, is derived from these exact bytes, so the template is this
+// package's data rather than a dependency's: a library revising its copy must
+// not make every existing record look like it came from another machine.
+// Changing this literal requires a new tpmParent kind.
+func tpmECCSRKTemplate() tpm2.TPMTPublic {
+	return tpm2.TPMTPublic{
+		Type:    tpm2.TPMAlgECC,
+		NameAlg: tpm2.TPMAlgSHA256,
+		ObjectAttributes: tpm2.TPMAObject{
+			FixedTPM:            true,
+			FixedParent:         true,
+			SensitiveDataOrigin: true,
+			UserWithAuth:        true,
+			NoDA:                true,
+			Restricted:          true,
+			Decrypt:             true,
+		},
+		Parameters: tpm2.NewTPMUPublicParms(tpm2.TPMAlgECC, &tpm2.TPMSECCParms{
+			Symmetric: tpm2.TPMTSymDefObject{
+				Algorithm: tpm2.TPMAlgAES,
+				KeyBits:   tpm2.NewTPMUSymKeyBits(tpm2.TPMAlgAES, tpm2.TPMKeyBits(128)),
+				Mode:      tpm2.NewTPMUSymMode(tpm2.TPMAlgAES, tpm2.TPMAlgCFB),
+			},
+			CurveID: tpm2.TPMECCNistP256,
+		}),
+		Unique: tpm2.NewTPMUPublicID(tpm2.TPMAlgECC, &tpm2.TPMSECCPoint{
+			X: tpm2.TPM2BECCParameter{Buffer: make([]byte, 32)},
+			Y: tpm2.TPM2BECCParameter{Buffer: make([]byte, 32)},
+		}),
 	}
 }
 
@@ -423,16 +476,55 @@ func (p tpmParentKey) flush(tpm transport.TPM) error {
 
 // selectTPMParent prefers the deterministic transient ECC SRK and falls back
 // to the provisioned persistent SRK where owner authorization is not empty.
+// tpmParentMemo remembers which storage parent worked, so a TPM whose owner
+// hierarchy rejects the empty authorization sees that failed attempt at most
+// once per process rather than on every seal.
+var tpmParentMemo struct {
+	sync.Mutex
+	kind tpmParent
+}
+
+// selectTPMParent returns the storage parent to seal under: the one that
+// worked before in this process, otherwise the platform's preferred order.
+// Where owner authorization is not empty (Windows), the provisioned SRK is
+// tried first so the owner hierarchy is not asked for an authorization it
+// will refuse.
 func selectTPMParent(tpm transport.TPM) (tpmParentKey, error) {
-	parent, transientErr := openTPMParent(tpm, tpmParentTransientECCSRK)
-	if transientErr == nil {
-		return parent, nil
+	tpmParentMemo.Lock()
+	remembered := tpmParentMemo.kind
+	tpmParentMemo.Unlock()
+	order := tpmParentOrder
+	if remembered != 0 {
+		order = []tpmParent{remembered}
+		for _, kind := range tpmParentOrder {
+			if kind != remembered {
+				order = append(order, kind)
+			}
+		}
 	}
-	parent, persistentErr := openTPMParent(tpm, tpmParentPersistentSRK)
-	if persistentErr == nil {
-		return parent, nil
+	var errs []error
+	for _, kind := range order {
+		parent, err := openTPMParent(tpm, kind)
+		if err == nil {
+			tpmParentMemo.Lock()
+			tpmParentMemo.kind = kind
+			tpmParentMemo.Unlock()
+			return parent, nil
+		}
+		errs = append(errs, fmt.Errorf("%s: %w", kind, err))
 	}
-	return tpmParentKey{}, fmt.Errorf("no usable storage root key: create ECC SRK: %w; persistent SRK: %w", transientErr, persistentErr)
+	return tpmParentKey{}, fmt.Errorf("no usable storage root key: %w", errors.Join(errs...))
+}
+
+func (k tpmParent) String() string {
+	switch k {
+	case tpmParentTransientECCSRK:
+		return "ECC SRK"
+	case tpmParentPersistentSRK:
+		return "persistent SRK"
+	default:
+		return fmt.Sprintf("parent %d", byte(k))
+	}
 }
 
 func openTPMParent(tpm transport.TPM, kind tpmParent) (tpmParentKey, error) {
@@ -440,7 +532,7 @@ func openTPMParent(tpm transport.TPM, kind tpmParent) (tpmParentKey, error) {
 	case tpmParentTransientECCSRK:
 		created, err := tpm2.CreatePrimary{
 			PrimaryHandle: tpm2.TPMRHOwner,
-			InPublic:      tpm2.New2B(tpm2.ECCSRKTemplate),
+			InPublic:      tpm2.New2B(tpmECCSRKTemplate()),
 		}.Execute(tpm)
 		if err != nil {
 			return tpmParentKey{}, err

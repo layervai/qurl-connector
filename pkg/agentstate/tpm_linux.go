@@ -15,3 +15,7 @@ const linuxTPMResourceManager = "/dev/tpmrm0"
 func openSystemTPM() (transport.TPMCloser, error) {
 	return linuxtpm.Open(linuxTPMResourceManager)
 }
+
+// tpmParentOrder prefers the deterministic transient SRK: Linux owner
+// authorization is normally empty.
+var tpmParentOrder = []tpmParent{tpmParentTransientECCSRK, tpmParentPersistentSRK}

@@ -3,6 +3,7 @@ package agentstate
 import (
 	"bytes"
 	"context"
+	"encoding/hex"
 	"errors"
 	"io"
 	"os"
@@ -405,5 +406,69 @@ func TestTPMProviderSealHonorsTheCallerDeadline(t *testing.T) {
 	}
 	if elapsed := time.Since(start); elapsed > 5*time.Second {
 		t.Fatalf("Seal returned after %s, want promptly after the deadline", elapsed)
+	}
+}
+
+func resetTPMParentMemo(t *testing.T) {
+	t.Helper()
+	reset := func() {
+		tpmParentMemo.Lock()
+		tpmParentMemo.kind = 0
+		tpmParentMemo.Unlock()
+	}
+	reset()
+	t.Cleanup(reset)
+}
+
+// TestTPMECCSRKTemplateIsPinned pins the exact template bytes every persisted
+// record's parent Name derives from. If this fails, the change orphans every
+// existing TPM-sealed namespace unless it ships as a new tpmParent kind.
+func TestTPMECCSRKTemplateIsPinned(t *testing.T) {
+	const want = "0023000b0003047200000006008000430010000300100020000000000000000000000000000000000000000000000000000000000000000000200000000000000000000000000000000000000000000000000000000000000000"
+	got := hex.EncodeToString(tpm2.Marshal(tpmECCSRKTemplate()))
+	if got != want {
+		t.Fatalf("ECC SRK template bytes changed:\n got %s\nwant %s", got, want)
+	}
+}
+
+func TestTPMWedgeGateReopensAfterItsBackoff(t *testing.T) {
+	blockingTPM(t)
+	originalBackoff := tpmWedgeBackoff
+	tpmWedgeBackoff = 50 * time.Millisecond
+	t.Cleanup(func() { tpmWedgeBackoff = originalBackoff })
+	short := func() (context.Context, context.CancelFunc) {
+		return context.WithTimeout(context.Background(), 10*time.Millisecond)
+	}
+	ctx, cancel := short()
+	defer cancel()
+	if _, err := (tpmKeyProvider{}).Seal(ctx, make([]byte, StateDEKSize), nil); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("first Seal = %v, want an abandoned deadline", err)
+	}
+	if _, err := (tpmKeyProvider{}).Seal(context.Background(), make([]byte, StateDEKSize), nil); err == nil || !strings.Contains(err.Error(), "has not returned") {
+		t.Fatalf("Seal inside the backoff = %v, want an immediate refusal", err)
+	}
+	time.Sleep(60 * time.Millisecond)
+	ctx2, cancel2 := short()
+	defer cancel2()
+	if _, err := (tpmKeyProvider{}).Seal(ctx2, make([]byte, StateDEKSize), nil); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Seal after the backoff = %v, want it let through to the TPM", err)
+	}
+}
+
+func TestTPMProviderReportsABusyDeviceAsNotResponding(t *testing.T) {
+	original := openTPM
+	t.Cleanup(func() { openTPM = original })
+	openTPM = func() (tpmCloser, error) { return nil, syscall.EBUSY }
+	if _, err := (tpmKeyProvider{}).Seal(context.Background(), make([]byte, StateDEKSize), nil); !errors.Is(err, ErrTPMNotResponding) || errors.Is(err, ErrTPMUnavailable) {
+		t.Fatalf("Seal with a busy device = %v, want only ErrTPMNotResponding", err)
+	}
+}
+
+func TestTPMCommandErrorKeepsRecordFailuresUnclassified(t *testing.T) {
+	if err := tpmCommandError("load", tpm2.TPMRCIntegrity); errors.Is(err, ErrTPMNotResponding) || errors.Is(err, ErrTPMUnavailable) {
+		t.Fatalf("integrity failure classified as %v", err)
+	}
+	if err := tpmCommandError("load", tpm2.TPMRCRetry); !errors.Is(err, ErrTPMNotResponding) {
+		t.Fatalf("retry warning = %v, want ErrTPMNotResponding", err)
 	}
 }
