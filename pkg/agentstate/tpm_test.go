@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -399,6 +400,7 @@ func TestClassifyTPMErrorSeparatesStructuralFromTransient(t *testing.T) {
 		"device i/o":         {err: io.ErrUnexpectedEOF, want: ErrTPMNotResponding},
 		"deadline":           {err: context.DeadlineExceeded, want: ErrTPMNotResponding},
 		"already classified": {err: ErrTPMUnavailable, want: ErrTPMUnavailable},
+		"unusable parent":    {err: fmt.Errorf("%w: persistent SRK is not a restricted storage key", errTPMParentUnusable), want: ErrTPMUnavailable},
 	} {
 		if got := classifyTPMError(tc.err); !errors.Is(got, tc.want) {
 			t.Errorf("%s: classifyTPMError(%v) = %v, want %v", name, tc.err, got, tc.want)
@@ -615,5 +617,60 @@ func TestRunTPMBoundedConcurrentAbandonAndComplete(t *testing.T) {
 			t.Fatalf("%d abandoned operations never drained", n)
 		}
 		time.Sleep(time.Millisecond)
+	}
+}
+
+// signingKeyAtSRKHandleTPM refuses the transient ECC SRK with an auth failure,
+// as Windows does, and answers ReadPublic at 0x81000001 with a persisted
+// signing key: both parents are unusable for good.
+type signingKeyAtSRKHandleTPM struct{}
+
+func (signingKeyAtSRKHandleTPM) Send(cmd []byte) ([]byte, error) {
+	if len(cmd) >= 10 && binary.BigEndian.Uint32(cmd[6:10]) == uint32(tpm2.TPMCCReadPublic) {
+		signing := tpm2.New2B(tpm2.TPMTPublic{
+			Type:    tpm2.TPMAlgECC,
+			NameAlg: tpm2.TPMAlgSHA256,
+			ObjectAttributes: tpm2.TPMAObject{
+				FixedTPM: true, FixedParent: true, SensitiveDataOrigin: true, UserWithAuth: true, SignEncrypt: true,
+			},
+			Parameters: tpm2.NewTPMUPublicParms(tpm2.TPMAlgECC, &tpm2.TPMSECCParms{
+				Scheme:  tpm2.TPMTECCScheme{Scheme: tpm2.TPMAlgECDSA, Details: tpm2.NewTPMUAsymScheme(tpm2.TPMAlgECDSA, &tpm2.TPMSSigSchemeECDSA{HashAlg: tpm2.TPMAlgSHA256})},
+				CurveID: tpm2.TPMECCNistP256,
+			}),
+			Unique: tpm2.NewTPMUPublicID(tpm2.TPMAlgECC, &tpm2.TPMSECCPoint{
+				X: tpm2.TPM2BECCParameter{Buffer: make([]byte, 32)},
+				Y: tpm2.TPM2BECCParameter{Buffer: make([]byte, 32)},
+			}),
+		})
+		body := tpm2.Marshal(signing)
+		body = append(body, tpm2.Marshal(tpm2.TPM2BName{Buffer: append([]byte{0, 0x0b}, make([]byte, 32)...)})...)
+		body = append(body, tpm2.Marshal(tpm2.TPM2BName{Buffer: append([]byte{0, 0x0b}, make([]byte, 32)...)})...)
+		rsp := make([]byte, 10, 10+len(body))
+		rsp = append(rsp, body...)
+		binary.BigEndian.PutUint16(rsp[0:2], uint16(tpm2.TPMSTNoSessions))
+		binary.BigEndian.PutUint32(rsp[2:6], uint32(len(rsp))) //nolint:gosec // test response is tiny.
+		return rsp, nil
+	}
+	rsp := make([]byte, 10)
+	binary.BigEndian.PutUint16(rsp[0:2], uint16(tpm2.TPMSTNoSessions))
+	binary.BigEndian.PutUint32(rsp[2:6], 10)
+	binary.BigEndian.PutUint32(rsp[6:10], uint32(tpm2.TPMRCBadAuth)|0x100) // session 1 bad auth
+	return rsp, nil
+}
+
+func (signingKeyAtSRKHandleTPM) Close() error { return nil }
+
+// TestSelectTPMParentTreatsItsOwnRejectionsAsStructural pins that a persisted
+// signing key at the SRK handle, next to an owner hierarchy that refuses the
+// empty authorization, is "no usable TPM" and not "try again later": the
+// fresh namespace falls back to plaintext instead of failing every enrollment.
+func TestSelectTPMParentTreatsItsOwnRejectionsAsStructural(t *testing.T) {
+	resetTPMParentMemo(t)
+	_, err := selectTPMParent(signingKeyAtSRKHandleTPM{})
+	if !strings.Contains(fmt.Sprint(err), "not a restricted storage key") {
+		t.Fatalf("selectTPMParent = %v, want the persistent SRK rejected by its attributes", err)
+	}
+	if !errors.Is(err, ErrTPMUnavailable) || errors.Is(err, ErrTPMNotResponding) {
+		t.Fatalf("selectTPMParent = %v, want only ErrTPMUnavailable", err)
 	}
 }

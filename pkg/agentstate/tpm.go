@@ -114,6 +114,13 @@ func tpmOpenError(err error) error {
 	return fmt.Errorf("%w: %w", ErrTPMUnavailable, err)
 }
 
+// errTPMParentUnusable marks a storage parent this package rejected itself: a
+// public area that does not decode, or a persistent object that is not a
+// restricted storage key. It carries no TPM response code, so without it the
+// classifiers would read it as device trouble; it is structural, because the
+// TPM answered and the answer will not change on retry.
+var errTPMParentUnusable = errors.New("unusable TPM storage parent")
+
 // tpmCommandError labels a failed TPM command. A warning or device I/O failure
 // is transient and carries ErrTPMNotResponding; any other TPM response (for
 // example an integrity failure on a tampered record) stays unclassified,
@@ -134,6 +141,9 @@ func tpmCommandError(label string, err error) error {
 func classifyTPMError(err error) error {
 	if err == nil || errors.Is(err, ErrTPMUnavailable) || errors.Is(err, ErrTPMNotResponding) {
 		return err
+	}
+	if errors.Is(err, errTPMParentUnusable) {
+		return fmt.Errorf("%w: %w", ErrTPMUnavailable, err)
 	}
 	var rc tpm2.TPMRC
 	if errors.As(err, &rc) && !rc.IsWarning() {
@@ -553,7 +563,7 @@ func openTPMParent(tpm transport.TPM, kind tpmParent) (tpmParentKey, error) {
 		}
 		public, err := created.OutPublic.Contents()
 		if err != nil {
-			return tpmParentKey{}, errors.Join(fmt.Errorf("decode SRK public area: %w", err), flushTPMHandle(tpm, created.ObjectHandle))
+			return tpmParentKey{}, errors.Join(fmt.Errorf("%w: decode SRK public area: %w", errTPMParentUnusable, err), flushTPMHandle(tpm, created.ObjectHandle))
 		}
 		return tpmParentKey{kind: kind, handle: created.ObjectHandle, name: created.Name, public: *public, transient: true}, nil
 	case tpmParentPersistentSRK:
@@ -563,11 +573,11 @@ func openTPMParent(tpm transport.TPM, kind tpmParent) (tpmParentKey, error) {
 		}
 		public, err := read.OutPublic.Contents()
 		if err != nil {
-			return tpmParentKey{}, fmt.Errorf("decode persistent SRK public area: %w", err)
+			return tpmParentKey{}, fmt.Errorf("%w: decode persistent SRK public area: %w", errTPMParentUnusable, err)
 		}
 		attrs := public.ObjectAttributes
 		if !attrs.FixedTPM || !attrs.FixedParent || !attrs.Restricted || !attrs.Decrypt || attrs.SignEncrypt {
-			return tpmParentKey{}, errors.New("persistent SRK is not a restricted storage key")
+			return tpmParentKey{}, fmt.Errorf("%w: persistent SRK is not a restricted storage key", errTPMParentUnusable)
 		}
 		return tpmParentKey{kind: kind, handle: tpmPersistentSRKHandle, name: read.Name, public: *public}, nil
 	default:
