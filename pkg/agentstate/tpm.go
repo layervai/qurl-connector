@@ -86,7 +86,7 @@ func ProbeTPM() error {
 	ctx, cancel := context.WithTimeout(context.Background(), tpmProbeTimeout)
 	defer cancel()
 	open := openTPM
-	_, err := runTPMBounded(ctx, func() (struct{}, error) { return struct{}{}, probeTPMOnce(open) }, nil)
+	_, err := runTPMBounded(ctx, func() (struct{}, error) { return struct{}{}, probeTPMOnce(open) }, nil, nil)
 	err = classifyTPMError(err)
 	if !errors.Is(err, ErrTPMNotResponding) {
 		tpmProbe.err, tpmProbe.done = err, true
@@ -183,10 +183,12 @@ func (p tpmKeyProvider) Seal(ctx context.Context, plaintext []byte, encContext m
 	}
 	plaintext = append([]byte(nil), plaintext...)
 	open := openTPM
+	// The copy is scrubbed by whichever side ends up owning it: the operation
+	// once it runs, or notStarted when the wedge gate refuses it first.
 	return runTPMBounded(ctx, func() (SealedPrivateKey, error) {
 		defer scrubBytes(plaintext)
 		return p.sealWithTPM(open, plaintext, encContext)
-	}, nil)
+	}, nil, func() { scrubBytes(plaintext) })
 }
 
 func (p tpmKeyProvider) sealWithTPM(open func() (tpmCloser, error), plaintext []byte, encContext map[string]string) (_ SealedPrivateKey, retErr error) {
@@ -288,7 +290,7 @@ func (p tpmKeyProvider) Unseal(ctx context.Context, sealed SealedPrivateKey) ([]
 	open := openTPM
 	return runTPMBounded(ctx, func() ([]byte, error) {
 		return unsealWithTPM(open, record, public, private, aad)
-	}, scrubBytes)
+	}, scrubBytes, nil)
 }
 
 // tpmCleanup folds a cleanup failure into a failed operation but only logs
@@ -320,7 +322,14 @@ func unsealWithTPM(open func() (tpmCloser, error), record tpmRecord, public *tpm
 			// taken ownership of the TPM. Name that, not "TPM unavailable".
 			return nil, fmt.Errorf("%w: this state was sealed under the owner-hierarchy storage key, and owner authorization has since been set on this TPM, so it can no longer be opened here; move the state directory aside and enroll again", ErrTPMUnavailable)
 		}
-		return nil, classifyTPMError(err)
+		classified := classifyTPMError(err)
+		if record.parent == tpmParentPersistentSRK && errors.Is(classified, ErrTPMUnavailable) {
+			// The provisioned SRK this state was sealed under is gone or
+			// replaced: the same cleared-TPM or other-machine case as a Name
+			// mismatch, and the same recovery.
+			return nil, fmt.Errorf("%w: the persistent TPM storage root key this state was sealed under is missing or changed (%w); the TPM was cleared or this state belongs to another machine", ErrTPMUnavailable, err)
+		}
+		return nil, classified
 	}
 	defer func() { retErr = tpmCleanup(retErr, "flush storage parent", parent.flush(tpm)) }()
 	if !bytes.Equal(parent.name.Buffer, record.parentName) {
@@ -389,13 +398,17 @@ var tpmWedgeBackoff = 30 * time.Second
 // provider timeout. On expiry the caller gets ErrTPMNotResponding while op
 // finishes in the background on its own transport; discard then scrubs a late
 // result. While a recent abandonment is outstanding, later calls fail
-// immediately; see tpmAbandoned.
-func runTPMBounded[T any](ctx context.Context, op func() (T, error), discard func(T)) (T, error) {
+// immediately without running op, and notStarted then releases anything the
+// caller prepared for it; see tpmAbandoned.
+func runTPMBounded[T any](ctx context.Context, op func() (T, error), discard func(T), notStarted func()) (T, error) {
 	var zero T
 	tpmAbandoned.Lock()
 	wedged := tpmAbandoned.count > 0 && time.Since(tpmAbandoned.last) < tpmWedgeBackoff
 	tpmAbandoned.Unlock()
 	if wedged {
+		if notStarted != nil {
+			notStarted()
+		}
 		return zero, fmt.Errorf("%w: an earlier TPM operation has not returned", ErrTPMNotResponding)
 	}
 	type result struct {

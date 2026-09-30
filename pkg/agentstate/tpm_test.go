@@ -609,7 +609,7 @@ func TestRunTPMBoundedConcurrentAbandonAndComplete(t *testing.T) {
 			_, _ = runTPMBounded(ctx, func() ([]byte, error) {
 				time.Sleep(delay)
 				return []byte{1}, nil
-			}, scrubBytes)
+			}, scrubBytes, nil)
 		}()
 	}
 	wg.Wait()
@@ -703,7 +703,7 @@ func TestRunTPMBoundedScrubsALateResultReturnedWithAnError(t *testing.T) {
 	_, err := runTPMBounded(ctx, func() ([]byte, error) {
 		<-release
 		return late, errors.New("cleanup failed after unseal")
-	}, func(b []byte) { scrubBytes(b); scrubbed <- b })
+	}, func(b []byte) { scrubBytes(b); scrubbed <- b }, nil)
 	if !errors.Is(err, ErrTPMNotResponding) {
 		t.Fatalf("runTPMBounded = %v, want abandonment", err)
 	}
@@ -761,5 +761,34 @@ func TestFreshDefaultFailsClosedOnAnUnclassifiedProbeError(t *testing.T) {
 	tpmProbe.Unlock()
 	if name, err := originalDefaultFreshKeyProvider(); err != nil || name != KeyProviderFile {
 		t.Fatalf("fresh default without a usable TPM = %q, %v; want plaintext", name, err)
+	}
+}
+
+func TestSealScrubsItsKeyCopyWhenTheWedgeGateRefusesIt(t *testing.T) {
+	release := make(chan struct{})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Millisecond)
+	defer cancel()
+	_, _ = runTPMBounded(ctx, func() ([]byte, error) { <-release; return nil, nil }, nil, nil)
+	t.Cleanup(func() {
+		close(release)
+		deadline := time.Now().Add(5 * time.Second)
+		for {
+			tpmAbandoned.Lock()
+			n := tpmAbandoned.count
+			tpmAbandoned.Unlock()
+			if n == 0 || time.Now().After(deadline) {
+				return
+			}
+			time.Sleep(time.Millisecond)
+		}
+	})
+	copyOwned := []byte{9, 9, 9}
+	ran := false
+	_, err := runTPMBounded(context.Background(), func() ([]byte, error) { ran = true; return nil, nil }, nil, func() { scrubBytes(copyOwned) })
+	if !errors.Is(err, ErrTPMNotResponding) || ran {
+		t.Fatalf("gated call = %v, ran=%v; want a refusal without running", err, ran)
+	}
+	if !bytes.Equal(copyOwned, []byte{0, 0, 0}) {
+		t.Fatalf("refused call left its prepared key unscrubbed: %v", copyOwned)
 	}
 }

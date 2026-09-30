@@ -117,6 +117,7 @@ var defaultFreshKeyProvider = func() (string, error) {
 	err := ProbeTPM()
 	switch {
 	case err == nil:
+		slog.Info("sealing new agent state to the local TPM; it will not be readable on other hardware or after a TPM clear", "key_provider", KeyProviderTPM)
 		return KeyProviderTPM, nil
 	case errors.Is(err, ErrTPMNotResponding):
 		return "", fmt.Errorf("%w; retry, or set %s=%s to create plaintext state", err, EnvKeyProvider, KeyProviderFile)

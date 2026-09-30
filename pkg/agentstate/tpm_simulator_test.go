@@ -352,3 +352,34 @@ func TestTPMStateSealedBeforeOwnershipNamesTheCause(t *testing.T) {
 	}
 	requireNoTransientHandles(t, sim)
 }
+
+// TestTPMStateSealedUnderAMissingPersistentSRKNamesTheCause covers the
+// primary Windows parent: the provisioned SRK the record names is gone.
+func TestTPMStateSealedUnderAMissingPersistentSRKNamesTheCause(t *testing.T) {
+	sim := useTPMSimulator(t)
+	dek := bytes.Repeat([]byte{0x55}, StateDEKSize)
+	sealed, err := tpmKeyProvider{}.Seal(context.Background(), dek, map[string]string{"agent_id": "agent-a"})
+	if err != nil {
+		t.Fatalf("Seal: %v", err)
+	}
+	raw, err := sealedCiphertextBytes(sealed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	record, err := parseTPMRecord(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Point the record at a persistent SRK that this TPM does not have.
+	record.parent = tpmParentPersistentSRK
+	moved, err := record.marshal()
+	if err != nil {
+		t.Fatal(err)
+	}
+	sealed.CiphertextBase64 = base64.StdEncoding.EncodeToString(moved)
+	_, err = tpmKeyProvider{}.Unseal(context.Background(), sealed)
+	if !errors.Is(err, ErrTPMUnavailable) || !strings.Contains(err.Error(), "TPM was cleared or this state belongs to another machine") {
+		t.Fatalf("Unseal under a missing persistent SRK = %v, want the cleared-TPM diagnosis", err)
+	}
+	requireNoTransientHandles(t, sim)
+}
