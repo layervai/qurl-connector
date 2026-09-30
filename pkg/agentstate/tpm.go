@@ -99,12 +99,14 @@ func probeTPMOnce(open func() (tpmCloser, error)) (retErr error) {
 	if err != nil {
 		return tpmOpenError(err)
 	}
-	defer func() { retErr = errors.Join(retErr, tpm.Close()) }()
+	defer func() { retErr = tpmCleanup(retErr, "close TPM", tpm.Close()) }()
 	parent, err := selectTPMParent(tpm)
 	if err != nil {
 		return err
 	}
-	return parent.flush(tpm)
+	// The TPM answered and produced a usable parent; a failed flush is
+	// housekeeping and must not become a cached, permanent "no TPM".
+	return tpmCleanup(nil, "flush probe parent", parent.flush(tpm))
 }
 
 // tpmOpenError marks a failure to open the device. Missing devices, missing
@@ -286,10 +288,12 @@ func (p tpmKeyProvider) Unseal(ctx context.Context, sealed SealedPrivateKey) ([]
 	}, scrubBytes)
 }
 
-// unsealCleanup folds a cleanup failure into a failed unseal but only logs it
-// after a successful one: the DEK is already recovered and authenticated, and
-// a housekeeping hiccup must not make a healthy namespace look unreadable.
-func unsealCleanup(opErr error, label string, cleanupErr error) error {
+// tpmCleanup folds a cleanup failure into a failed operation but only logs
+// it after a successful one: after an unseal the DEK is already recovered and
+// authenticated, and after a probe the TPM has already proved usable, so a
+// housekeeping hiccup must not make a healthy namespace look unreadable or a
+// usable TPM look absent.
+func tpmCleanup(opErr error, label string, cleanupErr error) error {
 	if cleanupErr == nil {
 		return opErr
 	}
@@ -305,7 +309,7 @@ func unsealWithTPM(open func() (tpmCloser, error), record tpmRecord, public *tpm
 	if err != nil {
 		return nil, tpmOpenError(err)
 	}
-	defer func() { retErr = unsealCleanup(retErr, "close TPM", tpm.Close()) }()
+	defer func() { retErr = tpmCleanup(retErr, "close TPM", tpm.Close()) }()
 	parent, err := openTPMParent(tpm, record.parent)
 	if err != nil {
 		if errors.Is(err, errTPMOwnerAuthSet) {
@@ -315,7 +319,7 @@ func unsealWithTPM(open func() (tpmCloser, error), record tpmRecord, public *tpm
 		}
 		return nil, classifyTPMError(err)
 	}
-	defer func() { retErr = unsealCleanup(retErr, "flush storage parent", parent.flush(tpm)) }()
+	defer func() { retErr = tpmCleanup(retErr, "flush storage parent", parent.flush(tpm)) }()
 	if !bytes.Equal(parent.name.Buffer, record.parentName) {
 		return nil, fmt.Errorf("%w: TPM storage root key does not match the one this state was sealed under; the TPM was cleared or this state belongs to another machine", ErrTPMUnavailable)
 	}
@@ -328,7 +332,7 @@ func unsealWithTPM(open func() (tpmCloser, error), record tpmRecord, public *tpm
 	if err != nil {
 		return nil, tpmCommandError("load TPM sealed KEK", err)
 	}
-	defer func() { retErr = unsealCleanup(retErr, "flush sealed KEK", flushTPMHandle(tpm, loaded.ObjectHandle)) }()
+	defer func() { retErr = tpmCleanup(retErr, "flush sealed KEK", flushTPMHandle(tpm, loaded.ObjectHandle)) }()
 
 	unsealed, err := tpm2.Unseal{
 		ItemHandle: tpm2.AuthHandle{

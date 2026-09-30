@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"slices"
 	"strings"
@@ -119,8 +120,13 @@ var defaultFreshKeyProvider = func() (string, error) {
 		return KeyProviderTPM, nil
 	case errors.Is(err, ErrTPMNotResponding):
 		return "", fmt.Errorf("%w; retry, or set %s=%s to create plaintext state", err, EnvKeyProvider, KeyProviderFile)
-	default:
+	case errors.Is(err, ErrTPMUnavailable):
+		slog.Debug("no usable TPM; new agent state will be plaintext", "reason", err)
 		return KeyProviderFile, nil
+	default:
+		// Plaintext is permanent for the namespace, so only a failure known to
+		// be structural may choose it; anything unclassified fails closed.
+		return "", err
 	}
 }
 

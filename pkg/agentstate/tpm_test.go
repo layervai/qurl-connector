@@ -685,11 +685,11 @@ func TestSelectTPMParentTreatsItsOwnRejectionsAsStructural(t *testing.T) {
 
 func TestUnsealCleanupNeverFailsARecoveredKey(t *testing.T) {
 	cleanup := errors.New("flush failed")
-	if err := unsealCleanup(nil, "flush", cleanup); err != nil {
+	if err := tpmCleanup(nil, "flush", cleanup); err != nil {
 		t.Fatalf("cleanup failure after a successful unseal = %v, want nil", err)
 	}
 	op := errors.New("unseal failed")
-	if err := unsealCleanup(op, "flush", cleanup); !errors.Is(err, op) || !errors.Is(err, cleanup) {
+	if err := tpmCleanup(op, "flush", cleanup); !errors.Is(err, op) || !errors.Is(err, cleanup) {
 		t.Fatalf("cleanup failure after a failed unseal = %v, want both errors", err)
 	}
 }
@@ -745,5 +745,21 @@ func TestEveryListedProviderIsConstructible(t *testing.T) {
 		if _, err := defaultKeyProviderForName(name); err != nil && strings.Contains(err.Error(), "unsupported envelope key provider") {
 			t.Errorf("provider %q is accepted but the factory does not know it", name)
 		}
+	}
+}
+
+func TestFreshDefaultFailsClosedOnAnUnclassifiedProbeError(t *testing.T) {
+	resetTPMProbeForTest(t)
+	tpmProbe.Lock()
+	tpmProbe.done, tpmProbe.err = true, errors.New("an error nothing classified")
+	tpmProbe.Unlock()
+	if name, err := originalDefaultFreshKeyProvider(); err == nil || name != "" {
+		t.Fatalf("fresh default with an unclassified probe error = %q, %v; want an error, never plaintext", name, err)
+	}
+	tpmProbe.Lock()
+	tpmProbe.err = fmt.Errorf("%w: permission denied", ErrTPMUnavailable)
+	tpmProbe.Unlock()
+	if name, err := originalDefaultFreshKeyProvider(); err != nil || name != KeyProviderFile {
+		t.Fatalf("fresh default without a usable TPM = %q, %v; want plaintext", name, err)
 	}
 }
