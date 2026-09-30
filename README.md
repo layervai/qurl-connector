@@ -39,10 +39,11 @@ A new state directory is sealed to the machine's TPM 2.0 when the process can
 use one: the Linux resource manager `/dev/tpmrm0` (usually `tss` group
 membership) or TPM Base Services on Windows. macOS, and machines without a
 usable TPM, keep the owner-only plaintext envelope. A TPM that is present but
-not responding (busy, timing out, or self-testing) fails the operation instead
-of falling back, because the choice is permanent for the directory. The TPM holds a random key
-that never leaves it; the state's data key is encrypted under that key. The
-choice is fixed when the directory is created:
+not responding (busy, starting, timing out, or self-testing) fails the
+operation instead of falling back, because the choice is permanent for the
+directory. The TPM holds a random key that never leaves it; the state's data
+key is encrypted under that key. The choice is fixed when the directory is
+created:
 
 - `LAYERV_KEY_PROVIDER=file` keeps a new directory plaintext; `tpm` requires
   the TPM. The cloud and `local-key` providers are unchanged.
@@ -57,6 +58,14 @@ choice is fixed when the directory is created:
   `LAYERV_KEY_PROVIDER=file` when building images.
 - Each state save and load performs a TPM round trip. These happen on
   lifecycle writes (enrollment, refresh, session changes), not per request.
+
+Sealing binds the state to the machine; it does not protect it from other
+users of that machine. The sealed key has no password or boot-state policy,
+so anyone who can read the state file and reach the TPM on the same machine
+can unseal it. The owner-only file permissions remain the access boundary.
+What the TPM removes is the ability to copy the file and read it elsewhere.
+Sealing also does not authenticate the envelope: someone who can write the
+state directory can replace it, exactly as with plaintext state.
 
 `cmd/frpc` is retained for development and diagnostics. It is not a supported
 customer distribution, Homebrew formula, release binary, or container image.

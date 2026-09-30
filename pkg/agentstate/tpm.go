@@ -326,9 +326,12 @@ func unsealWithTPM(open func() (tpmCloser, error), record tpmRecord, public *tpm
 // tpmAbandoned tracks TPM operations whose caller gave up while they were
 // still blocked in the device. For tpmWedgeBackoff after an abandonment the
 // TPM is presumed wedged and new operations fail fast instead of each parking
-// another goroutine and descriptor behind it. After the backoff one operation
-// is let through, so a TPM that recovers is used again and a wedged one costs
-// at most one parked operation per backoff period.
+// another goroutine and descriptor behind it. The gate reopens when the
+// abandoned operations finish or the backoff elapses, whichever is first, so a
+// TPM that recovers is used again. Callers waiting when it reopens are all
+// admitted; against a TPM that is still wedged each of them is abandoned in
+// turn and closes the gate for another period, so parked operations grow with
+// caller concurrency per period rather than with every retry.
 var tpmAbandoned struct {
 	sync.Mutex
 	count int

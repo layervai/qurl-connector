@@ -80,11 +80,20 @@ func explicitKeyProviderName() (string, error) {
 	if name == "" {
 		return "", nil
 	}
-	switch name {
-	case KeyProviderFile, KeyProviderAWSKMS, KeyProviderGCPKMS, KeyProviderAWSNitro, KeyProviderGCPConfidentialSpace, KeyProviderLocalKey, KeyProviderTPM:
+	switch {
+	case knownKeyProvider(name):
 		return name, nil
 	default:
 		return "", fmt.Errorf("%s must be one of %s, %s, %s, %s, %s, %s, %s; got %q", EnvKeyProvider, KeyProviderFile, KeyProviderAWSKMS, KeyProviderGCPKMS, KeyProviderAWSNitro, KeyProviderGCPConfidentialSpace, KeyProviderLocalKey, KeyProviderTPM, name)
+	}
+}
+
+func knownKeyProvider(name string) bool {
+	switch name {
+	case KeyProviderFile, KeyProviderAWSKMS, KeyProviderGCPKMS, KeyProviderAWSNitro, KeyProviderGCPConfidentialSpace, KeyProviderLocalKey, KeyProviderTPM:
+		return true
+	default:
+		return false
 	}
 }
 

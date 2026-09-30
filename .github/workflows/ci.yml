@@ -167,6 +167,8 @@ jobs:
       # The TPM simulator suite is cgo-only, so this is the one lane that can
       # prove the tpm key provider against real TPM 2.0 commands. Require its
       # PASS lines so a lost build tag or cgo toolchain cannot go green empty.
+      # It is an evidence gate only: make test-race above already ran these
+      # tests under -race, so do not add it here.
       - name: Require TPM simulator evidence
         run: |
           set -euo pipefail

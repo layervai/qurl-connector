@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"syscall"
 	"testing"
@@ -15,6 +16,8 @@ import (
 
 	"github.com/google/go-tpm/tpm2"
 	qurl "github.com/layervai/qurl-go/qurl"
+
+	"github.com/layervai/qurl-connector/internal/pinnedfs"
 )
 
 // TestMain pins the fresh-namespace default to the plaintext file so no test
@@ -51,6 +54,7 @@ func TestResolveKeyProviderSelectsByEnvironmentThenEnvelopeThenDefault(t *testin
 		{name: "tpm envelope with explicit tpm", env: "TPM", files: map[string]string{SealedAgentStateFile: `{"provider_id":"tpm"}`}, want: KeyProviderTPM},
 		{name: "local-key envelope still needs its environment", files: map[string]string{SealedAgentStateFile: `{"provider_id":"local-key"}`}, wantErr: "set LAYERV_KEY_PROVIDER=local-key"},
 		{name: "sealed envelope claiming the file provider is corrupt", freshDefault: KeyProviderTPM, files: map[string]string{SealedAgentStateFile: `{"provider_id":"file"}`}, wantErr: "never seals state"},
+		{name: "sealed envelope naming an unknown provider", files: map[string]string{SealedAgentStateFile: `{"provider_id":"hsm"}`}, wantErr: "unknown key provider \"hsm\""},
 		{name: "sealed envelope without a provider id", files: map[string]string{SealedAgentStateFile: `{}`}, wantErr: "does not name its key provider"},
 		{name: "explicit tpm over plaintext is not a migration", env: KeyProviderTPM, files: map[string]string{AgentStateFile: `{}`}, wantErr: "provider changes are not an in-place migration"},
 		{name: "explicit file over a tpm envelope is not a migration", env: KeyProviderFile, files: map[string]string{SealedAgentStateFile: `{"provider_id":"tpm"}`}, wantErr: "provider changes are not an in-place migration"},
@@ -504,4 +508,32 @@ func TestReadOnlyEntryPointsNeverProbeTheTPM(t *testing.T) {
 	if _, err := NewSDKStore(dir, ""); !errors.Is(err, ErrTPMNotResponding) || probed != 1 {
 		t.Fatalf("NewSDKStore = %v after %d probes, want the create path to probe once and refuse", err, probed)
 	}
+}
+
+func TestSealedEnvelopeReadsAreBoundedAndOwnerOnly(t *testing.T) {
+	t.Setenv(EnvKeyProvider, "")
+	t.Run("oversized", func(t *testing.T) {
+		dir := secureSDKStateDir(t)
+		huge := append([]byte(`{"provider_id":"tpm","pad":"`), bytes.Repeat([]byte("x"), maxSealedEnvelopeBytes)...)
+		huge = append(huge, `"}`...)
+		writePinnedSDKTestFile(t, dir, SealedAgentStateFile, huge, 0o600)
+		if _, err := ResolveKeyProvider(dir); err == nil || !strings.Contains(err.Error(), "exceeds") {
+			t.Fatalf("ResolveKeyProvider on an oversized envelope = %v, want a size refusal", err)
+		}
+	})
+	t.Run("loose mode", func(t *testing.T) {
+		if runtime.GOOS == "windows" {
+			t.Skip("Windows file modes do not express ACL safety")
+		}
+		dir := secureSDKStateDir(t)
+		writePinnedSDKTestFile(t, dir, SealedAgentStateFile, []byte(`{"provider_id":"tpm"}`), 0o644)
+		namespace, err := pinnedfs.OpenPrivate(dir, dirMode)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = namespace.Close() }()
+		if _, err := validateSDKStoreLayoutInNamespace(namespace, true); err == nil {
+			t.Fatal("pinned resolution accepted a group/world-readable sealed envelope")
+		}
+	})
 }

@@ -20,6 +20,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/layervai/qurl-connector/pkg/agentstate"
+
 	v1 "github.com/fatedier/frp/pkg/config/v1"
 	frpmetrics "github.com/fatedier/frp/pkg/metrics"
 	frplog "github.com/fatedier/frp/pkg/util/log"
@@ -58,6 +60,7 @@ const (
 )
 
 func TestMain(m *testing.M) {
+	pinPlaintextKeyProviderForTests()
 	if os.Getenv(proofRoutesEnv) != "" {
 		// An opt-in proof registers thousands of proxies; FRP's global logger
 		// prints several info lines per proxy, which would bury the summary.
@@ -1089,4 +1092,14 @@ func requireNoProofFailures(t *testing.T, what string, failures []error) {
 		shown = shown[:5]
 	}
 	t.Fatalf("%d %s failures; first %d: %v", len(failures), what, len(shown), shown)
+}
+
+// pinPlaintextKeyProviderForTests keeps every test in this package off the
+// host's TPM: a fresh state namespace would otherwise probe it and, on a
+// machine where the TPM is usable, seal test state to real hardware. A test
+// that needs another provider sets it with t.Setenv, which restores this.
+func pinPlaintextKeyProviderForTests() {
+	if os.Getenv(agentstate.EnvKeyProvider) == "" {
+		_ = os.Setenv(agentstate.EnvKeyProvider, agentstate.KeyProviderFile)
+	}
 }

@@ -234,6 +234,7 @@ func TestTPMProviderFallsBackToThePersistentSRK(t *testing.T) {
 
 func TestSDKStoreDefaultsFreshNamespacesToTheTPM(t *testing.T) {
 	sim := useTPMSimulator(t)
+	resetTPMProbeForTest(t)
 	t.Setenv(EnvKeyProvider, "")
 	original := defaultFreshKeyProvider
 	defaultFreshKeyProvider = originalDefaultFreshKeyProvider
