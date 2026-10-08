@@ -213,8 +213,8 @@ jobs:
           # Reads go only through the action's GitHub MCP subprocess, which holds
           # the repository token but not the Anthropic key. Local, network,
           # delegation, and GitHub file-write tools stay denied.
-          # Fleet review setting: Opus 5.5 at medium effort. Keep the model and effort
-          # in lockstep with claude.yml.
+          # Review model setting: Opus 5.5 at medium effort. Keep the model and
+          # effort identical in claude.yml; change both together.
           claude_args: >-
             --model claude-opus-5-5 --effort medium
             --allowed-tools
@@ -264,7 +264,7 @@ jobs:
           # restoreConfigFromBase() fetches the base branch through it. Asserting
           # the local pin survived therefore tested the action's version, not
           # Claude's behavior, and failed closed on every review from v1.0.187
-          # on (still present in v1.0.194).
+          # on (still present in v1.0.238).
           #
           # What still has to hold is the property that pin bought: origin may
           # only ever address THIS repository, so no credential-bearing remote
