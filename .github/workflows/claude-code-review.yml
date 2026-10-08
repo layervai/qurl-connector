@@ -213,6 +213,8 @@ jobs:
           # Reads go only through the action's GitHub MCP subprocess, which holds
           # the repository token but not the Anthropic key. Local, network,
           # delegation, and GitHub file-write tools stay denied.
+          # Fleet review setting: Opus 5.5 at medium effort. Keep the model and effort
+          # in lockstep with claude.yml.
           claude_args: >-
             --model claude-opus-5-5 --effort medium
             --allowed-tools
