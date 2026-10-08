@@ -653,6 +653,15 @@ esac
 		// like userinfo. A naive strip-to-first-@ would accept this.
 		{name: "userinfo lookalike path", remote: "https://evil.example.com/@github.com/layervai/qurl-connector.git"},
 		{name: "other scheme", remote: "ssh://git@evil.example.com/layervai/qurl-connector.git"},
+		// A URL client ends the host at "#", "?" or "\": each of these
+		// connects to evil.example.com although a strip through the last "@"
+		// leaves this repository's host and path.
+		{name: "host ended by fragment", remote: "https://evil.example.com#@github.com/layervai/qurl-connector.git"},
+		{name: "host ended by query", remote: "https://evil.example.com?@github.com/layervai/qurl-connector.git"},
+		{name: "host ended by backslash", remote: `https://evil.example.com\@github.com/layervai/qurl-connector.git`},
+		{name: "double at behind fragment", remote: "https://evil.example.com#x@y@github.com/layervai/qurl-connector.git"},
+		{name: "double at with credential", remote: "https://x-access-token:t@evil.example.com#@github.com/layervai/qurl-connector.git"},
+		{name: "ipv6 literal host", remote: "https://[::1]/layervai/qurl-connector.git"},
 	}
 	for _, testCase := range offRepoOrigins {
 		t.Run(testCase.name, func(t *testing.T) {
@@ -670,6 +679,15 @@ esac
 			runGit(t, repository, "remote", "set-url", "origin", actionOrigin)
 		})
 	}
+
+	// pushInsteadOf rewrites only the push URL. The verifier reads it through
+	// `git remote get-url --push`, so the rewrite is what gets compared.
+	const pushRewrite = "url.https://evil.example.com/.pushInsteadOf"
+	runGit(t, repository, "config", "--local", pushRewrite, "https://x-access-token:ghs-test-token@github.com/")
+	if output, err := runVerifier(nil); err == nil || !strings.Contains(output, boundaryError) {
+		t.Fatalf("pushInsteadOf rewrite: err = %v, output = %q, want %q", err, output, boundaryError)
+	}
+	runGit(t, repository, "config", "--local", "--unset-all", pushRewrite)
 
 	runGit(t, repository, "remote", "set-url", "origin", filepath.Join(repository, ".git"))
 	runGit(t, repository, "config", "--local", "credential.https://github.com.helper", "store")
@@ -1003,7 +1021,7 @@ func TestClaudeReviewIsTrustedBaseReadyOnlyAndImmutable(t *testing.T) {
 		`git config --local --get-regexp '^http\..*\.extraheader$'`,
 		`git config --local --get-regexp '^credential(\..*)?\.helper$'`,
 		`git config --local --get fetch.recurseSubmodules`,
-		`git remote get-url origin`,
+		`git remote get-url --all origin`,
 		`${GITHUB_WORKSPACE}/.git`,
 		`[.head.repo.full_name // "", .head.sha // "", .head.ref // "", .base.repo.full_name // "", .base.sha // "", .base.ref // ""] | @tsv`,
 		`local_head_sha="$(git rev-parse --verify HEAD 2>/dev/null)"`,
@@ -1016,9 +1034,13 @@ func TestClaudeReviewIsTrustedBaseReadyOnlyAndImmutable(t *testing.T) {
 		// authority is parsed explicitly so a path that merely looks like
 		// userinfo cannot masquerade as this repository.
 		`[[ -z "${GITHUB_SERVER_URL}" ]]`,
-		`origin_url="$(git remote get-url origin 2>/dev/null || true)"`,
-		`origin_authority="${origin_rest%%/*}"`,
-		`origin_authority="${origin_authority##*@}"`,
+		`origin_fetch_url="$(git remote get-url --all origin 2>/dev/null || true)"`,
+		`origin_push_url="$(git remote get-url --push --all origin 2>/dev/null || true)"`,
+		`authority="${rest%%/*}"`,
+		`host="${authority##*@}"`,
+		`[[ "${userinfo}" =~ ^[A-Za-z0-9._~%:_-]+$ ]] || return 1`,
+		`"${host}" =~ ^[A-Za-z0-9.-]+(:[0-9]+)?$ ]] || return 1`,
+		`[[ "${origin_ok}" != "true" ]]`,
 		`[[ "${origin_dest}" != "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git" ]]`,
 		`[[ ! "${current_head_sha}" =~ ^[0-9a-f]{40}$ ]]`,
 		`[[ ! "${current_base_sha}" =~ ^[0-9a-f]{40}$ ]]`,
@@ -1394,7 +1416,7 @@ func TestClaudeCommandTerminalContract(t *testing.T) {
 		`git config --local --get-regexp '^http\..*\.extraheader$'`,
 		`git config --local --get-regexp '^credential(\..*)?\.helper$'`,
 		`git config --local --get fetch.recurseSubmodules`,
-		`git remote get-url origin`, `${GITHUB_WORKSPACE}/.git`,
+		`git remote get-url --all origin`, `${GITHUB_WORKSPACE}/.git`,
 		`[.head.repo.full_name // "", .head.sha // "", .head.ref // "", .base.repo.full_name // "", .base.repo.default_branch // "", .base.sha // "", .base.ref // "", .state // ""] | @tsv`,
 		`refs/heads/${EXPECTED_HEAD_REF}^{commit}`, `refs/heads/${EXPECTED_BASE_REF}^{commit}`,
 		`refs/claude-command/head^{commit}`, `refs/claude-command/base^{commit}`,
@@ -1402,8 +1424,12 @@ func TestClaudeCommandTerminalContract(t *testing.T) {
 		// remote's destination, parsing the authority so a userinfo-lookalike
 		// path cannot masquerade as this repository.
 		`[[ -z "${GITHUB_SERVER_URL}" ]]`,
-		`origin_url="$(git remote get-url origin 2>/dev/null || true)"`,
-		`origin_authority="${origin_authority##*@}"`,
+		`origin_fetch_url="$(git remote get-url --all origin 2>/dev/null || true)"`,
+		`origin_push_url="$(git remote get-url --push --all origin 2>/dev/null || true)"`,
+		`host="${authority##*@}"`,
+		`[[ "${userinfo}" =~ ^[A-Za-z0-9._~%:_-]+$ ]] || return 1`,
+		`"${host}" =~ ^[A-Za-z0-9.-]+(:[0-9]+)?$ ]] || return 1`,
+		`[[ "${origin_ok}" != "true" ]]`,
 		`[[ "${origin_dest}" != "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git" ]]`,
 		`[[ "${current_head_repo}" != "${GITHUB_REPOSITORY}" ]]`,
 		`[[ "${current_base_repo}" != "${GITHUB_REPOSITORY}" ]]`,
@@ -1538,6 +1564,15 @@ func TestClaudeCommandTerminalRejectsUnsafeWriteTargets(t *testing.T) {
 		// Both lanes share the identical parser, so pin scheme enforcement on
 		// this one too rather than only on the review lane.
 		{name: "other scheme", remote: "ssh://git@evil.example.com/layervai/qurl-connector.git"},
+		// A URL client ends the host at "#", "?" or "\": each of these
+		// connects to evil.example.com although a strip through the last "@"
+		// leaves this repository's host and path.
+		{name: "host ended by fragment", remote: "https://evil.example.com#@github.com/layervai/qurl-connector.git"},
+		{name: "host ended by query", remote: "https://evil.example.com?@github.com/layervai/qurl-connector.git"},
+		{name: "host ended by backslash", remote: `https://evil.example.com\@github.com/layervai/qurl-connector.git`},
+		{name: "double at behind fragment", remote: "https://evil.example.com#x@y@github.com/layervai/qurl-connector.git"},
+		{name: "double at with credential", remote: "https://x-access-token:t@evil.example.com#@github.com/layervai/qurl-connector.git"},
+		{name: "ipv6 literal host", remote: "https://[::1]/layervai/qurl-connector.git"},
 	}
 	for _, testCase := range offRepoOrigins {
 		t.Run(testCase.name, func(t *testing.T) {
@@ -1555,4 +1590,13 @@ func TestClaudeCommandTerminalRejectsUnsafeWriteTargets(t *testing.T) {
 			runGit(t, repository, "remote", "set-url", "origin", actionOrigin)
 		})
 	}
+
+	// pushInsteadOf rewrites only the push URL. The verifier reads it through
+	// `git remote get-url --push`, so the rewrite is what gets compared.
+	const pushRewrite = "url.https://evil.example.com/.pushInsteadOf"
+	runGit(t, repository, "config", "--local", pushRewrite, "https://x-access-token:ghs-test-token@github.com/")
+	if output, err := runBash(t, repository, verify.Run, cloneEnvironment(nil)); err == nil || !strings.Contains(output, boundaryError) {
+		t.Fatalf("pushInsteadOf rewrite: err = %v, output = %q, want %q", err, output, boundaryError)
+	}
+	runGit(t, repository, "config", "--local", "--unset-all", pushRewrite)
 }
