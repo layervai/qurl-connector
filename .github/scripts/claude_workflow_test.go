@@ -15,8 +15,9 @@ import (
 
 const (
 	checkoutAction           = "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
-	claudeAction             = "anthropics/claude-code-action@d75b94d5ad426cb8546e6628b6f5f19b84e5cce1"
-	claudeModel              = "claude-opus-5"
+	claudeAction             = "anthropics/claude-code-action@12dd8d74c712f5f3669365b2369b558c495b1104"
+	claudeModel              = "claude-opus-5-5"
+	claudeEffort             = "medium"
 	automaticAllowedTools    = "mcp__github__get_pull_request,mcp__github__get_pull_request_diff,mcp__github__get_pull_request_files,mcp__github__get_pull_request_review_comments,mcp__github__get_pull_request_reviews,mcp__github__get_pull_request_status,mcp__github__get_issue_comments,mcp__github__get_file_contents,mcp__github__search_code,mcp__github__get_commit,mcp__github__add_issue_comment,mcp__github_inline_comment__create_inline_comment"
 	automaticDisallowedTools = "Bash,Read,Glob,Grep,LS,Task,Edit,Write,MultiEdit,NotebookEdit,WebFetch,WebSearch,mcp__github_file_ops__commit_files,mcp__github_file_ops__delete_files,mcp__github__create_or_update_file,mcp__github__push_files,mcp__github__delete_file"
 )
@@ -941,7 +942,7 @@ func TestClaudeReviewIsTrustedBaseReadyOnlyAndImmutable(t *testing.T) {
 		"prompt",
 		"claude_args",
 	)
-	wantArgs := `--model ` + claudeModel + ` --allowed-tools "` + automaticAllowedTools + `" --disallowed-tools "` + automaticDisallowedTools + `"`
+	wantArgs := `--model ` + claudeModel + ` --effort ` + claudeEffort + ` --allowed-tools "` + automaticAllowedTools + `" --disallowed-tools "` + automaticDisallowedTools + `"`
 	if got := compact(runClaude.With["claude_args"]); got != wantArgs {
 		t.Errorf("automatic Claude args = %q, want exact read/comment-only boundary %q", got, wantArgs)
 	}
@@ -1343,7 +1344,7 @@ func TestClaudeCommandActionContract(t *testing.T) {
 	}
 	wantInputs := map[string]string{
 		"anthropic_api_key":         "${{ secrets.ANTHROPIC_API_KEY }}",
-		"claude_args":               "--model " + claudeModel,
+		"claude_args":               "--model " + claudeModel + " --effort " + claudeEffort,
 		"use_commit_signing":        "true",
 		"exclude_comments_by_actor": "github-actions[bot]",
 	}

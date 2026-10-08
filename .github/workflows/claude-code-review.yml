@@ -154,7 +154,7 @@ jobs:
         # step, so the verify step never runs and the PR gets a bare
         # `cancelled` check with no comment and nothing saying why.
         timeout-minutes: 16
-        uses: anthropics/claude-code-action@d75b94d5ad426cb8546e6628b6f5f19b84e5cce1 # v1.0.216
+        uses: anthropics/claude-code-action@12dd8d74c712f5f3669365b2369b558c495b1104 # v1.0.238
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           github_token: ${{ github.token }}
@@ -214,7 +214,7 @@ jobs:
           # the repository token but not the Anthropic key. Local, network,
           # delegation, and GitHub file-write tools stay denied.
           claude_args: >-
-            --model claude-opus-5
+            --model claude-opus-5-5 --effort medium
             --allowed-tools
             "mcp__github__get_pull_request,mcp__github__get_pull_request_diff,mcp__github__get_pull_request_files,mcp__github__get_pull_request_review_comments,mcp__github__get_pull_request_reviews,mcp__github__get_pull_request_status,mcp__github__get_issue_comments,mcp__github__get_file_contents,mcp__github__search_code,mcp__github__get_commit,mcp__github__add_issue_comment,mcp__github_inline_comment__create_inline_comment"
             --disallowed-tools
