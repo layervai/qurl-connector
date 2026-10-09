@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.14.3](https://github.com/layervai/qurl-connector/compare/v0.14.2...v0.14.3) (2026-10-09)
+
+
+### Bug Fixes
+
+* **deps:** raise the Go floor to 1.26.9 and bump golang.org/x/net to v0.60.0 ([#119](https://github.com/layervai/qurl-connector/issues/119)) ([88bd86d](https://github.com/layervai/qurl-connector/commit/88bd86daf8cf325863adf972f70d10bb139b24c8))
+
+
+### Continuous Integration
+
+* **claude:** allowlist host and userinfo in the Claude origin check ([#117](https://github.com/layervai/qurl-connector/issues/117)) ([5f8f836](https://github.com/layervai/qurl-connector/commit/5f8f8361743da2d6b1557bde2fe433072f6a8fe9))
+* document the Claude review model and effort setting ([#116](https://github.com/layervai/qurl-connector/issues/116)) ([6537d3e](https://github.com/layervai/qurl-connector/commit/6537d3ebc5c15690774bd0ec8b5cea9b552e6a58))
+* run Claude review on Opus 5.5 at medium effort ([#114](https://github.com/layervai/qurl-connector/issues/114)) ([cbb9561](https://github.com/layervai/qurl-connector/commit/cbb9561c68ff342aeed6e05e61bbac60b04faaaa))
+
 ## [0.14.2](https://github.com/layervai/qurl-connector/compare/v0.14.1...v0.14.2) (2026-09-30)
 
 
