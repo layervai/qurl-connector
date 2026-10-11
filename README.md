@@ -1,8 +1,19 @@
-# qURL Connector
+# qURL Connector runtime for local services
 
-qURL Connector is the local tunnel runtime for qURL. It
-admits each shared resource with the Network-invisible Handshake Protocol
-(NHP), then carries approved traffic over a resource-bound FRP session.
+qURL™ Connector is the Go runtime that connects local web apps and private
+services to LayerV's temporary access links. It admits each shared resource
+with the Network-invisible Handshake Protocol (NHP), then carries approved
+traffic over a resource-bound FRP session.
+
+To share localhost as a user, install the
+[qURL CLI](https://github.com/layervai/qurl-integrations/tree/main/apps/cli),
+which embeds this runtime. Keep your local app running; the Connector carries
+traffic to it and the app's own sign-in requirements still apply.
+
+Developers working on the runtime can start with the
+[security model](#security-model), [source build](#build-from-source),
+[development checks](#development), or
+[developer command configuration](#developer-command-configuration).
 
 ```text
 local service -> qURL Connector -> qURL -> recipient
