@@ -106,6 +106,10 @@ Please report vulnerabilities through the repository's private
 [security-advisory form](https://github.com/layervai/qurl-connector/security/advisories/new),
 not a public issue.
 
+The Connector controls tunnel access; it does not sandbox the target app.
+See the proposed [public publishing isolation design](docs/public-publishing-isolation.md)
+for a future execution boundary that limits damage from a compromised app.
+
 ## Build from source
 
 Requirements:
