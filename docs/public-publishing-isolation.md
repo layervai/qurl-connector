@@ -51,7 +51,8 @@ qURL access control ------------ host Connector
                                dedicated app VM
                                app + chosen data
 
-host CLI, Connector keys, VM control, and other apps stay outside the VM ```
+host CLI, Connector keys, VM control, and other apps stay outside the VM
+```
 
 Begin with one supported Linux/KVM runtime. Firecracker with its jailer is a
 concrete candidate, subject to a compatibility and performance trial. Use its
