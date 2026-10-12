@@ -64,7 +64,7 @@ cannot start isolated publishing; it must not quietly run the app on the host.
 
 An ordinary host container is useful protection, but it shares a kernel with
 the host. Do not equate a default container, loopback listener, tunnel, or
-TPM-sealed Connector state with this app isolation contract. A different
+hardware-protected Connector keys with this app isolation contract. A different
 runtime, such as gVisor, needs its own compatibility and adversarial validation
 before it can be described as an equivalent supported profile.
 
@@ -76,14 +76,16 @@ paths. Open and copy each input relative to the selected input root without
 following symlinks or reparse points, including in parent directories. Keep
 that boundary enforced during copying; a separate path check is insufficient.
 Refuse any path that escapes the selected input root. Exclude credential
-stores, `.env` files, version-control metadata, and agent memory unless the publisher has
-selected a specific required input. A filename exclusion or secret scanner
+stores, `.env` files, version-control metadata, and agent memory unless the
+publisher has selected a specific required input. A filename exclusion or secret scanner
 alone does not prove that the selected content is safe to publish.
 
 Run package installation, build scripts, and the app inside the boundary.
 Do not run a guest-supplied build or launch command on the host. Build access
 to package sources is an explicit network policy that ends when the build
 ends; the serving app does not inherit unrestricted build-time access.
+Builds receive no app secrets. Provide selected app credentials only after
+the build ends and its network permissions are removed.
 
 Use a read-only source snapshot and a separate guest scratch disk. A guest
 must not change host source that an assistant or developer will later execute.
@@ -109,7 +111,9 @@ Serving egress is denied by default. Permit only destinations the publisher
 selected, with the required protocols. A policy must cover IPv4, IPv6, DNS,
 redirects, and destination changes after DNS resolution. Resolve and validate
 the actual destination at connection time. Do not implement an allowlist
-solely as a string check of the app's URL. Required external services should
+solely as a string check of the app's URL. Restrict DNS queries to a resolver
+and names permitted by host-enforced policy; block other resolvers and
+non-selected names to limit DNS-based data theft. Required external services should
 use scoped credentials and bounded spending where that service supports it.
 
 The app endpoint has no direct public listener and cannot bypass qURL access
@@ -191,6 +195,8 @@ Use synthetic credentials and isolated test machines.
 | Reach a host service, another guest, local network, or metadata address | Refused, including IPv6 and DNS/redirect variants |
 | Reach a non-selected internet destination while serving, or a selected name that resolves or redirects outside its permitted destinations | Refused by the host network policy |
 | Use build-time package-source access after the build ends | Refused; serving does not inherit build network access |
+| Read a selected app credential during the build | Credential is absent; supplied only after build network permissions end |
+| Query a non-selected DNS name or use another resolver | Refused by the host network policy |
 | Open the app without the qURL route | No direct public path |
 | Change the target, mounts, credentials, egress, or resource limits from the guest | Refused by the host boundary |
 | Access an explicitly permitted input or service | Works within the granted scope |
