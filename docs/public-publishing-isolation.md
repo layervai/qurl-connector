@@ -3,9 +3,9 @@
 Status: proposed future work. Implementation and rollout need a separate plan.
 
 Public CRIDs let unknown people and agents use a published app. The app must
-run with limited access to the publisher's machine. Assume that a consumer
-can exploit the app and execute arbitrary code inside it. The isolation
-boundary must limit what that code can reach.
+run with limited access to the publisher's machine. Assume that a consumer can
+exploit the app and execute arbitrary code inside it. The isolation boundary
+must limit what that code can reach.
 
 This design covers local HTTP apps. Public access stays anonymous. Email
 capture, invitations, payment, and private access decisions are separate
@@ -13,15 +13,15 @@ controls and are outside this design.
 
 ## Current boundary
 
-The Connector controls access to a published app and forwards requests to
-its configured HTTP target. It does not start the target inside an app
-sandbox. Restricting access does not restrict the target process's files,
-credentials, or network.
+The Connector controls access to a published app and forwards requests to its
+configured HTTP target. It does not start the target inside an app sandbox.
+Restricting access does not restrict the target process's files, credentials,
+or network.
 
 An app already running as the publisher can have access to the publisher's
-home directory and services. Putting a proxy in front of that process does
-not remove its permissions. It must be restarted inside a restricted
-environment before LayerV can describe it as isolated.
+home directory and services. Putting a proxy in front of that process does not
+remove its permissions. It must be restarted inside a restricted environment
+before LayerV can describe it as isolated.
 
 Access expiry stops access through LayerV. It does not recover copied data,
 undo changes in another service, or remove a compromise from a running app.
@@ -29,16 +29,16 @@ undo changes in another service, or remove a compromise from a running app.
 ## Proposed execution boundary
 
 Use one disposable Linux VM for each published workload. Keep the qURL CLI,
-Connector, access credentials, and VM control process outside the guest.
-Start the app in the guest under a non-root user, with a read-only base image
-and bounded writable scratch space. A container inside the guest can package
-the app; the VM remains the boundary that protects the publisher's host.
+Connector, access credentials, and VM control process outside the guest. Start
+the app in the guest under a non-root user, with a read-only base image and
+bounded writable scratch space. A container inside the guest can package the
+app; the VM remains the boundary that protects the publisher's host.
 
 Do not create a VM for each consumer, request, or qURL link. One running app
 serves many consumers. Each guest remains isolated from other workloads.
-Consumers of the same workload share one guest. A consumer who compromises
-the app can reach other consumers' traffic and data inside that guest. This
-design does not isolate consumers from each other.
+Consumers of the same workload share one guest. A consumer who compromises the
+app can reach other consumers' traffic and data inside that guest. This design
+does not isolate consumers from each other.
 
 ```text
 consumer
@@ -51,22 +51,21 @@ qURL access control ------------ host Connector
                                dedicated app VM
                                app + chosen data
 
-host CLI, Connector keys, VM control, and other apps stay outside the VM
-```
+host CLI, Connector keys, VM control, and other apps stay outside the VM ```
 
 Begin with one supported Linux/KVM runtime. Firecracker with its jailer is a
 concrete candidate, subject to a compatibility and performance trial. Use its
-maintained VM implementation and host-hardening guidance instead of writing
-a hypervisor. Its KVM model is not a native macOS or Windows implementation.
+maintained VM implementation and host-hardening guidance instead of writing a
+hypervisor. Its KVM model is not a native macOS or Windows implementation.
 Those platforms need a separately tested adapter to an existing VM runtime
 that supplies the same boundary. An unsupported host must report that it
 cannot start isolated publishing; it must not quietly run the app on the host.
 
 An ordinary host container is useful protection, but it shares a kernel with
 the host. Do not equate a default container, loopback listener, tunnel, or
-hardware-protected Connector keys with this app isolation contract. A different
-runtime, such as gVisor, needs its own compatibility and adversarial validation
-before it can be described as an equivalent supported profile.
+hardware-protected Connector keys with this app isolation contract. A
+different runtime, such as gVisor, needs its own compatibility and adversarial
+validation before it can be described as an equivalent supported profile.
 
 ## Files and build steps
 
@@ -78,23 +77,27 @@ that boundary enforced during copying; a separate path check is insufficient.
 Refuse any path that escapes the selected input root. Exclude credential
 stores, `.env` files, version-control metadata, and agent memory unless the
 publisher has selected a specific required input. A filename exclusion or
-secret scanner alone does not prove that the selected content is safe to publish.
+secret scanner alone does not prove that the selected content is safe to
+publish.
 
-Run package installation, build scripts, and the app inside the boundary.
-Do not run a guest-supplied build or launch command on the host. Build access
-to package sources is an explicit network policy that ends when the build
-ends; the serving app does not inherit unrestricted build-time access.
-Builds receive no app secrets. Provide selected app credentials only after
-the build ends and its network permissions are removed. Destroy the build
-guest and its connections before starting a clean serving guest with only
-selected build outputs, treated as untrusted. No build process or open flow
-may carry over. Give builds only
-selected source and manifest inputs; supply app data after the build ends.
-DNS restrictions apply during both build and serving. Treat selected source
-as exposed to permitted package hosts: build scripts can send it there.
-Publishers must accept that exposure before the build starts. Builds that require
-private package credentials are unsupported in this initial profile. Report
-that limit; do not copy package tokens or deploy keys into selected inputs.
+Run package installation, build scripts, and the app inside the boundary. Do
+not run a guest-supplied build or launch command on the host. Build access to
+package sources is an explicit network policy that ends when the build ends;
+the serving app does not inherit unrestricted build-time access. Builds
+receive no app secrets. Provide selected app credentials only after the build
+ends and its network permissions are removed. Destroy the build guest and its
+connections before starting a clean serving guest with only selected build
+outputs, treated as untrusted. No build process or open flow may carry over.
+Give builds only selected source and manifest inputs; supply app data after
+the build ends. DNS restrictions apply during both build and serving. Treat
+selected source as exposed to permitted package hosts: build scripts can send
+it there. Publishers must accept that exposure before the build starts. Builds
+that require private package credentials are unsupported in this initial
+profile. Report that limit; do not copy package tokens or deploy keys into
+selected inputs. Plaintext HTTP package mirrors are also unsupported.
+Downloads that redirect to another host require that host to be selected in
+the build policy; report a blocked destination clearly instead of weakening
+the policy.
 
 Use a read-only source snapshot and a separate guest scratch disk. A guest
 must not change host source that an assistant or developer will later execute.
@@ -115,15 +118,14 @@ guest connection. The guest must not be able to initiate a connection to the
 host Connector, VM management API, host loopback services, local network,
 another guest, or cloud metadata. A host firewall or trusted boundary process
 enforces this rule outside the guest. A compromised guest cannot change it.
-Use only the required disk and network devices. Disable additional
-guest-to-host socket channels, hypervisor metadata services, and shared host
-mounts in this initial profile; network firewall rules do not protect those
-channels.
+Use only the required disk and network devices. Disable additional guest-to-
+host socket channels, hypervisor metadata services, and shared host mounts in
+this initial profile; network firewall rules do not protect those channels.
 
 Serving egress is denied by default. Permit only destinations the publisher
 selected. The initial profile permits outbound TLS over TCP and DNS to the
-policy-selected resolver only; deny other UDP, QUIC, plaintext HTTP, and non-TLS
-TCP during both build and serving. A policy must cover IPv4, IPv6, DNS,
+policy-selected resolver only; deny other UDP, QUIC, plaintext HTTP, and non-
+TLS TCP during both build and serving. A policy must cover IPv4, IPv6, DNS,
 redirects, and destination changes after DNS resolution. Resolve and validate
 the actual destination at connection time. For TLS, bind the visible SNI
 service name to the selected name and resolved IP outside the guest. Block
@@ -133,9 +135,10 @@ Domain fronting through a permitted shared-IP service remains a risk; a name
 allowlist does not prove which tenant receives encrypted requests. Publishers
 must accept that risk for selected services. Do not implement an allowlist
 solely as a string check of the app's URL. Restrict DNS queries to a resolver
-and names permitted by host-enforced policy; block other resolvers and
-non-selected names to limit DNS-based data theft. Required external services
-should use scoped credentials and bounded spending where that service supports it.
+and names permitted by host-enforced policy; block other resolvers and non-
+selected names to limit DNS-based data theft. Required external services
+should use scoped credentials and bounded spending where that service supports
+it.
 
 The app endpoint has no direct public listener and cannot bypass qURL access
 enforcement. The guest cannot choose another tunnel target or ask the
@@ -147,40 +150,40 @@ external service permissions harmless.
 
 Set per-workload limits for CPU, memory, processes, scratch disk, network
 bandwidth, and connection count. Enforce them outside the guest. Apply the
-same budgets to build guests and terminate builds at a fixed timeout. An app that exhausts its budget must not
-stop sibling shares or fill the host disk. Guest logs are bounded, escaped
-untrusted text; instructions in them cannot change publishing policy.
+same budgets to build guests and terminate builds at a fixed timeout. An app
+that exhausts its budget must not stop sibling shares or fill the host disk.
+Guest logs are bounded, escaped untrusted text; instructions in them cannot
+change publishing policy.
 
 Before admitting a public route, check that the intended VM, image, endpoint,
 and policy are running and that the app answers a health probe. The probe
 checks app availability only; verify isolation from outside the guest. If a
 required protection cannot be installed or verified, leave that resource
-unavailable.
-Do not fall back to the original unrestricted host process.
+unavailable. Do not fall back to the original unrestricted host process.
 
-Record a small, owner-only workload descriptor with the existing desired
-share state: workload ID, input/image digest, runtime profile and version,
-endpoint, limits, network policy, and secret references. Store references to
-secrets, not their values. Keep app execution state separate from the
-published resource and its access links. Keep credential values out of the
-descriptor and existing managed service. After an unattended restart, a
-credentialed workload stays unavailable until the publisher supplies its app
-credentials through the foreground qURL command. No unattended secret store
-is part of this initial profile.
+Record a small, owner-only workload descriptor with the existing desired share
+state: workload ID, input/image digest, runtime profile and version, endpoint,
+limits, network policy, and secret references. Store references to secrets,
+not their values. Keep app execution state separate from the published
+resource and its access links. Keep credential values out of the descriptor
+and existing managed service. After an unattended restart, a credentialed
+workload stays unavailable until the publisher supplies its app credentials
+through the foreground qURL command. No unattended secret store is part of
+this initial profile.
 
 A restart reconciles the saved descriptor before reconnecting the route.
-Restart and replacement use the recorded image and source snapshot with
-fresh scratch space; never reuse the previous guest's scratch. This initial
-profile uses clean boots and does not support memory snapshot restore. Any selected
-app data restored separately is untrusted and must not supply executable
-code. Do not promise persistence for scratch data. Apps that need durable
-writes are unsupported in this initial profile.
-Switch traffic only after the new VM passes its checks. The old endpoint
-must never serve through the new route. A VM failure affects only its workload.
-Stopping a workload withdraws its routes and terminates its processes before
-releasing its private network. Delete scratch data under an explicit retention
-policy, with a later cleanup attempt if the first removal fails. Deletion does
-not undo an external side effect or revoke a credential already copied.
+Restart and replacement use the recorded image and source snapshot with fresh
+scratch space; never reuse the previous guest's scratch. This initial profile
+uses clean boots and does not support memory snapshot restore. Any selected
+app data restored separately is untrusted and must not supply executable code.
+Do not promise persistence for scratch data. Apps that need durable writes are
+unsupported in this initial profile. Switch traffic only after the new VM
+passes its checks. The old endpoint must never serve through the new route. A
+VM failure affects only its workload. Stopping a workload withdraws its routes
+and terminates its processes before releasing its private network. Delete
+scratch data under an explicit retention policy, with a later cleanup attempt
+if the first removal fails. Deletion does not undo an external side effect or
+revoke a credential already copied.
 
 ## Publisher and assistant flow
 
@@ -198,8 +201,8 @@ Private access can reduce its audience, but does not establish host isolation.
 
 The CLI, browser, skill, and API result must distinguish access mode from
 execution protection. Report the effective protection and supported runtime,
-not merely the publisher's requested setting. New flags and result fields
-are a later API/CLI design; this document does not claim they exist today.
+not merely the publisher's requested setting. New flags and result fields are
+a later API/CLI design; this document does not claim they exist today.
 
 ## Integration responsibilities
 
@@ -217,9 +220,9 @@ proposal adds no privileged component or installation method.
 
 The Connector accepts the runner's fixed app endpoint. Guest instructions
 cannot change that endpoint or publish additional apps. Publishing,
-replacement, and shutdown must preserve the existing access controls.
-Platform metadata, browser copy, and the customer skill must agree on what
-the runtime actually enforces.
+replacement, and shutdown must preserve the existing access controls. Platform
+metadata, browser copy, and the customer skill must agree on what the runtime
+actually enforces.
 
 ## Acceptance before a public protection claim
 
@@ -260,11 +263,11 @@ Connector-only measurements do not establish the VM path's performance.
 
 ## Limits and source guidance
 
-VM or runtime vulnerabilities remain possible. Keep the host, guest image,
-and runtime patched. This design limits damage; it does not guarantee that
-no future exploit can cross the boundary. Data and credentials deliberately
-given to the app remain exposed if the app is compromised. Those permissions
-must be small enough for the publisher to accept that loss.
+VM or runtime vulnerabilities remain possible. Keep the host, guest image, and
+runtime patched. This design limits damage; it does not guarantee that no
+future exploit can cross the boundary. Data and credentials deliberately given
+to the app remain exposed if the app is compromised. Those permissions must be
+small enough for the publisher to accept that loss.
 
 Consumers within one workload depend on the app to protect their data from
 each other. If the app is compromised, that protection can fail for every
