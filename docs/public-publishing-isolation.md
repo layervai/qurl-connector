@@ -115,7 +115,12 @@ credential helper, container socket, VM control socket, or cloud credentials.
 Keep control directories owner-only and outside every guest export.
 
 The host Connector forwards to one configured app endpoint on an isolated
-guest connection. The guest must not be able to initiate a connection to the
+guest connection. Treat all guest responses as untrusted. Bound response
+headers, idle time, total connection lifetime, and concurrent upgraded
+streams under the workload policy. Malformed, oversized, or stalled
+HTTP/WebSocket responses must not expose host credentials, stop the
+Connector, or interrupt sibling shares. The guest must not be able to
+initiate a connection to the
 host Connector, VM management API, host loopback services, local network,
 another guest, or cloud metadata. A host firewall or trusted boundary process
 enforces this rule outside the guest. A compromised guest cannot change it.
@@ -240,6 +245,7 @@ Use synthetic credentials and isolated test machines.
 | Use build-time package-source access after the build ends | Refused; serving does not inherit build network access |
 | Keep a build process or connection alive into serving | Build guest and its flows are terminated before app credentials or data are supplied |
 | Reach the host through a guest socket channel, hypervisor metadata service, or shared mount | Channel is disabled; no host access |
+| Return malformed, oversized, or stalled HTTP/WebSocket responses | Connector stays healthy; sibling shares remain usable; no host credential exposure |
 | Read a selected app credential during the build | Credential is absent; supplied only after build network permissions end |
 | Read selected app data during the build | Data is absent; supplied only after the build ends |
 | Query a non-selected DNS name or use another resolver | Refused by the host network policy |
