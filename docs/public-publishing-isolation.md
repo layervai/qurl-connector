@@ -72,8 +72,10 @@ before it can be described as an equivalent supported profile.
 
 Copy an explicit set of app inputs into the guest. Do not mount the
 publisher's home directory, an entire working directory, or writable host
-paths. Resolve each input path before copying it; refuse a symlink or path
-that escapes the selected input root. Exclude credential stores, `.env`
+paths. Open and copy each input relative to the selected input root without
+following symlinks or reparse points, including in parent directories. Keep
+that boundary enforced during copying; a separate path check is insufficient.
+Refuse any path that escapes the selected input root. Exclude credential stores, `.env`
 files, version-control metadata, and agent memory unless the publisher has
 selected a specific required input. A filename exclusion or secret scanner
 alone does not prove that the selected content is safe to publish.
@@ -125,8 +127,8 @@ untrusted text; instructions in them cannot change publishing policy.
 
 Before admitting a public route, check that the intended VM, image, endpoint,
 and policy are running and that the app answers a health probe. The probe
-checks app availability only; verify isolation from outside the guest. If a required
-protection cannot be installed or verified, leave that resource unavailable.
+checks app availability only; verify isolation from outside the guest. If a
+required protection cannot be installed or verified, leave that resource unavailable.
 Do not fall back to the original unrestricted host process.
 
 Record a small, owner-only workload descriptor with the existing desired
@@ -138,7 +140,7 @@ published resource and its access links.
 A restart reconciles the saved descriptor before reconnecting the route.
 Switch traffic only after the new VM passes its checks. The old endpoint
 must never serve through the new route. Failure of one VM affects only its
-workloads.
+workload.
 Stopping a workload withdraws its routes and terminates its processes before
 releasing its private network. Delete scratch data under an explicit retention
 policy, with a later cleanup attempt if the first removal fails. Deletion does
@@ -191,6 +193,7 @@ Use synthetic credentials and isolated test machines.
 | Change the target, mounts, credentials, egress, or resource limits from the guest | Refused by the host boundary |
 | Access an explicitly permitted input or service | Works within the granted scope |
 | Exhaust CPU, memory, process count, disk, or log budget | Workload is bounded; sibling share remains usable |
+| Start on an unsupported host or with a protection that cannot be installed or verified | Resource stays unavailable; no unrestricted host fallback |
 | Crash app, VM, runner, or Connector; restart the host | Reconciliation retains resource identity and never opens an unrestricted fallback |
 | Replace, stop, or expire a share during active HTTP/WebSocket traffic | Existing access/session limits hold; old endpoint cannot serve through a new route |
 | Supply hostile app text, guest output, or a log instruction | Cannot change assistant consent or host policy |
