@@ -87,7 +87,9 @@ ends; the serving app does not inherit unrestricted build-time access.
 Builds receive no app secrets. Provide selected app credentials only after
 the build ends and its network permissions are removed. Give builds only
 selected source and manifest inputs; supply app data after the build ends.
-DNS restrictions apply during both build and serving. Builds that require
+DNS restrictions apply during both build and serving. Treat selected source
+as exposed to permitted package hosts: build scripts can send it there.
+Publishers must accept that exposure before the build starts. Builds that require
 private package credentials are unsupported in this initial profile. Report
 that limit; do not copy package tokens or deploy keys into selected inputs.
 
@@ -114,11 +116,13 @@ enforces this rule outside the guest. A compromised guest cannot change it.
 Serving egress is denied by default. Permit only destinations the publisher
 selected, with the required protocols. A policy must cover IPv4, IPv6, DNS,
 redirects, and destination changes after DNS resolution. Resolve and validate
-the actual destination at connection time. A selected service name must also
-be bound to the connection and request, including TLS SNI and HTTP Host.
-An allowed IP alone is insufficient when services share an IP. Enforce this
-outside the guest; if the runtime cannot verify it, block that destination.
-Do not implement an allowlist
+the actual destination at connection time. For TLS, bind the visible SNI
+service name to the selected name and resolved IP outside the guest. Block
+connections whose service name cannot be verified, including encrypted SNI.
+This profile does not intercept TLS and cannot check the encrypted HTTP Host.
+Domain fronting through a permitted shared-IP service remains a risk; a name
+allowlist does not prove which tenant receives encrypted requests. Publishers
+must accept that risk for selected services. Do not implement an allowlist
 solely as a string check of the app's URL. Restrict DNS queries to a resolver
 and names permitted by host-enforced policy; block other resolvers and
 non-selected names to limit DNS-based data theft. Required external services
@@ -217,7 +221,7 @@ Use synthetic credentials and isolated test machines.
 | Read a selected app credential during the build | Credential is absent; supplied only after build network permissions end |
 | Read selected app data during the build | Data is absent; supplied only after the build ends |
 | Query a non-selected DNS name or use another resolver | Refused by the host network policy |
-| Reach another service on a permitted shared IP using a non-selected TLS SNI or HTTP Host | Refused; an allowed IP does not grant access to other service names |
+| Connect with non-selected TLS SNI, encrypted SNI, or an IP outside the selected service's resolved destinations | Refused by the host network policy |
 | Open the app without the qURL route | No direct public path |
 | Change the target, mounts, credentials, egress, or resource limits from the guest | Refused by the host boundary |
 | Access an explicitly permitted input or service | Works within the granted scope |
