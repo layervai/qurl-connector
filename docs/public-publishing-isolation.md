@@ -85,7 +85,10 @@ Do not run a guest-supplied build or launch command on the host. Build access
 to package sources is an explicit network policy that ends when the build
 ends; the serving app does not inherit unrestricted build-time access.
 Builds receive no app secrets. Provide selected app credentials only after
-the build ends and its network permissions are removed. Give builds only
+the build ends and its network permissions are removed. Destroy the build
+guest and its connections before starting a clean serving guest with only
+selected build outputs, treated as untrusted. No build process or open flow
+may carry over. Give builds only
 selected source and manifest inputs; supply app data after the build ends.
 DNS restrictions apply during both build and serving. Treat selected source
 as exposed to permitted package hosts: build scripts can send it there.
@@ -112,6 +115,10 @@ guest connection. The guest must not be able to initiate a connection to the
 host Connector, VM management API, host loopback services, local network,
 another guest, or cloud metadata. A host firewall or trusted boundary process
 enforces this rule outside the guest. A compromised guest cannot change it.
+Use only the required disk and network devices. Disable additional
+guest-to-host socket channels, hypervisor metadata services, and shared host
+mounts in this initial profile; network firewall rules do not protect those
+channels.
 
 Serving egress is denied by default. Permit only destinations the publisher
 selected. The initial profile permits outbound TCP/TLS and DNS to the
@@ -221,6 +228,8 @@ Use synthetic credentials and isolated test machines.
 | Reach a host service, another guest, local network, or metadata address | Refused, including IPv6 and DNS/redirect variants |
 | Reach a non-selected internet destination while serving, or a selected name that resolves or redirects outside its permitted destinations | Refused by the host network policy |
 | Use build-time package-source access after the build ends | Refused; serving does not inherit build network access |
+| Keep a build process or connection alive into serving | Build guest and its flows are terminated before app credentials or data are supplied |
+| Reach the host through a guest socket channel, hypervisor metadata service, or shared mount | Channel is disabled; no host access |
 | Read a selected app credential during the build | Credential is absent; supplied only after build network permissions end |
 | Read selected app data during the build | Data is absent; supplied only after the build ends |
 | Query a non-selected DNS name or use another resolver | Refused by the host network policy |
