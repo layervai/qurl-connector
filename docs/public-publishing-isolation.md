@@ -121,8 +121,8 @@ mounts in this initial profile; network firewall rules do not protect those
 channels.
 
 Serving egress is denied by default. Permit only destinations the publisher
-selected. The initial profile permits outbound TCP/TLS and DNS to the
-policy-selected resolver only; deny other UDP, QUIC, plaintext HTTP, and raw
+selected. The initial profile permits outbound TLS over TCP and DNS to the
+policy-selected resolver only; deny other UDP, QUIC, plaintext HTTP, and non-TLS
 TCP during both build and serving. A policy must cover IPv4, IPv6, DNS,
 redirects, and destination changes after DNS resolution. Resolve and validate
 the actual destination at connection time. For TLS, bind the visible SNI
@@ -145,8 +145,9 @@ external service permissions harmless.
 
 ## Resource limits and lifecycle
 
-Set per-workload limits for CPU, memory, processes, scratch disk, and network
-use. Enforce them outside the guest. An app that exhausts its budget must not
+Set per-workload limits for CPU, memory, processes, scratch disk, network
+bandwidth, and connection count. Enforce them outside the guest. Apply the
+same budgets to build guests and terminate builds at a fixed timeout. An app that exhausts its budget must not
 stop sibling shares or fill the host disk. Guest logs are bounded, escaped
 untrusted text; instructions in them cannot change publishing policy.
 
@@ -161,14 +162,19 @@ Record a small, owner-only workload descriptor with the existing desired
 share state: workload ID, input/image digest, runtime profile and version,
 endpoint, limits, network policy, and secret references. Store references to
 secrets, not their values. Keep app execution state separate from the
-published resource and its access links.
+published resource and its access links. Keep credential values out of the
+descriptor and existing managed service. After an unattended restart, a
+credentialed workload stays unavailable until the publisher supplies its app
+credentials through the foreground qURL command. No unattended secret store
+is part of this initial profile.
 
 A restart reconciles the saved descriptor before reconnecting the route.
 Restart and replacement use the recorded image and source snapshot with
 fresh scratch space; never reuse the previous guest's scratch. This initial
 profile uses clean boots and does not support memory snapshot restore. Any selected
 app data restored separately is untrusted and must not supply executable
-code. Do not promise persistence for scratch data.
+code. Do not promise persistence for scratch data. Apps that need durable
+writes are unsupported in this initial profile.
 Switch traffic only after the new VM passes its checks. The old endpoint
 must never serve through the new route. A VM failure affects only its workload.
 Stopping a workload withdraws its routes and terminates its processes before
@@ -238,7 +244,9 @@ Use synthetic credentials and isolated test machines.
 | Open the app without the qURL route | No direct public path |
 | Change the target, mounts, credentials, egress, or resource limits from the guest | Refused by the host boundary |
 | Access an explicitly permitted input or service | Works within the granted scope |
-| Exhaust CPU, memory, process count, disk, or log budget | Workload is bounded; sibling share remains usable |
+| Exhaust CPU, memory, process count, disk, logs, bandwidth, or connection budget during build or serving | Workload is bounded; sibling share remains usable |
+| Exceed the build timeout | Build guest is terminated; no serving route opens |
+| Restart a credentialed workload without foreground credential supply | Resource stays unavailable; managed service does not store or resolve secret values |
 | Start on an unsupported host or with a protection that cannot be installed or verified | Resource stays unavailable; no unrestricted host fallback |
 | Change scratch files, then restart or replace the guest | Changes are absent in the fresh scratch space |
 | Crash app, VM, runner, or Connector; restart the host | Reconciliation retains resource identity and never opens an unrestricted fallback |
