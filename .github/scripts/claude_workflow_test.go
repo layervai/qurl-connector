@@ -15,7 +15,7 @@ import (
 
 const (
 	checkoutAction           = "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
-	claudeAction             = "anthropics/claude-code-action@12dd8d74c712f5f3669365b2369b558c495b1104"
+	claudeAction             = "anthropics/claude-code-action@6c690188da61cf16ee7debb28383ba67f02abb4c"
 	claudeModel              = "claude-opus-5-5"
 	claudeEffort             = "medium"
 	automaticAllowedTools    = "mcp__github__get_pull_request,mcp__github__get_pull_request_diff,mcp__github__get_pull_request_files,mcp__github__get_pull_request_review_comments,mcp__github__get_pull_request_reviews,mcp__github__get_pull_request_status,mcp__github__get_issue_comments,mcp__github__get_file_contents,mcp__github__search_code,mcp__github__get_commit,mcp__github__add_issue_comment,mcp__github_inline_comment__create_inline_comment"
