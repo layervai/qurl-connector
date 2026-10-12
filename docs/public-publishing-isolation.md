@@ -77,15 +77,17 @@ following symlinks or reparse points, including in parent directories. Keep
 that boundary enforced during copying; a separate path check is insufficient.
 Refuse any path that escapes the selected input root. Exclude credential
 stores, `.env` files, version-control metadata, and agent memory unless the
-publisher has selected a specific required input. A filename exclusion or secret scanner
-alone does not prove that the selected content is safe to publish.
+publisher has selected a specific required input. A filename exclusion or
+secret scanner alone does not prove that the selected content is safe to publish.
 
 Run package installation, build scripts, and the app inside the boundary.
 Do not run a guest-supplied build or launch command on the host. Build access
 to package sources is an explicit network policy that ends when the build
 ends; the serving app does not inherit unrestricted build-time access.
 Builds receive no app secrets. Provide selected app credentials only after
-the build ends and its network permissions are removed.
+the build ends and its network permissions are removed. Builds that require
+private package credentials are unsupported in this initial profile. Report
+that limit; do not copy package tokens or deploy keys into selected inputs.
 
 Use a read-only source snapshot and a separate guest scratch disk. A guest
 must not change host source that an assistant or developer will later execute.
@@ -113,8 +115,8 @@ redirects, and destination changes after DNS resolution. Resolve and validate
 the actual destination at connection time. Do not implement an allowlist
 solely as a string check of the app's URL. Restrict DNS queries to a resolver
 and names permitted by host-enforced policy; block other resolvers and
-non-selected names to limit DNS-based data theft. Required external services should
-use scoped credentials and bounded spending where that service supports it.
+non-selected names to limit DNS-based data theft. Required external services
+should use scoped credentials and bounded spending where that service supports it.
 
 The app endpoint has no direct public listener and cannot bypass qURL access
 enforcement. The guest cannot choose another tunnel target or ask the
@@ -175,6 +177,13 @@ The qURL CLI owns workload preparation and the local publisher interaction.
 The local workload runner owns VM start, stop, reconciliation, and externally
 enforced policy. Reuse an existing runtime; keep the runner's privileged
 interface small and reject arbitrary host paths, commands, and sockets.
+
+The Linux runtime needs permission to use KVM and enforce host network and
+resource limits. The existing user service must not gain those privileges.
+Before implementation, define a separate runtime installation, update, and
+privilege plan. Its privileged interface must accept only the validated
+workload descriptor fields above, never arbitrary host operations. This
+proposal adds no privileged component or installation method.
 
 The Connector accepts the runner's fixed app endpoint. Guest instructions
 cannot change that endpoint or publish additional apps. Publishing,
