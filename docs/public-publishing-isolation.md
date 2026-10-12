@@ -85,7 +85,9 @@ Do not run a guest-supplied build or launch command on the host. Build access
 to package sources is an explicit network policy that ends when the build
 ends; the serving app does not inherit unrestricted build-time access.
 Builds receive no app secrets. Provide selected app credentials only after
-the build ends and its network permissions are removed. Builds that require
+the build ends and its network permissions are removed. Give builds only
+selected source and manifest inputs; supply app data after the build ends.
+DNS restrictions apply during both build and serving. Builds that require
 private package credentials are unsupported in this initial profile. Report
 that limit; do not copy package tokens or deploy keys into selected inputs.
 
@@ -145,6 +147,10 @@ secrets, not their values. Keep app execution state separate from the
 published resource and its access links.
 
 A restart reconciles the saved descriptor before reconnecting the route.
+Restart and replacement use the recorded image and source snapshot with
+fresh scratch space; never reuse the previous guest's scratch. Any selected
+app data restored separately is untrusted and must not supply executable
+code. Do not promise persistence for scratch data.
 Switch traffic only after the new VM passes its checks. The old endpoint
 must never serve through the new route. A VM failure affects only its workload.
 Stopping a workload withdraws its routes and terminates its processes before
@@ -205,12 +211,14 @@ Use synthetic credentials and isolated test machines.
 | Reach a non-selected internet destination while serving, or a selected name that resolves or redirects outside its permitted destinations | Refused by the host network policy |
 | Use build-time package-source access after the build ends | Refused; serving does not inherit build network access |
 | Read a selected app credential during the build | Credential is absent; supplied only after build network permissions end |
+| Read selected app data during the build | Data is absent; supplied only after the build ends |
 | Query a non-selected DNS name or use another resolver | Refused by the host network policy |
 | Open the app without the qURL route | No direct public path |
 | Change the target, mounts, credentials, egress, or resource limits from the guest | Refused by the host boundary |
 | Access an explicitly permitted input or service | Works within the granted scope |
 | Exhaust CPU, memory, process count, disk, or log budget | Workload is bounded; sibling share remains usable |
 | Start on an unsupported host or with a protection that cannot be installed or verified | Resource stays unavailable; no unrestricted host fallback |
+| Change scratch files, then restart or replace the guest | Changes are absent in the fresh scratch space |
 | Crash app, VM, runner, or Connector; restart the host | Reconciliation retains resource identity and never opens an unrestricted fallback |
 | Replace, stop, or expire a share during active HTTP/WebSocket traffic | Existing access/session limits hold; old endpoint cannot serve through a new route |
 | Supply hostile app text, guest output, or a log instruction | Cannot change assistant consent or host policy |
