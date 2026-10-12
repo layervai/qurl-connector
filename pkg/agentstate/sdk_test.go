@@ -911,7 +911,12 @@ func TestNewSDKStoreEnforcesSingleEnvelopeProviderBinding(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			dir := secureSDKStateDir(t)
 			for _, name := range tt.files {
-				writePinnedSDKTestFile(t, dir, name, []byte("{}"), 0o600)
+				raw := []byte("{}")
+				if name == SealedAgentStateFile {
+					// A real sealed envelope always names its provider.
+					raw = []byte(`{"provider_id":"` + tt.provider + `"}`)
+				}
+				writePinnedSDKTestFile(t, dir, name, raw, 0o600)
 			}
 			t.Setenv(EnvKeyProvider, tt.provider)
 			t.Setenv(EnvAWSKMSKeyID, "arn:aws:kms:us-east-1:111122223333:key/test")

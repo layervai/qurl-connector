@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"maps"
 	"net"
+	"path/filepath"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -20,6 +22,9 @@ import (
 	nhpconfig "github.com/layervai/qurl-connector/pkg/config"
 )
 
+// Unix sockaddr paths have a 104-byte ceiling on macOS; leave room for the NUL.
+const maxLocalSocketPathBytes = 100
+
 // LocalHTTPRoute is the exact local and platform identity of one managed HTTP
 // share. Public ResourcePublicKey is authorization metadata; ConnectorRoutingID is
 // the stable subdomain/load-balancer identity.
@@ -29,9 +34,26 @@ import (
 // Its formatting methods redact the request headers and JSON/YAML encoding
 // omits them.
 type LocalHTTPRoute struct {
-	RouteID            string
-	LocalIP            string
-	LocalPort          int
+	RouteID   string
+	LocalIP   string
+	LocalPort int
+	// LocalSocketPath selects a private Unix HTTP origin instead of TCP.
+	// It is runtime-only: JSON/YAML and formatting omit the pathname, so
+	// callers must restore it before loading a serialized route. The local
+	// supervisor must provide an owner-only socket directory whose ancestors
+	// untrusted principals cannot replace, and owns the listener lifetime;
+	// this library validates syntax and never unlinks or replaces the socket.
+	LocalSocketPath string `json:"-" yaml:"-"`
+	// LocalPipeName selects a private Windows named-pipe HTTP origin instead
+	// of TCP, in the canonical form ValidateLocalPipeName accepts. It is
+	// runtime-only like LocalSocketPath. Every dial checks that the connected
+	// pipe is owned by this process's user and refuses it otherwise. Where
+	// the "Default owner for objects created by members of the Administrators
+	// group" policy is set to Administrators, an elevated producer's pipe is
+	// owned by BUILTIN\Administrators and every request to it fails closed.
+	// The owner check does not restrict who else may open the producer's pipe;
+	// the producer owns that DACL (the default pipe DACL grants Everyone read).
+	LocalPipeName      string `json:"-" yaml:"-"`
 	ResourcePublicKey  string
 	ConnectorRoutingID string
 	// RequestHeaders are runtime-only values sent to frps in NewProxy and
@@ -49,9 +71,16 @@ type LocalHTTPRoute struct {
 // String keeps runtime request-header names and values out of logs,
 // assertions, and diagnostics.
 func (r LocalHTTPRoute) String() string {
+	privateOrigin := ""
+	if r.LocalSocketPath != "" {
+		privateOrigin += ", LocalSocketPath:[REDACTED]"
+	}
+	if r.LocalPipeName != "" {
+		privateOrigin += ", LocalPipeName:[REDACTED]"
+	}
 	return fmt.Sprintf(
-		"share.LocalHTTPRoute{RouteID:%q, LocalIP:%q, LocalPort:%d, ResourcePublicKey:%q, ConnectorRoutingID:%q, RequestHeaders:[REDACTED]}",
-		r.RouteID, r.LocalIP, r.LocalPort, r.ResourcePublicKey, r.ConnectorRoutingID,
+		"share.LocalHTTPRoute{RouteID:%q, LocalIP:%q, LocalPort:%d, ResourcePublicKey:%q, ConnectorRoutingID:%q%s, RequestHeaders:[REDACTED]}",
+		r.RouteID, r.LocalIP, r.LocalPort, r.ResourcePublicKey, r.ConnectorRoutingID, privateOrigin,
 	)
 }
 
@@ -59,13 +88,16 @@ func (r LocalHTTPRoute) String() string {
 func (r LocalHTTPRoute) GoString() string { return r.String() }
 
 func (r LocalHTTPRoute) hasRequestHeaders() bool { return len(r.RequestHeaders) > 0 }
+func (r LocalHTTPRoute) hasPrivateOrigin() bool {
+	return r.LocalSocketPath != "" || r.LocalPipeName != ""
+}
 
 // Equal reports whether two routes are the same registration: identity,
 // local target, and runtime request headers all match (nil and empty
 // headers are both headerless). TestLocalHTTPRouteEqualCoversEveryField
 // keeps it in step with the fields.
 func (r LocalHTTPRoute) Equal(other LocalHTTPRoute) bool {
-	return r.RouteID == other.RouteID && r.LocalIP == other.LocalIP && r.LocalPort == other.LocalPort &&
+	return r.RouteID == other.RouteID && r.LocalIP == other.LocalIP && r.LocalPort == other.LocalPort && r.LocalSocketPath == other.LocalSocketPath && r.LocalPipeName == other.LocalPipeName &&
 		r.ResourcePublicKey == other.ResourcePublicKey && r.ConnectorRoutingID == other.ConnectorRoutingID &&
 		maps.Equal(r.RequestHeaders, other.RequestHeaders)
 }
@@ -74,7 +106,20 @@ func validateLocalHTTPRoute(route LocalHTTPRoute) error {
 	if route.RouteID == "" || route.ResourcePublicKey == "" || route.ConnectorRoutingID == "" {
 		return errors.New("route identities are incomplete")
 	}
-	if route.LocalIP == "" || route.LocalPort < 1 || route.LocalPort > 65535 {
+	if route.LocalPipeName != "" {
+		if route.LocalIP != "" || route.LocalPort != 0 || route.LocalSocketPath != "" {
+			return errors.New("local named-pipe target is invalid")
+		}
+		if err := ValidateLocalPipeName(route.LocalPipeName); err != nil {
+			return err
+		}
+	} else if route.LocalSocketPath != "" {
+		if runtime.GOOS == "windows" || route.LocalIP != "" || route.LocalPort != 0 ||
+			!filepath.IsAbs(route.LocalSocketPath) || filepath.Clean(route.LocalSocketPath) != route.LocalSocketPath ||
+			len(route.LocalSocketPath) > maxLocalSocketPathBytes || strings.ContainsAny(route.LocalSocketPath, "\x00\r\n") {
+			return errors.New("local Unix socket target is invalid")
+		}
+	} else if route.LocalIP == "" || route.LocalPort < 1 || route.LocalPort > 65535 {
 		return errors.New("local target is invalid")
 	}
 	return ValidateRequestHeaders(route.RequestHeaders)
@@ -123,6 +168,21 @@ func buildRouteProxy(route LocalHTTPRoute, proxyName string) *v1.HTTPProxyConfig
 	proxy.Type = string(v1.ProxyTypeHTTP)
 	proxy.LocalIP = route.LocalIP
 	proxy.LocalPort = route.LocalPort
+	// validateLocalHTTPRoute rejects routes naming both; the switch keeps a
+	// bypassed validator from silently letting one transport overwrite the other.
+	switch {
+	case route.LocalSocketPath != "" && route.LocalPipeName != "":
+		// validateLocalHTTPRoute rejects this first. If bypassed, render no plugin
+		// and port 0: FRP accepts it, but 127.0.0.1:0 can never be dialed.
+		proxy.LocalIP, proxy.LocalPort = "", 0
+	case route.LocalSocketPath != "":
+		proxy.Plugin = v1.TypedClientPluginOptions{
+			Type:                v1.PluginUnixDomainSocket,
+			ClientPluginOptions: &v1.UnixDomainSocketPluginOptions{Type: v1.PluginUnixDomainSocket, UnixPath: route.LocalSocketPath},
+		}
+	case route.LocalPipeName != "":
+		proxy.Plugin = v1.TypedClientPluginOptions{Type: localPipePluginName, ClientPluginOptions: &localPipeOptions{PipeName: route.LocalPipeName}}
+	}
 	proxy.SubDomain = route.ConnectorRoutingID
 	proxy.LoadBalancer.Group = route.ConnectorRoutingID
 	proxy.LoadBalancer.GroupKey = route.ConnectorRoutingID
@@ -221,13 +281,17 @@ func tlsEnabled(common *v1.ClientCommonConfig) bool {
 	}
 }
 
-// requestHeaderTransportError fails closed when a route set carries runtime
+// routeTransportError fails closed when a route set carries runtime
 // request headers and the FRP transport would expose them: a plaintext
 // control connection sends NewProxy in the clear, unverified TLS permits
 // interception, and the local FRP
 // web/admin server reports every proxy's configuration to whoever reaches
-// it. A headerless set is never gated. The message names no header.
-func requestHeaderTransportError(common *v1.ClientCommonConfig, headered bool) error {
+// it. Private origins also require the web/admin server disabled because proxy
+// configuration includes their private pathname. Messages disclose neither.
+func routeTransportError(common *v1.ClientCommonConfig, headered, privateOrigin bool) error {
+	if privateOrigin && common != nil && common.WebServer.Port > 0 {
+		return errors.New("private origins require FRP web server to be disabled")
+	}
 	if !headered {
 		return nil
 	}

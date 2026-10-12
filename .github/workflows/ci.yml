@@ -127,14 +127,28 @@ jobs:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
-      - name: Run Windows native-state and user-job tests
+      - name: Run Windows native-state, named-pipe, and user-job tests
         shell: bash
         env:
           QURL_WINDOWS_USER_JOB_INTEGRATION: "1"
         run: |
+          node --version # Default-DACL named-pipe interoperability fixture.
           go build ./...
           go vet ./pkg/agentstate ./pkg/config ./pkg/share ./pkg/service ./internal/pinnedfs
-          CGO_ENABLED=0 go test -count=1 ./pkg/agentstate ./pkg/config ./pkg/share ./pkg/service ./internal/pinnedfs
+          # The private-origin outcomes below run once, verbosely, in their own step.
+          CGO_ENABLED=0 go test -count=1 -skip '^(TestLocalPipeNodeDefaultSecurity|TestHermeticNamedPipeOriginHeadersAndMissingOrigin)$' ./pkg/agentstate ./pkg/config ./pkg/share ./pkg/service ./internal/pinnedfs
+      - name: Record native private-origin outcomes
+        shell: bash
+        run: |
+          set -euo pipefail
+          log="$RUNNER_TEMP/windows-private-origin.log"
+          CGO_ENABLED=0 go test -count=1 -v -run '^(TestLocalPipeNodeDefaultSecurity|TestHermeticNamedPipeOriginHeadersAndMissingOrigin)$' ./pkg/share | tee "$log"
+          require() {
+            grep -qF -- "$1" "$log" || { echo "::error::missing private-origin evidence: $1 (a skipped Node test or an elevated runner whose default-owner policy makes pipes Administrators-owned passes go test but proves nothing)"; exit 1; }
+          }
+          require '--- PASS: TestLocalPipeNodeDefaultSecurity ('
+          require 'verified Node HTTP request succeeded'
+          require '--- PASS: TestHermeticNamedPipeOriginHeadersAndMissingOrigin ('
 
   # The race detector requires cgo, so this lane builds with CGO_ENABLED=1 —
   # the only place in CI that does. `make test` keeps proving the CGO_ENABLED=0
@@ -143,6 +157,7 @@ jobs:
   race:
     name: Race
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
@@ -150,6 +165,20 @@ jobs:
           go-version-file: go.mod
       - name: Run tests under the race detector
         run: make test-race
+      # The TPM simulator suite is cgo-only, so this is the one lane that can
+      # prove the tpm key provider against real TPM 2.0 commands. Require its
+      # PASS lines so a lost build tag or cgo toolchain cannot go green empty.
+      # It is an evidence gate only: make test-race above already ran these
+      # tests under -race, so do not add it here.
+      - name: Require TPM simulator evidence
+        run: |
+          set -euo pipefail
+          log="$(mktemp)"
+          tpm_tests="TestTPMProviderSealsToTheSimulator TestProbeTPMSucceedsOnTheSimulatorWithoutLeakingHandles TestTPMProviderFallsBackToThePersistentSRK TestSDKStoreDefaultsFreshNamespacesToTheTPM"
+          CGO_ENABLED=1 go test -count=1 -v -run "^($(echo "$tpm_tests" | tr ' ' '|'))$" ./pkg/agentstate | tee "$log"
+          for test_name in $tpm_tests; do
+            grep -qF -- "--- PASS: ${test_name} (" "$log" || { echo "::error::missing TPM simulator evidence: ${test_name}"; exit 1; }
+          done
 
   security:
     name: Security

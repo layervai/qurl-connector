@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -233,7 +234,7 @@ func ValidateSDKStoreLayout(dir string) (retErr error) {
 	defer func() {
 		retErr = errors.Join(retErr, namespace.Close())
 	}()
-	_, err = validateSDKStoreLayoutInNamespace(namespace)
+	_, err = validateSDKStoreLayoutInNamespace(namespace, false)
 	return err
 }
 
@@ -249,7 +250,7 @@ func ValidateSDKStoreLayoutReadOnly(dir string) (retErr error) {
 	defer func() {
 		retErr = errors.Join(retErr, namespace.Close())
 	}()
-	_, err = validateSDKStoreLayoutInNamespace(namespace)
+	_, err = validateSDKStoreLayoutInNamespace(namespace, false)
 	return err
 }
 
@@ -270,7 +271,7 @@ func OpenSDKStateReader(dir, configuredAgentID string) (_ qurl.AgentStateReader,
 		}
 	}()
 
-	providerName, err := validateSDKStoreLayoutInNamespace(namespace)
+	providerName, err := validateSDKStoreLayoutInNamespace(namespace, false)
 	if err != nil {
 		return nil, err
 	}
@@ -413,8 +414,10 @@ func LegacyArtifacts(dir string) ([]string, error) {
 	return found, nil
 }
 
-// NewSDKStore constructs the explicit qurl-go local store selected by
-// LAYERV_KEY_PROVIDER and returns its process-lifetime owner. It rejects legacy
+// NewSDKStore constructs the qurl-go local store that ResolveKeyProvider
+// selects (LAYERV_KEY_PROVIDER, else the existing envelope, else the TPM when
+// usable and the plaintext file otherwise) and returns its process-lifetime
+// owner. It rejects legacy
 // and conflicting native state before constructing any provider. The caller
 // must Close every successful result after every client/runtime use has ended.
 // configuredAgentID is optional; when present it pins a sealed envelope to the
@@ -437,9 +440,18 @@ func NewSDKStore(dir, configuredAgentID string) (_ *SDKStore, retErr error) {
 		}
 	}()
 
-	providerName, err := validateSDKStoreLayoutInNamespace(namespace)
+	sealedExisted, err := pathExistsInNamespace(namespace, SealedAgentStateFile)
 	if err != nil {
 		return nil, err
+	}
+	providerName, err := validateSDKStoreLayoutInNamespace(namespace, true)
+	if err != nil {
+		return nil, err
+	}
+	if providerName == KeyProviderTPM && !sealedExisted {
+		// Logged where the sealed store is actually created, not in
+		// resolution, which also serves pure queries.
+		slog.Info("new agent state in this directory will be sealed to the local TPM; it will not be readable on other hardware or after a TPM clear", "key_provider", KeyProviderTPM)
 	}
 	// The pinned qurl-go dependency writes both plaintext and sealed envelopes
 	// through its protected-ACL Windows pinned-state implementation.
@@ -472,7 +484,11 @@ func NewSDKStore(dir, configuredAgentID string) (_ *SDKStore, retErr error) {
 	return finishSDKStore(namespace, store, store)
 }
 
-func validateSDKStoreLayoutInNamespace(namespace *pinnedfs.Directory) (string, error) {
+// validateSDKStoreLayoutInNamespace checks the namespace and resolves its
+// provider. Only a caller about to create an envelope passes probe: for the
+// read-only and validate-only callers an empty namespace resolves to the file
+// provider without touching the TPM, since there is nothing to read or seal.
+func validateSDKStoreLayoutInNamespace(namespace *pinnedfs.Directory, probe bool) (string, error) {
 	legacy, err := legacyArtifactsInNamespace(namespace)
 	if err != nil {
 		return "", err
@@ -480,28 +496,207 @@ func validateSDKStoreLayoutInNamespace(namespace *pinnedfs.Directory) (string, e
 	if len(legacy) != 0 {
 		return "", fmt.Errorf("legacy pre-native agent state found in %s (%s); this greenfield cutover does not migrate split key/TOML state: stop the Connector, clear the state directory, and enroll again", namespace.Path(), strings.Join(legacy, ", "))
 	}
-	providerName, err := selectedKeyProviderName()
+	return resolveKeyProviderInNamespace(namespace, probe)
+}
+
+// resolveKeyProviderInNamespace resolves the provider inside the retained
+// Connector namespace capability.
+func resolveKeyProviderInNamespace(namespace *pinnedfs.Directory, probe bool) (string, error) {
+	return resolveKeyProvider(pinnedEnvelopeView{namespace: namespace}, probe)
+}
+
+// envelopeView is the narrow read surface provider resolution needs: whether
+// an envelope entry exists, and the raw bytes of the sealed envelope.
+type envelopeView interface {
+	exists(name string) (bool, error)
+	readSealed() ([]byte, error)
+}
+
+// resolveKeyProvider selects the envelope provider for a namespace.
+// LAYERV_KEY_PROVIDER wins when set and must match the existing envelope: its
+// kind (plaintext or sealed) and, for a sealed one, its provider_id.
+// Unset, an existing envelope decides: plaintext is the file provider, and a
+// sealed envelope opens only when its provider needs nothing from the
+// environment (tpm); any other sealed provider must be named explicitly. A
+// namespace holding no envelope takes defaultFreshKeyProvider.
+func resolveKeyProvider(view envelopeView, probe bool) (string, error) {
+	explicit, err := explicitKeyProviderName()
 	if err != nil {
 		return "", err
 	}
-	fileStateExists, err := pathExistsInNamespace(namespace, AgentStateFile)
+	fileStateExists, err := view.exists(AgentStateFile)
 	if err != nil {
 		return "", err
 	}
-	sealedStateExists, err := pathExistsInNamespace(namespace, SealedAgentStateFile)
+	sealedStateExists, err := view.exists(SealedAgentStateFile)
 	if err != nil {
 		return "", err
 	}
 	if fileStateExists && sealedStateExists {
 		return "", fmt.Errorf("agent state directory contains both %s and %s; exactly one native state envelope is allowed", AgentStateFile, SealedAgentStateFile)
 	}
-	if providerName == KeyProviderFile && sealedStateExists {
-		return "", fmt.Errorf("%s=%s conflicts with existing %s; provider changes are not an in-place migration", EnvKeyProvider, providerName, SealedAgentStateFile)
+	if explicit == "" {
+		switch {
+		case fileStateExists:
+			return KeyProviderFile, nil
+		case sealedStateExists:
+			sealedProvider, err := sealedEnvelopeProvider(view, false)
+			if err != nil {
+				return "", err
+			}
+			if sealedProvider == KeyProviderFile {
+				// The file provider never writes a sealed envelope; resolving to it
+				// here would write plaintext beside this one and wedge the
+				// namespace behind the both-envelopes check for good.
+				return "", fmt.Errorf("%s names the %q provider, which never seals state; the envelope is corrupt", SealedAgentStateFile, sealedProvider)
+			}
+			if !knownKeyProvider(sealedProvider) {
+				return "", fmt.Errorf("%s names unknown key provider %q; the envelope is corrupt or was written by a newer release", SealedAgentStateFile, sealedProvider)
+			}
+			if KeyProviderRequiresEnvironment(sealedProvider) {
+				return "", fmt.Errorf("%s is sealed by the %q key provider; set %s=%s and its companion variables to open it", SealedAgentStateFile, sealedProvider, EnvKeyProvider, sealedProvider)
+			}
+			return sealedProvider, nil
+		case !probe:
+			return KeyProviderFile, nil
+		default:
+			return defaultFreshKeyProvider()
+		}
 	}
-	if providerName != KeyProviderFile && fileStateExists {
-		return "", fmt.Errorf("%s=%s conflicts with existing %s; provider changes are not an in-place migration", EnvKeyProvider, providerName, AgentStateFile)
+	if explicit == KeyProviderFile && sealedStateExists {
+		return "", fmt.Errorf("%s=%s conflicts with existing %s; provider changes are not an in-place migration", EnvKeyProvider, explicit, SealedAgentStateFile)
 	}
-	return providerName, nil
+	if sealedStateExists {
+		// Fail closed here rather than leave a provider mismatch to qurl-go,
+		// with a message that names both providers.
+		sealedProvider, err := sealedEnvelopeProvider(view, true)
+		if err != nil {
+			return "", err
+		}
+		if sealedProvider != explicit {
+			return "", fmt.Errorf("%s=%s conflicts with %s sealed by %q; provider changes are not an in-place migration", EnvKeyProvider, explicit, SealedAgentStateFile, sealedProvider)
+		}
+	}
+	if explicit != KeyProviderFile && fileStateExists {
+		return "", fmt.Errorf("%s=%s conflicts with existing %s; provider changes are not an in-place migration", EnvKeyProvider, explicit, AgentStateFile)
+	}
+	if explicit == KeyProviderTPM && probe && !fileStateExists && !sealedStateExists {
+		// Asked for the TPM on a namespace about to be created: diagnose it
+		// now rather than at the first state write. An existing tpm envelope
+		// skips this; its Unseal is the real check.
+		if err := ProbeTPM(); err != nil {
+			return "", fmt.Errorf("%s=%s: %w", EnvKeyProvider, explicit, err)
+		}
+	}
+	return explicit, nil
+}
+
+// maxSealedEnvelopeBytes mirrors qurl-go's sealed envelope bound.
+const maxSealedEnvelopeBytes = 2 << 20
+
+// sealedEnvelopeProvider reads only the provider_id of the sealed envelope.
+// It is a routing hint, not an authority: qurl-go rejects an envelope whose
+// provider_id differs from the provider it is opened with.
+//
+// TODO(upstream-contract): mirrors qurl-go's sealedAgentStateEnvelope
+// provider_id field and its 2 MiB envelope bound.
+func sealedEnvelopeProvider(view envelopeView, explicit bool) (string, error) {
+	raw, err := view.readSealed()
+	if err != nil {
+		return "", err
+	}
+	var header struct {
+		ProviderID string `json:"provider_id"`
+	}
+	if err := json.Unmarshal(raw, &header); err != nil {
+		// Interrupted write or truncated restore: no variable can fix this.
+		return "", fmt.Errorf("%s is not valid JSON; the envelope is corrupt: %w", SealedAgentStateFile, err)
+	}
+	if header.ProviderID == "" {
+		if explicit {
+			// The operator already named a provider; pointing them at the
+			// variable again would send them in a circle.
+			return "", fmt.Errorf("%s has no provider_id; the envelope is corrupt", SealedAgentStateFile)
+		}
+		return "", fmt.Errorf("%s does not name its key provider; set %s to the provider that sealed it", SealedAgentStateFile, EnvKeyProvider)
+	}
+	return header.ProviderID, nil
+}
+
+type pinnedEnvelopeView struct{ namespace *pinnedfs.Directory }
+
+func (v pinnedEnvelopeView) exists(name string) (bool, error) {
+	return pathExistsInNamespace(v.namespace, name)
+}
+
+func (v pinnedEnvelopeView) readSealed() (_ []byte, retErr error) {
+	file, err := v.namespace.OpenFile(SealedAgentStateFile, os.O_RDONLY|pinnedfs.SafeOpenFlags(), 0)
+	if err != nil {
+		return nil, fmt.Errorf("open %s: %w", SealedAgentStateFile, err)
+	}
+	defer func() { retErr = errors.Join(retErr, file.Close()) }()
+	if _, err := pinnedfs.ValidateRegularFile(v.namespace, SealedAgentStateFile, file, "sealed agent state", 0o600); err != nil {
+		return nil, err
+	}
+	return readBoundedSealedEnvelope(file)
+}
+
+// pathEnvelopeView resolves through ordinary path lookups. It serves
+// ResolveKeyProvider, whose callers open the plaintext envelope with qurl-go's
+// own pinned capability and so must not inherit the Connector namespace's
+// stricter ancestor rules; every sealed open still validates through
+// pinnedEnvelopeView.
+type pathEnvelopeView struct{ dir string }
+
+func (v pathEnvelopeView) exists(name string) (bool, error) {
+	_, err := os.Lstat(filepath.Join(v.dir, name))
+	switch {
+	case err == nil:
+		return true, nil
+	case errors.Is(err, os.ErrNotExist):
+		return false, nil
+	default:
+		return false, fmt.Errorf("inspect native agent state %s: %w", name, err)
+	}
+}
+
+func (v pathEnvelopeView) readSealed() (_ []byte, retErr error) {
+	file, err := os.OpenFile(filepath.Join(v.dir, SealedAgentStateFile), os.O_RDONLY|pinnedfs.SafeOpenFlags(), 0)
+	if err != nil {
+		return nil, fmt.Errorf("open %s: %w", SealedAgentStateFile, err)
+	}
+	defer func() { retErr = errors.Join(retErr, file.Close()) }()
+	info, err := file.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("inspect %s: %w", SealedAgentStateFile, err)
+	}
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("%s must be a regular file", SealedAgentStateFile)
+	}
+	return readBoundedSealedEnvelope(file)
+}
+
+func readBoundedSealedEnvelope(file io.Reader) ([]byte, error) {
+	raw, err := io.ReadAll(io.LimitReader(file, maxSealedEnvelopeBytes+1))
+	if err != nil {
+		return nil, fmt.Errorf("read %s: %w", SealedAgentStateFile, err)
+	}
+	if len(raw) > maxSealedEnvelopeBytes {
+		return nil, fmt.Errorf("%s exceeds %d bytes", SealedAgentStateFile, maxSealedEnvelopeBytes)
+	}
+	return raw, nil
+}
+
+// ResolveKeyProvider reports which envelope provider NewSDKStore would use for
+// dir. It has no filesystem side effects, and a directory that does not exist
+// yet resolves like an empty one. For an empty namespace with
+// LAYERV_KEY_PROVIDER unset it probes the TPM: it may run TPM commands, it
+// fills the process-wide probe cache, and it returns ErrTPMNotResponding when
+// a TPM is present but does not answer. It checks only provider
+// selection; NewSDKStore additionally enforces the pinned namespace and the
+// legacy-artifact cutover.
+func ResolveKeyProvider(dir string) (string, error) {
+	return resolveKeyProvider(pathEnvelopeView{dir: ResolveDir(dir)}, true)
 }
 
 func finishSDKStore(namespace *pinnedfs.Directory, state qurl.AgentStateStore, continuity qurl.AgentStateContinuity) (*SDKStore, error) {

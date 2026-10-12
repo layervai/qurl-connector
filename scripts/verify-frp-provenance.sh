@@ -11,10 +11,11 @@ set -euo pipefail
 readonly module='github.com/layervai/frp'
 readonly repository='https://github.com/layervai/frp.git'
 
-# Reviewed dependency head and signed release merge on layerv/main. They have
-# the same tree; the pseudo-version avoids the generic new-release quarantine.
-readonly dependency_commit='d97c77893b28bf6206a66a6219d8276b445e3272'
-readonly release_commit='0a12d05047ed7742626fb47f9a2a78fc7d448376'
+# Signed v1.0.5 release on layerv/main (squash of reviewed head e6700eae, same
+# tree). The pseudo-version names the release commit itself, avoiding the
+# generic new-release quarantine while this script proves it is the signed tag.
+readonly dependency_commit='5570a4205458a17f6f6d57c15348d72cbcb0a3b2'
+readonly release_commit='5570a4205458a17f6f6d57c15348d72cbcb0a3b2'
 
 module_re="${module//./\\.}"
 replace_line="$(grep -E "^replace github\\.com/fatedier/frp => ${module_re} v" go.mod || true)"

@@ -1,20 +1,23 @@
 module github.com/layervai/qurl-connector
 
-go 1.26.6
+go 1.26.9
 
 require (
 	cloud.google.com/go/kms v1.33.0
+	github.com/Microsoft/go-winio v0.6.2
 	github.com/aws/aws-sdk-go-v2 v1.46.0
 	github.com/aws/aws-sdk-go-v2/config v1.33.3
 	github.com/aws/aws-sdk-go-v2/service/kms v1.59.0
 	github.com/denisbrodbeck/machineid v1.0.1
 	github.com/fatedier/frp v0.71.0
+	github.com/fatedier/golib v0.8.2
+	github.com/google/go-tpm v0.9.8
 	github.com/googleapis/gax-go/v2 v2.24.1
 	github.com/layervai/qurl-go v0.14.0
 	github.com/spf13/cobra v1.10.2
-	golang.org/x/crypto v0.56.0
-	golang.org/x/net v0.57.0
-	golang.org/x/sys v0.47.0
+	golang.org/x/crypto v0.57.0
+	golang.org/x/net v0.60.0
+	golang.org/x/sys v0.48.0
 	google.golang.org/protobuf v1.36.12
 	gopkg.in/natefinch/lumberjack.v2 v2.2.1
 	gopkg.in/yaml.v3 v3.0.1
@@ -44,12 +47,12 @@ require (
 	github.com/beorn7/perks v1.0.1 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/coreos/go-oidc/v3 v3.18.0 // indirect
-	github.com/fatedier/golib v0.8.2 // indirect
 	github.com/felixge/httpsnoop v1.0.4 // indirect
 	github.com/go-jose/go-jose/v4 v4.1.4 // indirect
 	github.com/go-logr/logr v1.4.3 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect
 	github.com/golang/snappy v1.0.0 // indirect
+	github.com/google/go-tpm-tools v0.4.10 // indirect
 	github.com/google/s2a-go v0.1.9 // indirect
 	github.com/googleapis/enterprise-certificate-proxy v0.3.17 // indirect
 	github.com/gorilla/mux v1.8.1 // indirect
@@ -81,8 +84,8 @@ require (
 	go.opentelemetry.io/otel/metric v1.44.0 // indirect
 	go.opentelemetry.io/otel/trace v1.44.0 // indirect
 	golang.org/x/oauth2 v0.36.0 // indirect
-	golang.org/x/sync v0.22.0 // indirect
-	golang.org/x/text v0.41.0 // indirect
+	golang.org/x/sync v0.23.0 // indirect
+	golang.org/x/text v0.42.0 // indirect
 	golang.org/x/time v0.15.0 // indirect
 	golang.zx2c4.com/wintun v0.0.0-20230126152724-0fa3db229ce2 // indirect
 	golang.zx2c4.com/wireguard v0.0.0-20231211153847-12269c276173 // indirect
@@ -105,4 +108,4 @@ replace github.com/hashicorp/yamux => github.com/fatedier/yamux v0.0.0-202508250
 
 // LayerV's signed FRP release supports system CA verification and the
 // InitialRunID hook that binds native NHP admission to the matching FRP Login.
-replace github.com/fatedier/frp => github.com/layervai/frp v1.0.2-0.20260918050615-d97c77893b28
+replace github.com/fatedier/frp => github.com/layervai/frp v1.0.5-0.20260926021043-5570a4205458
