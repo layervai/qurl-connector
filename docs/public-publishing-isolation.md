@@ -114,7 +114,9 @@ another guest, or cloud metadata. A host firewall or trusted boundary process
 enforces this rule outside the guest. A compromised guest cannot change it.
 
 Serving egress is denied by default. Permit only destinations the publisher
-selected, with the required protocols. A policy must cover IPv4, IPv6, DNS,
+selected. The initial profile permits outbound TCP/TLS and DNS to the
+policy-selected resolver only; deny other UDP, QUIC, plaintext HTTP, and raw
+TCP during both build and serving. A policy must cover IPv4, IPv6, DNS,
 redirects, and destination changes after DNS resolution. Resolve and validate
 the actual destination at connection time. For TLS, bind the visible SNI
 service name to the selected name and resolved IP outside the guest. Block
@@ -156,7 +158,8 @@ published resource and its access links.
 
 A restart reconciles the saved descriptor before reconnecting the route.
 Restart and replacement use the recorded image and source snapshot with
-fresh scratch space; never reuse the previous guest's scratch. Any selected
+fresh scratch space; never reuse the previous guest's scratch. This initial
+profile uses clean boots and does not support memory snapshot restore. Any selected
 app data restored separately is untrusted and must not supply executable
 code. Do not promise persistence for scratch data.
 Switch traffic only after the new VM passes its checks. The old endpoint
@@ -221,6 +224,7 @@ Use synthetic credentials and isolated test machines.
 | Read a selected app credential during the build | Credential is absent; supplied only after build network permissions end |
 | Read selected app data during the build | Data is absent; supplied only after the build ends |
 | Query a non-selected DNS name or use another resolver | Refused by the host network policy |
+| Reach a permitted IP over QUIC, non-DNS UDP, plaintext HTTP, or raw TCP | Refused during build and serving |
 | Connect with non-selected TLS SNI, encrypted SNI, or an IP outside the selected service's resolved destinations | Refused by the host network policy |
 | Open the app without the qURL route | No direct public path |
 | Change the target, mounts, credentials, egress, or resource limits from the guest | Refused by the host boundary |
