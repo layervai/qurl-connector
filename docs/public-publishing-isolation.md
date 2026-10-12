@@ -103,8 +103,8 @@ the policy.
 Use a read-only source snapshot and a separate guest scratch disk. A guest
 must not change host source that an assistant or developer will later execute.
 Export guest outputs only through an explicit operation that treats them as
-untrusted data. Updates create another selected snapshot and use the existing
-resource lifecycle to replace the serving app safely.
+untrusted data. Updates create another selected snapshot, repeat the build-then-clean-serve
+sequence, and use the existing resource lifecycle to replace the app safely.
 
 ## Credentials and network
 
@@ -168,7 +168,7 @@ required protection cannot be installed or verified, leave that resource
 unavailable. Do not fall back to the original unrestricted host process.
 
 Record a small, owner-only workload descriptor with the existing desired share
-state: workload ID, input/image digest, runtime profile and version, endpoint,
+state: workload ID, input/image digest, build-output digest, runtime profile and version, endpoint,
 limits, network policy, and secret references. Store references to secrets,
 not their values. Keep app execution state separate from the published
 resource and its access links. Keep credential values out of the descriptor
@@ -178,8 +178,10 @@ through the foreground qURL command. No unattended secret store is part of
 this initial profile.
 
 A restart reconciles the saved descriptor before reconnecting the route.
-Restart and replacement use the recorded image and source snapshot with fresh
-scratch space; never reuse the previous guest's scratch. This initial profile
+Retain the image, source snapshot, and selected build artifacts in owner-only
+host storage until the workload is removed. Restart and replacement verify
+their recorded digests and reuse these artifacts without rebuilding, with
+fresh scratch space; never reuse the previous guest's scratch. This initial profile
 uses clean boots and does not support memory snapshot restore. Any selected
 app data restored separately is untrusted and must not supply executable code.
 Do not promise persistence for scratch data. Apps that need durable writes are
