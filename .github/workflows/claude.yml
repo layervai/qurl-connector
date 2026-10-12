@@ -442,28 +442,56 @@ jobs:
           # itself assumes when it parses this URL. GitHub tokens are
           # [A-Za-z0-9_], so this holds; a "/" would truncate the authority
           # mid-token and reject the action's own legitimate origin.
-          origin_url="$(git remote get-url origin 2>/dev/null || true)"
-          origin_dest="${origin_url}"
-          if [[ "${origin_dest}" == *://* ]]; then
-            origin_scheme="${origin_dest%%://*}"
-            origin_rest="${origin_dest#*://}"
-            origin_authority="${origin_rest%%/*}"
-            origin_path="${origin_rest#"${origin_authority}"}"
-            origin_authority="${origin_authority##*@}"
-            origin_dest="${origin_scheme}://${origin_authority}${origin_path}"
-          fi
-
           if [[ -z "${GITHUB_SERVER_URL}" ]] || [[ -z "${GITHUB_REPOSITORY}" ]] ||
              [[ -z "${GITHUB_WORKSPACE}" ]]; then
             echo "::error::Runner-provided boundary comparison targets are unavailable; failing closed."
             exit 1
           fi
 
+          # The authority is everything up to the first "/", and userinfo is
+          # everything in it through the LAST "@". Host and userinfo are then held
+          # to allowlists, because a URL client ends the host at "#", "?" or "\" as
+          # well: without that, https://evil.example#@github.com/o/r.git parses
+          # here as host github.com while git connects to evil.example. A shape
+          # outside the allowlists (an IPv6 literal host, userinfo with other
+          # punctuation, no scheme at all) fails closed.
+          origin_destination() {
+            local url="$1" scheme rest authority host userinfo
+            [[ "${url}" == *://* ]] || return 1
+            scheme="${url%%://*}"
+            rest="${url#*://}"
+            authority="${rest%%/*}"
+            host="${authority##*@}"
+            if [[ "${authority}" == *@* ]]; then
+              userinfo="${authority%@*}"
+              [[ "${userinfo}" =~ ^[A-Za-z0-9._~%:_-]+$ ]] || return 1
+            fi
+            [[ "${scheme}" =~ ^[A-Za-z][A-Za-z0-9+.-]*$ &&
+               "${host}" =~ ^[A-Za-z0-9.-]+(:[0-9]+)?$ ]] || return 1
+            printf '%s://%s%s' "${scheme}" "${host}" "${rest#"${authority}"}"
+          }
+
+          # `git remote get-url` applies url.*.insteadOf and pushInsteadOf, so the
+          # fetch and push values compared are the ones Git would connect to.
+          # Never print either: they may carry the token.
+          origin_ok=true
+          origin_fetch_url="$(git remote get-url --all origin 2>/dev/null || true)"
+          origin_push_url="$(git remote get-url --push --all origin 2>/dev/null || true)"
+          for origin_candidate in "${origin_fetch_url}" "${origin_push_url}"; do
+            if [[ -z "${origin_candidate}" || "${origin_candidate}" == *$'\n'* ]]; then
+              origin_ok=false
+            elif [[ "${origin_candidate}" != "${GITHUB_WORKSPACE}/.git" ]]; then
+              if ! origin_dest="$(origin_destination "${origin_candidate}")" ||
+                 [[ "${origin_dest}" != "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git" ]]; then
+                origin_ok=false
+              fi
+            fi
+          done
+
           if git config --local --get-regexp '^http\..*\.extraheader$' >/dev/null 2>&1 ||
              git config --local --get-regexp '^credential(\..*)?\.helper$' >/dev/null 2>&1 ||
              [[ "$(git config --local --get fetch.recurseSubmodules)" != "false" ]] ||
-             { [[ "${origin_url}" != "${GITHUB_WORKSPACE}/.git" ]] &&
-               [[ "${origin_dest}" != "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git" ]]; }; then
+             [[ "${origin_ok}" != "true" ]]; then
             echo "::error::Local Git boundary moved off this repository; failing closed."
             exit 1
           fi

@@ -110,7 +110,7 @@ not a public issue.
 
 Requirements:
 
-- Go 1.26.6 or newer
+- Go 1.26.9 or newer
 - Git
 
 All Go dependencies, including the reviewed LayerV FRP fork, are public and
