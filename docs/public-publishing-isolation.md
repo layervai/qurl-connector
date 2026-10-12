@@ -75,8 +75,8 @@ publisher's home directory, an entire working directory, or writable host
 paths. Open and copy each input relative to the selected input root without
 following symlinks or reparse points, including in parent directories. Keep
 that boundary enforced during copying; a separate path check is insufficient.
-Refuse any path that escapes the selected input root. Exclude credential stores, `.env`
-files, version-control metadata, and agent memory unless the publisher has
+Refuse any path that escapes the selected input root. Exclude credential
+stores, `.env` files, version-control metadata, and agent memory unless the publisher has
 selected a specific required input. A filename exclusion or secret scanner
 alone does not prove that the selected content is safe to publish.
 
@@ -128,7 +128,8 @@ untrusted text; instructions in them cannot change publishing policy.
 Before admitting a public route, check that the intended VM, image, endpoint,
 and policy are running and that the app answers a health probe. The probe
 checks app availability only; verify isolation from outside the guest. If a
-required protection cannot be installed or verified, leave that resource unavailable.
+required protection cannot be installed or verified, leave that resource
+unavailable.
 Do not fall back to the original unrestricted host process.
 
 Record a small, owner-only workload descriptor with the existing desired
@@ -139,8 +140,7 @@ published resource and its access links.
 
 A restart reconciles the saved descriptor before reconnecting the route.
 Switch traffic only after the new VM passes its checks. The old endpoint
-must never serve through the new route. Failure of one VM affects only its
-workload.
+must never serve through the new route. A VM failure affects only its workload.
 Stopping a workload withdraws its routes and terminates its processes before
 releasing its private network. Delete scratch data under an explicit retention
 policy, with a later cleanup attempt if the first removal fails. Deletion does
@@ -189,6 +189,8 @@ Use synthetic credentials and isolated test machines.
 | Read synthetic host home, SSH/cloud keys, CLI state, or agent memory | No host file or credential is reachable |
 | Modify host source or use a symlink to escape selected inputs | Refused; no host write |
 | Reach a host service, another guest, local network, or metadata address | Refused, including IPv6 and DNS/redirect variants |
+| Reach a non-selected internet destination while serving, or a selected name that resolves or redirects outside its permitted destinations | Refused by the host network policy |
+| Use build-time package-source access after the build ends | Refused; serving does not inherit build network access |
 | Open the app without the qURL route | No direct public path |
 | Change the target, mounts, credentials, egress, or resource limits from the guest | Refused by the host boundary |
 | Access an explicitly permitted input or service | Works within the granted scope |
