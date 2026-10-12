@@ -103,7 +103,11 @@ the policy.
 Use a read-only source snapshot and a separate guest scratch disk. A guest
 must not change host source that an assistant or developer will later execute.
 Export guest outputs only through an explicit operation that treats them as
-untrusted data. Updates create another selected snapshot, repeat the build-then-clean-serve
+untrusted data. Copy exports without following links into an owner-only
+artifact root, enforcing containment throughout. Accept only regular files,
+reject links and special files, and bound file count and expanded size by the
+workload disk budget. Apply these rules during archive extraction too.
+Updates create another selected snapshot, repeat the build-then-clean-serve
 sequence, and use the existing resource lifecycle to replace the app safely.
 
 ## Credentials and network
@@ -242,6 +246,7 @@ Use synthetic credentials and isolated test machines.
 |---|---|
 | Read synthetic host home, SSH/cloud keys, CLI state, or agent memory | No host file or credential is reachable |
 | Modify host source or use a symlink to escape selected inputs | Refused; no host write |
+| Export escaping paths, links, special files, or oversized build artifacts | Refused; no host write outside the artifact root |
 | Reach a host service, another guest, local network, or metadata address | Refused, including IPv6 and DNS/redirect variants |
 | Reach a non-selected internet destination while serving, or a selected name that resolves or redirects outside its permitted destinations | Refused by the host network policy |
 | Use build-time package-source access after the build ends | Refused; serving does not inherit build network access |
