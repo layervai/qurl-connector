@@ -13,11 +13,10 @@ controls and are outside this design.
 
 ## Current boundary
 
-The Connector admits a resource through NHP and forwards traffic through FRP
-to its configured HTTP target. [`pkg/share`](../pkg/share) owns that lifecycle;
-[`pkg/config/target.go`](../pkg/config/target.go) parses the target address.
-Neither function starts the target inside an app sandbox. Restricting tunnel
-access does not restrict the target process's files, credentials, or network.
+The Connector controls access to a published app and forwards requests to
+its configured HTTP target. It does not start the target inside an app
+sandbox. Restricting access does not restrict the target process's files,
+credentials, or network.
 
 An app already running as the publisher can have access to the publisher's
 home directory and services. Putting a proxy in front of that process does
@@ -30,25 +29,24 @@ undo changes in another service, or remove a compromise from a running app.
 ## Proposed execution boundary
 
 Use one disposable Linux VM for each published workload. Keep the qURL CLI,
-Connector, admission keys, and VM control process outside the guest. Start the
-app in the guest under a non-root user, with a read-only base image and bounded
-writable scratch space. A container inside the guest can package the app; the
+Connector, access credentials, and VM control process outside the guest.
+Start the app in the guest under a non-root user, with a read-only base image
+and bounded writable scratch space. A container inside the guest can package the app; the
 VM remains the boundary that protects the publisher's host.
 
 Do not create a VM for each consumer, request, or qURL link. One running app
-serves many consumers. The existing Connector session grouping can still
-carry many isolated workloads without giving the guests access to each other.
+serves many consumers. Each guest remains isolated from other workloads.
 
 ```text
 consumer
    |
    v
-qURL access enforcement -- NHP/FRP -- host Connector
-                                         |
-                                  fixed app endpoint
-                                         |
-                                  dedicated app VM
-                                  app + chosen data
+qURL access control ------------ host Connector
+                                      |
+                               fixed app endpoint
+                                      |
+                               dedicated app VM
+                               app + chosen data
 
 host CLI, Connector keys, VM control, and other apps stay outside the VM
 ```
@@ -130,12 +128,12 @@ Do not fall back to the original unrestricted host process.
 Record a small, owner-only workload descriptor with the existing desired
 share state: workload ID, input/image digest, runtime profile and version,
 endpoint, limits, network policy, and secret references. Store references to
-secrets, not their values. Keep app execution state separate from CRID,
-resource, NHP session, and serving-epoch identities.
+secrets, not their values. Keep app execution state separate from the
+published resource and its access links.
 
 A restart reconciles the saved descriptor before reconnecting the route.
-Replacement must fence the old endpoint and use the existing safe session
-and serving-epoch rules. Failure of one VM affects only its workloads.
+Replacement must disconnect the old endpoint before the new app can receive
+requests. Failure of one VM affects only its workloads.
 Stopping a workload withdraws its routes and terminates its processes before
 releasing its private network. Delete scratch data under an explicit retention
 policy, with a later cleanup attempt if the first removal fails. Deletion does
@@ -167,11 +165,11 @@ The local workload runner owns VM start, stop, reconciliation, and externally
 enforced policy. Reuse an existing runtime; keep the runner's privileged
 interface small and reject arbitrary host paths, commands, and sockets.
 
-The Connector continues to use the single production lifecycle in
-`pkg/share`. It accepts the runner's fixed app endpoint, not untrusted guest
-instructions. Isolation does not require another NHP/FRP implementation or
-per-request identity-service call. Platform metadata, browser copy, and the
-customer skill must agree on what the runtime actually enforces.
+The Connector accepts the runner's fixed app endpoint. Guest instructions
+cannot change that endpoint or publish additional apps. Publishing,
+replacement, and shutdown must preserve the existing access controls.
+Platform metadata, browser copy, and the customer skill must agree on what
+the runtime actually enforces.
 
 ## Acceptance before a public protection claim
 
