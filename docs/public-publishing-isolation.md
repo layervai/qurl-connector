@@ -31,11 +31,14 @@ undo changes in another service, or remove a compromise from a running app.
 Use one disposable Linux VM for each published workload. Keep the qURL CLI,
 Connector, access credentials, and VM control process outside the guest.
 Start the app in the guest under a non-root user, with a read-only base image
-and bounded writable scratch space. A container inside the guest can package the app; the
-VM remains the boundary that protects the publisher's host.
+and bounded writable scratch space. A container inside the guest can package
+the app; the VM remains the boundary that protects the publisher's host.
 
 Do not create a VM for each consumer, request, or qURL link. One running app
 serves many consumers. Each guest remains isolated from other workloads.
+Consumers of the same workload share one guest. A consumer who compromises
+the app can reach other consumers' traffic and data inside that guest. This
+design does not isolate consumers from each other.
 
 ```text
 consumer
@@ -121,7 +124,8 @@ stop sibling shares or fill the host disk. Guest logs are bounded, escaped
 untrusted text; instructions in them cannot change publishing policy.
 
 Before admitting a public route, check that the intended VM, image, endpoint,
-and policy are running and that the app answers a health probe. If a required
+and policy are running and that the app answers a health probe. The probe
+checks app availability only; verify isolation from outside the guest. If a required
 protection cannot be installed or verified, leave that resource unavailable.
 Do not fall back to the original unrestricted host process.
 
@@ -132,8 +136,9 @@ secrets, not their values. Keep app execution state separate from the
 published resource and its access links.
 
 A restart reconciles the saved descriptor before reconnecting the route.
-Replacement must disconnect the old endpoint before the new app can receive
-requests. Failure of one VM affects only its workloads.
+Switch traffic only after the new VM passes its checks. The old endpoint
+must never serve through the new route. Failure of one VM affects only its
+workloads.
 Stopping a workload withdraws its routes and terminates its processes before
 releasing its private network. Delete scratch data under an explicit retention
 policy, with a later cleanup attempt if the first removal fails. Deletion does
@@ -202,6 +207,10 @@ and runtime patched. This design limits damage; it does not guarantee that
 no future exploit can cross the boundary. Data and credentials deliberately
 given to the app remain exposed if the app is compromised. Those permissions
 must be small enough for the publisher to accept that loss.
+
+Consumers within one workload depend on the app to protect their data from
+each other. If the app is compromised, that protection can fail for every
+consumer of that workload.
 
 - [NIST Application Container Security Guide](https://nvlpubs.nist.gov/nistpubs/SpecialPublications/NIST.SP.800-190.pdf)
   explains container, host, shared-kernel, and network risks.
