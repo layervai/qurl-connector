@@ -380,7 +380,7 @@ jobs:
         # false-success review and `/simplify` results. No github_token input is
         # supplied here: the trusted interactive lane uses the action's scoped
         # OIDC/App token so accepted edits can be API-signed and published.
-        uses: anthropics/claude-code-action@12dd8d74c712f5f3669365b2369b558c495b1104 # v1.0.238
+        uses: anthropics/claude-code-action@6c690188da61cf16ee7debb28383ba67f02abb4c # v1.0.242
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           claude_args: '--model claude-opus-5-5 --effort medium'
@@ -449,7 +449,7 @@ jobs:
           fi
 
           # The authority is everything up to the first "/", and userinfo is
-          # everything in it through the LAST "@". Host and userinfo are then held
+          # everything in it before the LAST "@". Host and userinfo are then held
           # to allowlists, because a URL client ends the host at "#", "?" or "\" as
           # well: without that, https://evil.example#@github.com/o/r.git parses
           # here as host github.com while git connects to evil.example. A shape
