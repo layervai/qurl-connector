@@ -1,25 +1,42 @@
 # qURL Connector runtime for local services
 
-[qURL™ by LayerV](https://layerv.ai/qurl/) shares localhost web apps, private APIs, and files through expiring access links. qURL Connector is the embedded Go runtime that connects local services to that access path. It admits each shared resource with the Network-invisible Handshake Protocol (NHP), then carries approved traffic over a resource-bound FRP session.
+[qURL™ by LayerV](https://layerv.ai/qurl/) shares localhost web apps, private
+APIs, and files through expiring access links. qURL Connector is the embedded
+Go runtime that connects local services to that access path. It admits each shared resource
+with the Network-invisible Handshake Protocol (NHP), then carries approved
+traffic over a resource-bound FRP session.
 
-To share localhost as a user, install the [qURL CLI](https://github.com/layervai/qurl-integrations/tree/main/apps/cli), which embeds this runtime. Keep your local app running; the Connector carries traffic to it and the app's own sign-in requirements still apply.
+To share localhost as a user, install the
+[qURL CLI](https://github.com/layervai/qurl-integrations/tree/main/apps/cli),
+which embeds this runtime. Keep your local app running; the Connector carries
+traffic to it and the app's own sign-in requirements still apply.
 
-Developers working on the runtime can start with the [security model](#security-model), [source build](#build-from-source), [development checks](#development), or [developer command configuration](#developer-command-configuration).
+Developers working on the runtime can start with the
+[security model](#security-model), [source build](#build-from-source),
+[development checks](#development), or
+[developer command configuration](#developer-command-configuration).
 
 ```text
 local service -> qURL Connector -> qURL -> recipient
 ```
 
-[Local sharing workflow](#how-the-connector-enables-localhost-sharing) · [File sharing](#file-sharing-through-a-local-service) · [Runtime questions](#connector-sharing-questions) · [Private links](https://qurl.link/)
+[Local sharing workflow](#how-the-connector-enables-localhost-sharing) ·
+[File sharing](#file-sharing-through-a-local-service) ·
+[Runtime questions](#connector-sharing-questions) · [Private links](https://qurl.link/)
 
 ## How the Connector enables localhost sharing
 
-Use the [qURL CLI](https://github.com/layervai/qurl-integrations#share-a-localhost-web-app) to let a teammate review a development preview, open an internal dashboard, or call a private HTTP API. The Connector embedded in that CLI supplies the serving runtime beside your app:
+Use the [qURL CLI](https://github.com/layervai/qurl-integrations#share-a-localhost-web-app)
+to let a teammate review a development preview, open an internal dashboard,
+or call a private HTTP API. The Connector embedded in that CLI supplies the
+serving runtime beside your app:
 
 1. Start the app on a loopback address, such as `127.0.0.1:3000`.
-2. Publish it through the CLI. The embedded Connector connects outward to the LayerV service, and the command returns a CRID after the route is ready.
+2. Publish it through the CLI. The embedded Connector connects outward to the
+   LayerV service, and the command returns a CRID after the route is ready.
 3. Mint an access link and send that full link to your recipient.
-4. Keep the app, host, and serving runtime available for the visit. Stop the local share when it is no longer needed.
+4. Keep the app, host, and serving runtime available for the visit. Stop the
+   local share when it is no longer needed.
 
 After installing and configuring the CLI, the publishing and sharing steps are:
 
@@ -28,7 +45,10 @@ qurl publish http://127.0.0.1:3000
 qurl share REPLACE_WITH_CRID --ttl 5m --session-duration 5m
 ```
 
-Replace `REPLACE_WITH_CRID` with the publish output; it is not a literal resource name. The service enforces resource permissions and may shorten the requested access window. See the [CLI command reference](https://github.com/layervai/qurl-integrations/tree/main/apps/cli#commands) for privacy, grants, start/stop, and supported deployment settings.
+Replace `REPLACE_WITH_CRID` with the publish output; it is not a literal resource
+name. The service enforces resource permissions and may shorten the requested
+access window. See the [CLI command reference](https://github.com/layervai/qurl-integrations/tree/main/apps/cli#commands)
+for privacy, grants, start/stop, and supported deployment settings.
 
 | Component | Responsibility |
 | --- | --- |
@@ -37,66 +57,153 @@ Replace `REPLACE_WITH_CRID` with the publish output; it is not a literal resourc
 | An issued qURL link | Grants access under the resource's link and session policy. |
 | Browser or supported SDK opener | Opens the link and uses the admitted resource connection. |
 
-Use this repository when building or maintaining the runtime. Users install the CLI rather than a separate `cmd/frpc` distribution. Runtime developers should continue with [source build](#build-from-source), [security model](#security-model), and [development](#development).
+Use this repository when building or maintaining the runtime. Users install
+the CLI rather than a separate `cmd/frpc` distribution. Runtime developers
+should continue with [source build](#build-from-source),
+[security model](#security-model), and [development](#development).
 
 ## File sharing through a local service
 
-For a static preview or a set of documents, run an HTTP server bound to localhost in a dedicated directory containing only the files you intend to share. Publish its root address using the CLI workflow above. Recipients can reach the files the HTTP app exposes while the local host remains available.
+For a static preview or a set of documents, run an HTTP server bound to
+localhost in a dedicated directory containing only the files you intend to
+share. Publish its root address using the CLI workflow above. Recipients can
+reach the files the HTTP app exposes while the local host remains available.
 
-For individually uploaded documents, use the [Gmail integration](https://github.com/layervai/qurl-integrations/tree/main/apps/chrome-extension) or [MCP upload tools](https://github.com/layervai/qurl-mcp#let-an-ai-agent-share-a-pdf-or-image). Those workflows use their configured upload service and per-file link contract. Their size limits and revocation support should not be inferred from this runtime's local-service lifecycle.
+For individually uploaded documents, use the
+[Gmail integration](https://github.com/layervai/qurl-integrations/tree/main/apps/chrome-extension)
+or [MCP upload tools](https://github.com/layervai/qurl-mcp#let-an-ai-agent-share-a-pdf-or-image).
+Those workflows use their configured upload service and per-file link
+contract. Their size limits and revocation support should not be inferred
+from this runtime's local-service lifecycle.
 
 ## Connector sharing questions
 
 ### Does the Connector deploy my app to the cloud?
 
-No. It carries access to an app on its existing host. The app and host must stay running; a sleeping laptop or unavailable origin cannot serve content. Use an appropriately supervised host for a continuously available service.
+No. It carries access to an app on its existing host. The app and host must
+stay running; a sleeping laptop or unavailable origin cannot serve content.
+Use an appropriately supervised host for a continuously available service.
 
 ### Do I need inbound firewall ports or a public app address?
 
-The local publishing path connects outbound. It still needs the deployment's required outbound network connectivity; it does not bypass an egress firewall. Close any independent public route if qURL should be the app's only access path.
+The local publishing path connects outbound. It still needs the deployment's
+required outbound network connectivity; it does not bypass an egress firewall.
+Close any independent public route if qURL should be the app's only access path.
 
 ### Does an expiring link replace login or stop the daemon?
 
-No. Your app's login continues to apply. Link expiry limits new redemption; session duration and local serving are separate lifecycles. Use the CLI's stop or delete operations when you intend to pause or retire the local share.
+No. Your app's login continues to apply. Link expiry limits new redemption;
+session duration and local serving are separate lifecycles. Use the CLI's
+stop or delete operations when you intend to pause or retire the local share.
 
 ### How does this relate to an ngrok localhost tunnel?
 
-Both can use outbound connectivity. This runtime participates in qURL's resource admission and access-link workflow. See the [qURL and ngrok comparison](https://github.com/layervai/qurl-integrations#qurl-and-ngrok-for-localhost-sharing) for the documented sharing and authentication models.
+Both can use outbound connectivity. This runtime participates in qURL's
+resource admission and access-link workflow. See the
+[qURL and ngrok comparison](https://github.com/layervai/qurl-integrations#qurl-and-ngrok-for-localhost-sharing)
+for the documented sharing and authentication models.
 
-Users install only the `qurl` CLI. It embeds this module. On Linux, macOS, and Windows, the CLI uses the native per-user job manager when a local share is first published or started. The daemon resumes desired-on shares after login and recovers automatically across sleep, wake, network changes, assignment refreshes, and session rotation. Linux uses a systemd user service; macOS uses launchd; Windows uses Task Scheduler. Each manager restarts failure exits, and the next login or foreground `qurl` command repairs a clean daemon exit. Linux fails clearly when the host has no real systemd user manager instead of pretending that it installed a persistent background process. The user manager must support `Type=exec`, append log output, and `RestrictSUIDSGID`. qURL reports these requirements if the installed systemd cannot load the managed service definition.
+Users install only the `qurl` CLI. It embeds this module. On Linux, macOS, and
+Windows, the CLI uses the native per-user job manager when a local share is
+first published or started. The daemon resumes desired-on shares after login
+and recovers automatically across sleep, wake, network changes, assignment
+refreshes, and session rotation. Linux uses a systemd user service; macOS uses
+launchd; Windows uses Task Scheduler. Each manager restarts failure exits, and
+the next login or foreground `qurl` command repairs a clean daemon exit. Linux
+fails clearly when the host has no real systemd user manager instead of
+pretending that it installed a persistent background process.
+The user manager must support `Type=exec`, append log output, and
+`RestrictSUIDSGID`. qURL reports these requirements if the installed systemd
+cannot load the managed service definition.
 
-On Windows, native state is under `%LOCALAPPDATA%\qurl-connector`. The first run creates the directory and its security-sensitive files with protected ACLs for the current user, SYSTEM, and Administrators. This is a greenfield contract: the Connector does not adopt a state directory or file with inherited or foreign ACLs. If ACL validation fails, stop the Connector, move that state directory aside, and start again so it can create protected state and enroll a new identity. Connector and pinned qurl-go writers use the same protected-file contract for all production identity and session state. A custom Windows state path must use a local filesystem under a user-owned namespace where Windows can flush directory updates. Network paths and system-owned parents are not supported state locations.
+On Windows, native state is under `%LOCALAPPDATA%\qurl-connector`. The first
+run creates the directory and its security-sensitive files with protected ACLs
+for the current user, SYSTEM, and Administrators. This is a greenfield contract:
+the Connector does not adopt a state directory or file with inherited or
+foreign ACLs. If ACL validation fails, stop the Connector, move that state
+directory aside, and start again so it can create protected state and enroll a
+new identity. Connector and pinned qurl-go writers use the same protected-file
+contract for all production identity and session state. A custom Windows state
+path must use a local filesystem under a user-owned namespace where Windows can
+flush directory updates. Network paths and system-owned parents are not
+supported state locations.
 
 ### Agent state key storage
 
-A new state directory is sealed to the machine's TPM 2.0 when the process can use one: the Linux resource manager `/dev/tpmrm0` (usually `tss` group membership) or TPM Base Services on Windows. macOS, and machines without a usable TPM, keep the owner-only plaintext envelope. A TPM that is present but not responding (busy, starting, timing out, or self-testing) fails the operation instead of falling back, because the choice is permanent for the directory. The TPM holds a random key that never leaves it; the state's data key is encrypted under that key. The choice is fixed when the directory is created:
+A new state directory is sealed to the machine's TPM 2.0 when the process can
+use one: the Linux resource manager `/dev/tpmrm0` (usually `tss` group
+membership) or TPM Base Services on Windows. macOS, and machines without a
+usable TPM, keep the owner-only plaintext envelope. A TPM that is present but
+not responding (busy, starting, timing out, or self-testing) fails the
+operation instead of falling back, because the choice is permanent for the
+directory. The TPM holds a random key that never leaves it; the state's data
+key is encrypted under that key. The choice is fixed when the directory is
+created:
 
-- `LAYERV_KEY_PROVIDER=file` keeps a new directory plaintext; `tpm` requires the TPM. The cloud and `local-key` providers are unchanged. An empty or whitespace value counts as unset, so a new directory then takes the TPM when one is usable; set `file` explicitly to pin plaintext.
-- A TPM-sealed directory reopens with no environment, so the managed daemon serves it like a plaintext one.
-- Existing directories keep their envelope. There is no migration in either direction.
-- A TPM-sealed directory cannot be restored from backup onto other hardware, carried by a VM clone or image, or read after the TPM is cleared. The error says the storage root key changed. Recovery is to move the state directory aside and enroll again. Enroll after cloning, or set `LAYERV_KEY_PROVIDER=file` when building images.
-- Where the key is held under the owner hierarchy (the default outside Windows), a TPM-sealed directory also stops opening if another component later takes ownership of the TPM, most commonly booting Windows on a dual-boot machine. The error names this cause; recovery is the same.
-- Each state load, and each save (which seals and then verifies), re-derives the TPM storage key and runs one sealing command. That is fast on firmware TPMs but can take a few seconds on discrete TPM chips. Saves and loads happen on lifecycle events (enrollment, refresh, session changes), not per request.
+- `LAYERV_KEY_PROVIDER=file` keeps a new directory plaintext; `tpm` requires
+  the TPM. The cloud and `local-key` providers are unchanged. An empty or
+  whitespace value counts as unset, so a new directory then takes the TPM when
+  one is usable; set `file` explicitly to pin plaintext.
+- A TPM-sealed directory reopens with no environment, so the managed daemon
+  serves it like a plaintext one.
+- Existing directories keep their envelope. There is no migration in either
+  direction.
+- A TPM-sealed directory cannot be restored from backup onto other hardware,
+  carried by a VM clone or image, or read after the TPM is cleared. The error
+  says the storage root key changed. Recovery is to move the state directory
+  aside and enroll again. Enroll after cloning, or set
+  `LAYERV_KEY_PROVIDER=file` when building images.
+- Where the key is held under the owner hierarchy (the default outside
+  Windows), a TPM-sealed directory also stops opening if another component
+  later takes ownership of the TPM, most commonly booting Windows on a
+  dual-boot machine. The error names this cause; recovery is the same.
+- Each state load, and each save (which seals and then verifies), re-derives
+  the TPM storage key and runs one sealing command. That is fast on firmware
+  TPMs but can take a few seconds on discrete TPM chips. Saves and loads
+  happen on lifecycle events (enrollment, refresh, session changes), not per
+  request.
 
-Sealing binds the state to the machine; it does not protect it from other users of that machine. The sealed key has no password or boot-state policy, so anyone who can read the state file and reach the TPM on the same machine can unseal it. The owner-only file permissions remain the access boundary. What the TPM removes is the ability to copy the file and read it elsewhere. Sealing also does not authenticate the envelope: someone who can write the state directory can replace it, exactly as with plaintext state.
+Sealing binds the state to the machine; it does not protect it from other
+users of that machine. The sealed key has no password or boot-state policy,
+so anyone who can read the state file and reach the TPM on the same machine
+can unseal it. The owner-only file permissions remain the access boundary.
+What the TPM removes is the ability to copy the file and read it elsewhere.
+Sealing also does not authenticate the envelope: someone who can write the
+state directory can replace it, exactly as with plaintext state.
 
-`cmd/frpc` is retained for development and diagnostics. It is not a supported customer distribution, Homebrew formula, release binary, or container image.
+`cmd/frpc` is retained for development and diagnostics. It is not a supported
+customer distribution, Homebrew formula, release binary, or container image.
 
-The developer command names two public LayerV endpoints in source: `https://api.layerv.ai/v1` for the public API and `hub.nhp.layerv.ai:443` for the public NHP Hub. Hostnames are not credentials. No Hub public key is embedded; the command fails closed unless an explicit trusted key is supplied.
+The developer command names two public LayerV endpoints in source:
+`https://api.layerv.ai/v1` for the public API and `hub.nhp.layerv.ai:443` for
+the public NHP Hub. Hostnames are not credentials. No Hub public key is
+embedded; the command fails closed unless an explicit trusted key is supplied.
 
 ## Security model
 
-- Tunnel TLS verifies the admitted server hostname with system CA certificates by default. A custom CA file remains available for private deployments. Certificate and key renewal do not require client updates.
-- NHP admission is resource-specific. A token or session issued for one resource cannot register a different resource.
-- The managed daemon does not retain an account bearer. Account-authorized lifecycle changes remain in the foreground `qurl` command.
-- New agent state is sealed to the local TPM 2.0 when one is usable; see [Agent state key storage](#agent-state-key-storage).
-- Connector state is owner-only and fails closed on unsafe permissions, symlinks, contradictory identity, or malformed persisted data.
-- Session renewal is make-before-break: a replacement must reach FRP's running state before the old route drains.
-- Assignment recovery is automatic, bounded, and persisted; normal network failures do not require an approval flag or reprovisioning.
+- Tunnel TLS verifies the admitted server hostname with system CA certificates
+  by default. A custom CA file remains available for private deployments.
+  Certificate and key renewal do not require client updates.
+- NHP admission is resource-specific. A token or session issued for one
+  resource cannot register a different resource.
+- The managed daemon does not retain an account bearer. Account-authorized
+  lifecycle changes remain in the foreground `qurl` command.
+- New agent state is sealed to the local TPM 2.0 when one is usable; see
+  [Agent state key storage](#agent-state-key-storage).
+- Connector state is owner-only and fails closed on unsafe permissions,
+  symlinks, contradictory identity, or malformed persisted data.
+- Session renewal is make-before-break: a replacement must reach FRP's running
+  state before the old route drains.
+- Assignment recovery is automatic, bounded, and persisted; normal network
+  failures do not require an approval flag or reprovisioning.
 
-Please report vulnerabilities through the repository's private [security-advisory form](https://github.com/layervai/qurl-connector/security/advisories/new), not a public issue.
+Please report vulnerabilities through the repository's private
+[security-advisory form](https://github.com/layervai/qurl-connector/security/advisories/new),
+not a public issue.
 
-The Connector controls tunnel access; it does not sandbox the target app. See the proposed [public publishing isolation design](docs/public-publishing-isolation.md) for a future execution boundary that limits damage from a compromised app.
+The Connector controls tunnel access; it does not sandbox the target app.
+See the proposed [public publishing isolation design](docs/public-publishing-isolation.md)
+for a future execution boundary that limits damage from a compromised app.
 
 ## Build from source
 
@@ -105,7 +212,8 @@ Requirements:
 - Go 1.26.9 or newer
 - Git
 
-All Go dependencies, including the reviewed LayerV FRP fork, are public and available through the public Go module proxy.
+All Go dependencies, including the reviewed LayerV FRP fork, are public and
+available through the public Go module proxy.
 
 ```bash
 make verify-deps
@@ -113,7 +221,9 @@ make frpc
 ./bin/qurl-connector version
 ```
 
-`make verify-deps` checks the pinned FRP release against its public-proxy checksums, source commit, and live release tag. `make frpc` builds the developer-only command locally.
+`make verify-deps` checks the pinned FRP release against its public-proxy
+checksums, source commit, and live release tag. `make frpc` builds the
+developer-only command locally.
 
 ## Development
 
@@ -125,13 +235,25 @@ make vet        # go vet
 make frpc       # build the developer-only command
 ```
 
-The reusable production runtime lives under `pkg/share`. It owns native assignment recovery, resource-bound NHP admission, FRP session readiness, make-before-break renewal, and per-resource failure isolation. Command code must use that implementation rather than introducing another knock/session supervisor. `SessionGroupRunner` serves one or many routes on one admission and one FRP session (up to `MaxGroupRoutes`), with live route add/remove/restart and per-route failure reporting.
+The reusable production runtime lives under `pkg/share`. It owns native
+assignment recovery, resource-bound NHP admission, FRP session readiness,
+make-before-break renewal, and per-resource failure isolation. Command code
+must use that implementation rather than introducing another knock/session
+supervisor. `SessionGroupRunner` serves one or many routes on one admission
+and one FRP session (up to `MaxGroupRoutes`), with live route
+add/remove/restart and per-route failure reporting.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for change and validation expectations.
 
 ## Scaling proof
 
-`TestHermeticSessionGroupServes1000Routes` in `pkg/share` proves that one Connector process serves many routes on one NHP admission and one FRP control session, and measures what that costs. It runs in-process against the real FRP client and the real FRP server from the pinned fork; the knock is a scripted admitter and the tunnel-auth plugin is a hermetic HTTP plugin that answers `NewProxy` the way the platform does. Everything between them is production code on loopback.
+`TestHermeticSessionGroupServes1000Routes` in `pkg/share` proves that one
+Connector process serves many routes on one NHP admission and one FRP control
+session, and measures what that costs. It runs in-process against the real
+FRP client and the real FRP server from the pinned fork; the knock is a
+scripted admitter and the tunnel-auth plugin is a hermetic HTTP plugin that
+answers `NewProxy` the way the platform does. Everything between them is
+production code on loopback.
 
 The normal suite runs it at 50 routes. The opt-in run is:
 
@@ -139,7 +261,15 @@ The normal suite runs it at 50 routes. The opt-in run is:
 make proof-1000   # 1000 routes with the race detector off, then 200 with it on
 ```
 
-`QURL_PROOF_ROUTES` sets the route count and `QURL_PROOF_REPORT` writes the measurements as JSON (`make proof-1000` leaves them in `bin/`). One run asserts, in order: every route registers on the single admission and answers through the vhost; ten routes leave and ten join with no second knock and no sibling re-registration; one route restarts under a fresh proxy name alone; the admission rotates and the replacement carries every route before the old session retires, with a background request loop running across the overlap; and one route the server rejects as `resource_not_found` is withdrawn while every sibling keeps answering.
+`QURL_PROOF_ROUTES` sets the route count and `QURL_PROOF_REPORT` writes the
+measurements as JSON (`make proof-1000` leaves them in `bin/`). One run
+asserts, in order: every route registers on the single admission and answers
+through the vhost; ten routes leave and ten join with no second knock and no
+sibling re-registration; one route restarts under a fresh proxy name alone;
+the admission rotates and the replacement carries every route before the old
+session retires, with a background request loop running across the overlap;
+and one route the server rejects as `resource_not_found` is withdrawn while
+every sibling keeps answering.
 
 Measured on darwin/arm64 (Apple M5 Max, 18 cores, Go 1.27.1):
 
@@ -161,15 +291,78 @@ Measured on darwin/arm64 (Apple M5 Max, 18 cores, Go 1.27.1):
 | `NewProxy` admitted / rejected | 2011 / 1 | 411 / 1 |
 | goroutines / FDs after stop (baseline 42 / 15) | 45 / 17 | 45 / 17 |
 
-Registration and rotation are linear and fast: about 80 µs per route on the server's serial `NewProxy` path, and about 0.6 ms per route end to end because proxies are handed to FRP through a 16-wide registration window that the session refills once per status poll: 10 ms in the proof, 100 ms in production, where the refill alone therefore bounds a 1000-route registration at about 6 s and a 2000-route one at about 13 s, inside the 30 s lead floor. The production rotation lead's a-priori estimate of 50 ms per route is still well over a hundred times what this machine needs. A platform behind the server is slower: its per-`NewProxy` authorization and registration round trips take hundreds of milliseconds, and because the server reads a session's messages serially, N proxies handed to FRP at once form an N-deep queue. Two mechanisms keep that queue from turning into churn. Proxies register through a window (16 in flight per session), so no proxy waits long enough for the pinned client's 20 s `NewProxy` re-send to fire and register twice; and the rotation lead follows the registration rate the runner measured on the last full cycle (with a 1.5× margin), so a replacement is started early enough to register every route before the old admission expires. The window is proven hermetically at platform speed by `TestHermeticSessionGroupRegistersEveryRouteOnceOnSlowServer` in the default lanes and by `TestHermeticSessionGroupRotationRegistersEveryRouteOnce` across a rotation under `make proof-1000`; the measured lead by the runner's tests. The window cannot bound what the pinned client re-sends on its own after a control loss, when its new control registers the whole pushed set at Login; that is a fork-side change. The steady-state cost of a route is one goroutine and no file descriptor. Memory and descriptors scale with idle work connections, not routes: the FRP server keeps up to five idle work connections per Host for 60 s, so once every route has been hit the process holds about two descriptors per route (client and server ends, in-process), roughly five goroutines per connection, and roughly 75 KiB of stream buffers per connection. Goroutines and descriptors return to baseline after stop; Go's `sys` is not handed back to the OS promptly, as usual.
+Registration and rotation are linear and fast: about 80 µs per route on the
+server's serial `NewProxy` path, and about 0.6 ms per route end to end
+because proxies are handed to FRP through a 16-wide registration window
+that the session refills once per status poll: 10 ms in the proof, 100 ms in
+production, where the refill alone therefore bounds a 1000-route
+registration at about 6 s and a 2000-route one at about 13 s, inside the
+30 s lead floor. The production rotation lead's a-priori estimate of 50 ms per
+route is still well over a hundred times what this machine needs. A
+platform behind the server is slower: its per-`NewProxy` authorization and
+registration round trips take hundreds of milliseconds, and because the
+server reads a session's messages serially, N proxies handed to FRP at once
+form an N-deep queue. Two mechanisms keep that queue from turning into
+churn. Proxies register through a window (16 in flight per session), so no
+proxy waits long enough for the pinned client's 20 s `NewProxy` re-send to
+fire and register twice; and the rotation lead follows the registration
+rate the runner measured on the last full cycle (with a 1.5× margin), so a
+replacement is started early enough to register every route before the old
+admission expires. The window is proven hermetically at platform speed by
+`TestHermeticSessionGroupRegistersEveryRouteOnceOnSlowServer` in the
+default lanes and by `TestHermeticSessionGroupRotationRegistersEveryRouteOnce`
+across a rotation under `make proof-1000`; the measured lead by the
+runner's tests. The window cannot bound what the pinned client re-sends on
+its own after a control loss, when its new control registers the whole
+pushed set at Login; that is a fork-side change. The steady-state cost of a route is one
+goroutine and no file descriptor. Memory and descriptors scale
+with idle work connections, not routes: the FRP server keeps up to five idle
+work connections per Host for 60 s, so once every route has been hit the
+process holds about two descriptors per route (client and server ends,
+in-process), roughly five goroutines per connection, and roughly 75 KiB of
+stream buffers per connection. Goroutines and descriptors return to baseline
+after stop; Go's `sys` is not handed back to the OS promptly, as usual.
 
-Caveats: hermetic knock, hermetic tunnel-auth plugin, one machine, loopback, in-process server (goroutine and descriptor counts include the server's share; the breakdown is printed). Peak RSS covers the whole test process, and the race-on figure is dominated by the detector's shadow memory; Go `sys` is the runtime's high-water mark and includes the proof's own goroutine-dump buffers. Peak RSS and descriptor counts are not measured on Windows. Under the race detector the overlap loop starts only after the old proxies have left the server (see the gap below), so the race-on overlap column covers the drain, not the whole rotation. Server-side budgets are proven separately by the platform.
+Caveats: hermetic knock, hermetic tunnel-auth plugin, one machine, loopback,
+in-process server (goroutine and descriptor counts include the server's
+share; the breakdown is printed). Peak RSS covers the whole test process, and
+the race-on figure is dominated by the detector's shadow memory; Go `sys` is
+the runtime's high-water mark and includes the proof's own goroutine-dump
+buffers. Peak RSS and descriptor counts are not measured on Windows. Under
+the race detector the overlap loop starts only after the old proxies have
+left the server (see the gap below), so the race-on overlap column covers the
+drain, not the whole rotation. Server-side budgets are proven separately by
+the platform.
 
-One gap was found, and it is not in this repository. The pinned FRP client admits a work connection only while its proxy is in the running phase, and that phase lags the server on both edges of a proxy's life: the server adds a new proxy to its load-balancer group inside `RegisterProxy` and only then sends `NewProxyResp`, and `Wrapper.Stop` marks a proxy closed in the same instant it sends `CloseProxy`. A request the server dispatches to the proxy inside either window is refused by the client and answered 404 by the server's reverse proxy. Under a deliberately hostile overlap load (16 workers, no pause, about 36,000 requests per second across 20 routes) it shows as one to three such 404s per rotation in roughly half the runs, every one at its own route's re-registration instant; at the proof's background load it appears about once per few hundred thousand requests (0 in 96,203 in the published 1000-route run, 1 in 95,018 in an earlier one, 1 in about 500,000 across the 50-route runs). The proof attributes every overlap failure to that exact instant, bounds how many it will excuse, and fails on any failure outside it. The same site is also a data race: `Wrapper.InWorkConn` reads the proxy phase after releasing the wrapper's lock, so the race detector reports the dispatch whenever it happens under `-race`, which is why the race lane starts its overlap loop after withdrawal. The fix belongs in the FRP fork's client: read the phase under the lock, accept work connections while a proxy awaits its `NewProxyResp`, and keep accepting through the drain grace after `CloseProxy` is sent.
+One gap was found, and it is not in this repository. The pinned FRP client
+admits a work connection only while its proxy is in the running phase, and
+that phase lags the server on both edges of a proxy's life: the server adds a
+new proxy to its load-balancer group inside `RegisterProxy` and only then
+sends `NewProxyResp`, and `Wrapper.Stop` marks a proxy closed in the same
+instant it sends `CloseProxy`. A request the server dispatches to the proxy
+inside either window is refused by the client and answered 404 by the
+server's reverse proxy. Under a deliberately hostile overlap load (16 workers,
+no pause, about 36,000 requests per second across 20 routes) it shows as one
+to three such 404s per rotation in roughly half the runs, every one at its
+own route's re-registration instant; at the proof's background load it
+appears about once per few hundred thousand requests (0 in 96,203 in the
+published 1000-route run, 1 in 95,018 in an earlier one, 1 in about
+500,000 across the 50-route runs). The
+proof attributes every overlap failure to that exact instant, bounds how
+many it will excuse, and fails on any failure outside it. The same
+site is also a data race: `Wrapper.InWorkConn` reads the proxy phase after
+releasing the wrapper's lock, so the race detector reports the dispatch
+whenever it happens under `-race`, which is why the race lane starts its
+overlap loop after withdrawal. The fix belongs in the FRP fork's client:
+read the phase under the lock, accept work connections while a proxy awaits
+its `NewProxyResp`, and keep accepting through the drain grace after
+`CloseProxy` is sent.
 
 ## Developer command configuration
 
-The standalone binary reads `qurl-proxy.yaml` from the current directory, the binary's `etc` directory, or the user's qURL config directory. A minimal route looks like:
+The standalone binary reads `qurl-proxy.yaml` from the current directory, the
+binary's `etc` directory, or the user's qURL config directory. A minimal route
+looks like:
 
 ```yaml
 server:
@@ -181,9 +374,15 @@ routes:
     local_port: 8080
 ```
 
-Resource, routing, and knock identities are issued by the qURL platform. Do not derive or substitute one identity for another. Standard placement comes from the authenticated NHP response; custom Hub and endpoint overrides are intended only for deployments that own the corresponding trust configuration.
+Resource, routing, and knock identities are issued by the qURL platform. Do
+not derive or substitute one identity for another. Standard placement comes
+from the authenticated NHP response; custom Hub and endpoint overrides are
+intended only for deployments that own the corresponding trust configuration.
 
-Native session operations require `QURL_CONNECTOR_NATIVE_OWNER_ID` from the authenticated account context. The command never derives the owner from a CRID, route, API resource, or NHP packet. AWS accounts, regions, and storage names are private NHP server configuration and are not Connector settings or build data.
+Native session operations require `QURL_CONNECTOR_NATIVE_OWNER_ID` from the
+authenticated account context. The command never derives the owner from a CRID,
+route, API resource, or NHP packet. AWS accounts, regions, and storage names are
+private NHP server configuration and are not Connector settings or build data.
 
 The developer command stays in the foreground:
 
@@ -193,9 +392,12 @@ qurl-connector run
 
 ## Supply chain
 
-- Releases are immutable Go module source tags; this repository publishes no customer binary or container artifact.
-- The module pins Go dependencies and the FRP fork's exact reviewed source revision and checksum.
-- Dependabot, dependency review, govulncheck, CodeQL, and secret scanning gate changes.
+- Releases are immutable Go module source tags; this repository publishes no
+  customer binary or container artifact.
+- The module pins Go dependencies and the FRP fork's exact reviewed source
+  revision and checksum.
+- Dependabot, dependency review, govulncheck, CodeQL, and secret scanning gate
+  changes.
 
 ## License
 
