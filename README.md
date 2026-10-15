@@ -1,7 +1,8 @@
 # qURL Connector runtime for local services
 
-qURL™ Connector is the Go runtime that connects local web apps and private
-services to LayerV's temporary access links. It admits each shared resource
+[qURL™ by LayerV](https://layerv.ai/qurl/) shares localhost web apps, private
+APIs, and files through expiring access links. qURL Connector is the embedded
+Go runtime that connects local services to that access path. It admits each shared resource
 with the Network-invisible Handshake Protocol (NHP), then carries approved
 traffic over a resource-bound FRP session.
 
@@ -18,6 +19,89 @@ Developers working on the runtime can start with the
 ```text
 local service -> qURL Connector -> qURL -> recipient
 ```
+
+[Local sharing workflow](#how-the-connector-enables-localhost-sharing) ·
+[File sharing](#file-sharing-through-a-local-service) ·
+[Runtime questions](#connector-sharing-questions) · [Private links](https://qurl.link/)
+
+## How the Connector enables localhost sharing
+
+Use the [qURL CLI](https://github.com/layervai/qurl-integrations#share-a-localhost-web-app)
+to let a teammate review a development preview, open an internal dashboard,
+or call a private HTTP API. The Connector embedded in that CLI supplies the
+serving runtime beside your app:
+
+1. Start the app on a loopback address, such as `127.0.0.1:3000`.
+2. Publish it through the CLI. The embedded Connector connects outward to the
+   LayerV service, and the command returns a CRID after the route is ready.
+3. Mint an access link and send that full link to your recipient.
+4. Keep the app, host, and serving runtime available for the visit. Stop the
+   local share when it is no longer needed.
+
+After installing and configuring the CLI, the publishing and sharing steps are:
+
+```bash
+qurl publish http://127.0.0.1:3000
+qurl share REPLACE_WITH_CRID --ttl 5m --session-duration 5m
+```
+
+Replace `REPLACE_WITH_CRID` with the publish output; it is not a literal resource
+name. The service enforces resource permissions and may shorten the requested
+access window. See the [CLI command reference](https://github.com/layervai/qurl-integrations/tree/main/apps/cli#commands)
+for privacy, grants, start/stop, and supported deployment settings.
+
+| Component | Responsibility |
+| --- | --- |
+| Your HTTP app or API | Serves the content on its own host and retains its own application login. |
+| qURL CLI and embedded Connector | Publish the local service and keep its access path running. |
+| An issued qURL link | Grants access under the resource's link and session policy. |
+| Browser or supported SDK opener | Opens the link and uses the admitted resource connection. |
+
+Use this repository when building or maintaining the runtime. Users install
+the CLI rather than a separate `cmd/frpc` distribution. Runtime developers
+should continue with [source build](#build-from-source),
+[security model](#security-model), and [development](#development).
+
+## File sharing through a local service
+
+For a static preview or a set of documents, run an HTTP server bound to
+localhost in a dedicated directory containing only the files you intend to
+share. Publish its root address using the CLI workflow above. Recipients can
+reach the files the HTTP app exposes while the local host remains available.
+
+For individually uploaded documents, use the
+[Gmail integration](https://github.com/layervai/qurl-integrations/tree/main/apps/chrome-extension)
+or [MCP upload tools](https://github.com/layervai/qurl-mcp#let-an-ai-agent-share-a-pdf-or-image).
+Those workflows use their configured upload service and per-file link
+contract. Their size limits and revocation support should not be inferred
+from this runtime's local-service lifecycle.
+
+## Connector sharing questions
+
+### Does the Connector deploy my app to the cloud?
+
+No. It carries access to an app on its existing host. The app and host must
+stay running; a sleeping laptop or unavailable origin cannot serve content.
+Use an appropriately supervised host for a continuously available service.
+
+### Do I need inbound firewall ports or a public app address?
+
+The local publishing path connects outbound. It still needs the deployment's
+required outbound network connectivity; it does not bypass an egress firewall.
+Close any independent public route if qURL should be the app's only access path.
+
+### Does an expiring link replace login or stop the daemon?
+
+No. Your app's login continues to apply. Link expiry limits new redemption;
+session duration and local serving are separate lifecycles. Use the CLI's
+stop or delete operations when you intend to pause or retire the local share.
+
+### How does this relate to an ngrok localhost tunnel?
+
+Both can use outbound connectivity. This runtime participates in qURL's
+resource admission and access-link workflow. See the
+[qURL and ngrok comparison](https://github.com/layervai/qurl-integrations#qurl-and-ngrok-for-localhost-sharing)
+for the documented sharing and authentication models.
 
 Users install only the `qurl` CLI. It embeds this module. On Linux, macOS, and
 Windows, the CLI uses the native per-user job manager when a local share is
