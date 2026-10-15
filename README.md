@@ -76,6 +76,20 @@ Those workflows use their configured upload service and per-file link
 contract. Their size limits and revocation support should not be inferred
 from this runtime's local-service lifecycle.
 
+## Connector, cloudflared, and tailnet serving
+
+A runtime's connection to an origin and its rules for admitting a recipient are separate parts of sharing. Compare those responsibilities when choosing how to reach a local web app or private API:
+
+| Runtime | Connection and access model |
+| --- | --- |
+| qURL Connector, embedded in the CLI | Connects outbound, admits a published resource through NHP, and carries approved traffic over a resource-bound FRP session. The CLI and service manage the resource's access links and policy. |
+| [Cloudflare Tunnel](https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/) (`cloudflared`) | Connects an origin outward to Cloudflare. [Access application policies](https://developers.cloudflare.com/cloudflare-one/access-controls/applications/choose-application-type/) can govern which identities reach a configured application. |
+| [Tailscale Serve](https://tailscale.com/docs/features/tailscale-serve) | Serves a local port or files within a tailnet, subject to its access rules. It fits an origin and recipients already connected through that private network. |
+
+Outbound origin connectivity is shared by qURL Connector and `cloudflared`. With qURL, NHP resource admission and the access-link lifecycle sit alongside the FRP transport; a transport connection alone is not an access grant. Tailscale [Funnel](https://tailscale.com/docs/features/tailscale-funnel) changes the audience to the public internet, so it should not be confused with private Serve access.
+
+In these local-serving workflows, the origin must remain available. Choose based on your resource policy, recipient access model, and operational requirements. For application-level choices, including ngrok and hosted previews, see the [sharing guide](https://github.com/layervai/qurl-integrations#choose-how-to-share-an-app-or-file). Continue with this repository's [security model](#security-model) for the Connector's own trust and isolation requirements.
+
 ## Connector sharing questions
 
 ### Does the Connector deploy my app to the cloud?
@@ -100,7 +114,7 @@ stop or delete operations when you intend to pause or retire the local share.
 
 Both can use outbound connectivity. This runtime participates in qURL's
 resource admission and access-link workflow. See the
-[qURL and ngrok comparison](https://github.com/layervai/qurl-integrations#qurl-and-ngrok-for-localhost-sharing)
+[app and file-sharing comparison](https://github.com/layervai/qurl-integrations#choose-how-to-share-an-app-or-file)
 for the documented sharing and authentication models.
 
 Users install only the `qurl` CLI. It embeds this module. On Linux, macOS, and
