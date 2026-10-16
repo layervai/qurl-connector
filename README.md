@@ -26,7 +26,7 @@ local service -> qURL Connector -> qURL -> recipient
 
 ## How the Connector enables localhost sharing
 
-Use the [qURL CLI](https://github.com/layervai/qurl-integrations#share-a-localhost-web-app)
+Use the [qURL CLI](https://github.com/layervai/qurl-integrations/tree/main/apps/cli#publish-localhost-in-60-seconds)
 to let a teammate review a development preview, open an internal dashboard,
 or call a private HTTP API. The Connector embedded in that CLI supplies the
 serving runtime beside your app:
@@ -71,7 +71,7 @@ reach the files the HTTP app exposes while the local host remains available.
 
 For individually uploaded documents, use the
 [Gmail integration](https://github.com/layervai/qurl-integrations/tree/main/apps/chrome-extension)
-or [MCP upload tools](https://github.com/layervai/qurl-mcp#let-an-ai-agent-share-a-pdf-or-image).
+or [MCP upload tools](https://github.com/layervai/qurl-mcp#upload-tools).
 Those workflows use their configured upload service and per-file link
 contract. Their size limits and revocation support should not be inferred
 from this runtime's local-service lifecycle.
@@ -88,7 +88,7 @@ A runtime's connection to an origin and its rules for admitting a recipient are 
 
 Outbound origin connectivity is shared by qURL Connector and `cloudflared`. With qURL, NHP resource admission and the access-link lifecycle sit alongside the FRP transport; a transport connection alone is not an access grant. Tailscale [Funnel](https://tailscale.com/docs/features/tailscale-funnel) changes the audience to the public internet, so it should not be confused with private Serve access.
 
-In these local-serving workflows, the origin must remain available. Choose based on your resource policy, recipient access model, and operational requirements. For application-level choices, including ngrok and hosted previews, see the [sharing guide](https://github.com/layervai/qurl-integrations#choose-how-to-share-an-app-or-file). Continue with this repository's [security model](#security-model) for the Connector's own trust and isolation requirements.
+In these local-serving workflows, the origin must remain available. Choose based on your resource policy, recipient access model, and operational requirements. Continue with this repository's [security model](#security-model) for the Connector's own trust and isolation requirements.
 
 ## Connector sharing questions
 
@@ -114,8 +114,8 @@ stop or delete operations when you intend to pause or retire the local share.
 
 Both can use outbound connectivity. This runtime participates in qURL's
 resource admission and access-link workflow. See the
-[app and file-sharing comparison](https://github.com/layervai/qurl-integrations#choose-how-to-share-an-app-or-file)
-for the documented sharing and authentication models.
+[CLI publishing reference](https://github.com/layervai/qurl-integrations/tree/main/apps/cli#qurl-publish)
+for the supported local and remote publishing models.
 
 Users install only the `qurl` CLI. It embeds this module. On Linux, macOS, and
 Windows, the CLI uses the native per-user job manager when a local share is
