@@ -30,6 +30,9 @@ var (
 		"qurl-conformance":       true,
 		"qurl-connector":         true,
 		"qurl-go":                true,
+		// Verified public on 2026-10-15.
+		"qurl-integrations": true,
+		"qurl-mcp":          true,
 	}
 	// These exact qurl-connector paths are public local namespaces, not cloud
 	// parameter paths. Do not use a prefix exemption: an unlisted child path
