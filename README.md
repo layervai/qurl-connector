@@ -223,7 +223,7 @@ for a future execution boundary that limits damage from a compromised app.
 
 Requirements:
 
-- Go 1.26.9 or newer
+- Go 1.26.10 or newer
 - Git
 
 All Go dependencies, including the reviewed LayerV FRP fork, are public and
