@@ -174,7 +174,24 @@ func (r *connectorRuntime) Close() error {
 func runCmdFunc(_ *cobra.Command, _ []string) error {
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
-	return runConnectorCommand(ctx)
+	return finishConnectorRun(ctx, runConnectorCommand(ctx))
+}
+
+// finishConnectorRun keeps a terminal startup refusal from becoming a supervisor retry loop.
+func finishConnectorRun(ctx context.Context, err error) error {
+	if !authoritativeConnectorResourceRejection(err) {
+		return err
+	}
+	guidance := "Check this account's Connector permission and saved resource identity."
+	if errors.Is(err, qurl.ErrConnectorResourceQuotaExceeded) {
+		guidance = "The Connector resource quota is full. Free a resource or upgrade the account plan."
+	}
+	slog.ErrorContext(ctx, "Connector startup paused after a terminal resource rejection; automatic retry is disabled",
+		"error", err, "action", guidance+" Restart the Connector after the cause is fixed.")
+	// Startup has already released its runtime and file locks. Keep only the process
+	// alive so Docker/systemd/desktop supervisors cannot repeat the refused request.
+	<-ctx.Done()
+	return nil
 }
 
 // runConnectorCommand is the entire run-command body behind runCmdFunc's
