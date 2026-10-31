@@ -171,8 +171,8 @@ func TestFinishConnectorRunPausesTerminalRejectionsUntilStopped(t *testing.T) {
 			cancel()
 			select {
 			case err := <-done:
-				if err != nil {
-					t.Fatalf("stop returned %v", err)
+				if !errors.Is(err, refusal) {
+					t.Fatalf("stop lost the terminal refusal: %v", err)
 				}
 			case <-time.After(time.Second):
 				t.Fatal("paused startup ignored shutdown")

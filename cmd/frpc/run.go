@@ -191,7 +191,7 @@ func finishConnectorRun(ctx context.Context, err error) error {
 	// Startup has already released its runtime and file locks. Keep only the process
 	// alive so Docker/systemd/desktop supervisors cannot repeat the refused request.
 	<-ctx.Done()
-	return nil
+	return err
 }
 
 // runConnectorCommand is the entire run-command body behind runCmdFunc's

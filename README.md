@@ -135,8 +135,10 @@ resource refusal pauses startup until the process is stopped. It makes no more
 enrollment attempts while paused, even under a supervisor with an automatic
 restart policy. Read the error log, fix the account permission, saved identity,
 or resource quota, then restart the process. A full quota requires freeing a
-resource or upgrading the account plan. SIGINT and SIGTERM stop the paused
-process. Temporary network or service failures keep their existing failure-exit
+resource or upgrading the account plan. Foreground runs also wait; use Ctrl-C
+to stop them. SIGINT and SIGTERM stop the paused process with a failure status.
+A paused process is not serving and has no readiness endpoint. Process uptime
+alone is not a health signal; monitor the terminal-refusal error log. Temporary network or service failures keep their existing failure-exit
 behavior; configure supervisor backoff for those failures.
 
 On Windows, native state is under `%LOCALAPPDATA%\qurl-connector`. The first
