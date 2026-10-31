@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"net"
 	"net/http"
 	"strconv"
@@ -15,6 +17,7 @@ import (
 	v1 "github.com/fatedier/frp/pkg/config/v1"
 	"github.com/fatedier/frp/pkg/config/v1/validation"
 	"github.com/fatedier/frp/pkg/policy/security"
+	qurl "github.com/layervai/qurl-go/qurl"
 
 	nhpconfig "github.com/layervai/qurl-connector/pkg/config"
 )
@@ -145,6 +148,43 @@ func TestAdminAPIWorksWithoutDashboardAssets(t *testing.T) {
 		_ = resp.Body.Close()
 		if resp.StatusCode != check.want {
 			t.Errorf("GET %s status = %d, want %d", check.path, resp.StatusCode, check.want)
+		}
+	}
+}
+
+func TestFinishConnectorRunPausesTerminalRejectionsUntilStopped(t *testing.T) {
+	for _, refusal := range []error{
+		qurl.ErrConnectorResourceIdentityRejected, qurl.ErrConnectorResourceEntitlementDenied,
+		qurl.ErrConnectorResourceIdentityConflict, qurl.ErrConnectorResourceQuotaExceeded,
+		qurl.ErrConnectorResourceRequestRejected,
+	} {
+		t.Run(refusal.Error(), func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			done := make(chan error, 1)
+			go func() { done <- finishConnectorRun(ctx, fmt.Errorf("startup: %w", refusal)) }()
+			select {
+			case err := <-done:
+				t.Fatalf("terminal refusal exited into the supervisor restart loop: %v", err)
+			case <-time.After(20 * time.Millisecond):
+			}
+			cancel()
+			select {
+			case err := <-done:
+				if !errors.Is(err, refusal) {
+					t.Fatalf("stop lost the terminal refusal: %v", err)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("paused startup ignored shutdown")
+			}
+		})
+	}
+}
+
+func TestFinishConnectorRunPreservesOtherResults(t *testing.T) {
+	for _, err := range []error{nil, qurl.ErrConnectorResourceUnavailable, qurl.ErrConnectorResourceRateLimited, errors.New("config error")} {
+		if got := finishConnectorRun(context.Background(), err); !errors.Is(got, err) {
+			t.Fatalf("result changed: got %v, want %v", got, err)
 		}
 	}
 }

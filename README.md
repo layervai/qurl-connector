@@ -130,6 +130,18 @@ The user manager must support `Type=exec`, append log output, and
 `RestrictSUIDSGID`. qURL reports these requirements if the installed systemd
 cannot load the managed service definition.
 
+For the standalone `qurl-connector run` command, an authenticated terminal
+resource refusal pauses startup until the process is stopped. It makes no more
+enrollment attempts while paused, even under a supervisor with an automatic
+restart policy. Read the error log, fix the account permission, saved identity,
+or resource quota, then restart the process. A full quota requires freeing a
+resource or upgrading the account plan. Foreground runs also wait; use Ctrl-C
+to stop them. SIGINT and SIGTERM stop the paused process with a failure status.
+A paused process is not serving and has no readiness endpoint. Process uptime
+alone is not a health signal; monitor the terminal-refusal error log. Temporary
+network or service failures keep their existing failure-exit behavior; configure
+supervisor backoff for those failures.
+
 On Windows, native state is under `%LOCALAPPDATA%\qurl-connector`. The first
 run creates the directory and its security-sensitive files with protected ACLs
 for the current user, SYSTEM, and Administrators. This is a greenfield contract:
