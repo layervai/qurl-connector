@@ -138,8 +138,9 @@ or resource quota, then restart the process. A full quota requires freeing a
 resource or upgrading the account plan. Foreground runs also wait; use Ctrl-C
 to stop them. SIGINT and SIGTERM stop the paused process with a failure status.
 A paused process is not serving and has no readiness endpoint. Process uptime
-alone is not a health signal; monitor the terminal-refusal error log. Temporary network or service failures keep their existing failure-exit
-behavior; configure supervisor backoff for those failures.
+alone is not a health signal; monitor the terminal-refusal error log. Temporary
+network or service failures keep their existing failure-exit behavior; configure
+supervisor backoff for those failures.
 
 On Windows, native state is under `%LOCALAPPDATA%\qurl-connector`. The first
 run creates the directory and its security-sensitive files with protected ACLs

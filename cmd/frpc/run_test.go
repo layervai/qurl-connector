@@ -17,9 +17,9 @@ import (
 	v1 "github.com/fatedier/frp/pkg/config/v1"
 	"github.com/fatedier/frp/pkg/config/v1/validation"
 	"github.com/fatedier/frp/pkg/policy/security"
+	qurl "github.com/layervai/qurl-go/qurl"
 
 	nhpconfig "github.com/layervai/qurl-connector/pkg/config"
-	qurl "github.com/layervai/qurl-go/qurl"
 )
 
 func TestFRPClientCommonDefaultsAuthToToken(t *testing.T) {
@@ -183,7 +183,7 @@ func TestFinishConnectorRunPausesTerminalRejectionsUntilStopped(t *testing.T) {
 
 func TestFinishConnectorRunPreservesOtherResults(t *testing.T) {
 	for _, err := range []error{nil, qurl.ErrConnectorResourceUnavailable, qurl.ErrConnectorResourceRateLimited, errors.New("config error")} {
-		if got := finishConnectorRun(context.Background(), err); got != err {
+		if got := finishConnectorRun(context.Background(), err); !errors.Is(got, err) {
 			t.Fatalf("result changed: got %v, want %v", got, err)
 		}
 	}
