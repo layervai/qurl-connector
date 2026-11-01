@@ -27,6 +27,9 @@ type NativeRuntimeConfig struct {
 	ClientBaseURL                string
 	EnrollmentCredential         string
 	EnrollmentCredentialProvider qurl.AgentEnrollmentCredentialProvider
+	// RequiredRegistrationKeyKind restricts enrollment before REG. Zero accepts
+	// both headless kinds. Completed-state callers must also check the stored kind.
+	RequiredRegistrationKeyKind qurl.RegistrationKeyKind
 	// RecoveryCredentialProvider is invoked after the pinned Hub authenticates
 	// the persisted agent and rejects its device credential, or when the same
 	// state contains a valid pending credential-recovery episode. It must return
@@ -141,6 +144,11 @@ func OpenNativeRuntime(ctx context.Context, cfg NativeRuntimeConfig) (_ *NativeR
 	if mode != "auto" && mode != "disabled" {
 		return nil, fmt.Errorf("open native runtime: refresh mode %q must be auto or disabled", mode)
 	}
+	switch cfg.RequiredRegistrationKeyKind {
+	case "", qurl.RegistrationKeyKindBootstrap, qurl.RegistrationKeyKindConnectorBootstrap:
+	default:
+		return nil, fmt.Errorf("%w: required registration key kind must be bootstrap or connector_bootstrap", qurl.ErrInvalidRegisterConfig)
+	}
 	store, err := newNativeStateStore(cfg.StateDir, strings.TrimSpace(cfg.AgentID))
 	if err != nil {
 		return nil, err
@@ -242,7 +250,11 @@ func OpenNativeRuntime(ctx context.Context, cfg NativeRuntimeConfig) (_ *NativeR
 	registerOptions := []qurl.AgentRuntimeRegistrationOption{
 		qurl.WithAgentRuntimeHub(cfg.Hub),
 		qurl.WithAgentRuntimeMetadata(normalizeNativeHostname(cfg.Hostname), cfg.Version),
-		qurl.WithAgentRuntimeHeadlessEnrollment(),
+	}
+	if cfg.RequiredRegistrationKeyKind == "" {
+		registerOptions = append(registerOptions, qurl.WithAgentRuntimeHeadlessEnrollment())
+	} else {
+		registerOptions = append(registerOptions, qurl.WithAgentRuntimeAllowedRegistrationKeyKinds(cfg.RequiredRegistrationKeyKind))
 	}
 	if cfg.AgentID != "" {
 		registerOptions = append(registerOptions, qurl.WithAgentRuntimeIdentity(strings.TrimSpace(cfg.AgentID)))
