@@ -197,6 +197,12 @@ What the TPM removes is the ability to copy the file and read it elsewhere.
 Sealing also does not authenticate the envelope: someone who can write the
 state directory can replace it, exactly as with plaintext state.
 
+The Connector's local origin uses cleartext HTTP. Use a loopback HTTP
+listener. If the app accepts only HTTPS, place a local reverse proxy in front
+of it that verifies the app's TLS certificate, and point the Connector at that
+proxy's loopback HTTP port. New `https://` targets are rejected during setup;
+changing only the target port does not enable origin TLS.
+
 `cmd/frpc` is retained for development and diagnostics. It is not a supported
 customer distribution, Homebrew formula, release binary, or container image.
 

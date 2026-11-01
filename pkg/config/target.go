@@ -10,9 +10,7 @@ import (
 // ParseTarget parses a managed HTTP target. Empty hostname defaults to
 // 127.0.0.1.
 //
-// Schemes:
-//   - http  -> default port 80
-//   - https -> default port 443
+// Only cleartext HTTP origins are supported; TLS terminates at the private entry.
 func ParseTarget(raw string) (host string, port int, targetURL string, err error) {
 	u, err := url.Parse(raw)
 	if err != nil {
@@ -33,11 +31,9 @@ func ParseTarget(raw string) (host string, port int, targetURL string, err error
 			port = 80
 		}
 	case "https":
-		if portStr == "" {
-			port = 443
-		}
+		return "", 0, "", fmt.Errorf("HTTPS origins are not supported; point the Connector at a loopback HTTP listener, or a local TLS-verifying reverse proxy")
 	default:
-		return "", 0, "", fmt.Errorf("unsupported scheme %q (use http:// or https://)", scheme)
+		return "", 0, "", fmt.Errorf("unsupported scheme %q (use http://)", scheme)
 	}
 
 	if port == 0 {
