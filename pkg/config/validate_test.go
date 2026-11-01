@@ -363,3 +363,13 @@ func TestValidate_BootstrapInputAllowsDistinctPendingRoutes(t *testing.T) {
 		t.Fatalf("startup-input rejected distinct unresolved routes: %v", err)
 	}
 }
+
+func TestValidateRejectsHTTPSOriginBeforeStartup(t *testing.T) {
+	cfg := &Config{Routes: []Route{{
+		ID: "web-app", Type: RouteTypeHTTP, LocalIP: "127.0.0.1", LocalPort: 8443,
+		TargetURL: "https://localhost:8443",
+	}}}
+	if err := Validate(cfg); err == nil || !strings.Contains(err.Error(), "HTTPS origins are not supported") {
+		t.Fatalf("HTTPS route must fail before startup: %v", err)
+	}
+}

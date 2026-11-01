@@ -194,6 +194,11 @@ func validate(cfg *Config, requireManagedRouting bool) error {
 			errs = append(errs, fmt.Errorf("%s (%s): unsupported route type %q; use type: http", prefix, r.ID, r.Type))
 		}
 
+		if r.TargetURL != "" {
+			if _, _, _, err := ParseTarget(r.TargetURL); err != nil {
+				errs = append(errs, fmt.Errorf("%s: target_url: %w", prefix, err))
+			}
+		}
 		if r.LocalPort < 1 || r.LocalPort > 65535 {
 			errs = append(errs, fmt.Errorf("%s (%s): local_port must be 1-65535, got %d", prefix, r.ID, r.LocalPort))
 		}
