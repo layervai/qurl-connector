@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.14.4](https://github.com/layervai/qurl-connector/compare/v0.14.3...v0.14.4) (2026-11-01)
+
+
+### Bug Fixes
+
+* **agent:** enforce exact enrollment key kind before registration ([#138](https://github.com/layervai/qurl-connector/issues/138)) ([ec85a2a](https://github.com/layervai/qurl-connector/commit/ec85a2ad996adc4d289d3760ecaff7e2c320eb2b))
+* pause terminal standalone Connector startup refusals ([#140](https://github.com/layervai/qurl-connector/issues/140)) ([f7ec00e](https://github.com/layervai/qurl-connector/commit/f7ec00e43e76e5139edcb32d37630df35ef925cc))
+
+
+### Continuous Integration
+
+* accept the generated release pull request scope ([#141](https://github.com/layervai/qurl-connector/issues/141)) ([c62264d](https://github.com/layervai/qurl-connector/commit/c62264d877e826728785ebe5785f64e7283ea690))
+
 ## [0.14.3](https://github.com/layervai/qurl-connector/compare/v0.14.2...v0.14.3) (2026-10-21)
 
 
