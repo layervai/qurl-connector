@@ -27,6 +27,7 @@ jobs:
             ci
             chore
             revert
+          # Release Please uses chore(main) for this repository's release PR.
           scopes: |
             share
             agent
@@ -35,6 +36,7 @@ jobs:
             frpc
             audit
             release
+            main
             ci
             docs
             deps
