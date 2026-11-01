@@ -11,6 +11,7 @@ name: Dependency Age Check (Go)
 # in the diff — see "No go.sum changes detected" in age-check-go.sh.
 on:
   pull_request:
+    types: [opened, synchronize, reopened, labeled, unlabeled]
   workflow_dispatch:
 
 # Cancel superseded runs on the same PR branch — the reusable workflow
