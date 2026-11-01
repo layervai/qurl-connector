@@ -1,6 +1,8 @@
 package config
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -34,5 +36,26 @@ func TestParseTarget(t *testing.T) {
 				t.Fatalf("ParseTarget(%q) = (%q, %d, %q, %v)", test.raw, host, port, raw, err)
 			}
 		})
+	}
+}
+
+func TestLoadKeepsLegacyTargetMetadataEditable(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "qurl-proxy.yaml")
+	const saved = `routes:
+  - id: legacy-tls
+    type: http
+    local_port: 8443
+    target_url: https://localhost:8443
+  - id: working-http
+    type: http
+    local_port: 8080
+    target_url: http://localhost:8080
+`
+	if err := os.WriteFile(path, []byte(saved), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil || len(cfg.Routes) != 2 {
+		t.Fatalf("legacy metadata must not block config edits or healthy siblings: %v", err)
 	}
 }
