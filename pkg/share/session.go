@@ -116,8 +116,11 @@ func (d *cycleDrainSet) start(session ServingSession, expiresAt time.Time, stopT
 		// Cancellation and the original deadline force teardown. Stop has a
 		// separate bounded budget; it cannot extend authorization.
 		// A lost retired control must not stop its healthy replacement.
-		if err == context.Canceled || err == context.DeadlineExceeded || err == net.ErrClosed { //nolint:errorlint // Keep joined failures; only plain context or retired-close errors are benign.
-			err = nil
+		for cause := err; cause != nil; cause = errors.Unwrap(cause) {
+			if cause == context.Canceled || cause == context.DeadlineExceeded || cause == net.ErrClosed { //nolint:errorlint // Unwrap single causes only; joined failures must stay visible.
+				err = nil
+				break
+			}
 		}
 		stopCtx, stopCancel := context.WithTimeout(context.Background(), stopTimeout)
 		err = errors.Join(err, session.Stop(stopCtx))

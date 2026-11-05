@@ -408,7 +408,7 @@ func (r *SessionGroupRunner) observeAddedRegistration(cycle *groupCycle, states 
 // with bounded jitter. Run returns early only when the group's protected
 // resource is permanently gone (ErrResourceGone from admission), when every
 // route has been withdrawn as permanently unavailable (ErrGroupEmpty), or
-// when teardown fails.
+// when teardown fails, including exact retirement of an old admission.
 func (r *SessionGroupRunner) Run(ctx context.Context) (retErr error) {
 	if ctx == nil {
 		return errors.New("run session group: context is nil")

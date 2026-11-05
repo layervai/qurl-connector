@@ -228,8 +228,8 @@ embedded; the command fails closed unless an explicit trusted key is supplied.
   state before the old route drains. Existing streams drain until they finish
   or the original authorization expires. Stop and resource revocation close
   them immediately. At most two retired controls remain. Before a third is
-  retained, both older controls are stopped, which can close their streams early. This does not extend access
-  past the original grant.
+  retained, both older controls are stopped, which can close their streams early.
+  This does not extend access past the original grant.
 - Assignment recovery is automatic, bounded, and persisted; normal network
   failures do not require an approval flag or reprovisioning.
 

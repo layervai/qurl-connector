@@ -3,6 +3,7 @@ package share
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"sync"
 	"testing"
@@ -233,7 +234,11 @@ func TestGroupRetiredControlLossKeepsReplacementAndJoinedFailures(t *testing.T) 
 		wantFailure bool
 	}{
 		{"closed", net.ErrClosed, false},
+		{"wrapped closed", fmt.Errorf("retired transport: %w", net.ErrClosed), false},
+		{"wrapped deadline", fmt.Errorf("retired grant: %w", context.DeadlineExceeded), false},
+		{"wrapped canceled", fmt.Errorf("retired drain: %w", context.Canceled), false},
 		{"joined", errors.Join(net.ErrClosed, sentinel), true},
+		{"wrapped joined", fmt.Errorf("retired transport: %w", errors.Join(net.ErrClosed, sentinel)), true},
 	} {
 		t.Run(scenario.name, func(t *testing.T) {
 			factory := &retainedGroupFactory{drainFailure: scenario.failure}
