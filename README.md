@@ -229,7 +229,8 @@ embedded; the command fails closed unless an explicit trusted key is supplied.
   or the original authorization expires. Stop and resource revocation close
   them immediately. At most two retired controls remain. Before a third is
   retained, both older controls are stopped, which can close their streams early.
-  This does not extend access past the original grant.
+  This does not extend access past the original grant. A failure to stop or
+  exactly retire an old admission ends the group and is reported.
 - Assignment recovery is automatic, bounded, and persisted; normal network
   failures do not require an approval flag or reprovisioning.
 

@@ -114,6 +114,9 @@ type failedDrainSession struct {
 }
 
 func (s *failedDrainSession) Drain(context.Context) error {
+	if s.failure == nil {
+		return context.DeadlineExceeded
+	}
 	return errors.Join(context.DeadlineExceeded, s.failure)
 }
 func (s *failedDrainSession) Stop(ctx context.Context) error {
@@ -200,5 +203,25 @@ func TestGroupRunnerWaitsForPriorCleanupBeforeNewAdmission(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("prior cleanup error not reported")
+	}
+}
+
+func TestCycleDrainKeepsRetiredStopTimeoutAndAttemptsRetirement(t *testing.T) {
+	session := &failedDrainSession{fakeGroupSession: newHeldDrainSession().fakeGroupSession, stopFailure: context.DeadlineExceeded}
+	drains := cycleDrainSet{changed: make(chan struct{}, 1)}
+	var retired atomic.Int32
+	if err := drains.start(session, time.Now().Add(time.Hour), time.Second, func() error { retired.Add(1); return nil }); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-drains.changed:
+	case <-time.After(time.Second):
+		t.Fatal("retired teardown did not return")
+	}
+	if err := drains.stopAndWait(time.Second); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("retired Stop timeout lost: %v", err)
+	}
+	if retired.Load() != 1 {
+		t.Fatal("retired Stop timeout skipped exact retirement")
 	}
 }

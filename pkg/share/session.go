@@ -133,9 +133,10 @@ func (d *cycleDrainSet) start(session ServingSession, expiresAt time.Time, stopT
 		d.err = errors.Join(d.err, err)
 		delete(d.cycles, drain)
 		close(done)
+		changed := d.changed
 		d.mu.Unlock()
 		select {
-		case d.changed <- struct{}{}:
+		case changed <- struct{}{}:
 		default:
 		}
 	}()
