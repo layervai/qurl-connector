@@ -311,3 +311,16 @@ func TestGroupRetiredControlLossKeepsReplacementAndJoinedFailures(t *testing.T) 
 		})
 	}
 }
+
+func TestWithdrawGoneHealthyThousandRoutesDoesNotAllocate(t *testing.T) {
+	runner := &SessionGroupRunner{desired: make(map[string]LocalHTTPRoute)}
+	states := make(map[string]RouteState)
+	for _, route := range thousandRoutes(1000) {
+		runner.desired[route.RouteID] = route
+		states[route.RouteID] = RouteState{Phase: RouteServing}
+	}
+	ctx := t.Context()
+	if allocations := testing.AllocsPerRun(100, func() { runner.withdrawGone(ctx, states) }); allocations != 0 {
+		t.Fatalf("healthy status poll allocations = %g, want zero", allocations)
+	}
+}

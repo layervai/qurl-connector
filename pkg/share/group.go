@@ -954,14 +954,15 @@ func (r *SessionGroupRunner) withdrawGone(ctx context.Context, states map[string
 		r.restarts[routeID]++
 		gone = append(gone, goneRoute{routeID: routeID, err: state.Err})
 	}
+	if len(gone) == 0 {
+		r.mu.Unlock()
+		return
+	}
 	remaining := make([]LocalHTTPRoute, 0, len(r.desired))
 	for _, route := range r.desired {
 		remaining = append(remaining, route)
 	}
 	r.mu.Unlock()
-	if len(gone) == 0 {
-		return
-	}
 	r.drains.retainRoutes(remaining)
 	sort.Slice(gone, func(i, j int) bool { return gone[i].routeID < gone[j].routeID })
 	_ = r.apply(ctx)
