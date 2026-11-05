@@ -87,7 +87,7 @@ func (d *cycleDrainSet) start(session ServingSession, expiresAt time.Time, stopT
 	if session == nil {
 		return nil
 	}
-	// A short replacement grant must not accumulate controls from older grants.
+	// Stop both older controls before retaining a third; cleanup is bounded.
 	d.mu.Lock()
 	full := len(d.cycles) >= 2
 	d.mu.Unlock()
@@ -115,7 +115,8 @@ func (d *cycleDrainSet) start(session ServingSession, expiresAt time.Time, stopT
 		}
 		// Cancellation and the original deadline force teardown. Stop has a
 		// separate bounded budget; it cannot extend authorization.
-		if err == context.Canceled || err == context.DeadlineExceeded { //nolint:errorlint // Keep joined teardown errors; only plain context errors are benign.
+		// A lost retired control must not stop its healthy replacement.
+		if err == context.Canceled || err == context.DeadlineExceeded || err == net.ErrClosed { //nolint:errorlint // Keep joined failures; only plain context or retired-close errors are benign.
 			err = nil
 		}
 		stopCtx, stopCancel := context.WithTimeout(context.Background(), stopTimeout)

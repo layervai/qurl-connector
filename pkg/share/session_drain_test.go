@@ -3,6 +3,7 @@ package share
 import (
 	"context"
 	"errors"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -150,5 +151,54 @@ func TestGroupStopCycleKeepsStopFailureAndRetiresOriginal(t *testing.T) {
 	defer admitter.mu.Unlock()
 	if len(admitter.retired) != 1 || admitter.retired[0] != 77 {
 		t.Fatalf("original retirement = %v", admitter.retired)
+	}
+}
+
+func TestGroupRunnerWaitsForPriorCleanupBeforeNewAdmission(t *testing.T) {
+	admitter := &rotatingAdmitter{openTime: time.Hour}
+	runner, err := NewSessionGroupRunner(SessionGroupConfig{
+		KnockResourceID: "catalog", ResourcePublicKey: "resource", Routes: groupTestRoutes("a"),
+		Admitter: admitter, Sessions: &fakeGroupFactory{}, StopTimeout: time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := newHeldDrainSession()
+	retiring, resume := make(chan struct{}), make(chan struct{})
+	release := sync.OnceFunc(func() { close(resume) })
+	defer runner.drains.cancel()
+	defer release()
+	failure := errors.New("prior exact retirement failed")
+	if err := runner.drains.start(session, time.Now().Add(time.Hour), time.Second, func() error {
+		close(retiring)
+		<-resume
+		return failure
+	}); err != nil {
+		t.Fatal(err)
+	}
+	<-session.entered
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- runner.Run(ctx) }()
+	select {
+	case <-retiring:
+	case <-time.After(time.Second):
+		t.Fatal("new Run did not resume prior cleanup")
+	}
+	admitter.mu.Lock()
+	calls := admitter.next
+	admitter.mu.Unlock()
+	if calls != 0 {
+		t.Fatal("new admission started before prior cleanup completed")
+	}
+	release()
+	select {
+	case err := <-done:
+		if !errors.Is(err, failure) {
+			t.Fatalf("prior failure lost: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("prior cleanup error not reported")
 	}
 }

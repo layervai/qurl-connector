@@ -3,6 +3,7 @@ package share
 import (
 	"context"
 	"errors"
+	"net"
 	"sync"
 	"testing"
 	"time"
@@ -10,8 +11,9 @@ import (
 
 type retainedGroupSession struct {
 	*fakeGroupSession
-	revoked  map[string]bool
-	prepared bool
+	revoked      map[string]bool
+	prepared     bool
+	drainFailure error
 }
 
 func (s *retainedGroupSession) prepareDrain() {
@@ -25,6 +27,9 @@ func (s *retainedGroupSession) Drain(ctx context.Context) error {
 	s.stopped = true
 	s.drained = true
 	s.mu.Unlock()
+	if s.drainFailure != nil {
+		return s.drainFailure
+	}
 	<-ctx.Done()
 	return ctx.Err()
 }
@@ -48,9 +53,10 @@ func (s *retainedGroupSession) wasRevoked(id string) bool {
 }
 
 type retainedGroupFactory struct {
-	base     fakeGroupFactory
-	mu       sync.Mutex
-	sessions []*retainedGroupSession
+	base         fakeGroupFactory
+	mu           sync.Mutex
+	sessions     []*retainedGroupSession
+	drainFailure error
 }
 
 func (f *retainedGroupFactory) Start(ctx context.Context, admission Admission, routes []GroupRoute) (GroupServingSession, error) {
@@ -58,7 +64,7 @@ func (f *retainedGroupFactory) Start(ctx context.Context, admission Admission, r
 	if err != nil {
 		return nil, err
 	}
-	retained := &retainedGroupSession{fakeGroupSession: session.(*fakeGroupSession), revoked: make(map[string]bool)}
+	retained := &retainedGroupSession{fakeGroupSession: session.(*fakeGroupSession), revoked: make(map[string]bool), drainFailure: f.drainFailure}
 	f.mu.Lock()
 	f.sessions = append(f.sessions, retained)
 	f.mu.Unlock()
@@ -216,5 +222,87 @@ func TestGroupDrainCapacityFailureRetiresReadyReplacement(t *testing.T) {
 		if counts[id] != 1 {
 			t.Fatalf("exact retirement counts=%v", counts)
 		}
+	}
+}
+
+func TestGroupRetiredControlLossKeepsReplacementAndJoinedFailures(t *testing.T) {
+	sentinel := errors.New("additional cleanup failure")
+	for _, scenario := range []struct {
+		name        string
+		failure     error
+		wantFailure bool
+	}{
+		{"closed", net.ErrClosed, false},
+		{"joined", errors.Join(net.ErrClosed, sentinel), true},
+	} {
+		t.Run(scenario.name, func(t *testing.T) {
+			factory := &retainedGroupFactory{drainFailure: scenario.failure}
+			admitter := &rotatingAdmitter{openTime: 600 * time.Millisecond}
+			promoted := make(chan struct{})
+			runner, err := NewSessionGroupRunner(SessionGroupConfig{
+				KnockResourceID: "catalog", ResourcePublicKey: "resource", Routes: groupTestRoutes("a", "b"), Admitter: admitter, Sessions: factory,
+				MinBackoff: time.Millisecond, MaxBackoff: time.Millisecond, StopTimeout: time.Second,
+				OnServing: func(a Admission) {
+					if a.SessionID == 2 {
+						close(promoted)
+					}
+				},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			ctx, cancel := context.WithCancel(t.Context())
+			done := make(chan error, 1)
+			go func() { done <- runner.Run(ctx) }()
+			defer cancel()
+			select {
+			case <-promoted:
+			case <-time.After(3 * time.Second):
+				t.Fatal("replacement did not promote")
+			}
+			if scenario.wantFailure {
+				select {
+				case err := <-done:
+					if !errors.Is(err, sentinel) {
+						t.Fatalf("joined failure lost: %v", err)
+					}
+				case <-time.After(time.Second):
+					t.Fatal("joined failure not reported")
+				}
+				return
+			}
+			waitUntil(t, time.Second, func() bool {
+				admitter.mu.Lock()
+				defer admitter.mu.Unlock()
+				return len(admitter.retired) >= 1 && admitter.retired[0] == 1
+			}, "original retirement")
+			admitter.mu.Lock()
+			retired := append([]uint64(nil), admitter.retired...)
+			admitter.mu.Unlock()
+			if len(retired) != 1 {
+				t.Fatalf("retired control loss retired the replacement: %v", retired)
+			}
+			select {
+			case <-factory.session(0).Done():
+			default:
+				t.Fatal("retired control was not stopped")
+			}
+			for _, id := range []string{"a", "b"} {
+				if factory.session(1).RouteStates()[id].Phase != RouteServing {
+					t.Fatalf("replacement route %s stopped", id)
+				}
+			}
+			select {
+			case err := <-done:
+				t.Fatalf("retired control loss stopped replacement: %v", err)
+			case <-time.After(30 * time.Millisecond):
+			}
+			cancel()
+			select {
+			case <-done:
+			case <-time.After(3 * time.Second):
+				t.Fatal("runner did not stop")
+			}
+		})
 	}
 }

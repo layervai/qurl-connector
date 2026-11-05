@@ -17,14 +17,18 @@ import (
 )
 
 func TestHermeticGroupRotationPreservesOriginalStream(t *testing.T) {
-	testHermeticGroupRotationOriginalStream(t, false)
+	testHermeticGroupRotationOriginalStream(t, false, false)
 }
 
 func TestHermeticGroupRotationRevokesOriginalStream(t *testing.T) {
-	testHermeticGroupRotationOriginalStream(t, true)
+	testHermeticGroupRotationOriginalStream(t, true, false)
 }
 
-func testHermeticGroupRotationOriginalStream(t *testing.T, revoke bool) {
+func TestHermeticGroupDrainDeadlineKeepsReplacementServing(t *testing.T) {
+	testHermeticGroupRotationOriginalStream(t, false, true)
+}
+
+func testHermeticGroupRotationOriginalStream(t *testing.T, revoke, expire bool) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -145,6 +149,47 @@ func testHermeticGroupRotationOriginalStream(t *testing.T, revoke bool) {
 	_ = start(102)
 	if _, err := reader.ReadString('\n'); err != nil {
 		t.Fatalf("original stream ended before drain: %v", err)
+	}
+	if expire {
+		drains := cycleDrainSet{changed: make(chan struct{}, 1)}
+		retired := make(chan struct{})
+		if err := drains.start(original, time.Now().Add(200*time.Millisecond), time.Second, func() error { close(retired); return nil }); err != nil {
+			t.Fatal(err)
+		}
+		defer drains.cancel()
+		select {
+		case <-drains.changed:
+		case <-ctx.Done():
+			t.Fatal("deadline did not close original work")
+		}
+		if err := drains.stopAndWait(time.Second); err != nil {
+			t.Fatalf("real FRP deadline was not a benign drain result: %v", err)
+		}
+		select {
+		case <-retired:
+		default:
+			t.Fatal("original admission was not retired")
+		}
+		for {
+			if _, err := reader.ReadString('\n'); err != nil {
+				break
+			}
+			if ctx.Err() != nil {
+				t.Fatal("original SSE outlived drain deadline")
+			}
+		}
+		for {
+			if err := websocket.Message.Receive(ws, &tick); err != nil {
+				break
+			}
+			if ctx.Err() != nil {
+				t.Fatal("original WebSocket outlived drain deadline")
+			}
+		}
+		if status, body, err := proofGet(client, port, request.Host); err != nil || status != http.StatusOK || body != "ok" {
+			t.Fatalf("original deadline interrupted replacement: %d %q %v", status, body, err)
+		}
+		return
 	}
 	drained := make(chan error, 1)
 	go func() { drained <- original.(drainingSession).Drain(ctx) }()
