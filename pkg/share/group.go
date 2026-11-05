@@ -85,7 +85,8 @@ type SessionGroupConfig struct {
 // is current, and only withdraws from a session that is already being
 // replaced; additions during a rotation land on the replacement.
 type SessionGroupRunner struct {
-	cfg SessionGroupConfig
+	cfg    SessionGroupConfig
+	drains cycleDrainSet
 
 	// applyMu serializes pushes of the desired set to live sessions so every
 	// session observes route changes in the order they were made.
@@ -407,7 +408,7 @@ func (r *SessionGroupRunner) observeAddedRegistration(cycle *groupCycle, states 
 // with bounded jitter. Run returns early only when the group's protected
 // resource is permanently gone (ErrResourceGone from admission), when every
 // route has been withdrawn as permanently unavailable (ErrGroupEmpty), or
-// when an exact retirement fails.
+// when teardown fails, including exact retirement of an old admission.
 func (r *SessionGroupRunner) Run(ctx context.Context) (retErr error) {
 	if ctx == nil {
 		return errors.New("run session group: context is nil")
@@ -425,10 +426,21 @@ func (r *SessionGroupRunner) Run(ctx context.Context) (retErr error) {
 		r.mu.Unlock()
 	}()
 
-	var drains cycleDrainSet
+	drains := &r.drains
+	drains.mu.Lock()
+	if drains.changed == nil {
+		drains.changed = make(chan struct{}, 1)
+	}
+	drains.mu.Unlock()
+	// A prior Run may have returned while its bounded cleanup was still active.
+	if err := drains.stopAndWait(r.cfg.StopTimeout); err != nil {
+		return err
+	}
 	backoff := r.cfg.MinBackoff
-	defer drains.stopAndWait(r.cfg.StopTimeout)
-	defer func() { retErr = errors.Join(retErr, r.stopCycle(r.takeActive())) }()
+	defer func() {
+		drains.cancel()
+		retErr = errors.Join(retErr, r.stopCycle(r.takeActive()), drains.stopAndWait(r.cfg.StopTimeout))
+	}()
 
 	for {
 		if err := ctx.Err(); err != nil {
@@ -460,6 +472,11 @@ func (r *SessionGroupRunner) Run(ctx context.Context) (retErr error) {
 		case <-ctx.Done():
 			stopTimer(rotate)
 			return ctx.Err()
+		case <-drains.changed:
+			stopTimer(rotate)
+			if err := drains.takeError(); err != nil {
+				return err
+			}
 		case <-r.wake:
 			stopTimer(rotate)
 			r.healDivergence(ctx)
@@ -499,13 +516,26 @@ func (r *SessionGroupRunner) Run(ctx context.Context) (retErr error) {
 				}
 				continue
 			}
+			if err := drains.start(active.session, active.expiresAt, r.cfg.StopTimeout, func() error { return r.retireAdmission(active.admission) }); err != nil {
+				return r.failCycle(replacement, err)
+			}
 			r.promote(ctx, replacement)
-			drains.start(active.session, r.cfg.StopTimeout, func() { _ = r.retireAdmission(active.admission) })
+			drains.retainRoutes(r.desiredLocalRoutes())
 			if r.desiredCount() == 0 {
 				return ErrGroupEmpty
 			}
 		}
 	}
+}
+
+func (r *SessionGroupRunner) desiredLocalRoutes() []LocalHTTPRoute {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	routes := make([]LocalHTTPRoute, 0, len(r.desired))
+	for _, route := range r.desired {
+		routes = append(routes, route)
+	}
+	return routes
 }
 
 // SetRoutes replaces the group's desired route set. Additions and removals
@@ -519,7 +549,7 @@ func (r *SessionGroupRunner) Run(ctx context.Context) (retErr error) {
 // RouteStates). Outside rotation, the old registration is removed before the
 // new registration serves; requests can fail during this gap, including while
 // the registration window is full. During rotation the retiring session retains its previous
-// headers until the replacement is promoted and its drain grace ends: a
+// headers until its assigned work ends or its authorization expires: a
 // header change is replacement, not revocation. A route's
 // public resource ID and connector routing ID are immutable identities and
 // may not change in place (remove the route and add it again). Request
@@ -566,6 +596,7 @@ func (r *SessionGroupRunner) SetRoutes(ctx context.Context, routes []LocalHTTPRo
 	}
 	r.desired = next
 	r.mu.Unlock()
+	r.drains.retainRoutes(routes)
 	return r.applyAndWake(ctx)
 }
 
@@ -923,10 +954,16 @@ func (r *SessionGroupRunner) withdrawGone(ctx context.Context, states map[string
 		r.restarts[routeID]++
 		gone = append(gone, goneRoute{routeID: routeID, err: state.Err})
 	}
-	r.mu.Unlock()
 	if len(gone) == 0 {
+		r.mu.Unlock()
 		return
 	}
+	remaining := make([]LocalHTTPRoute, 0, len(r.desired))
+	for _, route := range r.desired {
+		remaining = append(remaining, route)
+	}
+	r.mu.Unlock()
+	r.drains.retainRoutes(remaining)
 	sort.Slice(gone, func(i, j int) bool { return gone[i].routeID < gone[j].routeID })
 	_ = r.apply(ctx)
 	if r.cfg.OnRouteFailed != nil {
@@ -985,8 +1022,7 @@ func (r *SessionGroupRunner) failCycle(cycle *groupCycle, cause error) error {
 	if err == nil {
 		err = cycle.session.Err()
 	}
-	stopServingSession(cycle.session, r.cfg.StopTimeout)
-	err = errors.Join(err, r.retireAdmission(cycle.admission))
+	err = errors.Join(err, stopServingSession(cycle.session, r.cfg.StopTimeout), r.retireAdmission(cycle.admission))
 	if err == nil {
 		err = errors.New("FRP session ended before serving")
 	}
@@ -997,8 +1033,7 @@ func (r *SessionGroupRunner) stopCycle(cycle *groupCycle) error {
 	if cycle == nil {
 		return nil
 	}
-	stopServingSession(cycle.session, r.cfg.StopTimeout)
-	return r.retireAdmission(cycle.admission)
+	return errors.Join(stopServingSession(cycle.session, r.cfg.StopTimeout), r.retireAdmission(cycle.admission))
 }
 
 func (r *SessionGroupRunner) retireAdmission(admission Admission) error {
