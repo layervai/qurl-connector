@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.14.5](https://github.com/layervai/qurl-connector/compare/v0.14.4...v0.14.5) (2026-11-05)
+
+
+### Bug Fixes
+
+* **config:** reject unsupported HTTPS origins during setup ([#145](https://github.com/layervai/qurl-connector/issues/145)) ([73dd58b](https://github.com/layervai/qurl-connector/commit/73dd58be7ef1e72a2d75da1af229bf9d489107df))
+* **share:** preserve active streams during publisher rotation ([#149](https://github.com/layervai/qurl-connector/issues/149)) ([f37503c](https://github.com/layervai/qurl-connector/commit/f37503c044a909c31c28463723a41c91b41e543f))
+
+
+### Continuous Integration
+
+* adopt verified age-check workflows v0.15.0 ([#142](https://github.com/layervai/qurl-connector/issues/142)) ([1aadfce](https://github.com/layervai/qurl-connector/commit/1aadfce8ab9eb6aba0ebf7d10957edf08c52688a))
+* rerun age checks when bypass labels change ([#144](https://github.com/layervai/qurl-connector/issues/144)) ([1334570](https://github.com/layervai/qurl-connector/commit/1334570a957871c6c115bb099eb3a8392903095d))
+
 ## [0.14.4](https://github.com/layervai/qurl-connector/compare/v0.14.3...v0.14.4) (2026-11-01)
 
 
