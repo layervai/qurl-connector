@@ -69,26 +69,39 @@ type drainingSession interface {
 	Drain(context.Context) error
 }
 
-// cycleDrainSet tracks retired cycles that are still draining. A drain retires
-// the cycle's admission only after the session exits or the cleanup budget ends.
+// cycleDrainSet retains original admissions until work exits or authorization ends.
 type cycleDrainSet struct {
-	mu     sync.Mutex
-	cycles map[*cycleDrain]struct{}
+	mu      sync.Mutex
+	cycles  map[*cycleDrain]struct{}
+	changed chan struct{}
+	err     error
 }
 
 type cycleDrain struct {
-	done   <-chan struct{}
-	cancel context.CancelFunc
+	session ServingSession
+	done    <-chan struct{}
+	cancel  context.CancelFunc
 }
 
-func (d *cycleDrainSet) start(session ServingSession, stopTimeout time.Duration, retire func()) {
+func (d *cycleDrainSet) start(session ServingSession, expiresAt time.Time, stopTimeout time.Duration, retire func() error) error {
 	if session == nil {
-		return
+		return nil
+	}
+	// A short replacement grant must not accumulate controls from older grants.
+	d.mu.Lock()
+	full := len(d.cycles) >= 2
+	d.mu.Unlock()
+	if full {
+		if err := d.stopAndWait(stopTimeout); err != nil {
+			return err
+		}
+	}
+	if preparing, ok := session.(interface{ prepareDrain() }); ok {
+		preparing.prepareDrain()
 	}
 	done := make(chan struct{})
-	cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), stopTimeout)
-	drainCtx, cancelDrain := context.WithCancel(cleanupCtx)
-	drain := &cycleDrain{done: done, cancel: cancelDrain}
+	drainCtx, cancel := context.WithDeadline(context.Background(), expiresAt)
+	drain := &cycleDrain{session: session, done: done, cancel: cancel}
 	d.mu.Lock()
 	if d.cycles == nil {
 		d.cycles = make(map[*cycleDrain]struct{})
@@ -96,55 +109,86 @@ func (d *cycleDrainSet) start(session ServingSession, stopTimeout time.Duration,
 	d.cycles[drain] = struct{}{}
 	d.mu.Unlock()
 	go func() {
-		defer func() {
-			cancelDrain()
-			cleanupCancel()
-			close(done)
-			d.mu.Lock()
-			delete(d.cycles, drain)
-			d.mu.Unlock()
-		}()
+		var err error
 		if draining, ok := session.(drainingSession); ok {
-			_ = draining.Drain(drainCtx)
-		} else {
-			_ = session.Stop(drainCtx)
+			err = draining.Drain(drainCtx)
 		}
-		// Drain may return as soon as its context is canceled while the
-		// underlying FRP control is still completing its bounded grace period.
-		// Keep the cycle tracked until the session itself exits or the cleanup
-		// budget is exhausted.
-		select {
-		case <-session.Done():
-		case <-cleanupCtx.Done():
+		// Cancellation and the original deadline force teardown. Stop has a
+		// separate bounded budget; it cannot extend authorization.
+		if err == context.Canceled || err == context.DeadlineExceeded {
+			err = nil
 		}
+		stopCtx, stopCancel := context.WithTimeout(context.Background(), stopTimeout)
+		err = errors.Join(err, session.Stop(stopCtx))
+		stopCancel()
 		if retire != nil {
-			retire()
+			err = errors.Join(err, retire())
+		}
+		cancel()
+		d.mu.Lock()
+		d.err = errors.Join(d.err, err)
+		delete(d.cycles, drain)
+		close(done)
+		d.mu.Unlock()
+		select {
+		case d.changed <- struct{}{}:
+		default:
 		}
 	}()
+	return nil
 }
 
-func (d *cycleDrainSet) stopAndWait(timeout time.Duration) {
+func (d *cycleDrainSet) retainRoutes(routes []LocalHTTPRoute) {
+	d.mu.Lock()
+	sessions := make([]ServingSession, 0, len(d.cycles))
+	for cycle := range d.cycles {
+		sessions = append(sessions, cycle.session)
+	}
+	d.mu.Unlock()
+	for _, session := range sessions {
+		if revoked, ok := session.(interface{ retainDrainedRoutes([]LocalHTTPRoute) }); ok {
+			revoked.retainDrainedRoutes(routes)
+		}
+	}
+}
+
+func (d *cycleDrainSet) takeError() error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	err := d.err
+	d.err = nil
+	return err
+}
+
+func (d *cycleDrainSet) cancel() {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	for drain := range d.cycles {
+		drain.cancel()
+	}
+}
+
+func (d *cycleDrainSet) stopAndWait(timeout time.Duration) error {
 	d.mu.Lock()
 	drains := make([]*cycleDrain, 0, len(d.cycles))
 	for drain := range d.cycles {
 		drains = append(drains, drain)
 	}
 	d.mu.Unlock()
-	if len(drains) == 0 {
-		return
-	}
 	for _, drain := range drains {
 		drain.cancel()
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	// Stop and native retirement each have their own cleanup budget.
+	ctx, cancel := context.WithTimeout(context.Background(), 2*timeout)
 	defer cancel()
 	for _, drain := range drains {
 		select {
 		case <-drain.done:
 		case <-ctx.Done():
-			return
+			return errors.Join(ctx.Err(), d.takeError())
 		}
 	}
+	return d.takeError()
 }
 
 // retryAfter reports one failed attempt and sleeps the bounded delay. Time the
@@ -224,13 +268,13 @@ func retireAdmission(admitter Admitter, admission Admission, timeout time.Durati
 	return admitter.Retire(ctx, admission)
 }
 
-func stopServingSession(session ServingSession, timeout time.Duration) {
+func stopServingSession(session ServingSession, timeout time.Duration) error {
 	if session == nil {
-		return
+		return nil
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
-	_ = session.Stop(ctx)
+	return session.Stop(ctx)
 }
 
 func sleepWithContext(ctx context.Context, d time.Duration) error {

@@ -338,6 +338,12 @@ func (s *recordingGroupService) Run(ctx context.Context) error {
 
 func (*recordingGroupService) GracefulClose(time.Duration) {}
 
+func (*recordingGroupService) PrepareDrain() {}
+
+func (*recordingGroupService) Drain(context.Context) error { return nil }
+
+func (*recordingGroupService) CloseProxyConnections(string) {}
+
 func (s *recordingGroupService) UpdateAllConfigurer(proxies []v1.ProxyConfigurer, _ []v1.VisitorConfigurer) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()

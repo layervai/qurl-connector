@@ -47,6 +47,7 @@ require (
 	github.com/beorn7/perks v1.0.1 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/coreos/go-oidc/v3 v3.18.0 // indirect
+	github.com/fatedier/yamux v0.2.0 // indirect
 	github.com/felixge/httpsnoop v1.1.0 // indirect
 	github.com/go-jose/go-jose/v4 v4.1.6 // indirect
 	github.com/go-logr/logr v1.4.4 // indirect
@@ -56,7 +57,6 @@ require (
 	github.com/google/s2a-go v0.1.11 // indirect
 	github.com/googleapis/enterprise-certificate-proxy v0.3.23 // indirect
 	github.com/gorilla/mux v1.8.1 // indirect
-	github.com/hashicorp/yamux v0.1.1 // indirect
 	github.com/inconshreveable/mousetrap v1.1.0 // indirect
 	github.com/klauspost/cpuid/v2 v2.3.0 // indirect
 	github.com/klauspost/reedsolomon v1.12.0 // indirect
@@ -104,10 +104,6 @@ require (
 	sigs.k8s.io/yaml v1.3.0 // indirect
 )
 
-// Go does not inherit replace directives from dependencies.
-// FRP's go.mod replaces yamux, so we must duplicate it here.
-replace github.com/hashicorp/yamux => github.com/fatedier/yamux v0.0.0-20250825093530-d0154be01cd6
-
 // LayerV's signed FRP release supports system CA verification and the
 // InitialRunID hook that binds native NHP admission to the matching FRP Login.
-replace github.com/fatedier/frp => github.com/layervai/frp v1.0.5-0.20260926021043-5570a4205458
+replace github.com/fatedier/frp => github.com/layervai/frp v1.0.6-0.20261105061151-e091a7ca0123

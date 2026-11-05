@@ -225,7 +225,11 @@ embedded; the command fails closed unless an explicit trusted key is supplied.
 - Connector state is owner-only and fails closed on unsafe permissions,
   symlinks, contradictory identity, or malformed persisted data.
 - Session renewal is make-before-break: a replacement must reach FRP's running
-  state before the old route drains.
+  state before the old route drains. Existing streams drain until they finish
+  or the original authorization expires. Stop and resource revocation close
+  them immediately. At most two retired controls remain; shorter replacement
+  grants can force older controls to close early. This does not extend access
+  past the original grant.
 - Assignment recovery is automatic, bounded, and persisted; normal network
   failures do not require an approval flag or reprovisioning.
 

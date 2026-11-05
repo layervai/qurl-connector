@@ -457,6 +457,9 @@ func (f *FRPSessionGroupFactory) Start(ctx context.Context, admission Admission,
 // stops only what changed.
 type frpGroupService interface {
 	frpService
+	PrepareDrain()
+	Drain(context.Context) error
+	CloseProxyConnections(string)
 	UpdateAllConfigurer([]v1.ProxyConfigurer, []v1.VisitorConfigurer) error
 }
 
@@ -1020,33 +1023,62 @@ func (s *frpGroupSession) Err() error {
 }
 
 func (s *frpGroupSession) Stop(ctx context.Context) error {
-	return s.shutdown(ctx, 0)
+	return s.shutdown(ctx)
 }
 
 // Drain preserves requests already assigned to the old proxies while removing
 // them from new routing after a replacement becomes serving.
 func (s *frpGroupSession) Drain(ctx context.Context) error {
-	return s.shutdown(ctx, 4*time.Second)
+	if ctx == nil {
+		return errors.New("drain FRP session group: context is nil")
+	}
+	s.prepareDrain()
+	return s.svc.Drain(ctx)
 }
 
-func (s *frpGroupSession) shutdown(ctx context.Context, grace time.Duration) error {
+// Fence reconnect before the retired session is visible to promotion callbacks.
+func (s *frpGroupSession) prepareDrain() {
+	s.updateMu.Lock()
+	defer s.updateMu.Unlock()
+	s.mu.Lock()
+	s.stopped = true
+	s.mu.Unlock()
+	s.svc.PrepareDrain()
+}
+
+// Removed routes revoke existing work even after routing has been withdrawn.
+func (s *frpGroupSession) retainDrainedRoutes(routes []LocalHTTPRoute) {
+	keep := make(map[string]LocalHTTPRoute, len(routes))
+	for _, route := range routes {
+		keep[route.RouteID] = route
+	}
+	s.mu.Lock()
+	var removed []string
+	for id, entry := range s.routes {
+		route, exists := keep[id]
+		if !exists || route.ResourcePublicKey != entry.route.ResourcePublicKey || route.ConnectorRoutingID != entry.route.ConnectorRoutingID {
+			removed = append(removed, entry.name)
+		}
+	}
+	s.mu.Unlock()
+	for _, name := range removed {
+		s.svc.CloseProxyConnections(name)
+	}
+}
+
+func (s *frpGroupSession) shutdown(ctx context.Context) error {
 	s.stopOnce.Do(func() {
 		s.mu.Lock()
 		s.stopped = true
 		s.mu.Unlock()
-		// Record the drain interval before canceling the parent context; an
-		// early cancel races FRP into an immediate close with zero grace.
-		s.svc.GracefulClose(grace)
+		s.svc.GracefulClose(0)
 		s.cancel()
 	})
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
 	case <-s.done:
-		err := s.Err()
-		if errors.Is(err, context.Canceled) {
-			return nil
-		}
-		return err
+		// Err reports the run failure; Stop reports whether teardown completed.
+		return nil
 	}
 }
