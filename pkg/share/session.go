@@ -115,7 +115,7 @@ func (d *cycleDrainSet) start(session ServingSession, expiresAt time.Time, stopT
 		}
 		// Cancellation and the original deadline force teardown. Stop has a
 		// separate bounded budget; it cannot extend authorization.
-		if err == context.Canceled || err == context.DeadlineExceeded {
+		if err == context.Canceled || err == context.DeadlineExceeded { //nolint:errorlint // Keep joined teardown errors; only plain context errors are benign.
 			err = nil
 		}
 		stopCtx, stopCancel := context.WithTimeout(context.Background(), stopTimeout)

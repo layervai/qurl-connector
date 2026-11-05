@@ -31,7 +31,9 @@ func TestCycleDrainUsesOriginalAuthorizationDeadline(t *testing.T) {
 	drains := cycleDrainSet{changed: make(chan struct{}, 1)}
 	var retired atomic.Bool
 	deadline := time.Now().Add(120 * time.Millisecond)
-	drains.start(session, deadline, 20*time.Millisecond, func() error { retired.Store(true); return nil })
+	if err := drains.start(session, deadline, 20*time.Millisecond, func() error { retired.Store(true); return nil }); err != nil {
+		t.Fatal(err)
+	}
 	<-session.entered
 	if got := <-session.deadline; !got.Equal(deadline) {
 		t.Fatalf("deadline = %v, want original %v", got, deadline)
@@ -57,7 +59,9 @@ func TestCycleDrainStopCancelsHeldWorkAndRetainsRetirementError(t *testing.T) {
 	session := newHeldDrainSession()
 	var drains cycleDrainSet
 	expected := errors.New("original receipt retirement failed")
-	drains.start(session, time.Now().Add(time.Hour), time.Second, func() error { return expected })
+	if err := drains.start(session, time.Now().Add(time.Hour), time.Second, func() error { return expected }); err != nil {
+		t.Fatal(err)
+	}
 	<-session.entered
 	if err := drains.stopAndWait(time.Second); !errors.Is(err, expected) {
 		t.Fatalf("cleanup error = %v", err)
