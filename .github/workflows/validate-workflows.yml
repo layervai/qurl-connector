@@ -24,7 +24,7 @@ jobs:
         with:
           go-version-file: go.mod
           cache: false
-      - uses: reviewdog/action-actionlint@48e36f54d8da326b83ab061aee2cc5e01b5ca46f # v1.80.6
+      - uses: reviewdog/action-actionlint@7abf25e1607ec65838b73d0484ff31f8e9499d80 # v1.81.2
       # Keep the public-source security boundary in the established required
       # check until Enrollment recovery is required after this workflow lands.
       - name: Test public-source sanitizer
