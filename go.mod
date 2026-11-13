@@ -13,7 +13,7 @@ require (
 	github.com/fatedier/golib v0.8.2
 	github.com/google/go-tpm v0.9.8
 	github.com/googleapis/gax-go/v2 v2.27.0
-	github.com/layervai/qurl-go v0.26.4
+	github.com/layervai/qurl-go v0.26.3
 	github.com/spf13/cobra v1.10.2
 	golang.org/x/crypto v0.58.0
 	golang.org/x/net v0.62.0
