@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.14.6](https://github.com/layervai/qurl-connector/compare/v0.14.5...v0.14.6) (2026-11-14)
+
+
+### Bug Fixes
+
+* use Go 1.26.11 for Connector builds ([#155](https://github.com/layervai/qurl-connector/issues/155)) ([06dee41](https://github.com/layervai/qurl-connector/commit/06dee41a1c0d7a31fff31f5c57ed76031c0895ad))
+
 ## [0.14.5](https://github.com/layervai/qurl-connector/compare/v0.14.4...v0.14.5) (2026-11-05)
 
 
