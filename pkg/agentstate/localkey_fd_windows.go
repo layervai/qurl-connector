@@ -6,6 +6,7 @@ import (
 	"errors"
 	"runtime"
 	"strconv"
+	"sync"
 	"time"
 	"unsafe"
 
@@ -15,6 +16,8 @@ import (
 var localKeyKernel32 = windows.NewLazySystemDLL("kernel32.dll")
 var localKeyGetStartupInfo = localKeyKernel32.NewProc("GetStartupInfoW")
 var localKeyPeekNamedPipe = localKeyKernel32.NewProc("PeekNamedPipe")
+var localKeyGetHandleInformation = localKeyKernel32.NewProc("GetHandleInformation")
+var windowsLocalKeyAttempt sync.Once
 
 // x/sys omits the CRT-reserved fields; retain the Windows STARTUPINFOW layout.
 type localKeyStartupInfo struct {
@@ -43,8 +46,20 @@ func readLocalWrappingKey(fdValue string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+
+	// The CRT table is immutable: after consuming or rejecting its entry, a
+	// retry must never inspect a handle number Windows may have recycled.
+	allowed := false
+	windowsLocalKeyAttempt.Do(func() { allowed = true })
+	if !allowed {
+		return nil, errors.New("inherited wrapping-key handle already consumed")
+	}
 	handle := windows.Handle(raw)
-	defer func() { _ = windows.CloseHandle(handle) }()
+	var handleFlags uint32
+	inherited, _, _ := localKeyGetHandleInformation.Call(uintptr(handle), uintptr(unsafe.Pointer(&handleFlags)))
+	if inherited == 0 || handleFlags&windows.HANDLE_FLAG_INHERIT == 0 {
+		return nil, errors.New("wrapping key handle was not inherited")
+	}
 	kind, err := windows.GetFileType(handle)
 	if err != nil || kind != windows.FILE_TYPE_PIPE {
 		return nil, errors.New("wrapping key descriptor is not a pipe")
@@ -62,6 +77,7 @@ func readLocalWrappingKey(fdValue string) ([]byte, error) {
 	if err != nil || userErr != nil || owner == nil || user == nil || !owner.Equals(user.User.Sid) && !isLocalKeyTokenOwner(owner) {
 		return nil, errors.New("wrapping key pipe is not owned by the current token")
 	}
+	defer func() { _ = windows.CloseHandle(handle) }()
 	return readWindowsLocalKeyPipe(handle, time.Now().Add(5*time.Second))
 }
 

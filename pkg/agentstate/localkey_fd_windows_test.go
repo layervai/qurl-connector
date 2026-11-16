@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"os"
 	"os/exec"
+	"strings"
 	"testing"
 
 	"golang.org/x/sys/windows"
@@ -51,7 +52,11 @@ func TestWindowsLocalKeyChild(t *testing.T) {
 	} else if err == nil {
 		t.Fatal("accepted invalid wrapping-key pipe")
 	}
+
 	scrubBytes(key)
+	if _, err := readLocalWrappingKey("3"); err == nil || !strings.Contains(err.Error(), "already consumed") {
+		t.Fatalf("retried an immutable inherited handle: %v", err)
+	}
 }
 
 func TestWindowsLocalKeyTokenOwnerRejectsForeignSID(t *testing.T) {
