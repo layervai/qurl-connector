@@ -156,6 +156,14 @@ supported state locations.
 
 ### Agent state key storage
 
+Externally supervised applications can select `LAYERV_KEY_PROVIDER=local-key`
+and pass a 32-byte key on `LAYERV_LOCAL_KEY_FD` (descriptor 3 or higher). Unix
+uses an inherited anonymous pipe or socketpair. Windows uses the inherited CRT
+pipe table supplied by Node.js/libuv; the handle must be a single-instance byte
+pipe owned by the process user or its token's default owner. The writer must
+close after exactly 32 bytes; a five-second deadline rejects a stalled handoff.
+The key is never passed as an argument, environment value, or file.
+
 A new state directory is sealed to the machine's TPM 2.0 when the process can
 use one: the Linux resource manager `/dev/tpmrm0` (usually `tss` group
 membership) or TPM Base Services on Windows. macOS, and machines without a
