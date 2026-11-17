@@ -41,12 +41,6 @@ func readLocalWrappingKey(fdValue string) ([]byte, error) {
 	if startup.ReservedData == nil || startup.ReservedSize == 0 {
 		return nil, errors.New("missing inherited pipe table")
 	}
-	table := unsafe.Slice(startup.ReservedData, int(startup.ReservedSize))
-	raw, err := inheritedCRTHandle(table, fd, int(unsafe.Sizeof(uintptr(0))))
-	if err != nil {
-		return nil, err
-	}
-
 	// The CRT table is immutable: after consuming or rejecting its entry, a
 	// retry must never inspect a handle number Windows may have recycled.
 	allowed := false
@@ -54,6 +48,12 @@ func readLocalWrappingKey(fdValue string) ([]byte, error) {
 	if !allowed {
 		return nil, errors.New("inherited wrapping-key handle already consumed")
 	}
+	table := unsafe.Slice(startup.ReservedData, int(startup.ReservedSize))
+	raw, err := inheritedCRTHandle(table, fd, int(unsafe.Sizeof(uintptr(0))))
+	if err != nil {
+		return nil, err
+	}
+
 	handle := windows.Handle(raw)
 	var handleFlags uint32
 	inherited, _, _ := localKeyGetHandleInformation.Call(uintptr(handle), uintptr(unsafe.Pointer(&handleFlags)))
