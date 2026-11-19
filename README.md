@@ -1,28 +1,51 @@
-# qURL Connector runtime for local services
+# qURL Connector
 
-[qURL™ by LayerV](https://layerv.ai/qurl/) shares localhost web apps, private
-APIs, and files through expiring access links. qURL Connector is the embedded
-Go runtime that connects local services to that access path. It admits each shared resource
-with the Network-invisible Handshake Protocol (NHP), then carries approved
-traffic over a resource-bound FRP session.
-
-To share localhost as a user, install the
-[qURL CLI](https://github.com/layervai/qurl-integrations/tree/main/apps/cli),
-which embeds this runtime. Keep your local app running; the Connector carries
-traffic to it and the app's own sign-in requirements still apply.
-
-Developers working on the runtime can start with the
-[security model](#security-model), [source build](#build-from-source),
-[development checks](#development), or
-[developer command configuration](#developer-command-configuration).
+**Hide an app behind a qURL: no inbound ports, no public address, and only the people you invite get in.**
+The Connector is the Go runtime that serves a qURL app. It runs beside your
+app, connects outward to LayerV, and lets a visitor through only after their
+qURL is admitted for that one resource with the Network-invisible Handshake
+Protocol (NHP). You invite people by email and decide who gets in. The person
+you invite just clicks the link. The Connector is built into the qURL CLI, so
+publishing an app starts it for you and keeps it running across sleep, wake,
+and network changes.
 
 ```text
-local service -> qURL Connector -> qURL -> recipient
+your app -> qURL Connector -> qURL -> the people you invite
 ```
 
-[Local sharing workflow](#how-the-connector-enables-localhost-sharing) ·
-[File sharing](#file-sharing-through-a-local-service) ·
-[Runtime questions](#connector-sharing-questions) · [Private links](https://qurl.link/)
+## What you can do in two minutes
+
+| You want to… | How |
+| --- | --- |
+| Hide a local app and invite a reviewer | `qurl publish http://127.0.0.1:3000 --name "Design review" --access invite_only`, then `qurl access invite <CRID> --email ana@example.com` |
+| See who has access | `qurl access list_grants <CRID>` |
+| Remove someone's access | `qurl access revoke_grant <CRID> <grant-id> --version <n>` |
+| Pause or resume the app | `qurl stop <CRID>` / `qurl start <CRID>` |
+| Serve many routes from one Go process | `SessionGroupRunner` in `pkg/share`: up to `MaxGroupRoutes` routes on one admission and one session |
+
+Quickest start: [install the qURL CLI](https://github.com/layervai/qurl-integrations/tree/main/apps/cli#install),
+keep your app running, then:
+
+```bash
+qurl publish http://127.0.0.1:3000 --name "Design review" --access invite_only -o json
+qurl access invite <CRID> --email ana@example.com
+```
+
+### For AI agents and tools
+
+- Go module: `github.com/layervai/qurl-connector` · Go 1.26.11 or newer
+- People who share apps install only the `qurl` CLI. It embeds this runtime
+  and runs it as a per-user background service (a systemd user service on
+  Linux, launchd on macOS, Task Scheduler on Windows).
+- Core flow: `qurl publish <loopback URL> --name <app name> --access invite_only`
+  → read the CRID → `qurl access invite <CRID> --email <address>` →
+  `qurl access list_grants <CRID>` to review who has access
+- Origin: a loopback HTTP listener such as `http://127.0.0.1:3000`; for an
+  HTTPS-only app, point the Connector at a local reverse proxy
+- Build and test: `make verify-deps`, `make frpc`, `make test`
+- Related: [qURL CLI](https://github.com/layervai/qurl-integrations/tree/main/apps/cli) ·
+  [MCP server](https://github.com/layervai/qurl-mcp) ·
+  [Go SDK](https://github.com/layervai/qurl-go)
 
 ## How the Connector enables localhost sharing
 
