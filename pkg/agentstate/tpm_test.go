@@ -131,7 +131,7 @@ func TestNewSDKStoreFreshNamespaceSealsWithDefaultProvider(t *testing.T) {
 	if _, sealed := store.(*qurl.SealedFileAgentStateStore); !sealed {
 		t.Fatalf("fresh namespace store = %T, want sealed", store)
 	}
-	if err := store.SaveAgentState(context.Background(), &qurl.AgentState{AgentID: "agent-a", DeviceAPIKey: "device-secret"}); err != nil {
+	if err := store.SaveAgentState(context.Background(), &qurl.AgentState{AgentID: "agent-a", PrivateKeyB64: "private", PublicKeyB64: "public", DeviceAPIKey: "device-secret"}); err != nil {
 		t.Fatalf("SaveAgentState: %v", err)
 	}
 
@@ -144,7 +144,7 @@ func TestNewSDKStoreFreshNamespaceSealsWithDefaultProvider(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadAgentState: %v", err)
 	}
-	if loaded.DeviceAPIKey != "device-secret" || !provider.unsealSeen {
+	if loaded.PrivateKeyB64 != "private" || loaded.PublicKeyB64 != "public" || loaded.DeviceAPIKey != "device-secret" || !provider.unsealSeen {
 		t.Fatalf("reopened state = %#v, unsealSeen=%v", loaded, provider.unsealSeen)
 	}
 	if _, err := os.Lstat(filepath.Join(dir, AgentStateFile)); !os.IsNotExist(err) {
