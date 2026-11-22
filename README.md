@@ -1,19 +1,30 @@
 # qURL Connector
 
-**Hide an app behind a qURL: no inbound ports, no public address, and only the people you invite get in.**
-The Connector is the Go runtime that serves a qURL app. It runs beside your
-app, connects outward to LayerV, and lets a visitor through only after their
-qURL is admitted for that one resource with the Network-invisible Handshake
-Protocol (NHP). You invite people by email and decide who gets in. The person
-you invite just clicks the link. The Connector is built into the qURL CLI, so
-publishing an app starts it for you and keeps it running across sleep, wake,
-and network changes.
+**qURL makes apps invisible by default, with zero public port exposure for
+protected apps. Give people and AI agents access only when you choose.**
+
+[qURL™ by LayerV](https://layerv.ai/qurl/) puts access under your control.
+Its core protocol, OpenNHP (Network-invisible Handshake Protocol), admits each
+resource before the Connector carries traffic over a resource-bound session.
+A transport connection alone grants no access. qURL then enforces the resource's
+link and session policy for each visitor.
+
+The Connector is the Go runtime that brings this access model to your local
+apps and private APIs. It runs beside your app and connects outward to LayerV;
+you do not open an inbound port or give the app a public listening address.
+Use invite-only access to choose recipients by email, or use the access-link
+workflow below. Your app's own sign-in still applies. Close any independent
+public route if qURL should be the app's only access path.
+
+The qURL CLI embeds the Connector. Publishing an app starts its background
+service, which recovers after sleep, wake, and network changes. The app and
+host must remain available to serve requests.
 
 ```text
 your app -> qURL Connector -> qURL -> the people you invite
 ```
 
-## What you can do in two minutes
+## Publish an app and control access
 
 | You want to… | How |
 | --- | --- |
@@ -48,6 +59,9 @@ qurl access invite <CRID> --email ana@example.com
   [Go SDK](https://github.com/layervai/qurl-go)
 
 ## How the Connector enables localhost sharing
+
+The example above uses email invitations. The workflow below issues access
+links under the resource's configured privacy and link policy.
 
 Use the [qURL CLI](https://github.com/layervai/qurl-integrations#share-a-localhost-web-app)
 to let a teammate review a development preview, open an internal dashboard,
