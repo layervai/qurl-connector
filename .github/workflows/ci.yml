@@ -3,12 +3,8 @@ name: CI
 on:
   push:
     branches: [main]
+  # Required checks must report for documentation PRs too.
   pull_request:
-    paths-ignore:
-      - "**.md"
-      - ".gitignore"
-      - "LICENSE"
-      - "docs/**"
 
 concurrency:
   group: "ci-${{ github.ref }}"

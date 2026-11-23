@@ -1,30 +1,67 @@
-# qURL Connector runtime for local services
+# qURL Connector
 
-[qURL™ by LayerV](https://layerv.ai/qurl/) shares localhost web apps, private
-APIs, and files through expiring access links. qURL Connector is the embedded
-Go runtime that connects local services to that access path. It admits each shared resource
-with the Network-invisible Handshake Protocol (NHP), then carries approved
-traffic over a resource-bound FRP session.
+**qURL makes apps invisible by default, with zero public port exposure for
+protected apps. Give people and AI agents access only when you choose.**
 
-To share localhost as a user, install the
-[qURL CLI](https://github.com/layervai/qurl-integrations/tree/main/apps/cli),
-which embeds this runtime. Keep your local app running; the Connector carries
-traffic to it and the app's own sign-in requirements still apply.
+[qURL™ by LayerV](https://layerv.ai/qurl/) puts access under your control.
+Its core protocol, OpenNHP (Network-invisible Handshake Protocol), admits each
+resource before the Connector carries traffic over a resource-bound session.
+A transport connection alone grants no access. qURL then enforces the resource's
+link and session policy for each visitor.
 
-Developers working on the runtime can start with the
-[security model](#security-model), [source build](#build-from-source),
-[development checks](#development), or
-[developer command configuration](#developer-command-configuration).
+The Connector is the Go runtime that brings this access model to your local
+apps and private APIs. It runs beside your app and connects outward to LayerV;
+you do not open an inbound port or give the app a public listening address.
+Use invite-only access to choose recipients by email, or use the access-link
+workflow below. Your app's own sign-in still applies. Close any independent
+public route if qURL should be the app's only access path.
+
+The qURL CLI embeds the Connector. Publishing an app starts its background
+service, which recovers after sleep, wake, and network changes. The app and
+host must remain available to serve requests.
 
 ```text
-local service -> qURL Connector -> qURL -> recipient
+your app -> qURL Connector -> qURL -> the people you invite
 ```
 
-[Local sharing workflow](#how-the-connector-enables-localhost-sharing) ·
-[File sharing](#file-sharing-through-a-local-service) ·
-[Runtime questions](#connector-sharing-questions) · [Private links](https://qurl.link/)
+## Publish an app and control access
+
+| You want to… | How |
+| --- | --- |
+| Hide a local app and invite a reviewer | `qurl publish http://127.0.0.1:3000 --name "Design review" --access invite_only`, then `qurl access invite <CRID> --email ana@example.com` |
+| See who has access | `qurl access list_grants <CRID>` |
+| Remove someone's access | `qurl access revoke_grant <CRID> <grant-id> --version <n>` |
+| Pause or resume the app | `qurl stop <CRID>` / `qurl start <CRID>` |
+| Serve many routes from one Go process | `SessionGroupRunner` in `pkg/share`: up to `MaxGroupRoutes` routes on one admission and one session |
+
+Quickest start: [install the qURL CLI](https://github.com/layervai/qurl-integrations/tree/main/apps/cli#install),
+keep your app running, then:
+
+```bash
+qurl publish http://127.0.0.1:3000 --name "Design review" --access invite_only -o json
+qurl access invite <CRID> --email ana@example.com
+```
+
+### For AI agents and tools
+
+- Go module: `github.com/layervai/qurl-connector` · Go 1.26.11 or newer
+- People who share apps install only the `qurl` CLI. It embeds this runtime
+  and runs it as a per-user background service (a systemd user service on
+  Linux, launchd on macOS, Task Scheduler on Windows).
+- Core flow: `qurl publish <loopback URL> --name <app name> --access invite_only`
+  → read the CRID → `qurl access invite <CRID> --email <address>` →
+  `qurl access list_grants <CRID>` to review who has access
+- Origin: a loopback HTTP listener such as `http://127.0.0.1:3000`; for an
+  HTTPS-only app, point the Connector at a local reverse proxy
+- Build and test: `make verify-deps`, `make frpc`, `make test`
+- Related: [qURL CLI](https://github.com/layervai/qurl-integrations/tree/main/apps/cli) ·
+  [MCP server](https://github.com/layervai/qurl-mcp) ·
+  [Go SDK](https://github.com/layervai/qurl-go)
 
 ## How the Connector enables localhost sharing
+
+The example above uses email invitations. The workflow below issues access
+links under the resource's configured privacy and link policy.
 
 Use the [qURL CLI](https://github.com/layervai/qurl-integrations#share-a-localhost-web-app)
 to let a teammate review a development preview, open an internal dashboard,
