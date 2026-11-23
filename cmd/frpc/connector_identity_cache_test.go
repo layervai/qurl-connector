@@ -135,7 +135,7 @@ func seedConnectorIdentityCacheForTest(t *testing.T, dir, id, resourceID string)
 		t.Fatal(err)
 	}
 	store := qurl.FileAgentState(filepath.Join(dir, agentstate.AgentStateFile))
-	if err := store.SaveAgentState(context.Background(), &qurl.AgentState{AgentID: testConnectorCacheAgentID}); err != nil {
+	if err := store.SaveAgentState(context.Background(), &qurl.AgentState{AgentID: testConnectorCacheAgentID, PrivateKeyB64: "private", PublicKeyB64: "public"}); err != nil {
 		t.Fatal(err)
 	}
 	if err := withConnectorIdentityCacheLock(dir, func(txn *connectorIdentityCacheTxn) error {
