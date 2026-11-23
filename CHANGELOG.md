@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.14.7](https://github.com/layervai/qurl-connector/compare/v0.14.6...v0.14.7) (2026-11-23)
+
+
+### Features
+
+* **agent:** accept supervised Windows wrapping-key pipes ([#162](https://github.com/layervai/qurl-connector/issues/162)) ([4576e91](https://github.com/layervai/qurl-connector/commit/4576e9182679c2b086612de8b4f79013f78b2b31))
+
 ## [0.14.6](https://github.com/layervai/qurl-connector/compare/v0.14.5...v0.14.6) (2026-11-14)
 
 
